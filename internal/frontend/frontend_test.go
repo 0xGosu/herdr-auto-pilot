@@ -2243,6 +2243,12 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"task_source_provider.timeout_seconds":     "20",
 		"task_source_provider.refresh_seconds":     "30",
 		"task_source_provider.github_gist.gist_id": "3f2a1b9c4d5e6f708192a3b4c5d6e7f8",
+		// turso and not sqlite for the same reason as github_gist above.
+		"database.engine":                      "turso",
+		"database.turso_database_url":          "libsql://hap-me.turso.io",
+		"database.turso_auth_token":            "eyJ.sample.token",
+		"database.turso_sync_interval_seconds": "20",
+		"database.node_label":                  "laptop",
 		// Non-zero on purpose: 0 is a valid setting here ("never prune") but
 		// this sample also feeds the FieldValue round trip, and a real day
 		// count is the case worth exercising. The explicit-0 path has its own
@@ -2373,6 +2379,11 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 		"llm.task_generate_command":            true,
 		"llm.learn_from_user_command":          true,
 		"embedding.model_path":                 true,
+		// A URL, a token and a label are free text too; the token is also
+		// hidden, but the declared flag is what this test pins.
+		"database.turso_database_url": true,
+		"database.turso_auth_token":   true,
+		"database.node_label":         true,
 	}
 	for _, f := range frontend.ConfigFields {
 		// Assert the DECLARED flag, not the accessor's output. A hidden
@@ -2427,6 +2438,10 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"task_source_provider.env_file":        true,
 		"task_source_provider.timeout_seconds": true,
 		"task_source_provider.refresh_seconds": true,
+		// The token is a secret (rendered redacted, but not a row to show at
+		// all); the interval is tuned once if ever.
+		"database.turso_auth_token":            true,
+		"database.turso_sync_interval_seconds": true,
 		// Eight color strings would bury the settings a TUI operator actually
 		// reaches for, but they stay registered so `hap config set` reaches them.
 		"tui.palette.title":   true,

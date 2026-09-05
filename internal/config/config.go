@@ -624,6 +624,130 @@ const (
 // value and fails at use time (see ValidateTaskSource).
 var ValidTaskSourceProviders = []string{ProviderLocalFS, ProviderGitHubGist}
 
+// Database engines.
+const (
+	// EngineSQLite is the default: one local file in the state dir that every
+	// hap process opens directly.
+	EngineSQLite = "sqlite"
+	// EngineTurso is the opt-in central database: a Turso sync database that
+	// the DAEMON alone opens and syncs with Turso Cloud, and that every other
+	// hap process on the machine reaches through the daemon. Several machines
+	// pointing at one Turso database see one another's agents, escalations,
+	// audit and learned rules.
+	EngineTurso = "turso"
+)
+
+// ValidDatabaseEngines are the values database.engine accepts. Mirrors
+// ValidTaskSourceProviders: `hap config set` and the TUI picker validate
+// against it, while a hand-edited config.toml still LOADS an unrecognized
+// value and fails at use time (ValidateDatabase).
+var ValidDatabaseEngines = []string{EngineSQLite, EngineTurso}
+
+// DefaultTursoSyncIntervalSeconds is how often the daemon pulls from Turso
+// Cloud when the key is 0. Short enough that a remote confirm lands while the
+// operator is still looking; long enough that an idle fleet costs a request
+// every few seconds, not every second.
+const DefaultTursoSyncIntervalSeconds = 15
+
+// MinTursoSyncIntervalSeconds floors the pull interval: each pull is an HTTP
+// round trip to Turso Cloud from every node.
+const MinTursoSyncIntervalSeconds = 5
+
+// TursoAuthTokenEnv is the environment variable read when turso_auth_token is
+// empty — for an operator who would rather keep the token out of config.toml.
+const TursoAuthTokenEnv = "TURSO_AUTH_TOKEN"
+
+// Database selects where hap keeps its state. The default is the local SQLite
+// file and nothing else in this section matters then.
+//
+// Under engine = "turso" the whole store lives in a Turso sync database: a
+// local file the daemon syncs with the Turso Cloud database named by
+// turso_database_url. Every hap process on the machine then talks to the
+// daemon (the sync engine allows one process per file), and every machine
+// sharing that URL sees the others' agents, escalations, audit and rules —
+// including pane excerpts. Rows are stamped with a per-machine node id so
+// identical herdr pane ids on two machines never collide.
+//
+// The section is read once, when a process opens its store: a change needs
+// `hap daemon --ensure` (and reopening the TUI). Config itself never enters
+// the database — each machine keeps its own config.toml.
+type Database struct {
+	// Engine is one of ValidDatabaseEngines. Empty means sqlite. An
+	// UNRECOGNIZED value is neither rejected at Load nor coerced — coercing it
+	// to sqlite would silently run a fleet install alone on a local file.
+	Engine string `toml:"engine,omitempty"`
+	// TursoDatabaseURL is the Turso Cloud database (libsql://…, turso://… or
+	// https://…), from `turso db show <db>`.
+	TursoDatabaseURL string `toml:"turso_database_url,omitempty"`
+	// TursoAuthToken authenticates against it (`turso db tokens create <db>`).
+	// Rendered redacted by every operator surface. Empty falls back to the
+	// TURSO_AUTH_TOKEN environment variable.
+	TursoAuthToken string `toml:"turso_auth_token,omitempty"`
+	// TursoSyncIntervalSeconds is how often the daemon pulls (0 = the
+	// built-in default, floored at MinTursoSyncIntervalSeconds).
+	TursoSyncIntervalSeconds int `toml:"turso_sync_interval_seconds,omitempty"`
+	// NodeLabel is how other machines see this one beside its agents
+	// ("name@label"). Empty means the hostname.
+	NodeLabel string `toml:"node_label,omitempty"`
+}
+
+// EngineOrDefault is the engine in force: sqlite when the key is empty.
+func (d Database) EngineOrDefault() string {
+	if d.Engine == "" {
+		return EngineSQLite
+	}
+	return d.Engine
+}
+
+// IsTurso reports whether the central Turso database is selected.
+func (d Database) IsTurso() bool { return d.Engine == EngineTurso }
+
+// AuthToken is the Turso token in force: the config value, else the
+// TURSO_AUTH_TOKEN environment variable.
+func (d Database) AuthToken() string {
+	if t := strings.TrimSpace(d.TursoAuthToken); t != "" {
+		return t
+	}
+	return strings.TrimSpace(os.Getenv(TursoAuthTokenEnv))
+}
+
+// SyncInterval is the daemon's pull interval in force.
+func (d Database) SyncInterval() time.Duration {
+	s := d.TursoSyncIntervalSeconds
+	if s <= 0 {
+		s = DefaultTursoSyncIntervalSeconds
+	}
+	if s < MinTursoSyncIntervalSeconds {
+		s = MinTursoSyncIntervalSeconds
+	}
+	return time.Duration(s) * time.Second
+}
+
+// ValidateDatabase is the USE-time check: an unrecognized engine, or turso
+// without a URL or a token. Load deliberately does not call it — a config
+// already on disk in a rejected state must still load, or the operator is
+// locked out of the CLI that repairs it — and SetField does not either, so the
+// three keys are never order-dependent to set.
+func ValidateDatabase(cfg Config) error {
+	d := cfg.Database
+	switch d.EngineOrDefault() {
+	case EngineSQLite:
+		return nil
+	case EngineTurso:
+		if strings.TrimSpace(d.TursoDatabaseURL) == "" {
+			return fmt.Errorf("database.engine is %q but database.turso_database_url is not set: "+
+				"run `turso db show <db>` and `hap config set database.turso_database_url <url>`", EngineTurso)
+		}
+		if d.AuthToken() == "" {
+			return fmt.Errorf("database.engine is %q but no auth token is set: "+
+				"`hap config set database.turso_auth_token <token>` or export %s", EngineTurso, TursoAuthTokenEnv)
+		}
+		return nil
+	default:
+		return fmt.Errorf("database.engine %q is not one of %s", d.Engine, strings.Join(ValidDatabaseEngines, ", "))
+	}
+}
+
 // DefaultTaskStoreTimeoutSeconds bounds one backend call (a gist GET or PATCH).
 const DefaultTaskStoreTimeoutSeconds = 20
 
@@ -1348,6 +1472,9 @@ type Config struct {
 	TUI         TUI         `toml:"tui"`
 	CLI         CLI         `toml:"cli"`
 	Agents      Agents      `toml:"agents"`
+	// Database selects the store engine. Declared before TaskSources for the
+	// same reason TaskSourceProvider is (see below).
+	Database Database `toml:"database"`
 	// TaskSourceProvider is the DEFAULT storage backend for task lists, which
 	// each [[task_sources]] entry may override. Declared BEFORE TaskSources on
 	// purpose: BurntSushi emits a struct's sub-tables after its scalars, and
@@ -1404,6 +1531,9 @@ func Default() Config {
 		// renders something for the registry parity test, and so an operator
 		// reading a saved config sees the posture they are running under.
 		TaskSourceProvider: TaskSourceProvider{Provider: ProviderLocalFS},
+		// The local file unless the operator says otherwise, named for the
+		// same two reasons as the provider above.
+		Database: Database{Engine: EngineSQLite},
 	}
 }
 
@@ -1507,6 +1637,18 @@ func (p Paths) DBPath() string { return filepath.Join(p.StateDir, "herd-auto-pro
 
 // ControlSocketPath returns the daemon control socket path.
 func (p Paths) ControlSocketPath() string { return filepath.Join(p.StateDir, "control.sock") }
+
+// TursoDir is where the turso engine keeps its local sync database and the
+// sync engine's sidecar files. Disposable: deleting it re-bootstraps from the
+// remote on the next daemon start.
+func (p Paths) TursoDir() string { return filepath.Join(p.StateDir, "turso") }
+
+// TursoDBPath is the turso engine's local database file.
+func (p Paths) TursoDBPath() string { return filepath.Join(p.TursoDir(), "hap.db") }
+
+// StoreSocketPath is the socket the daemon serves the store on under the turso
+// engine, for the TUI, the CLI verbs and the MCP server on this machine.
+func (p Paths) StoreSocketPath() string { return filepath.Join(p.StateDir, "store.sock") }
 
 // legacyKeys mirrors every deprecated or removed config key that Load must
 // detect in the RAW file. Presence is the point: once decoded into Config, a
@@ -1944,6 +2086,11 @@ func (c *Config) fillZeroes() {
 	// the message can name the key and the valid values.
 	if c.TaskSourceProvider.Provider == "" {
 		c.TaskSourceProvider.Provider = d.TaskSourceProvider.Provider
+	}
+	// Same posture for the engine: only an EMPTY value is filled, an
+	// unrecognized one is left as written and fails at use (ValidateDatabase).
+	if c.Database.Engine == "" {
+		c.Database.Engine = d.Database.Engine
 	}
 	if c.Limits.MaxConsecutiveAutoPrompts <= 0 {
 		c.Limits.MaxConsecutiveAutoPrompts = d.Limits.MaxConsecutiveAutoPrompts

@@ -297,6 +297,7 @@ func TestPruneAuditExcerptsPreservesPendingEscalationDedupSet(t *testing.T) {
 }
 
 func TestOpenSetsJournalSizeLimit(t *testing.T) {
+	skipUnlessSQLite(t)
 	s, _ := openTestStore(t)
 	var limit int64
 	if err := s.db.QueryRowContext(context.Background(),

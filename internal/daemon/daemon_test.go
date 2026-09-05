@@ -731,7 +731,11 @@ type harness struct {
 	ctlPath string
 	cancel  context.CancelFunc
 	runDone chan struct{} // closed when d.Run returns (after background drain)
+	db      string        // the SQLite file, for tests that open it as another node
 }
+
+// dbPath is the harness's SQLite file.
+func (h *harness) dbPath() string { return h.db }
 
 // stop cancels the daemon and blocks until Run has fully returned — i.e. until
 // shutdownBackground has drained every background goroutine/timer. Tests use it
@@ -828,7 +832,8 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	if err := os.WriteFile(cfgPath, []byte(cfgTOML), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	dbPath := filepath.Join(dir, "test.db")
+	raw, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -897,7 +902,7 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 
 	return &harness{
 		t: t, daemon: d, store: fs, raw: raw, herdr: fh, events: fe, llm: fl,
-		cfgPath: cfgPath, ctlPath: ctlPath, cancel: cancel, runDone: runDone,
+		cfgPath: cfgPath, ctlPath: ctlPath, cancel: cancel, runDone: runDone, db: dbPath,
 	}
 }
 

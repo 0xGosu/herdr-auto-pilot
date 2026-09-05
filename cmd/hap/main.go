@@ -22,6 +22,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemon"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
@@ -35,6 +36,8 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/turso"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tui"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tuisession"
 )
@@ -272,7 +275,7 @@ func drainSubmitRetries(app *frontend.App) {
 }
 
 func buildApp(paths config.Paths) (*frontend.App, func(), error) {
-	st, err := store.Open(paths.DBPath())
+	st, err := openProcessStore(paths)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -381,11 +384,64 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 	})
 	defer survived.Stop()
 
-	st, err := store.Open(paths.DBPath())
-	if err != nil {
-		return err
+	// The store, under the configured engine. turso: the daemon is the one
+	// process that opens the sync database; it serves it to every other hap
+	// process on this machine over the store socket, and syncs it with Turso
+	// Cloud from the fleet sync loop.
+	var st *store.Store
+	var fleet ports.FleetSyncPort
+	var fleetWrites chan struct{}
+	var storeSocket string
+	var nodeID string
+	if bootCfg.Database.IsTurso() {
+		if err := config.ValidateDatabase(bootCfg); err != nil {
+			return err
+		}
+		var err error
+		if nodeID, err = store.LoadNodeID(paths.StateDir); err != nil {
+			return err
+		}
+		fleetWrites = make(chan struct{}, 1)
+		tdb, err := openTurso(ctx, paths, bootCfg, nodeID, fleetWrites, time.Now())
+		if err != nil {
+			return fmt.Errorf("turso: %w", err)
+		}
+		defer tdb.Close()
+		st, err = store.OpenDB(tdb.DB(), store.Options{
+			NodeID:       nodeID,
+			Engine:       store.EngineTurso,
+			IDs:          store.NewTimeOrderedIDs(store.NodeBits(nodeID), nil),
+			Migrate:      false,
+			AgentLockDir: filepath.Join(paths.StateDir, "agent-automation-locks"),
+		})
+		if err != nil {
+			return err
+		}
+		defer st.Close()
+		// Pull, then migrate only as the schema lead: two nodes issuing the
+		// same DDL wedge the loser (see turso.PrepareSharedSchema).
+		if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
+			return fmt.Errorf("turso: prepare schema: %w", err)
+		}
+		if err := importLegacyStore(ctx, paths, st); err != nil {
+			slog.Warn("turso: importing the local sqlite database failed; continuing without it", "error", err)
+		}
+		storeSocket = paths.StoreSocketPath()
+		ln, err := control.ListenSocket(storeSocket)
+		if err != nil {
+			return fmt.Errorf("store socket: %w", err)
+		}
+		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{})
+		defer srv.Close()
+		fleet = tdb
+	} else {
+		var err error
+		st, err = store.Open(paths.DBPath())
+		if err != nil {
+			return err
+		}
+		defer st.Close()
 	}
-	defer st.Close()
 
 	cliAdapter := herdr.NewCLI()
 	// The LLM adapter is rebuilt from config on every reload so that
@@ -396,6 +452,8 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			Timeout:         cfg.LLMTimeout(),
 			DBPath:          paths.DBPath(),
 			ControlPath:     paths.ControlSocketPath(),
+			StoreSocketPath: storeSocket,
+			NodeID:          nodeID,
 			Store:           st,
 			TaskGenTemplate: cfg.LLM.GenerateTaskCommand,
 			TaskGenTimeout:  cfg.GenerateTaskTimeout(),
@@ -493,6 +551,12 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		DisableFSP:          fspApp.DisableFullSelfPromptingWithReason,
 		MatchIndexDir:       filepath.Join(paths.StateDir, "match-index"),
 		StateDir:            paths.StateDir,
+		// The shared database's sync engine and its write signal (turso only;
+		// both nil under sqlite, and the loop never runs).
+		FleetSync:         fleet,
+		FleetSyncInterval: bootCfg.Database.SyncInterval(),
+		FleetWrites:       fleetWrites,
+		NodeLabel:         bootCfg.Database.NodeLabel,
 		// Hand the herd to the binary that replaced ours (plugin upgrade)
 		// instead of soldiering on with children we can no longer spawn.
 		//
@@ -659,7 +723,17 @@ func runMCP(ctx context.Context, paths config.Paths) error {
 	if controlPath == "" {
 		controlPath = paths.ControlSocketPath()
 	}
-	st, err := store.Open(dbPath)
+	// Under the turso engine the daemon hands its MCP children the store
+	// socket and this node's id, the same way it hands them the paths above —
+	// the launching CLI may have sanitized the environment that would let this
+	// process work them out itself.
+	var st *store.Store
+	var err error
+	if sock := os.Getenv("HAP_STORE_SOCKET_PATH"); sock != "" {
+		st, err = openProxyStore(sock, filepath.Dir(dbPath), os.Getenv("HAP_NODE_ID"))
+	} else {
+		st, err = store.Open(dbPath)
+	}
 	if err != nil {
 		return err
 	}

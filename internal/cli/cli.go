@@ -920,6 +920,9 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	if h.EmbedderDegraded {
 		fmt.Fprintf(out, "embedder health:     DEGRADED at runtime — %s\n", h.EmbedderNote)
 	}
+	if h.FleetSyncLine != "" {
+		fmt.Fprintf(out, "fleet sync:          %s\n", h.FleetSyncLine)
+	}
 	// The evidence behind the state: which budgets are in force, how many calls
 	// hit them, and the last error. Printed even when NOT degraded, so a run of
 	// timeouts is visible before the latch trips (the diag lines are empty
@@ -1447,7 +1450,18 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "%s set to %s%s\n", key, value, reloadNote(reloaded))
+		shown := value
+		if key == "database.turso_auth_token" {
+			// A secret, and this line is what lands in a terminal scrollback.
+			shown = "(set)"
+		}
+		fmt.Fprintf(out, "%s set to %s%s\n", key, shown, reloadNote(reloaded))
+		if strings.HasPrefix(key, "database.") {
+			// The store is opened once per process, so a reload cannot apply
+			// this; said on stderr like the other notes, since stdout is parsed.
+			fmt.Fprintln(deprecationOut, "note: [database] is read when a process opens its store — "+
+				"run `hap daemon --ensure` and reopen the TUI for it to take effect")
+		}
 		PrintNextSteps(out, configHints())
 		return nil
 	case "set-threshold":
@@ -1526,6 +1540,31 @@ func printConfig(out io.Writer, cfg config.Config) {
 	fmt.Fprintf(out, "task sources: %d, operator never-auto rules: %d (+%d seed)\n",
 		len(cfg.TaskSources), len(cfg.Safety.NeverAutoPatterns)+len(cfg.Safety.NeverAutoRules), seedCount)
 	printTaskStoreLine(out, cfg)
+	printDatabaseLine(out, cfg)
+}
+
+// printDatabaseLine reports the store engine, only when it is not the default
+// local file — the same rule as printTaskStoreLine, for the same reason. The
+// token is never printed; whether one is set is.
+func printDatabaseLine(out io.Writer, cfg config.Config) {
+	d := cfg.Database
+	if d.EngineOrDefault() == config.EngineSQLite {
+		return
+	}
+	token := "none"
+	if d.AuthToken() != "" {
+		token = "set"
+	}
+	label := d.NodeLabel
+	if label == "" {
+		label = "(hostname)"
+	}
+	fmt.Fprintf(out, "database:   engine=%s url=%s token=%s sync=%s node_label=%s\n",
+		d.EngineOrDefault(), frontend.FieldValue(cfg, "database.turso_database_url"), token,
+		d.SyncInterval(), label)
+	if err := config.ValidateDatabase(cfg); err != nil {
+		fmt.Fprintf(out, "database:   MISCONFIGURED — %v\n", err)
+	}
 }
 
 // printTaskStoreLine reports where task lists live, and why they cannot be

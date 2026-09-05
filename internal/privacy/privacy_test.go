@@ -1,7 +1,7 @@
 // Package privacy holds the no-telemetry verification (NFR-007, SC-6): the
 // plugin sends no telemetry and makes no outbound network call beyond the
-// local Herdr socket, the operator-configured local LLM CLI, and TWO
-// allowlisted exceptions, both operator opt-in and both off by default:
+// local Herdr socket, the operator-configured local LLM CLI, and THREE
+// allowlisted exceptions, all operator opt-in and all off by default:
 //
 //  1. internal/updatecheck/fetch.go — the opt-out release check, which asks
 //     GitHub for the newest published version and sends nothing else.
@@ -11,9 +11,14 @@
 //     no learned rules, no audit history. A source uses it only when
 //     [task_source_provider] (or that source's own `provider`) selects it, and
 //     the default is local_fs.
+//  3. internal/store/turso/turso.go — the turso store engine, which syncs the
+//     WHOLE store (agents, escalations with their pane excerpts, audit, learned
+//     rules) with a Turso Cloud database the operator owns, with a token the
+//     operator supplies, so several of their machines share one hap view. Used
+//     only when [database] engine = "turso"; the default is sqlite, a local file.
 //
-// Both files are allowlisted BY NAME below; net/http, or the GitHub SDK, from
-// anywhere else still fails.
+// The files are allowlisted BY NAME below; net/http, the GitHub SDK or the
+// Turso SDK from anywhere else still fails.
 package privacy
 
 import (
@@ -42,6 +47,11 @@ var forbiddenImports = map[string]string{
 	// adapter that used only the SDK — never naming net/http itself — would
 	// egress while passing this test. Passing is not compliance.
 	"github.com/google/go-github/v90/github": "GitHub REST egress",
+	// The Turso SDK is purego over an embedded native library: its network
+	// I/O happens in Rust, so no Go import of net/http would ever betray it.
+	// Banning the SDK's own path (and the library loader's) is the only gate.
+	"turso.tech/database/tursogo":                     "Turso Cloud sync egress",
+	"github.com/tursodatabase/turso-go-platform-libs": "Turso native library (the SDK's network code)",
 }
 
 // allowedNetURLFiles may import net/url for non-network purposes.
@@ -68,6 +78,12 @@ var allowedEgressFiles = map[string]map[string]string{
 	},
 	"github.com/google/go-github/v90/github": {
 		"internal/taskstore/gist/gist.go": "opt-in github_gist task-list backend (task text only)",
+	},
+	"turso.tech/database/tursogo": {
+		"internal/store/turso/turso.go": "opt-in turso store engine (the whole store, to the operator's own Turso Cloud database)",
+	},
+	"github.com/tursodatabase/turso-go-platform-libs": {
+		"internal/store/turso/library.go": "the turso engine's native library loader",
 	},
 }
 
@@ -174,6 +190,12 @@ func TestHTTPAllowlistStaysMinimal(t *testing.T) {
 		"github.com/google/go-github/v90/github": {
 			"internal/taskstore/gist/gist.go": true,
 		},
+		"turso.tech/database/tursogo": {
+			"internal/store/turso/turso.go": true,
+		},
+		"github.com/tursodatabase/turso-go-platform-libs": {
+			"internal/store/turso/library.go": true,
+		},
 	}
 
 	if len(allowedEgressFiles) != len(want) {
@@ -220,6 +242,23 @@ func TestGoGitHubImportIsAllowlistedToOneFile(t *testing.T) {
 	if _, forbidden := forbiddenImports[sdk]; !forbidden {
 		t.Error("the SDK must stay in forbiddenImports — the walker checks DIRECT imports, so " +
 			"without this entry an adapter that used only the SDK would egress while passing")
+	}
+}
+
+// TestTursoImportIsAllowlistedToOneFile keeps the Turso SDK confined to the
+// single adapter file, as the GitHub SDK is: the store, the daemon and the front
+// ends see a *sql.DB and a ports.FleetSyncPort, never the SDK.
+func TestTursoImportIsAllowlistedToOneFile(t *testing.T) {
+	const sdk = "turso.tech/database/tursogo"
+	files := allowedEgressFiles[sdk]
+	if len(files) != 1 {
+		t.Fatalf("%s must be allowlisted for exactly one file, got %v", sdk, slices.Sorted(maps.Keys(files)))
+	}
+	if _, ok := files["internal/store/turso/turso.go"]; !ok {
+		t.Errorf("the SDK allowlist names %v, want the turso adapter", slices.Sorted(maps.Keys(files)))
+	}
+	if _, forbidden := forbiddenImports[sdk]; !forbidden {
+		t.Error("the Turso SDK must stay in forbiddenImports — its network I/O is native, so nothing else can catch it")
 	}
 }
 

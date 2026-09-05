@@ -5571,6 +5571,8 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 		return config.ValidThemes, true
 	case "task_source_provider.provider":
 		return config.ValidTaskSourceProviders, true
+	case "database.engine":
+		return config.ValidDatabaseEngines, true
 	default:
 		return nil, false
 	}

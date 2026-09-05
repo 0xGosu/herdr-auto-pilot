@@ -580,6 +580,37 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
                                   # next attention event; after that it runs on
                                   # each agent's ordinary captures.
 
+# ── database ────────────────────────────────────────────────────────
+# Where hap keeps its state. "sqlite" (the default) is one local file in the
+# state dir that every hap process opens directly.
+#
+# "turso" is the opt-in CENTRAL database for several machines: the daemon holds
+# a local Turso sync database and syncs it with the Turso Cloud database named
+# below, so every machine pointing at the same URL sees one another's agents,
+# escalations, audit, learned rules and pause state in one TUI, and can answer
+# another machine's escalations. Rows are stamped with a per-machine node id
+# (<state>/node-id), so identical herdr pane ids on two machines never collide.
+#
+# PRIVACY: under "turso" the WHOLE store — pane excerpts included — lives in a
+# Turso Cloud database you own. Nothing is sent anywhere else. The default
+# ("sqlite") makes no outbound call.
+#
+# Every other hap process on the machine (the TUI, `hap` verbs, the MCP server)
+# reaches the store through the daemon under "turso", so they need a running
+# daemon (`hap daemon --ensure`). The section is read when a process opens its
+# store: after changing it, run `hap daemon --ensure` and reopen the TUI. Config
+# itself stays in this file on each machine — it is never stored in the database.
+#
+# Setup:  turso db create <name> --tursodb
+#         turso db show <name>            → turso_database_url
+#         turso db tokens create <name>   → turso_auth_token (or export TURSO_AUTH_TOKEN)
+# [database]
+# engine = "turso"
+# turso_database_url = "libsql://<name>-<org>.turso.io"
+# turso_auth_token = ""                   # empty = read TURSO_AUTH_TOKEN from the environment
+# turso_sync_interval_seconds = 15        # how often the daemon pulls (min 5)
+# node_label = ""                         # how other machines see this one (default: hostname)
+
 # ── Where task lists are stored: the DEFAULT (per-source overridable) ──
 # This section supplies the DEFAULT storage for the checklists below. Each
 # [[task_sources]] entry may override it, so some agents can keep their lists

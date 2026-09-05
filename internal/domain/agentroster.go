@@ -11,6 +11,8 @@ import "time"
 // only a snapshot can carry: when it was observed, and the cwd that costs a
 // subprocess to read.
 type RosterAgent struct {
+	// NodeID is the installation whose daemon published this row.
+	NodeID      string
 	AgentID     string
 	PaneID      string
 	TabID       string
@@ -97,4 +99,11 @@ func RosterFresh(publishedAt, now time.Time) bool {
 type RosterCwd struct {
 	Cwd        string
 	TerminalID string
+}
+
+// NodeAgent identifies an agent fleet-wide: herdr pane ids repeat on every
+// machine, so an agent id alone is ambiguous once several nodes share a store.
+type NodeAgent struct {
+	NodeID  string
+	AgentID string
 }

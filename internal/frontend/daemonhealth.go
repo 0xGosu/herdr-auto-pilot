@@ -71,6 +71,9 @@ type DaemonHealth struct {
 	// diagnostics and something has failed, degraded or not: a run of timeouts
 	// short of the latch is the early warning that the budgets are too tight.
 	EmbedderDiagLines []string
+	// FleetSyncLine describes the shared database's sync state under the
+	// turso engine ("" under the local engine).
+	FleetSyncLine string
 	// Reason explains a gave-up / auto-disabled latch.
 	Reason string
 	// StderrLog is the captured daemon stderr path (for hung/crashed post-mortem).
@@ -108,6 +111,7 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 			}
 			h.EmbedderDiagLines = rec.EmbedderDiagLines()
 			h.BinaryReplaced = rec.BinaryReplaced
+			h.FleetSyncLine = rec.FleetSync.Line(now)
 		}
 	}
 	if g, ok := crashguard.Read(a.StateDir); ok {

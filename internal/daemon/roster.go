@@ -68,14 +68,40 @@ const rosterLocationTTL = 60 * time.Second
 // event-driven path and the sweep still publish, so the cost of being wrong is
 // a slower refresh, never a missing roster.
 func (d *Daemon) rosterDemand() bool {
-	if d.opt.StateDir == "" {
-		return false
+	return d.rosterDemandLevel() != rosterDemandNone
+}
+
+// rosterDemandLevel says who is watching: a TUI on THIS machine (the fast
+// tick), a TUI on ANOTHER machine sharing the store (a publish per sync
+// interval — fast enough for a remote view that arrives a pull later anyway,
+// and slow enough not to push a changeset every two seconds), or nobody.
+type rosterDemandLevel int
+
+const (
+	rosterDemandNone rosterDemandLevel = iota
+	rosterDemandRemote
+	rosterDemandLocal
+)
+
+// remoteRosterInterval paces the roster publish for a REMOTE watcher. It
+// matches the default sync interval: publishing faster than the store syncs
+// buys the remote TUI nothing and costs every node a changeset per tick.
+const remoteRosterInterval = 15 * time.Second
+
+func (d *Daemon) rosterDemandLevel() rosterDemandLevel {
+	if d.opt.StateDir != "" {
+		if live, err := tuisession.Live(tuisession.Dir(d.opt.StateDir)); err == nil && len(live) > 0 {
+			return rosterDemandLocal
+		}
 	}
-	live, err := tuisession.Live(tuisession.Dir(d.opt.StateDir))
-	if err != nil {
-		return false
+	// A read error is "nobody watching", as with the local registry: the
+	// event-driven path and the sweep still publish.
+	if d.opt.Store != nil && d.opt.Clock != nil {
+		if n, err := d.opt.Store.RemoteWatchers(context.Background(), d.opt.Clock.Now()); err == nil && n > 0 {
+			return rosterDemandRemote
+		}
 	}
-	return len(live) > 0
+	return rosterDemandNone
 }
 
 // rosterShellOutTTLs returns the cwd and location TTLs for this pass.
@@ -105,14 +131,22 @@ func (d *Daemon) rosterShellOutTTLs() (cwd, locations time.Duration) {
 // latch is released by the goroutine's own defer AND by hand when spawn
 // refuses, or one shutdown race disables the tick for the life of the process.
 func (d *Daemon) startRosterTickPass(ctx context.Context) {
-	if !d.rosterDemand() {
+	level := d.rosterDemandLevel()
+	if level == rosterDemandNone {
 		return
 	}
+	now := d.opt.Clock.Now()
 	d.mu.Lock()
 	if d.rosterTickRunning {
 		d.mu.Unlock()
 		return
 	}
+	// A remote watcher gets a publish per sync interval, not per tick.
+	if level == rosterDemandRemote && !d.rosterRemoteAt.IsZero() && now.Sub(d.rosterRemoteAt) < remoteRosterInterval {
+		d.mu.Unlock()
+		return
+	}
+	d.rosterRemoteAt = now
 	d.rosterTickRunning = true
 	d.mu.Unlock()
 

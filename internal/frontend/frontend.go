@@ -2182,6 +2182,15 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "task_source_provider.timeout_seconds", TUIEditable: true, TUIHidden: true},
 	{Key: "task_source_provider.refresh_seconds", TUIEditable: true, TUIHidden: true},
 	{Key: "task_source_provider.github_gist.gist_id", TUIEditable: true},
+	// [database]: the engine is a picker; the URL and the node label are free
+	// text (CR-036: read-only in the TUI); the token is registered so `hap
+	// config set` reaches it but rendered REDACTED everywhere and kept off the
+	// Config tab, like every other key that holds a secret.
+	{Key: "database.engine", TUIEditable: true},
+	{Key: "database.turso_database_url"},
+	{Key: "database.turso_auth_token", TUIHidden: true},
+	{Key: "database.turso_sync_interval_seconds", TUIEditable: true, TUIHidden: true},
+	{Key: "database.node_label"},
 	// Palette roles are TUIHidden, not absent: eight color strings would bury
 	// the settings a TUI operator actually reaches for, but `hap config fields`
 	// and `hap config set` must still reach every key config.toml accepts.
@@ -2515,6 +2524,27 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.Itoa(int(cfg.TaskSourceProvider.SnapshotTTL() / time.Second))
 	case "task_source_provider.github_gist.gist_id":
 		return pathFieldValue(cfg.TaskSourceProvider.GitHubGist.GistID)
+	case "database.engine":
+		return cfg.Database.EngineOrDefault()
+	case "database.turso_database_url":
+		return pathFieldValue(cfg.Database.TursoDatabaseURL)
+	case "database.turso_auth_token":
+		// Never the value: a token is a secret, and every registered key is
+		// printed by `hap config fields`.
+		if strings.TrimSpace(cfg.Database.TursoAuthToken) != "" {
+			return "(set)"
+		}
+		if os.Getenv(config.TursoAuthTokenEnv) != "" {
+			return "(from " + config.TursoAuthTokenEnv + ")"
+		}
+		return "(none)"
+	case "database.turso_sync_interval_seconds":
+		return defaultedInt(cfg.Database.TursoSyncIntervalSeconds, config.DefaultTursoSyncIntervalSeconds)
+	case "database.node_label":
+		if strings.TrimSpace(cfg.Database.NodeLabel) == "" {
+			return "(hostname)"
+		}
+		return cfg.Database.NodeLabel
 	}
 	return ""
 }
@@ -2977,6 +3007,48 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 					"(the hex tail of its URL), got %q", value)
 			}
 			cfg.TaskSourceProvider.GitHubGist.GistID = id
+			return nil
+		case "database.engine":
+			// Same rule as task_source_provider.provider: the typed surface
+			// rejects a typo with the valid list; a hand-edited file still loads
+			// and fails at use time (config.ValidateDatabase).
+			e := strings.ToLower(strings.TrimSpace(value))
+			if e == "" {
+				cfg.Database.Engine = ""
+				return nil
+			}
+			if !slices.Contains(config.ValidDatabaseEngines, e) {
+				return fmt.Errorf("database.engine must be one of %s, got %q",
+					strings.Join(config.ValidDatabaseEngines, ", "), value)
+			}
+			cfg.Database.Engine = e
+			return nil
+		case "database.turso_database_url":
+			// Not validated against the engine: the three keys must not be
+			// order-dependent to set. Shape only.
+			u := strings.TrimSpace(value)
+			if strings.ContainsAny(u, " \t\r\n") {
+				return fmt.Errorf("database.turso_database_url must be a single URL, got %q", value)
+			}
+			cfg.Database.TursoDatabaseURL = u
+			return nil
+		case "database.turso_auth_token":
+			cfg.Database.TursoAuthToken = strings.TrimSpace(value)
+			return nil
+		case "database.turso_sync_interval_seconds":
+			v, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || v < 0 {
+				return fmt.Errorf("database.turso_sync_interval_seconds must be a non-negative "+
+					"integer (0 = the built-in %d), got %q", config.DefaultTursoSyncIntervalSeconds, value)
+			}
+			cfg.Database.TursoSyncIntervalSeconds = v
+			return nil
+		case "database.node_label":
+			l := strings.TrimSpace(value)
+			if strings.ContainsAny(l, "\t\r\n@") {
+				return fmt.Errorf("database.node_label must be a short label without @ or line breaks, got %q", value)
+			}
+			cfg.Database.NodeLabel = l
 			return nil
 		case "cli.ai_agent_friendly_output":
 			v, err := strconv.ParseBool(value)

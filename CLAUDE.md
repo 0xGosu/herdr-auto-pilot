@@ -871,13 +871,44 @@ whose manifest carries exactly that version).
   paired tests (`TestGistRefusesToWriteBlankContent` / `TestGistFakeRejectsBlankContentLikeGitHub` /
   `TestBootstrapSeedsTheListWithItsHeaderNotBlank` / `TestNewListHeaderIsNeverBlank` /
   `TestEnsureListRefusesABlankSeedOnEveryBackend`).
-- **Egress has exactly two exceptions, both opt-in and off by default** — the release check
-  (`internal/updatecheck/fetch.go`) and the `github_gist` task-list backend
-  (`internal/taskstore/gist/gist.go`), which carries task text only. `internal/privacy` bans the
-  GitHub SDK by its own import path as well as `net/http`, because the walker checks DIRECT
-  imports: an adapter using only the SDK would egress while passing. The gist adapter must keep
-  using `github.WithURLs` (not a `*url.URL`) and `github.WithTimeout` (not a hand-built
-  transport), or `net/url` and the no-remote-dial scan need widening too.
+- **Egress has exactly three exceptions, all opt-in and off by default** — the release check
+  (`internal/updatecheck/fetch.go`), the `github_gist` task-list backend
+  (`internal/taskstore/gist/gist.go`), which carries task text only, and the `turso` store
+  engine (`internal/store/turso/turso.go`), which syncs the WHOLE store with the operator's
+  own Turso Cloud database. `internal/privacy` bans the GitHub SDK and the Turso SDK (plus its
+  native-library loader) by their own import paths as well as `net/http`, because the walker
+  checks DIRECT imports: an adapter using only an SDK would egress while passing — and the
+  Turso SDK's network code is native, so nothing else could ever catch it. The gist adapter
+  must keep using `github.WithURLs` (not a `*url.URL`) and `github.WithTimeout` (not a
+  hand-built transport), or `net/url` and the no-remote-dial scan need widening too.
+- **The store is node-scoped, and the Turso engine is daemon-owned, gated and never
+  cancelled** — several machines may share one database (`[database] engine = "turso"`), and
+  a herdr pane id (`1`, `w1:p2`) repeats on every one of them, so it is never an identity on
+  its own. Every node-owned row carries `node_id` (`store.LoadNodeID`, `<state>/node-id`);
+  machine-local natural keys are composite (`agent_names(node_id, agent_id)` with
+  `UNIQUE(node_id, name)`, `agent_rate`, `error_retries`, `task_handouts`, `agent_roster`,
+  `herdr_locations`, `roster_meta`); INTEGER keys are allocated with node bits under turso
+  (`store.TimeOrderedIDs`, bound as `s.nextID()` — NULL under sqlite so AUTOINCREMENT still
+  assigns). Every OPERATIONAL statement (act, claim, sweep, rate, reclaim-at-startup, pending
+  LLM request, name adoption, roster publish) filters `node_id = self`; FLEET reads span nodes
+  and return `node_id`; by-id statements on fleet-unique ids are exempt by name.
+  `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by construction (an AST walk with an
+  exemption map that must stay live), `TestOperationalReadsNeverSeeAnotherNodesRows` proves it
+  behaviourally, and the store suite runs THREE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso`)
+  so every statement is proven through the socket proxy AND on the Turso engine. The daemon's
+  `hasOpenEscalation` asks the store (`HasOpenEscalation`) rather than filtering the fleet
+  queue by agent id — filtering in Go would let another machine's pane `1` block this one's
+  reconcile. Under turso only the daemon opens the file (the sync engine allows one process);
+  the TUI, CLI verbs and MCP server get a `database/sql` driver over `<state>/store.sock`
+  (`internal/store/sqlbridge`), lazily dialled so `hap config` works with no daemon. The
+  adapter wraps the SDK in a gate (statements read-lock, Push/Pull/Checkpoint write-lock, a
+  transaction holds the lock, rows are returned EAGERLY) over a FIXED pre-warmed pool, and
+  sync ops run on a background context — verified: unguarded they flood `database is locked`
+  and a Push cancelled mid-flight hangs the engine for good. Schema DDL on the shared database
+  is issued only by the schema lead (`turso.PrepareSharedSchema`, pull first, smallest fresh
+  node id) because two identical ALTERs wedge the loser SILENTLY. Config never enters the
+  database. Keep the spike (`internal/store/turso/spike_test.go`, tag `tursospike`) and
+  `TestTwoNodesShareEscalationsAndRemoteConfirms` (skips without `tursodb`).
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).

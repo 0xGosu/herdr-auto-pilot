@@ -331,6 +331,33 @@ func TaskStoreRemote(s TaskStore) bool {
 	return ok && r.Remote()
 }
 
+// FleetSyncStats is the sync engine's view of a node's shared database.
+type FleetSyncStats struct {
+	// PendingOps counts local writes not yet pushed.
+	PendingOps int64
+	// MainWALBytes and RevertWALBytes size the local write-ahead logs, which a
+	// sync database never checkpoints on its own.
+	MainWALBytes, RevertWALBytes int64
+	LastPull, LastPush           time.Time
+	NetworkSentBytes             int64
+	NetworkReceivedBytes         int64
+	// Revision is the remote's opaque revision; displayed, never parsed.
+	Revision string
+}
+
+// FleetSyncPort is the shared database's sync engine, as the daemon drives it:
+// pull remote changes, push local ones, compact the local log. Optional — under
+// the local engine there is nothing to sync and the daemon never has one. The
+// operations take no context on purpose: the engine must never be cancelled
+// mid-flight (an abandoned operation wedges the next one), so a caller bounds
+// them by scheduling, not by deadline.
+type FleetSyncPort interface {
+	Pull() (changed bool, err error)
+	Push() error
+	Checkpoint() error
+	Stats(ctx context.Context) (FleetSyncStats, error)
+}
+
 // StorePort is the persistence boundary. Write-ownership is partitioned:
 // daemon-exclusive writers for signatures/agent_rate/error_retries/decisions,
 // daemon-emitted audit rows, and signature_embeddings (with one maintenance
@@ -444,6 +471,15 @@ type DaemonStore interface {
 	// current session (name and history survive). Empty terminalID and
 	// unknown agentID are no-ops. Returns reset=true when created_at moved.
 	SyncAgentTerminalID(ctx context.Context, agentID, terminalID string) (bool, error)
+	// HasOpenEscalation reports whether one of THIS node's agents has a
+	// pending escalation — the reconcile guard. Node-scoped by construction:
+	// an agent id is a herdr pane id and repeats on every machine sharing the
+	// store, so a fleet-wide PendingEscalations filtered by agent id in Go
+	// would let another machine's open question block this one's reconcile.
+	HasOpenEscalation(ctx context.Context, agentID string) (bool, error)
+	// UpsertNode records this daemon's heartbeat in the nodes table (label,
+	// version, started, last seen). Only the daemon writes it.
+	UpsertNode(ctx context.Context, n domain.NodeInfo) error
 
 	// PublishRoster replaces the daemon's published view of the running herd.
 	// Only the daemon writes it; the front ends read it instead of listing
@@ -516,6 +552,9 @@ type DaemonStore interface {
 
 // FrontendStore is the front-end (TUI/CLI) write surface plus shared reads.
 type FrontendStore interface {
+	// StampWatching records that a TUI on this node is watching the fleet
+	// until the given time, so other nodes' daemons publish faster for it.
+	StampWatching(ctx context.Context, until time.Time) error
 	ReadStore
 
 	// RecordTaskReservation / DeleteTaskReservation give an UNATTENDED
@@ -628,6 +667,16 @@ type ReadStore interface {
 	// daemon last observed it, "" when unknown. Herdr reuses pane ids, so this
 	// is what tells "same agent" from "new terminal on a recycled pane id".
 	AgentTerminalID(ctx context.Context, agentID string) (string, error)
+	// AgentTerminalIDOn is AgentTerminalID for an agent on any node — a reply
+	// to another machine's escalation is checked against THAT machine's record.
+	AgentTerminalIDOn(ctx context.Context, nodeID, agentID string) (string, error)
+	// NodeID is this installation's identity (store.LoadNodeID): the value every
+	// row it owns is stamped with, and the one the fleet views call "self".
+	NodeID() string
+	// ListNodes returns every installation sharing the store, this one included.
+	ListNodes(ctx context.Context) ([]domain.NodeInfo, error)
+	// RemoteWatchers counts OTHER nodes with a TUI watching the fleet as of now.
+	RemoteWatchers(ctx context.Context, now time.Time) (int, error)
 
 	// LiveRoster returns the agents the daemon last published, plus when it
 	// published them. A ZERO time means no daemon ever has, which is not the
@@ -650,6 +699,8 @@ type ReadStore interface {
 	// resuming a paused daemon the moment the mode is switched off. Test fakes
 	// must filter too, or they pass a case that should fail.
 	LatestKillEvent(ctx context.Context) (*domain.KillEvent, error)
+	// LatestKillEventOn is LatestKillEvent for any node.
+	LatestKillEventOn(ctx context.Context, nodeID string) (*domain.KillEvent, error)
 	// KillEvents returns the merged automation history (both scopes), newest
 	// first — what the Pause/Kill tab and `hap kill-history` render.
 	KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error)
@@ -659,6 +710,8 @@ type ReadStore interface {
 	// CountPendingEscalations counts pending escalations without fetching
 	// the (pane-excerpt-heavy) rows.
 	CountPendingEscalations(ctx context.Context) (int64, error)
+	// CountPendingEscalationsOn counts one node's pending escalations.
+	CountPendingEscalationsOn(ctx context.Context, nodeID string) (int64, error)
 	// PendingEscalationExcerpts returns the pane excerpts of the escalations that
 	// dedup a re-fire for this agent + agent type: every still-pending one (any
 	// age) plus every originally-escalated ask whose answer was DELIVERED
@@ -674,6 +727,8 @@ type ReadStore interface {
 	// HasPendingLLMConsult reports whether a consult is still in flight for
 	// the agent (a pending llm_requests row) — the retry concurrency guard.
 	HasPendingLLMConsult(ctx context.Context, agentID string) (bool, error)
+	// HasPendingLLMConsultOn is HasPendingLLMConsult for an agent on any node.
+	HasPendingLLMConsultOn(ctx context.Context, nodeID, agentID string) (bool, error)
 	GetAgentRate(ctx context.Context, agentID string) (*domain.AgentRate, error)
 	GetErrorRetry(ctx context.Context, errorSignature string) (*domain.ErrorRetry, error)
 	PendingLLMDecisions(ctx context.Context) ([]domain.LLMDecision, error)

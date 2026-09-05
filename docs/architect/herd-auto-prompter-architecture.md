@@ -831,7 +831,14 @@ Removed keys still decoded only to warn and ignore: `limits.verify_unblock_ms`,
 Two concerns are kept separate:
 
 1. **Corruption safety** is guaranteed by **SQLite WAL + `busy_timeout` + strict
-   transactions**. All processes run on the same host/filesystem; under WAL,
+   transactions**. Under the default engine all processes run on the same
+   host/filesystem and open the file directly. Under the `turso` engine the
+   DAEMON is the one process holding the (sync) database — the engine allows
+   one — and serves it to the TUI, the CLI verbs and the MCP server over a
+   unix socket (`internal/store/sqlbridge`); every node-owned row carries a
+   per-machine `node_id`, every operational statement is scoped to it, and
+   fleet reads return it (`store.TestEveryNodeOwnedStatementIsNodeScoped`).
+   Under WAL (sqlite),
    concurrent writers are serialized and readers proceed concurrently. Multiple
    processes writing the same file does **not** corrupt it — no application-level
    command inbox is needed.
@@ -939,8 +946,12 @@ Exactly two tools:
   index live in the plugin's config/state dir with normal user permissions; the
   control socket is owner-only; the operator can clear/reset learned and audit
   data (`hap clear-data`). A dedicated no-egress test (`internal/privacy`) asserts
-  NFR-007. It allows exactly TWO outbound calls, both by name and both operator
-  opt-in: the release check (`internal/updatecheck/fetch.go`), which asks GitHub
+  NFR-007. It allows exactly THREE outbound calls, all by name and all operator
+  opt-in. The third is the `turso` store engine (`internal/store/turso/turso.go`),
+  which syncs the WHOLE store with a Turso Cloud database the operator owns so
+  several of their machines share one hap view; the default engine is `sqlite`, a
+  local file, and the SDK is banned by its own import path because its network
+  code is native. The other two: the release check (`internal/updatecheck/fetch.go`), which asks GitHub
   for the newest published version, sends nothing about the operator or their
   panes, and is switched off by `[tui] disable_check_for_update`; and the
   `github_gist` task-list backend (`internal/taskstore/gist/gist.go`), which reads
@@ -1073,7 +1084,7 @@ the sections they gate.
 | **NFR-005** | Auditability completeness | Represent 100% of automated decisions and escalations in the audit log (1:1 action-to-record ratio); no autonomous action without a corresponding record. |
 | **NFR-005a** | Allowlist corpus regression | Maintain and CI-regression-test the irreversible-op corpus so seed patterns match 100% of it; a corpus miss fails the build. |
 | **NFR-006** | LLM fallback timeout | Bound LLM consultation by a configurable timeout; on timeout / missing / unparseable output, fail safe and escalate. |
-| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket, the configured local LLM CLI, the opt-out GitHub release check (`internal/updatecheck`, version numbers only), and — only when the operator explicitly selects a remote task-list storage provider — that provider's API, carrying the task text of the sources configured for it and nothing else (no pane content, no learned rules, no audit history). The default posture is fully local: the default provider is `local_fs`. Emit no telemetry. |
+| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket, the configured local LLM CLI, the opt-out GitHub release check (`internal/updatecheck`, version numbers only), and — only when the operator explicitly selects them — two opt-in remotes the operator owns: a remote task-list storage provider's API, carrying the task text of the sources configured for it and nothing else; and, under `[database] engine = "turso"`, the operator's own Turso Cloud database, which then holds the WHOLE store (agents, escalations with pane excerpts, audit, learned rules) so several of the operator's machines share one view. The default posture is fully local: the default provider is `local_fs` and the default engine is `sqlite`. Emit no telemetry. |
 | **NFR-008** | Portability | Run on Linux and macOS, avoiding design that precludes a future Windows build. |
 | **NFR-009** | Control-mutation propagation | Reflect a control mutation (esp. pause/kill) issued from TUI/CLI in daemon behavior within a small bounded delay (target ≤ 1 s). |
 
@@ -1084,7 +1095,7 @@ the sections they gate.
 | **DR-001** | Learned decision history | Persist decision records: signature, situation type, agent type, chosen/corrected action, source (operator/rule/LLM), confidence at decision time, consecutive-confirmation count, and timestamp. |
 | **DR-002** | Audit log | Persist an append-only audit trail of every automated decision and escalation with the FR-020 fields. Every decision-pipeline row (status `auto` as well as `escalated`) also persists its full `SignatureResult` — the never-remapped content hash, the masked salient, the over-mask verdict, and the salient window used — as the baseline a later staleness comparison needs (FR-018a). Written at insert time so a row demoted by `EscalateAudit` already carries it; additive, never backfilled, and an empty `sig_raw` means "no baseline", which every consumer treats as fail-closed. |
 | **DR-003** | Rules & configuration | Persist operator-editable config: per-situation thresholds (+ minimum-agreement floor), graduation N, never-auto patterns, per-agent/workspace task-source references, LLM CLI config + timeout, rate/consecutive ceilings, and pause/kill state — in hand-editable form. |
-| **DR-004** | Data locality & retention | Keep all persisted data on the operator's machine; allow the operator to clear/reset learned history and audit data; no pane content leaves the machine except, when configured, to the local LLM CLI. |
+| **DR-004** | Data locality & retention | Keep all persisted data on the operator's machine by default; allow the operator to clear/reset learned history and audit data; no pane content leaves the machine except, when configured, to the local LLM CLI — or, when the operator selects the `turso` engine, to the Turso Cloud database they own, which then IS the store for every machine they point at it. |
 | **DR-005** | Correction lineage | Record corrections so the relationship between an original automated decision and its correction is preserved for audit. |
 
 ### Integration Requirements

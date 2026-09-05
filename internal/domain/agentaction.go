@@ -12,7 +12,11 @@ import "time"
 // front end that merely nudged could never learn whether the action landed.
 // Status and Error are that answer, polled back by the surface that queued it.
 type AgentAction struct {
-	ID int64
+	// NodeID is the installation that owns this row (store.LoadNodeID). Under
+	// one machine it is always that machine; under a shared database it is what
+	// keeps one node's rows apart from another's.
+	NodeID string
+	ID     int64
 	// Kind selects the executor. See the AgentActionKind constants.
 	Kind AgentActionKind
 	// Target is the operator's spelling of the agent: a pane id, an agent id,

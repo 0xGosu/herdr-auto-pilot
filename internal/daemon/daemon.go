@@ -125,6 +125,25 @@ type Options struct {
 	// heartbeat, so it must be safe to call more than once. A nil HandOff
 	// leaves this daemon running and only flags health.
 	HandOff func(exePath string) error
+	// NodeLabel is what other machines sharing the store see this node as.
+	// Empty means the hostname.
+	NodeLabel string
+	// SyncEvents, when set, is signalled by the store's sync loop after a pull
+	// brought in rows from other nodes. The daemon drains its queues on it —
+	// an action another machine's operator filed for one of this node's agents
+	// arrives this way, and no control-socket nudge can reach across machines.
+	// A nil channel never fires, which is the single-machine case. When
+	// FleetSync is set and this is nil, New creates the channel the fleet
+	// sync loop signals.
+	SyncEvents <-chan struct{}
+	// FleetSync is the shared database's sync engine (turso). nil under the
+	// local engine: no loop runs and nothing here changes.
+	FleetSync ports.FleetSyncPort
+	// FleetSyncInterval paces pulls (0 = 15s).
+	FleetSyncInterval time.Duration
+	// FleetWrites is signalled by the store after a committed write; the sync
+	// loop debounces a push on it. nil means no push-on-write.
+	FleetWrites <-chan struct{}
 }
 
 // Daemon is the monitor/decide/act loop.
@@ -309,6 +328,16 @@ type Daemon struct {
 	// things an operator creates by hand, so they ride their own TTL rather
 	// than the tick — which also means most passes have nothing to do at all.
 	rosterLocationsAt time.Time
+
+	// rosterRemoteAt is when the roster was last published FOR A REMOTE
+	// watcher (guarded by mu); see remoteRosterInterval.
+	rosterRemoteAt time.Time
+
+	// fleet is the sync loop's state for the health record (own mutex).
+	fleet fleetSyncState
+	// syncEvents is the send side of Options.SyncEvents when the daemon made
+	// the channel itself (FleetSync set, SyncEvents nil).
+	syncEvents chan struct{}
 
 	// toggleAttempt records, per agent, the signature of the multi-select form
 	// this daemon last started answering — the evidence that lets a later
@@ -567,7 +596,13 @@ func New(opt Options) (*Daemon, error) {
 	if opt.ResolveSelf == nil {
 		opt.ResolveSelf = selfpath.Resolve
 	}
+	var syncEvents chan struct{}
+	if opt.FleetSync != nil && opt.SyncEvents == nil {
+		syncEvents = make(chan struct{}, 1)
+		opt.SyncEvents = syncEvents
+	}
 	d := &Daemon{
+		syncEvents:                syncEvents,
 		opt:                       opt,
 		taskSnapshots:             map[string]taskSnapshot{},
 		taskReclaimResults:        make(chan taskReclaimOutcome, 32),
@@ -1005,9 +1040,31 @@ func (d *Daemon) writeHealth(startedAt time.Time) {
 		EmbedderDiag:   diag,
 		ExePath:        d.exePath,
 		BinaryReplaced: d.binaryReplaced.Load(),
+		FleetSync:      d.fleetHealth(),
 	}
 	if err := daemonhealth.Write(d.opt.StateDir, h); err != nil {
 		slog.Debug("heartbeat write failed", "error", err)
+	}
+}
+
+// upsertNode refreshes this node's row in the shared nodes table on every
+// heartbeat: label, version, start time, last seen. It is how other machines
+// learn this one exists and whether its daemon is still reporting.
+func (d *Daemon) upsertNode(startedAt time.Time) {
+	label := d.opt.NodeLabel
+	if label == "" {
+		if h, err := os.Hostname(); err == nil {
+			label = h
+		}
+	}
+	err := d.opt.Store.UpsertNode(context.Background(), domain.NodeInfo{
+		Label:      label,
+		HapVersion: buildinfo.Version,
+		StartedAt:  startedAt,
+		LastSeen:   d.opt.Clock.Now(),
+	})
+	if err != nil {
+		slog.Debug("node heartbeat write failed", "error", err)
 	}
 }
 
@@ -1101,6 +1158,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.exePath = self
 	}
 	d.writeHealth(startedAt)
+	d.upsertNode(startedAt)
 	if d.opt.StateDir != "" {
 		defer func() { _ = daemonhealth.Remove(d.opt.StateDir) }()
 	}
@@ -1150,6 +1208,15 @@ func (d *Daemon) Run(ctx context.Context) error {
 			slog.Error("event subscriber terminated", "error", err)
 		}
 	})
+	// The shared database's sync loop (turso only), likewise off the loop.
+	if d.opt.FleetSync != nil {
+		d.spawn(func() {
+			_ = logging.Guard("fleet-sync", func() error {
+				d.runFleetSync(ctx)
+				return nil
+			})
+		})
+	}
 
 	// Consume corrections that accumulated while the daemon was down (a
 	// failed front-end nudge is non-fatal by design), and keep a slow
@@ -1236,6 +1303,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return nil
 			}
 			d.writeHealth(startedAt)
+			d.upsertNode(startedAt)
 			// Bound the captured stderr log for a daemon that never restarts.
 			// OpenStderrLog only checks at spawn, so without this a long-lived
 			// process grows it without limit. Two cheap Stats, same as above.
@@ -1300,6 +1368,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case tr := <-d.delayedTr:
 			logging.Guard("pipeline", func() error {
 				d.handleAttention(ctx, tr)
+				return nil
+			})
+		case <-d.opt.SyncEvents:
+			// Rows from other nodes just arrived: an operator elsewhere may have
+			// filed an action, a correction or an LLM retry for one of THIS
+			// node's agents. Drain the queues as a nudge would — but not the
+			// attention reconcile, which lists agents and belongs to the sweep.
+			logging.Guard("sync-event", func() error {
+				d.processAgentActions(ctx)
+				d.processCorrections(ctx)
+				d.processLLMRetries(ctx)
+				d.expireStaleLLMWork(ctx)
 				return nil
 			})
 		case kind := <-d.nudges:
@@ -1718,17 +1798,16 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 // escalation (an audit_log row still in status 'escalated'). Fails safe: on a
 // store error it returns true so reconcile skips rather than risk a duplicate.
 func (d *Daemon) hasOpenEscalation(ctx context.Context, agentID string) bool {
-	esc, err := d.opt.Store.PendingEscalations(ctx)
+	// Asked of the store rather than filtered here: PendingEscalations is the
+	// FLEET queue, and an agent id is a pane id that repeats on every machine
+	// sharing it, so matching e.AgentID in Go would read another node's open
+	// question as this agent's. Fails closed on error, as before.
+	open, err := d.opt.Store.HasOpenEscalation(ctx, agentID)
 	if err != nil {
 		slog.Warn("reconcile: pending-escalation check failed", "agent", agentID, "error", err)
 		return true
 	}
-	for _, e := range esc {
-		if e.AgentID == agentID {
-			return true
-		}
-	}
-	return false
+	return open
 }
 
 // duplicatePendingEscalation reports whether the captured situation repeats an

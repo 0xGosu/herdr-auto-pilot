@@ -395,6 +395,11 @@ tab-separated stdout is unaffected.
 | `task_source_provider.timeout_seconds` | 20 | per remote store call |
 | `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |
 | `task_source_provider.github_gist.gist_id` | (none) | the gist hex id |
+| `database.engine` | sqlite | `sqlite` (local file) or `turso` (central database several machines share) |
+| `database.turso_database_url` | (none) | the Turso Cloud database, from `turso db show <db>` |
+| `database.turso_auth_token` | (none) | its token; rendered `(set)`, never printed; empty = `$TURSO_AUTH_TOKEN` |
+| `database.turso_sync_interval_seconds` | 15 | how often the daemon pulls from Turso Cloud (min 5) |
+| `database.node_label` | (hostname) | how other machines see this one beside its agents |
 | `tui.palette.<role>` | theme default | `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help` |
 
 Palette values are 256-color codes (`"205"`) or hex (`"#ff5faf"`); `""` clears
