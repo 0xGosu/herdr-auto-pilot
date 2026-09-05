@@ -182,6 +182,19 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 // status events carry no terminal id at all, so every transition would blank
 // the id a publish recorded, leaving a genuinely recycled pane id looking
 // unchanged the next time one arrived.
+//
+// The STATUS is the one field an older write must never roll back, and
+// seen_at is what says which is older. A listing is taken before it is
+// published — the daemon lists, then hands the snapshot to a background
+// pass — so a transition recorded in between describes the agent LATER than
+// the snapshot does. Writing the snapshot's status over it republishes a
+// state the agent has already left, and readers act on that field: an agent
+// that just went working would read as idle, and `hap task send` decides
+// whether an agent is free from exactly this column. It corrects itself on
+// the next publish, but "the next publish" with no TUI open is a minute away.
+//
+// Position, location and terminal are NOT guarded this way, deliberately: a
+// full listing is authoritative for them and an event reports none of them.
 func upsertRosterRow(ctx context.Context, tx *sql.Tx,
 	a domain.RosterAgent, seq int, authoritative bool) error {
 	// A non-authoritative write keeps whatever gone_at the row already has.
@@ -195,12 +208,15 @@ func upsertRosterRow(ctx context.Context, tx *sql.Tx,
 		ON CONFLICT(agent_id) DO UPDATE SET
 			pane_id = excluded.pane_id, tab_id = excluded.tab_id,
 			workspace_id = excluded.workspace_id, agent_type = excluded.agent_type,
-			status = excluded.status,
+			status = CASE WHEN agent_roster.seen_at > excluded.seen_at
+				THEN agent_roster.status ELSE excluded.status END,
 			terminal_id = CASE WHEN excluded.terminal_id = '' THEN agent_roster.terminal_id ELSE excluded.terminal_id END,
 			cwd = CASE WHEN excluded.cwd = '' THEN agent_roster.cwd ELSE excluded.cwd END,
 			cwd_read_at = CASE WHEN excluded.cwd = '' THEN agent_roster.cwd_read_at ELSE excluded.cwd_read_at END,
 			list_seq = CASE WHEN excluded.list_seq = ? THEN agent_roster.list_seq ELSE excluded.list_seq END,
-			seen_at = excluded.seen_at, gone_at = `+goneAt,
+			seen_at = CASE WHEN agent_roster.seen_at > excluded.seen_at
+				THEN agent_roster.seen_at ELSE excluded.seen_at END,
+			gone_at = `+goneAt,
 		a.AgentID, a.PaneID, a.TabID, a.WorkspaceID, a.AgentType,
 		a.Status, a.TerminalID, a.Cwd, unix(a.CwdReadAt), unix(a.SeenAt), seq, rosterSeqUnknown)
 	return err

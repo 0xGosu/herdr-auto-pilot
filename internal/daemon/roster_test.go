@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -582,4 +583,63 @@ func TestAListingArrivingMidPassIsStillPublished(t *testing.T) {
 		agents, _, err := raw.LiveRoster(ctx)
 		return err == nil && len(agents) == 0
 	})
+}
+
+// A listing arriving exactly as the worker stands down must still be
+// published.
+//
+// The worker finds no pending work and exits; a publish landing between that
+// decision and the latch being released would store its snapshot, see a
+// running pass, and return — and then nothing would consume it. It is not
+// lost forever, but it waits for the NEXT publish, which with no TUI open is
+// the minute sweep. An empty listing stranded that way is precisely the
+// vanish reconciliation the pass exists to guarantee.
+//
+// Driven deterministically through the stand-down hook rather than by racing:
+// the window is microseconds wide, so a timing test would pass on a bug most
+// runs.
+func TestAListingRacingTheStandDownIsStillPublished(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := store.Open(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+
+	fh := &fakeHerdr{}
+	d := &Daemon{opt: Options{StateDir: dir, Store: raw, Herdr: fh, Clock: ports.SystemClock{}}}
+	ctx := context.Background()
+
+	d.publishRoster(ctx, []domain.AgentTransition{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
+	})
+	waitFor(t, 3*time.Second, func() bool {
+		agents, _, err := raw.LiveRoster(ctx)
+		return err == nil && len(agents) == 1
+	})
+
+	// The agent vanished, and its empty listing lands in the stand-down
+	// window exactly once.
+	var once sync.Once
+	d.setRosterStoodDown(func() {
+		once.Do(func() { d.publishRoster(ctx, nil) })
+	})
+	t.Cleanup(func() { d.setRosterStoodDown(nil) })
+
+	// Any publish now reaches the hook on its way out.
+	d.publishRoster(ctx, []domain.AgentTransition{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"},
+	})
+	waitFor(t, 5*time.Second, func() bool {
+		agents, _, err := raw.LiveRoster(ctx)
+		return err == nil && len(agents) == 0
+	})
+}
+
+// setRosterStoodDown installs the stand-down hook under the lock that owns it,
+// so a test writing it cannot race the worker reading it.
+func (d *Daemon) setRosterStoodDown(fn func()) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.rosterStoodDown = fn
 }

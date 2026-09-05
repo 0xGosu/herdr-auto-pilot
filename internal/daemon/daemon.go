@@ -291,6 +291,12 @@ type Daemon struct {
 	// that has moved on.
 	rosterPending *rosterSnapshot
 
+	// rosterStoodDown, when set, is called just after the roster worker
+	// releases its latch (guarded by mu). Test-only: it is how the handoff
+	// window — microseconds wide, and unreachable by timing — is driven
+	// deterministically.
+	rosterStoodDown func()
+
 	// rosterTickRunning latches the roster TICK's own goroutine (guarded by
 	// mu), which lists the herd before publishRoster can hand its shell-out
 	// half over. Same single-flight rule, one step earlier in the pass: the

@@ -176,14 +176,7 @@ func (d *Daemon) publishRoster(ctx context.Context, agents []domain.AgentTransit
 	d.rosterPassRunning = true
 	d.mu.Unlock()
 
-	if !d.spawn(func() {
-		defer func() {
-			d.mu.Lock()
-			d.rosterPassRunning = false
-			d.mu.Unlock()
-		}()
-		d.runRosterPasses(ctx)
-	}) {
+	if !d.spawn(func() { d.runRosterPasses(ctx) }) {
 		d.mu.Lock()
 		d.rosterPassRunning = false
 		d.mu.Unlock()
@@ -203,15 +196,46 @@ type rosterSnapshot struct {
 // rather than being dropped, so the last thing the daemon saw is always what
 // ends up stored — including an empty listing, the only evidence that an agent
 // has vanished.
+//
+// Finding no work and standing down happen under ONE lock, and that is the
+// whole handoff. Releasing the latch afterwards — in a defer, say — leaves a
+// window where the worker has decided to exit but still looks busy: a listing
+// arriving there is stored as pending, sees a running pass, and returns, and
+// then the worker exits without ever consuming it. The listing is not lost
+// forever, but it waits for the NEXT publish, which with no TUI open is the
+// minute sweep — and an empty listing stranded that way is the vanish
+// reconciliation this loop exists to guarantee.
 func (d *Daemon) runRosterPasses(ctx context.Context) {
+	// Only the panic path: the loop below releases the latch itself, under
+	// the same lock that finds nothing to do.
+	released := false
+	defer func() {
+		if released {
+			return
+		}
+		d.mu.Lock()
+		d.rosterPassRunning = false
+		d.mu.Unlock()
+	}()
 	for {
 		d.mu.Lock()
 		snap := d.rosterPending
 		d.rosterPending = nil
-		d.mu.Unlock()
 		if snap == nil {
+			d.rosterPassRunning = false
+			released = true
+			// Read under the same lock that owns it; called after, so the
+			// hook is free to publish. A test uses it to drive a listing into
+			// exactly this window, which is microseconds wide and so cannot be
+			// hit reliably by timing.
+			hook := d.rosterStoodDown
+			d.mu.Unlock()
+			if hook != nil {
+				hook()
+			}
 			return
 		}
+		d.mu.Unlock()
 		if err := d.opt.Store.PublishRoster(ctx, snap.rows, snap.at); err != nil {
 			slog.Warn("roster: publishing failed", "error", err)
 			continue

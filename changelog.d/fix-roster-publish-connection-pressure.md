@@ -12,3 +12,8 @@
   once-a-minute sweep, and every two seconds while a TUI is open — no longer on
   every operator action. Nothing reads any fresher for it: `hap agents` and
   `hap status` are pure reads and never woke the daemon in the first place
+- Fixed an agent's status briefly reverting after it started working. The daemon
+  lists its agents and records that listing a moment later, so a status change
+  arriving in between was overwritten by the older reading — and with no TUI
+  open the next listing is a minute away. An agent that had just gone to work
+  could read as free for that minute, including to `hap task send`

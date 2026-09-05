@@ -630,3 +630,59 @@ func rosterByAgentID(agents []domain.RosterAgent, id string) (domain.RosterAgent
 	}
 	return domain.RosterAgent{}, false
 }
+
+// A listing taken BEFORE a transition must not republish the state the agent
+// has already left.
+//
+// The daemon lists agents, then hands the snapshot to a background pass, so a
+// transition recorded in between describes the agent later than the snapshot
+// does. Writing the snapshot's status over it puts a stale answer in the
+// column readers act on: an agent that just went working reads as idle, and
+// `hap task send` decides whether an agent is free from exactly that field.
+func TestAStaleListingDoesNotRollBackANewerStatus(t *testing.T) {
+	st := rosterStore(t)
+	ctx := context.Background()
+	listedAt := time.Now()
+	agent := domain.RosterAgent{
+		AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: listedAt,
+	}
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, listedAt); err != nil {
+		t.Fatal(err)
+	}
+	// The agent starts working AFTER the next listing was taken.
+	event := agent
+	event.Status = "working"
+	event.SeenAt = listedAt.Add(time.Second)
+	if err := st.UpsertRosterAgent(ctx, event); err != nil {
+		t.Fatal(err)
+	}
+	// That older listing is only published now.
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, listedAt); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agents[0].Status != "working" {
+		t.Errorf("status = %q; a listing taken before the transition republished "+
+			"a state the agent had already left", agents[0].Status)
+	}
+
+	// A listing taken AFTER it is still authoritative — the rule is "older
+	// does not win", not "an event wins forever".
+	later := agent
+	later.Status = "idle"
+	later.SeenAt = listedAt.Add(2 * time.Second)
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{later}, later.SeenAt); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err = st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agents[0].Status != "idle" {
+		t.Errorf("status = %q; a newer listing must still win", agents[0].Status)
+	}
+}
