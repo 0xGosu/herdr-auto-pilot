@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -17,6 +18,13 @@ import (
 // external test package has its own copy; this one is for tests that need the
 // package's unexported lease timing.)
 func localSyncServer(t *testing.T) string {
+	url, _ := localSyncServerKillable(t)
+	return url
+}
+
+// localSyncServerKillable is localSyncServer plus a way to take the remote
+// away mid-test.
+func localSyncServerKillable(t *testing.T) (string, func()) {
 	t.Helper()
 	bin, err := exec.LookPath("tursodb")
 	if err != nil {
@@ -35,21 +43,24 @@ func localSyncServer(t *testing.T) string {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
+	kill := func() {
 		_ = cmd.Process.Kill()
 		_, _ = cmd.Process.Wait()
+	}
+	t.Cleanup(func() {
+		kill()
 		logf.Close()
 	})
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
 			c.Close()
-			return fmt.Sprintf("http://127.0.0.1:%d", port)
+			return fmt.Sprintf("http://127.0.0.1:%d", port), kill
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	t.Fatal("sync server did not come up")
-	return ""
+	return "", nil
 }
 
 func openLeaseNode(t *testing.T, url, id string) *DB {
@@ -305,5 +316,36 @@ func TestALeaseTakenDuringTheFinalStepIsNotPublished(t *testing.T) {
 	err := PrepareSharedSchema(ctx, a, owner, time.Now)
 	if !errors.Is(err, ErrSchemaLeaseLost) {
 		t.Fatalf("PrepareSharedSchema = %v, want ErrSchemaLeaseLost from the post-migration proof", err)
+	}
+}
+
+// TestAFailedFinalLeaseProofRefusesToPublish: the check before publication is
+// strict — when the remote cannot be reached for the final pull/renew/push,
+// the migration is NOT published even though nobody is known to have taken the
+// lease and the last renewal is well within the TTL.
+func TestAFailedFinalLeaseProofRefusesToPublish(t *testing.T) {
+	ttl, renew, poll := schemaLeaseTTL, schemaLeaseRenew, schemaPollInterval
+	schemaLeaseTTL, schemaLeaseRenew, schemaPollInterval = 1500*time.Millisecond, 10*time.Minute, 300*time.Millisecond
+	t.Cleanup(func() { schemaLeaseTTL, schemaLeaseRenew, schemaPollInterval = ttl, renew, poll })
+
+	url, kill := localSyncServerKillable(t)
+	a := openLeaseNode(t, url, "aaaaaaaaaaaaaaaa")
+	if err := a.Push(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// A migration whose steps all pass their checks — then the remote goes
+	// away before the final proof.
+	owner := &takeoverOwner{id: "aaaaaaaaaaaaaaaa", db: a}
+	owner.steal = func() error { kill(); return nil }
+	err := PrepareSharedSchema(ctx, a, owner, time.Now)
+	if err == nil {
+		t.Fatal("the migration was published without a fresh lease proof")
+	}
+	if errors.Is(err, ErrSchemaLeaseLost) {
+		t.Fatalf("err = %v: the lease was not taken; the refusal must name the failed proof", err)
+	}
+	if !strings.Contains(err.Error(), "freshly proved") {
+		t.Fatalf("err = %v, want the strict pre-publication refusal", err)
 	}
 }

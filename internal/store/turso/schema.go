@@ -106,11 +106,13 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 				if err != nil {
 					return err
 				}
-				// And once more before the push that publishes the result: the
-				// background renewal's last verdict was only logged, and the
-				// migration's own final check ran before its last statement
-				// was pushed. Nothing is published under a lease not held.
-				if err := hold.verify(); err != nil {
+				// And once more, STRICTLY, before the push that publishes the
+				// result: the between-step checks tolerate a transient failure
+				// because the migration can still stop at the next one, but
+				// here there is no next one — a pull, renewal or push that
+				// fails is not a fresh proof, and nothing is published without
+				// one. The daemon exits and is started again by `--ensure`.
+				if err := hold.verifyStrict(); err != nil {
 					return err
 				}
 				if err := releaseSchemaLease(ctx, db.DB(), s.NodeID()); err != nil {
@@ -255,30 +257,45 @@ func (h *leaseHold) stop() {
 	<-h.done
 }
 
-// verify re-proves ownership: pull (so a takeover is SEEN — the renewal's WHERE
-// is evaluated locally and the engine replays the row unconditionally, so a
-// blind renewal would overwrite a legitimate new owner), renew, push. A
-// definitive loss is ErrSchemaLeaseLost. A transient failure (busy, offline) is
-// tolerated only while the last confirmed renewal is younger than the TTL;
+// verify re-proves ownership between migration steps: pull (so a takeover is
+// SEEN — the renewal's WHERE is evaluated locally and the engine replays the
+// row unconditionally, so a blind renewal would overwrite a legitimate new
+// owner), renew, push. A definitive loss is ErrSchemaLeaseLost. A transient
+// failure (busy, offline) is tolerated only while the last confirmed renewal
+// is younger than the TTL — the migration can still stop at the next check;
 // past that the lease may have lapsed and been claimed, and the caller must
 // stop rather than issue DDL on hope.
-func (h *leaseHold) verify() error {
+func (h *leaseHold) verify() error { return h.check(false) }
+
+// verifyStrict is verify with NO tolerance: every failure to pull, renew or
+// push is an error. It is the check before publication, where there is no
+// later check to catch a lapse.
+func (h *leaseHold) verifyStrict() error { return h.check(true) }
+
+func (h *leaseHold) check(strict bool) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	fail := func(err error) error {
+		if strict {
+			return fmt.Errorf("turso: the schema lease could not be freshly proved before publishing the migration; "+
+				"refusing to publish (start the daemon again once the remote answers): %w", err)
+		}
+		return h.tolerate(err)
+	}
 	if _, err := h.db.Pull(); err != nil {
-		return h.tolerate(fmt.Errorf("pull: %w", err))
+		return fail(fmt.Errorf("pull: %w", err))
 	}
 	res, err := h.db.DB().ExecContext(context.Background(),
 		`UPDATE hap_schema_lease SET expires_at = ? WHERE id = 1 AND node_id = ?`,
 		h.now().Add(schemaLeaseTTL).UnixMilli(), h.self)
 	if err != nil {
-		return h.tolerate(fmt.Errorf("renew: %w", err))
+		return fail(fmt.Errorf("renew: %w", err))
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrSchemaLeaseLost
 	}
 	if err := h.db.Push(); err != nil {
-		return h.tolerate(fmt.Errorf("push: %w", err))
+		return fail(fmt.Errorf("push: %w", err))
 	}
 	h.lastOK = h.now()
 	return nil
