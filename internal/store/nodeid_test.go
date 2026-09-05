@@ -119,6 +119,9 @@ func TestTimeOrderedIDsSortByTimeAcrossNodes(t *testing.T) {
 
 func TestNextIDIsNilUnderSQLiteAndAllocatedUnderTurso(t *testing.T) {
 	skipUnlessSQLite(t)
+	if proxyMode() {
+		t.Skip("a proxied store draws its ids from the daemon, exactly like a turso front end")
+	}
 	s, _ := openTestStore(t)
 	if s.nextID() != nil {
 		t.Fatalf("sqlite engine must let the database assign ids, got %v", s.nextID())

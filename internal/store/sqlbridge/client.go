@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"strconv"
 	"sync"
@@ -28,13 +29,86 @@ type DialConnector struct {
 
 // OpenRemote returns a *sql.DB served by the daemon at path.
 func OpenRemote(path string) *sql.DB {
-	db := sql.OpenDB(&DialConnector{Path: path})
+	return OpenDB(&DialConnector{Path: path})
+}
+
+// OpenDB returns a *sql.DB over c. Callers that also need the daemon's id
+// allocator (NewRemoteIDs) build the connector themselves and pass it here.
+func OpenDB(c *DialConnector) *sql.DB {
+	db := sql.OpenDB(c)
 	// Two, like the local store: a session is a daemon connection held for as
 	// long as this one lives.
 	db.SetMaxOpenConns(2)
 	db.SetMaxIdleConns(2)
 	db.SetConnMaxIdleTime(time.Minute)
 	return db
+}
+
+// NextID asks the daemon for the next INTEGER PRIMARY KEY over a session of
+// its own, dialled and closed for the call. Front ends allocate an id only when
+// they insert a row — an operator's confirm, a kill event, a task list — so a
+// dial per id costs nothing that matters, and it keeps the id request off the
+// pooled sessions database/sql may be holding mid-transaction.
+func (d *DialConnector) NextID(ctx context.Context) (int64, error) {
+	c, err := d.Connect(ctx)
+	if err != nil {
+		return 0, err
+	}
+	sess := c.(*conn).b.(*remoteSession)
+	defer sess.Close()
+	resp, err := sess.roundTrip(ctx, request{Kind: kindNextID})
+	if err != nil {
+		return 0, err
+	}
+	id, err := strconv.ParseInt(resp.LastID, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("sqlbridge: malformed id %q from the daemon", resp.LastID)
+	}
+	return id, nil
+}
+
+// RemoteIDs is a store id allocator (store.IDAllocator) that draws from the
+// daemon through the socket, so a front end's inserts and the daemon's own
+// share one sequence per node.
+//
+// fallback is used — and the switch logged once — when the daemon cannot
+// answer: an older daemon that allocates no ids, or a socket that has just
+// gone away (in which case the insert the id was for fails on its own). A nil
+// fallback yields 0, which the next insert refuses as a duplicate key rather
+// than letting a silent id leak through.
+type RemoteIDs struct {
+	c        *DialConnector
+	fallback func() int64
+	warn     sync.Once
+	// Timeout bounds one id request (0 = 5s).
+	Timeout time.Duration
+}
+
+// NewRemoteIDs returns an allocator over c with the given fallback.
+func NewRemoteIDs(c *DialConnector, fallback func() int64) *RemoteIDs {
+	return &RemoteIDs{c: c, fallback: fallback}
+}
+
+// Next implements store.IDAllocator.
+func (r *RemoteIDs) Next() int64 {
+	timeout := r.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	id, err := r.c.NextID(ctx)
+	if err == nil {
+		return id
+	}
+	r.warn.Do(func() {
+		slog.Warn("store: the daemon did not allocate an id; falling back to a local allocator for this process",
+			"error", err)
+	})
+	if r.fallback == nil {
+		return 0
+	}
+	return r.fallback()
 }
 
 // Connect dials the socket. A refused or missing socket is ErrStoreUnavailable,

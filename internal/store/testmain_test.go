@@ -150,10 +150,16 @@ func openTestStoreProxy(t *testing.T, path string) *Store {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := sqlbridge.Serve(ln, exec, sqlbridge.ServerOptions{})
-	s, err := OpenDB(sqlbridge.OpenRemote(sock), Options{
+	// Ids are allocated on the daemon side and fetched over the wire, exactly
+	// as a front end does under the turso engine — so every INSERT in the
+	// proxy pass exercises the remote allocator, not just the statements.
+	ids := NewTimeOrderedIDs(NodeBits(backing.NodeID()), nil)
+	srv := sqlbridge.Serve(ln, exec, sqlbridge.ServerOptions{NextID: ids.Next})
+	c := &sqlbridge.DialConnector{Path: sock}
+	s, err := OpenDB(sqlbridge.OpenDB(c), Options{
 		NodeID:       backing.NodeID(),
 		Engine:       EngineSQLite,
+		IDs:          sqlbridge.NewRemoteIDs(c, nil),
 		Migrate:      false,
 		AgentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks"),
 	})

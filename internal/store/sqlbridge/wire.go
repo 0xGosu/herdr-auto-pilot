@@ -14,6 +14,7 @@ import (
 //
 //	→ {"id":N,"k":"exec"|"query","q":"<sql>","a":[<value>…]}
 //	→ {"id":N,"k":"begin"|"commit"|"rollback"|"ping"}
+//	→ {"id":N,"k":"nextid"}                      ← {"id":N,"k":"ok","li":"<int64>"}
 //	← {"id":N,"k":"ok","li":"<int64>","ra":"<int64>"}
 //	← {"id":N,"k":"rows","c":["col"…],"r":[[<value>…]…]}
 //	← {"id":N,"k":"err","m":"<message>"}
@@ -49,9 +50,16 @@ const (
 	kindCommit   = "commit"
 	kindRollback = "rollback"
 	kindPing     = "ping"
-	kindOK       = "ok"
-	kindRows     = "rows"
-	kindErr      = "err"
+	// kindNextID asks the daemon for the next INTEGER PRIMARY KEY. Under the
+	// turso engine ids carry node bits and a per-node sequence, and every
+	// process on the node — the TUI, a CLI verb, the MCP server — inserts
+	// rows too; allocating in ONE place (the daemon) is what keeps two
+	// processes on one machine from minting the same id in the same
+	// millisecond. The id rides in "li".
+	kindNextID = "nextid"
+	kindOK     = "ok"
+	kindRows   = "rows"
+	kindErr    = "err"
 )
 
 type wireValue struct {

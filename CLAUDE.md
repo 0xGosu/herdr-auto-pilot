@@ -895,7 +895,7 @@ whose manifest carries exactly that version).
   `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by construction (an AST walk with an
   exemption map that must stay live), `TestOperationalReadsNeverSeeAnotherNodesRows` proves it
   behaviourally, and the store suite runs THREE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso`)
-  so every statement is proven through the socket proxy AND on the Turso engine. The daemon's
+  so every statement is proven through the socket proxy AND on the Turso engine. The two-node sync tests in `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` + `HAP_TURSO_TEST_TOKEN` point them at a REAL Turso database instead (its hap tables must start empty — run them one at a time and wipe between). The daemon's
   `hasOpenEscalation` asks the store (`HasOpenEscalation`) rather than filtering the fleet
   queue by agent id — filtering in Go would let another machine's pane `1` block this one's
   reconcile. Under turso only the daemon opens the file (the sync engine allows one process);

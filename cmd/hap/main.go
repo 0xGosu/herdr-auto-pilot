@@ -407,10 +407,11 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			return fmt.Errorf("turso: %w", err)
 		}
 		defer tdb.Close()
+		ids := store.NewTimeOrderedIDs(store.NodeBits(nodeID), nil)
 		st, err = store.OpenDB(tdb.DB(), store.Options{
 			NodeID:       nodeID,
 			Engine:       store.EngineTurso,
-			IDs:          store.NewTimeOrderedIDs(store.NodeBits(nodeID), nil),
+			IDs:          ids,
 			Migrate:      false,
 			AgentLockDir: filepath.Join(paths.StateDir, "agent-automation-locks"),
 		})
@@ -431,7 +432,9 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 		if err != nil {
 			return fmt.Errorf("store socket: %w", err)
 		}
-		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{})
+		// The front ends draw their ids from this allocator too, so every
+		// process on the node shares one sequence.
+		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{NextID: ids.Next})
 		defer srv.Close()
 		fleet = tdb
 	} else {

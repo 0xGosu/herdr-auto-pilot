@@ -225,3 +225,61 @@ func TestSQLiteProviderNeverPrintsGistFields(t *testing.T) {
 		}
 	}
 }
+
+// TestAuditAndKillHistoryNameTheNodeLast: both listings are fleet-wide under a
+// shared store, so each row ends with the machine it belongs to — appended, so
+// every existing field keeps its position.
+func TestAuditAndKillHistoryNameTheNodeLast(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	other, err := store.OpenAs(filepath.Join(filepath.Dir(app.ConfigPath), "t.db"), "bbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "laptop", LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.AppendAudit(ctx, domain.AuditRecord{AgentID: "1", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationIdle, Action: "noop", Status: "auto", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendAudit(ctx, domain.AuditRecord{AgentID: "2", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationIdle, Action: "noop", Status: "auto", CreatedAt: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.InsertKillEvent(ctx, domain.KillEvent{State: domain.KillStateActiveValue, Author: "operator", Scope: "global", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "audit", "--limit", "5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := listedRows(out)
+	if len(rows) != 2 {
+		t.Fatalf("audit rows = %d:\n%s", len(rows), out)
+	}
+	for _, row := range rows {
+		fields := strings.Split(row, "\t")
+		last := fields[len(fields)-1]
+		switch {
+		case strings.Contains(row, "\tnoop\t") && strings.HasSuffix(row, "node=laptop"):
+		case strings.HasSuffix(row, "node="+st.NodeID()[:8]):
+		default:
+			t.Errorf("audit row must end with the node label, got %q (last field %q)", row, last)
+		}
+	}
+	if !strings.Contains(out, "node=laptop") {
+		t.Errorf("the laptop's audit row must be labelled:\n%s", out)
+	}
+
+	out, err = run(t, app, "kill-history")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "\tglobal\tnode=laptop") {
+		t.Errorf("kill history must end each row with its node:\n%s", out)
+	}
+}

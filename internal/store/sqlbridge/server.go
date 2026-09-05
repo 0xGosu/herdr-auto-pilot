@@ -22,6 +22,10 @@ type ServerOptions struct {
 	// pool must be sized past it, or a stuck TUI starves the daemon's own
 	// writes.
 	MaxClients int
+	// NextID answers a client's "nextid" request from the daemon's own id
+	// allocator, so every process on this node draws from one sequence. nil
+	// refuses the request (the client then falls back to a local allocator).
+	NextID func() int64
 }
 
 // DefaultMaxClients is how many front-end processes may hold a session at once.
@@ -191,6 +195,11 @@ func (s *Server) handle(ctx context.Context, sess *Session, req request) respons
 		if err := sess.Ping(ctx); err != nil {
 			return fail(err)
 		}
+	case kindNextID:
+		if s.opts.NextID == nil {
+			return fail(errors.New("sqlbridge: this daemon allocates no ids"))
+		}
+		return response{Kind: kindOK, LastID: strconv.FormatInt(s.opts.NextID(), 10)}
 	default:
 		return fail(errors.New("sqlbridge: unknown request kind " + strconv.Quote(req.Kind)))
 	}

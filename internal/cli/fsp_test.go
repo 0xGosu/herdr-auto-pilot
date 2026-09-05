@@ -105,16 +105,21 @@ func TestKillHistoryPrintsFSPTogglesInTheParsedShape(t *testing.T) {
 		if !strings.HasPrefix(line, "#") {
 			continue
 		}
+		// Six columns: the five parsed here plus the node, APPENDED so these
+		// indexes keep meaning what they always did.
 		cols := strings.Split(line, "\t")
 		switch {
-		case len(cols) == 5 && cols[2] == domain.KillStateFSPOn:
+		case len(cols) == 6 && cols[2] == domain.KillStateFSPOn:
 			fspRow = cols
-		case len(cols) == 5 && cols[2] == domain.KillStateActiveValue:
+		case len(cols) == 6 && cols[2] == domain.KillStateActiveValue:
 			pauseRow = cols
 		}
 	}
 	if fspRow == nil {
-		t.Fatalf("kill-history printed no fsp_on row in the expected 5-column shape:\n%s", out)
+		t.Fatalf("kill-history printed no fsp_on row in the expected 6-column shape:\n%s", out)
+	}
+	if !strings.HasPrefix(fspRow[5], "node=") {
+		t.Errorf("last column = %q, want the node label", fspRow[5])
 	}
 	if fspRow[4] != domain.KillScopeFSP {
 		t.Errorf("fsp_on row scope column = %q, want %q", fspRow[4], domain.KillScopeFSP)

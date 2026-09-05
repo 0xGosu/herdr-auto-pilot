@@ -17,8 +17,15 @@ import (
 )
 
 // startLocalSyncServer runs `tursodb --sync-server` for one test, or skips.
+//
+// HAP_TURSO_TEST_URL (with HAP_TURSO_TEST_TOKEN) points the two-node tests at
+// a REAL Turso database instead — the operator's own test database — for a
+// live check of the sync path. The tests assume the hap tables start empty.
 func startLocalSyncServer(t *testing.T) string {
 	t.Helper()
+	if url := os.Getenv("HAP_TURSO_TEST_URL"); url != "" {
+		return url
+	}
 	bin, err := exec.LookPath("tursodb")
 	if err != nil {
 		t.Skip("tursodb not on PATH; install the Turso CLI to run the sync tests")
@@ -66,7 +73,8 @@ func openNode(t *testing.T, url, id string) *node {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	db, err := turso.Open(ctx, turso.Options{Path: filepath.Join(dir, "hap.db"), RemoteURL: url, ClientName: "hap-" + id, Connections: 4})
+	db, err := turso.Open(ctx, turso.Options{Path: filepath.Join(dir, "hap.db"), RemoteURL: url,
+		AuthToken: os.Getenv("HAP_TURSO_TEST_TOKEN"), ClientName: "hap-" + id, Connections: 4})
 	if err != nil {
 		t.Fatalf("%s: open: %v", id, err)
 	}

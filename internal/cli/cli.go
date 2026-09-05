@@ -1293,15 +1293,23 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 	if err != nil {
 		return err
 	}
+	// The audit log is fleet-wide under a shared store, so each row names the
+	// machine it happened on — APPENDED, so every existing field keeps its
+	// position for the parsers reading this listing.
+	st, err := app.GetStatus(ctx)
+	if err != nil {
+		return err
+	}
 	rules, _ := ruleIndex(ctx, app)
 	for _, r := range recs {
 		rule := "-"
 		if row, ok := rules[r.Signature]; ok {
 			rule = string(row.Mode)
 		}
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\n",
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\tnode=%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), frontend.AuditStatusLabel(r), r.SituationType,
-			r.Action, frontend.ConfidenceLabel(r.Confidence), llmConfCLI(r.LLMConfidence), rule, r.Rationale)
+			r.Action, frontend.ConfidenceLabel(r.Confidence), llmConfCLI(r.LLMConfidence), rule, r.Rationale,
+			st.NodeLabel(r.NodeID))
 	}
 	return nil
 }
@@ -1409,9 +1417,15 @@ func killHistory(ctx context.Context, app *frontend.App, out io.Writer) error {
 		fmt.Fprintln(out, "no pause/kill events recorded")
 		return nil
 	}
+	// Fleet-wide history: the node is appended so a pause landed on another
+	// machine (`hap pause --node`) reads as that machine's.
+	st, err := app.GetStatus(ctx)
+	if err != nil {
+		return err
+	}
 	for _, e := range events {
-		fmt.Fprintf(out, "#%d\t%s\t%s\tby %s\t%s\n",
-			e.ID, e.CreatedAt.Format(time.RFC3339), e.State, e.Author, e.Scope)
+		fmt.Fprintf(out, "#%d\t%s\t%s\tby %s\t%s\tnode=%s\n",
+			e.ID, e.CreatedAt.Format(time.RFC3339), e.State, e.Author, e.Scope, st.NodeLabel(e.NodeID))
 	}
 	return nil
 }

@@ -331,3 +331,52 @@ func TestConcurrentClientsDoNotInterleaveFrames(t *testing.T) {
 		t.Fatalf("rows = %d %v, want 20", n, err)
 	}
 }
+
+// TestNextIDComesFromTheDaemonsAllocator: a front end's ids are drawn from the
+// server's allocator over the wire — one sequence per node — and a server
+// that allocates none makes the client fall back (once, loudly) rather than
+// hand out a silent duplicate.
+func TestNextIDComesFromTheDaemonsAllocator(t *testing.T) {
+	e := NewExecutor(openBacking(t), nil)
+	var seq int64
+	sock := filepath.Join(testutil.SocketDir(t), "ids.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := Serve(ln, e, ServerOptions{NextID: func() int64 { seq++; return 1000 + seq }})
+	t.Cleanup(func() { srv.Close() })
+	c := &DialConnector{Path: sock}
+
+	ids := NewRemoteIDs(c, nil)
+	for want := int64(1001); want <= 1003; want++ {
+		if got := ids.Next(); got != want {
+			t.Fatalf("Next() = %d, want %d from the server's allocator", got, want)
+		}
+	}
+	if got, err := c.NextID(context.Background()); err != nil || got != 1004 {
+		t.Fatalf("NextID = %d, %v", got, err)
+	}
+
+	// A daemon that allocates no ids: the fallback answers.
+	bare := filepath.Join(testutil.SocketDir(t), "bare.sock")
+	ln2, err := net.Listen("unix", bare)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv2 := Serve(ln2, e, ServerOptions{})
+	t.Cleanup(func() { srv2.Close() })
+	fallbackCalls := 0
+	fb := NewRemoteIDs(&DialConnector{Path: bare}, func() int64 { fallbackCalls++; return 7 })
+	if got := fb.Next(); got != 7 || fallbackCalls != 1 {
+		t.Fatalf("fallback: got %d (calls %d), want the local allocator's 7", got, fallbackCalls)
+	}
+	// No fallback at all yields 0, never a made-up id.
+	if got := NewRemoteIDs(&DialConnector{Path: bare}, nil).Next(); got != 0 {
+		t.Fatalf("without a fallback Next() = %d, want 0", got)
+	}
+	// A missing socket is the same story.
+	if got := NewRemoteIDs(&DialConnector{Path: filepath.Join(t.TempDir(), "nope.sock")}, func() int64 { return 9 }).Next(); got != 9 {
+		t.Fatalf("missing socket: Next() = %d, want the fallback", got)
+	}
+}
