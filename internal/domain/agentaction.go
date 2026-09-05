@@ -149,3 +149,19 @@ type FocusPayload struct {
 	TabID  string `json:"tab_id"`
 	PaneID string `json:"pane_id"`
 }
+
+// CaptureResult is the capture action's outcome.
+//
+// A dedicated type rather than an AgentTransition, for two reasons. The
+// transition carries transient fields the daemon sets for its own pipeline
+// (RetryAuditID, ManualCapture, AutoIdleSend) that have no meaning to a
+// caller and no business crossing the queue; and it has no json tags at all,
+// so round-tripping it would pin every field name to its Go spelling by
+// accident. This carries what the requesting surface actually reports.
+type CaptureResult struct {
+	AgentID string `json:"agent_id"`
+	PaneID  string `json:"pane_id"`
+	// Status is the parked status the capture was accepted for: blocked,
+	// idle or done. Anything else is refused rather than reported.
+	Status string `json:"status"`
+}

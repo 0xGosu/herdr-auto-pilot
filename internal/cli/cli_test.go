@@ -3,26 +3,24 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
-	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
-	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 func testApp(t *testing.T) (*frontend.App, *store.Store) {
@@ -37,6 +35,9 @@ func testApp(t *testing.T) (*frontend.App, *store.Store) {
 		Store:      st,
 		ConfigPath: filepath.Join(dir, "config.toml"),
 		Author:     "operator",
+		// StateDir is where the daemon health record lives, and every verb
+		// that queues an agent action reads it through requireLiveDaemon.
+		StateDir: dir,
 	}, st
 }
 
@@ -71,53 +72,74 @@ func (f *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, er
 func TestCaptureCLI(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
-	if err := st.AssignAgentName(ctx, "pane-live", "vivid-falcon"); err != nil {
+	app.DaemonInfo = func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version }
+	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
 		t.Fatal(err)
 	}
-	app.Herdr = &captureHerdr{agents: []domain.AgentTransition{{
-		AgentID: "pane-live", PaneID: "pane-live", AgentType: "codex", Status: "blocked",
-	}}}
-	app.DaemonInfo = func() (bool, int, string) { return true, 42, buildinfo.Version }
-	sock := filepath.Join(testutil.SocketDir(t), "capture.sock")
-	var mu sync.Mutex
-	var kinds []control.Kind
-	srv, err := control.NewServer(sock, func(k control.Kind) {
-		mu.Lock()
-		defer mu.Unlock()
-		kinds = append(kinds, k)
+
+	// Stand in for the daemon's drain. The resolution and the parked-status
+	// check are ITS job now, so the verb's contract is only that the
+	// operator's spelling reaches the queue and the answer reaches stdout.
+	result, _ := json.Marshal(domain.CaptureResult{
+		AgentID: "pane-live", PaneID: "pane-live", Status: "blocked",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer srv.Close()
-	app.ControlPath = sock
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			acts, err := st.PendingAgentActions(ctx)
+			if err == nil {
+				for _, a := range acts {
+					errText, out := "", string(result)
+					status := domain.AgentActionDone
+					if a.Target == "ghost" {
+						status, errText, out = domain.AgentActionFailed, `no live agent matches "ghost"`, ""
+					}
+					if ok, _ := st.ClaimAgentAction(ctx, a.ID, time.Now()); ok {
+						st.FinishAgentAction(ctx, a.ID, status, errText, out, time.Now())
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
 
 	out, err := run(t, app, "capture", "vivid-falcon")
 	if err != nil || !strings.Contains(out, "capture queued for vivid-falcon") || !strings.Contains(out, "pane-live") {
 		t.Fatalf("capture output=%q err=%v", out, err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		mu.Lock()
-		n := len(kinds)
-		mu.Unlock()
-		if n == 1 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	acts, err := st.AgentActionByID(ctx, 1)
+	if err != nil || acts == nil {
+		t.Fatalf("no action queued: %v", err)
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(kinds) != 1 {
-		t.Fatalf("capture nudges = %v", kinds)
-	}
-	if target, ok := control.CaptureTarget(kinds[0]); !ok || target != "pane-live" {
-		t.Fatalf("capture target=%q ok=%v", target, ok)
+	if acts.Kind != domain.AgentActionCapture || acts.Target != "vivid-falcon" {
+		t.Fatalf("queued %+v; want a capture carrying the operator's spelling", acts)
 	}
 
-	app.DaemonInfo = func() (bool, int, string) { return true, 42, "old-version" }
-	if _, err := run(t, app, "capture", "vivid-falcon"); err == nil || !strings.Contains(err.Error(), "STALE") {
-		t.Fatalf("stale daemon should be rejected, got %v", err)
+	// The daemon's refusal is the verb's error. It used to be a log line the
+	// operator never saw, printed over by "capture queued".
+	if _, err := run(t, app, "capture", "ghost"); err == nil || !strings.Contains(err.Error(), "ghost") {
+		t.Fatalf("an unresolvable target should fail with the daemon's reason, got %v", err)
+	}
+
+	// A daemon that holds the lock but has stopped making progress drains
+	// nothing, so the request is refused before it is written — something the
+	// old version-only pre-check waved through.
+	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now().Add(-daemonhealth.StaleAfter - time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(t, app, "capture", "vivid-falcon"); err == nil ||
+		!errors.Is(err, frontend.ErrDaemonUnavailable) {
+		t.Fatalf("a hung daemon should be refused, got %v", err)
 	}
 }
 

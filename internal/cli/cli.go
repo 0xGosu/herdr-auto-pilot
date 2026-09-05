@@ -179,16 +179,11 @@ func capture(ctx context.Context, app *frontend.App, out io.Writer, args []strin
 	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("usage: capture <agent-name-or-pane-id> (see: hap help capture)")
 	}
-	if app.DaemonInfo != nil {
-		running, _, ver := app.DaemonInfo()
-		if !running {
-			return fmt.Errorf("daemon is not running — run: hap daemon --ensure")
-		}
-		if ver != buildinfo.Version {
-			return fmt.Errorf("daemon is STALE (running %s, binary is %s) — run: hap daemon --ensure",
-				daemonlock.VersionLabel(ver), buildinfo.Version)
-		}
-	}
+	// No liveness pre-check here any more: CaptureAgent queues the request for
+	// the daemon and refuses through requireLiveDaemon, which asks strictly
+	// more than this did — a daemon that holds the lock but has stopped making
+	// progress, or one whose binary was replaced underneath it, both read as
+	// "running" to a version compare and drain nothing.
 	agent, err := app.CaptureAgent(ctx, args[0])
 	if err != nil {
 		return err

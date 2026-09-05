@@ -60,7 +60,7 @@ var herdrPorts = map[string]bool{
 // ever shrinks" a property of the test rather than of review discipline.
 var herdrPortExemptions = map[string]map[string]string{
 	"internal/frontend/frontend.go": {
-		"Herdr":         "stages 2-5: every reader below reaches the adapter through the field",
+		"Herdr":         "stages 3-5: every reader below reaches the adapter through the field",
 		"HerdrPort":     "stage 6: the field's declared type, once every reader below is gone",
 		"ListAgents":    "stage 3: the roster snapshot replaces the live listing",
 		"InspectorPort": "stage 3: agent cwd moves to the roster",

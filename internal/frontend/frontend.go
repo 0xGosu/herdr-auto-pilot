@@ -580,30 +580,40 @@ func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool
 // CaptureAgent asks the daemon to re-run the normal attention pipeline for a
 // currently parked live agent. Exact pane/agent ids take precedence over the
 // operator-assigned short name.
-func (a *App) CaptureAgent(ctx context.Context, target string) (domain.AgentTransition, error) {
-	if a.Herdr == nil {
-		return domain.AgentTransition{}, fmt.Errorf("herdr is unavailable")
+//
+// The target is resolved by the DAEMON, not here. That is what removed this
+// command's live agent listing from the front end — and it is also why the two
+// refusals an operator actually hits (a name that matches nothing, an agent
+// caught mid-work) now come back as errors instead of a daemon-log warning
+// nobody was reading, after this call had already reported the capture queued.
+func (a *App) CaptureAgent(ctx context.Context, target string) (domain.CaptureResult, error) {
+	if strings.TrimSpace(target) == "" {
+		return domain.CaptureResult{}, fmt.Errorf("an agent is required")
 	}
-	if a.ControlPath == "" {
-		return domain.AgentTransition{}, fmt.Errorf("daemon control socket is unavailable")
+	if err := a.requireLiveDaemon(); err != nil {
+		return domain.CaptureResult{}, err
 	}
-	found, err := a.FindLiveAgent(ctx, target)
+	id, err := a.Store.EnqueueAgentAction(ctx, domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: target,
+		Author: a.Author, CreatedAt: time.Now(),
+	})
 	if err != nil {
-		return domain.AgentTransition{}, err
+		return domain.CaptureResult{}, err
 	}
-	switch found.Status {
-	case "blocked", "idle", "done":
-	default:
-		return domain.AgentTransition{}, fmt.Errorf("agent %q is %s; capture requires blocked, idle, or done", target, found.Status)
+	a.nudge(ctx, control.KindWake)
+
+	// Waited for, unlike a focus: the caller PRINTS the resolved agent, and
+	// the whole point of moving the resolution to the daemon is that its
+	// answer — including a refusal — reaches the operator.
+	result, err := a.AwaitAgentAction(ctx, id, DefaultActionTimeout)
+	if err != nil {
+		return domain.CaptureResult{}, err
 	}
-	agentID := found.AgentID
-	if agentID == "" {
-		agentID = found.PaneID
+	var res domain.CaptureResult
+	if err := json.Unmarshal([]byte(result), &res); err != nil {
+		return domain.CaptureResult{}, fmt.Errorf("the daemon's capture result could not be read: %w", err)
 	}
-	if err := control.NudgeCapture(ctx, a.ControlPath, agentID); err != nil {
-		return domain.AgentTransition{}, fmt.Errorf("requesting capture from daemon: %w", err)
-	}
-	return found, nil
+	return res, nil
 }
 
 // Escalations lists pending escalations.

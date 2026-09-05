@@ -85,36 +85,41 @@ func TestReembedNudgeRoundTrip(t *testing.T) {
 	t.Fatal("reembed nudge never reached the handler")
 }
 
-func TestCaptureNudgeRoundTrip(t *testing.T) {
+// The protocol carries KINDS and nothing else. A kind that looks like it is
+// smuggling a payload is refused, which is the property the capture nudge used
+// to violate — it encoded its target as "capture:<agent>" and needed a
+// validator here to stay inside the one-field message. That request is an
+// agent_actions row now; this pins the socket back to payload-free signals so
+// the next one cannot quietly reintroduce the shape.
+func TestOnlyPayloadFreeKindsAreAccepted(t *testing.T) {
 	path := filepath.Join(testutil.SocketDir(t), "ctl.sock")
-	got := make(chan Kind, 1)
+	got := make(chan Kind, 8)
 	srv, err := NewServer(path, func(k Kind) { got <- k })
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer srv.Close()
 
-	if err := NudgeCapture(context.Background(), path, "w2:pB"); err != nil {
+	for _, kind := range []Kind{"capture:w2:pB", "reload:w2:pB", "teleport", ""} {
+		if validKind(kind) {
+			t.Errorf("validKind(%q) = true; the socket carries no domain payload", kind)
+		}
+		if err := Nudge(context.Background(), path, kind); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A real kind afterwards proves the refusals were dropped rather than the
+	// connection broken — otherwise this test would pass on a dead server.
+	if err := Nudge(context.Background(), path, KindReload); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case kind := <-got:
-		if target, ok := CaptureTarget(kind); !ok || target != "w2:pB" {
-			t.Fatalf("capture kind %q decoded as target=%q ok=%v", kind, target, ok)
+		if kind != KindReload {
+			t.Fatalf("handler saw %q; a payload-bearing kind reached it", kind)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("capture nudge never reached the handler")
-	}
-
-	for _, target := range []string{"", "bad\nagent", string(make([]byte, 257))} {
-		if _, err := CaptureKind(target); err == nil {
-			t.Errorf("CaptureKind(%q) should fail", target)
-		}
-	}
-	for _, kind := range []Kind{"capture: padded", Kind("capture:" + string(make([]byte, 257)))} {
-		if target, ok := CaptureTarget(kind); ok {
-			t.Errorf("CaptureTarget(%q) = %q, true; want rejected", kind, target)
-		}
+		t.Fatal("the valid nudge never reached the handler")
 	}
 }
 

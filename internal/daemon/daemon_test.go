@@ -954,8 +954,10 @@ func TestManualCaptureNudgeUsesNormalPipeline(t *testing.T) {
 		AgentID: "agent-manual", PaneID: "agent-manual", AgentType: "claude", Status: "blocked",
 	}})
 
-	if err := control.NudgeCapture(context.Background(), h.ctlPath, "agent-manual"); err != nil {
-		t.Fatal(err)
+	if got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "agent-manual",
+	})); got.Status != domain.AgentActionDone {
+		t.Fatalf("capture action %q: %s", got.Status, got.Error)
 	}
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(context.Background(), 10)
@@ -983,8 +985,10 @@ func TestManualCaptureRecognizesIdleCodexPlanApproval(t *testing.T) {
 		AgentID: "agent-codex-plan", PaneID: "agent-codex-plan", AgentType: "codex", Status: "idle",
 	}})
 
-	if err := control.NudgeCapture(context.Background(), h.ctlPath, "agent-codex-plan"); err != nil {
-		t.Fatal(err)
+	if got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionCapture, Target: "agent-codex-plan",
+	})); got.Status != domain.AgentActionDone {
+		t.Fatalf("capture action %q: %s", got.Status, got.Error)
 	}
 	waitFor(t, 3*time.Second, func() bool {
 		audits, _ := h.raw.AuditLog(context.Background(), 10)

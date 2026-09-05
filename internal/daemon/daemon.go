@@ -1252,18 +1252,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			})
 		case kind := <-d.nudges:
 			logging.Guard("nudge", func() error {
-				if target, ok := control.CaptureTarget(kind); ok {
-					d.captureLiveAgent(ctx, target)
-				} else {
-					switch kind {
-					case control.KindReload:
-						d.reload()
-					case control.KindReembed:
-						// Operator-requested re-compute: force a fresh embedder
-						// (clean degraded latch) and re-run the semantic init.
-						d.reloadWith(true)
-					}
+				switch kind {
+				case control.KindReload:
+					d.reload()
+				case control.KindReembed:
+					// Operator-requested re-compute: force a fresh embedder
+					// (clean degraded latch) and re-run the semantic init.
+					d.reloadWith(true)
 				}
+				// processAgentActions runs BEFORE reconcileAttention, which is
+				// what lets the capture executor claim its parked episode
+				// ahead of the reconcile — see captureLiveAgent.
 				d.processAgentActions(ctx)
 				d.processCorrections(ctx)
 				d.processLLMRetries(ctx)
@@ -1307,38 +1306,64 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-// captureLiveAgent resolves a targeted control request against the daemon's
+// captureLiveAgent resolves an operator's capture request against the daemon's
 // current live view, then feeds the current parked state into the same delayed
 // capture pipeline as a real Herdr event. It intentionally bypasses only the
 // reconcile episode/open-escalation guards; downstream duplicate and safety
 // checks remain authoritative.
-func (d *Daemon) captureLiveAgent(ctx context.Context, target string) {
+//
+// Its refusals are RETURNED rather than logged. They used to reach nobody: the
+// request arrived as a fire-and-forget control nudge with no reply channel, so
+// an operator who typed the wrong name, or caught an agent mid-work, was told
+// their capture was queued and then watched nothing happen. As a queued action
+// the same two refusals are the row's error, and `hap capture` prints them.
+//
+// "Done" here means SCHEDULED, not classified: scheduleCapture arms a timer for
+// the configured capture delay and the pipeline runs later on delayedTr. That
+// is the same promise the CLI has always printed ("capture queued for …"), and
+// it is what keeps the caller's wait sub-second.
+func (d *Daemon) captureLiveAgent(ctx context.Context, target string) (domain.CaptureResult, error) {
+	// The operator's spelling may be the short NAME, which only the store can
+	// map. Resolving it here rather than at the requesting surface is what the
+	// Target column already promises ("a pane id, an agent id, or the
+	// operator-assigned short name … resolved by the DAEMON"), and it is the
+	// half of this move that is easy to drop: the pane-id case works without
+	// it, so a test that never names an agent would not notice `hap capture
+	// reviewer` had stopped resolving. An unknown target passes through
+	// unchanged, so the id forms still match below.
+	resolved, err := d.opt.Store.ResolveAgent(ctx, target)
+	if err != nil {
+		return domain.CaptureResult{}, fmt.Errorf("%w: resolving %q: %v", errActionTransient, target, err)
+	}
 	agents, err := d.opt.Herdr.ListAgents(ctx)
 	if err != nil {
-		slog.Error("manual capture: listing agents failed", "target", target, "error", err)
-		return
+		// The listing, not the request, is what failed — worth another pass
+		// before telling the operator their target does not exist.
+		return domain.CaptureResult{}, fmt.Errorf("%w: listing agents: %v", errActionTransient, err)
 	}
 	for _, tr := range agents {
-		if tr.AgentID != target && tr.PaneID != target {
+		if tr.AgentID != resolved && tr.PaneID != resolved {
 			continue
 		}
 		switch tr.Status {
 		case "blocked", "idle", "done":
-			tr.ManualCapture = true
-			// The nudge loop runs reconciliation immediately after this method.
-			// Claim the parked episode first so reconcile cannot coalesce a
-			// provenance-less transition over this explicit request.
-			d.mu.Lock()
-			d.episodeHandled[tr.PaneID] = true
-			d.mu.Unlock()
-			slog.Info("manual capture queued", "agent", tr.AgentID, "pane", tr.PaneID, "status", tr.Status)
-			d.scheduleCapture(ctx, tr)
 		default:
-			slog.Warn("manual capture ignored: agent is not parked", "agent", tr.AgentID, "status", tr.Status)
+			return domain.CaptureResult{}, fmt.Errorf(
+				"agent %q is %s; capture requires blocked, idle, or done", target, tr.Status)
 		}
-		return
+		tr.ManualCapture = true
+		// Reconciliation runs immediately after the action drain (see Run's
+		// nudge arm, where processAgentActions precedes reconcileAttention).
+		// Claim the parked episode first so reconcile cannot coalesce a
+		// provenance-less transition over this explicit request.
+		d.mu.Lock()
+		d.episodeHandled[tr.PaneID] = true
+		d.mu.Unlock()
+		slog.Info("manual capture queued", "agent", tr.AgentID, "pane", tr.PaneID, "status", tr.Status)
+		d.scheduleCapture(ctx, tr)
+		return domain.CaptureResult{AgentID: tr.AgentID, PaneID: tr.PaneID, Status: tr.Status}, nil
 	}
-	slog.Warn("manual capture ignored: live agent not found", "target", target)
+	return domain.CaptureResult{}, fmt.Errorf("no live agent matches %q", target)
 }
 
 // handleTransition evaluates one agent-status transition end to end.

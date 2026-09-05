@@ -2,16 +2,22 @@
 // local socket carrying reload/wake nudges from front-ends and the mcp
 // process (NFR-009, no idle polling per NFR-003). Nudges carry no domain
 // payload — data is already committed to the DB before the nudge.
+//
+// That was once true with an exception. A manual capture smuggled its target
+// into the kind itself ("capture:<agent>"), which needed a validator here for
+// no reason except to keep that payload from breaking the one-field protocol,
+// and left the request with no way to report back — an operator who named an
+// agent that did not exist was told nothing. It is an agent_actions row now,
+// so the rule holds without a carve-out and the socket is once again purely a
+// latency optimization over the periodic drain.
 package control
 
 import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net"
-	"strings"
 	"sync"
 	"time"
 )
@@ -29,36 +35,8 @@ const (
 	KindReembed Kind = "reembed"
 )
 
-const capturePrefix = "capture:"
-
-// CaptureKind returns a targeted manual-capture nudge. The target is carried
-// in the kind so the existing one-field control protocol and server callback
-// remain backward compatible.
-func CaptureKind(target string) (Kind, error) {
-	target = strings.TrimSpace(target)
-	if !validCaptureTarget(target) {
-		return "", fmt.Errorf("invalid capture target %q", target)
-	}
-	return Kind(capturePrefix + target), nil
-}
-
-// CaptureTarget extracts a target from a manual-capture kind.
-func CaptureTarget(kind Kind) (string, bool) {
-	target, ok := strings.CutPrefix(string(kind), capturePrefix)
-	return target, ok && validCaptureTarget(target)
-}
-
-func validCaptureTarget(target string) bool {
-	return target != "" && len(target) <= 256 && target == strings.TrimSpace(target) &&
-		!strings.ContainsAny(target, "\r\n\x00")
-}
-
 func validKind(kind Kind) bool {
-	if kind == KindReload || kind == KindWake || kind == KindReembed {
-		return true
-	}
-	_, ok := CaptureTarget(kind)
-	return ok
+	return kind == KindReload || kind == KindWake || kind == KindReembed
 }
 
 type message struct {
@@ -184,14 +162,4 @@ func Nudge(ctx context.Context, path string, kind Kind) error {
 	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
 	_, err = conn.Write(append(data, '\n'))
 	return err
-}
-
-// NudgeCapture asks the daemon to re-run its normal capture pipeline for one
-// live agent, even when startup reconciliation already handled that episode.
-func NudgeCapture(ctx context.Context, path, target string) error {
-	kind, err := CaptureKind(target)
-	if err != nil {
-		return err
-	}
-	return Nudge(ctx, path, kind)
 }

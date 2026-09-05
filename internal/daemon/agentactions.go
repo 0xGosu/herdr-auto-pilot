@@ -226,6 +226,8 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 		return d.deliverReply(ctx, a)
 	case domain.AgentActionFocus:
 		return d.focusAgent(ctx, a)
+	case domain.AgentActionCapture:
+		return d.captureAgentAction(ctx, a)
 	default:
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)
