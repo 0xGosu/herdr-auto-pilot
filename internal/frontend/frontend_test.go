@@ -2676,19 +2676,6 @@ func TestJoinCommandRoundTrip(t *testing.T) {
 	}
 }
 
-// fakeHerdrPort serves a fixed live agent list (no sends expected).
-type fakeHerdrPort struct {
-	agents []domain.AgentTransition
-}
-
-func (f *fakeHerdrPort) Send(ctx context.Context, paneID, input string) error { return nil }
-func (f *fakeHerdrPort) ReadPane(ctx context.Context, paneID string, lines int) (string, error) {
-	return "", nil
-}
-func (f *fakeHerdrPort) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) {
-	return f.agents, nil
-}
-
 func TestStatusHidesOnlyDoublePlaceholderAgents(t *testing.T) {
 	app, st := testApp(t)
 	// Seeded straight into the roster, bypassing the daemon's own filter, so
@@ -3322,21 +3309,6 @@ func TestResetSignatureGraduationThroughApp(t *testing.T) {
 	if _, err := app.ResetSignatureGraduation(ctx, "nope:xyz"); err == nil {
 		t.Error("prefix resolution error must surface")
 	}
-}
-
-// fakeLocatorPort is a fakeHerdrPort that also reports workspace/tab
-// metadata (ports.LocatorPort).
-type fakeLocatorPort struct {
-	fakeHerdrPort
-	workspaces []domain.WorkspaceInfo
-	tabs       []domain.TabInfo
-}
-
-func (f *fakeLocatorPort) ListWorkspaces(ctx context.Context) ([]domain.WorkspaceInfo, error) {
-	return f.workspaces, nil
-}
-func (f *fakeLocatorPort) ListTabs(ctx context.Context) ([]domain.TabInfo, error) {
-	return f.tabs, nil
 }
 
 func TestGetStatusNamesLiveAgentsAndReportsLocation(t *testing.T) {

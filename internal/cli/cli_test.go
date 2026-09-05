@@ -57,18 +57,6 @@ func run(t *testing.T, app *frontend.App, verb string, args ...string) (string, 
 	return out.String(), err
 }
 
-type captureHerdr struct {
-	agents []domain.AgentTransition
-}
-
-func (f *captureHerdr) Send(context.Context, string, string) error { return nil }
-func (f *captureHerdr) ReadPane(context.Context, string, int) (string, error) {
-	return "", nil
-}
-func (f *captureHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
-	return f.agents, nil
-}
-
 func TestCaptureCLI(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
