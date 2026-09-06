@@ -11,13 +11,26 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
-// namedAgent gives an agent id a name row, which is what the rename and
-// set_enabled executors act on.
+// namedAgent gives an agent id a name row AND puts it in a freshly published
+// roster.
+//
+// Both halves are required, and the roster is the one that is easy to forget: a
+// name row is permanent and outlives its agent, so the executors deliberately
+// refuse a target that is not also RUNNING here. A helper that only wrote the
+// name row would build the stale-row shape these tests exist to reject.
 func (h *harness) namedAgent(t *testing.T, agentID string) string {
 	t.Helper()
-	name, err := h.raw.EnsureAgentName(context.Background(), agentID)
+	ctx := context.Background()
+	name, err := h.raw.EnsureAgentName(ctx, agentID)
 	if err != nil {
 		t.Fatalf("ensure agent name: %v", err)
+	}
+	h.liveRoster = append(h.liveRoster, domain.RosterAgent{
+		AgentID: agentID, PaneID: agentID, AgentType: "claude",
+		Status: "idle", SeenAt: time.Now(),
+	})
+	if err := h.raw.PublishRoster(ctx, h.liveRoster, time.Now()); err != nil {
+		t.Fatalf("publish roster: %v", err)
 	}
 	return name
 }
@@ -429,5 +442,100 @@ func TestEveryAutomationLockCallInAnExecutorIsTimeBoxed(t *testing.T) {
 	}
 	if found == 0 {
 		t.Fatal("no SetAgentDisabled call found in agentnames.go — this guard has gone stale")
+	}
+}
+
+// An agent_names row is PERMANENT — it outlives the agent — so "a name row
+// exists" only ever proved that some agent once wore that id here. Acting on
+// that alone renames a row nobody can see, and (worse) can ENABLE automation on
+// whatever live agent herdr has since handed the recycled pane id to.
+//
+// This is not hypothetical: a live install was found carrying a stale
+// `nimble-otter` name row for a pane that had been gone for hours, beside a
+// DIFFERENT machine's live agent of the same name.
+func TestAQueuedActionRefusesAnAgentThatIsNoLongerRunning(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	// A name row and NO roster entry — deliberately not namedAgent, which
+	// publishes one. This is exactly the stale-row shape: the agent is gone,
+	// the row it left behind is not.
+	if _, err := h.raw.EnsureAgentName(ctx, "agent-ghost"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.PublishRoster(ctx, []domain.RosterAgent{{
+		AgentID: "someone-else", PaneID: "someone-else", AgentType: "claude",
+		Status: "idle", SeenAt: time.Now(),
+	}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.SetAgentDisabled(ctx, "agent-ghost", true); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(domain.SetEnabledPayload{Disabled: false})
+	id := h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionSetEnabled, Target: "agent-ghost", Payload: string(payload),
+	})
+	got := h.awaitAction(id)
+	if got.Status != domain.AgentActionFailed {
+		t.Fatalf("status = %q (%s), want failed", got.Status, got.Error)
+	}
+	if !strings.Contains(got.Error, "is running on this machine") {
+		t.Errorf("error = %q, want it to say no such agent is RUNNING here", got.Error)
+	}
+	// The critical half: automation was not re-armed.
+	if off, err := h.raw.AgentDisabled(ctx, "agent-ghost"); err != nil || !off {
+		t.Errorf("AgentDisabled = %v (err %v) — automation was re-armed on an agent that is not running",
+			off, err)
+	}
+}
+
+// The terminal-identity guard cannot carry this on its own. Both sides of its
+// comparison are written by syncTerminalIDs, so a daemon that is heartbeating
+// but can no longer list agents freezes them at the SAME stale value and the
+// comparison passes. Roster freshness is the evidence that this daemon has
+// actually looked recently.
+//
+// A stale roster is transient, not a verdict: the request waits for the next
+// publish rather than being thrown away.
+func TestAQueuedActionWaitsWhileThisMachinesRosterIsStale(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.namedAgent(t, "agent-blind")
+	// Publish a roster CONTAINING the agent, but stamped long enough ago that
+	// domain.RosterFresh refuses it — the "alive but blind" state.
+	stale := time.Now().Add(-24 * time.Hour)
+	if err := h.raw.PublishRoster(ctx, []domain.RosterAgent{{
+		AgentID: "agent-blind", PaneID: "agent-blind", AgentType: "claude",
+		Status: "idle", SeenAt: stale,
+	}}, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, _ := json.Marshal(domain.RenamePayload{Name: "blindly"})
+	id := h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionRename, Target: "agent-blind", Payload: string(payload),
+	})
+	// Transient: the claim is taken and handed BACK, so the request waits for
+	// the next publish instead of being thrown away. Assert that shape rather
+	// than a terminal status, which only arrives after the retry budget.
+	var last domain.AgentAction
+	waitFor(t, 3*time.Second, func() bool {
+		a, err := h.raw.AgentActionByID(ctx, id)
+		if err != nil || a == nil {
+			return false
+		}
+		last = *a
+		return a.Attempts > 0 && a.Status == domain.AgentActionPending
+	})
+	if last.Attempts == 0 || last.Status != domain.AgentActionPending {
+		t.Fatalf("action = %+v, want it retried and returned to pending while the roster is stale", last)
+	}
+	names, err := h.raw.AgentNames(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if names["agent-blind"] == "blindly" {
+		t.Error("renamed against a roster this machine could not vouch for")
 	}
 }

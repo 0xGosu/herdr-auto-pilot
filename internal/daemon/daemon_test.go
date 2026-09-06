@@ -732,6 +732,9 @@ type harness struct {
 	cancel  context.CancelFunc
 	runDone chan struct{} // closed when d.Run returns (after background drain)
 	db      string        // the SQLite file, for tests that open it as another node
+	// liveRoster accumulates the agents namedAgent has published, so publishing
+	// a second one does not retire the first (PublishRoster replaces the herd).
+	liveRoster []domain.RosterAgent
 }
 
 // dbPath is the harness's SQLite file.

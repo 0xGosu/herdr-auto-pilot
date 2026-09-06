@@ -13,8 +13,13 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
-// twoNodes stands both machines up in the nodes table with fresh heartbeats,
-// which is what requireLiveDaemonFor reads before it will queue anything.
+// twoNodes stands both machines up as healthy: a fresh heartbeat (what
+// requireLiveDaemonFor reads) AND a freshly published roster (what
+// requireFreshRosterOn reads).
+//
+// Both are needed, and the roster is the one worth naming: the two questions
+// come apart, and a helper that set up only the heartbeat would build the
+// "alive but blind" node these tests exist to reject.
 func twoNodes(t *testing.T, app *frontend.App, st *store.Store, now time.Time) *store.Store {
 	t.Helper()
 	ctx := context.Background()
@@ -23,6 +28,11 @@ func twoNodes(t *testing.T, app *frontend.App, st *store.Store, now time.Time) *
 		t.Fatal(err)
 	}
 	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "laptop", LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.PublishRoster(ctx, []domain.RosterAgent{{
+		AgentID: "7", PaneID: "7", AgentType: "claude", Status: "idle", SeenAt: now,
+	}}, now); err != nil {
 		t.Fatal(err)
 	}
 	return other
@@ -335,5 +345,58 @@ func TestSetAgentModeRefusesARemoteTargetEvenWhenALocalPaneShadowsIt(t *testing.
 	}
 	if !strings.Contains(err.Error(), "laptop") {
 		t.Errorf("error = %v, want it to name the other node", err)
+	}
+}
+
+// THE CLI/TUI ASYMMETRY.
+//
+// requireLiveDaemonFor asks only "is that daemon alive". A daemon that is
+// heartbeating but can no longer list agents — herdr down, its socket wedged —
+// passes that while its whole view of the herd is frozen, including the
+// terminal id the executor compares against. Both sides of that comparison are
+// then the same stale value, so it passes on an agent id herdr may since have
+// handed to somebody else.
+//
+// The TUI already refuses this through RemoteAgent.Stale, the WIDER predicate
+// (NodeStale OR the roster being old). Without the same gate here, `hap …
+// --node` is the softer door into the same machine.
+func TestRemoteVerbsRefuseANodeWhoseRosterHasGoneStale(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	other := twoNodes(t, app, st, now) // both heartbeating, right now
+
+	// That node published its herd a day ago and has said nothing since: alive
+	// by the heartbeat, blind by the roster.
+	stale := now.Add(-24 * time.Hour)
+	if err := other.PublishRoster(ctx, []domain.RosterAgent{{
+		AgentID: "7", PaneID: "7", AgentType: "claude", Status: "idle", SeenAt: stale,
+	}}, stale); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.EnsureAgentName(ctx, "7"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The heartbeat gate alone would let all three through.
+	if err := app.RequireLiveDaemonForTest(ctx, otherNode); err != nil {
+		t.Fatalf("precondition: the node must still look ALIVE by heartbeat, got %v", err)
+	}
+
+	for _, tc := range []struct {
+		verb string
+		err  error
+	}{
+		{"rename", func() error { _, e := app.RenameAgentOn(ctx, otherNode, "7", "x"); return e }()},
+		{"disable", app.SetAgentDisabledOn(ctx, otherNode, "7", true)},
+		{"enable", app.SetAgentDisabledOn(ctx, otherNode, "7", false)},
+		{"capture", func() error { _, e := app.CaptureAgentOn(ctx, otherNode, "7"); return e }()},
+	} {
+		if tc.err == nil || !strings.Contains(tc.err.Error(), "has not published its agent list recently") {
+			t.Errorf("%s against a blind node = %v, want a stale-roster refusal", tc.verb, tc.err)
+		}
+	}
+	if got := len(pendingFor(t, other)); got != 0 {
+		t.Errorf("%d rows were queued for a node that cannot tell which agent they name", got)
 	}
 }

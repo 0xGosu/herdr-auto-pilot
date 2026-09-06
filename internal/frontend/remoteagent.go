@@ -140,6 +140,9 @@ func (a *App) runRemoteAction(ctx context.Context, nodeID string, kind domain.Ag
 	if err := a.requireLiveDaemonFor(ctx, nodeID); err != nil {
 		return "", err
 	}
+	if err := a.requireFreshRosterOn(ctx, nodeID); err != nil {
+		return "", err
+	}
 	action := domain.AgentAction{
 		NodeID: nodeID, Kind: kind, Target: target, Payload: payload,
 		Author: a.Author, CreatedAt: time.Now(),
@@ -159,6 +162,33 @@ func (a *App) runRemoteAction(ctx context.Context, nodeID string, kind domain.Ag
 		return "", a.explainRemoteFailure(ctx, nodeID, err)
 	}
 	return out, nil
+}
+
+// requireFreshRosterOn refuses a request for a node that is heartbeating but
+// has stopped publishing what it is running.
+//
+// requireLiveDaemonFor asks only "is that daemon alive", and the two questions
+// come apart: the heartbeat is its own timer, so a daemon that can no longer
+// list agents at all — herdr down, its socket wedged — keeps reporting healthy
+// while its view of the herd freezes. Every identity this path relies on is
+// written by that same listing, including the terminal id the executor compares
+// against, so in that state the comparison is stale-against-stale and passes on
+// an agent id herdr may since have handed to somebody else.
+//
+// This is the gate the TUI already applies through RemoteAgent.Stale, which is
+// the WIDER predicate (NodeStale OR the roster being old). Applying it here is
+// what stops `hap … --node` being the softer door into the same machine.
+func (a *App) requireFreshRosterOn(ctx context.Context, nodeID string) error {
+	_, published, err := a.Store.FleetRoster(ctx)
+	if err != nil {
+		return err
+	}
+	if domain.RosterFresh(published[nodeID], a.now()) {
+		return nil
+	}
+	return fmt.Errorf("%w: node %s is reporting in but has not published its agent list recently, "+
+		"so it cannot tell which agent this is any more",
+		ErrDaemonUnavailable, a.NodeLabelFor(ctx, nodeID))
 }
 
 // remoteTerminalID reads the target's terminal identity as the OWNING node last

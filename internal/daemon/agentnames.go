@@ -169,11 +169,29 @@ func (d *Daemon) setAgentEnabledAction(ctx context.Context, a domain.AgentAction
 // resolveActionTarget maps the operator's spelling of an agent to its agent id,
 // in THIS node's namespace — which is the whole reason these kinds are queued.
 //
-// A target that resolves to no name row is not refused here: it may be a live
-// pane id this daemon has not named yet, and the callers' ErrUnknownAgent
-// branches handle that. What is refused is a target matching nothing in the
-// live roster either, because a rename that invented a row for a typo would be
-// invisible state.
+// The resolved id must then be present in a FRESH live roster, and that second
+// half is the load-bearing one. An agent_names row is PERMANENT: it outlives
+// the agent, so "a name row exists" only ever proved that some agent once wore
+// that id here. Accepting on that alone had two failure modes, and the second
+// is a safety one:
+//
+//   - a rename lands on a dead row nobody can see, and reports success (a real
+//     stale `nimble-otter` row, for a pane that had been gone for hours, was
+//     found on a live install exactly this way); and
+//   - herdr RECYCLES pane ids, so the row may since have come to describe a
+//     DIFFERENT live agent — and enabling that one re-arms automation on an
+//     agent nobody vetted.
+//
+// The terminal-identity guard does not cover this on its own. It compares the
+// id stamped at queue time against the id stored now, and BOTH are written by
+// syncTerminalIDs — so a daemon that is heartbeating but can no longer list
+// agents (herdr down, the socket wedged) freezes both sides at the same stale
+// value and the comparison passes. Roster freshness is the evidence that this
+// daemon has actually looked recently, which is what makes the guard mean
+// anything.
+//
+// A stale roster is TRANSIENT: the daemon is expected to publish again shortly,
+// and the operator's request should land then rather than be thrown away.
 func (d *Daemon) resolveActionTarget(ctx context.Context, a domain.AgentAction) (string, error) {
 	target := strings.TrimSpace(a.Target)
 	if target == "" {
@@ -183,44 +201,22 @@ func (d *Daemon) resolveActionTarget(ctx context.Context, a domain.AgentAction) 
 	if err != nil {
 		return "", fmt.Errorf("%w: resolving agent %q: %v", errActionTransient, target, err)
 	}
-	if agentID != target {
-		return agentID, nil // a short name resolved to its id
-	}
-	// The target passed through unresolved, so it is an id (or a typo). Accept
-	// it when a name row already exists for it, else when the live roster does
-	// — the second case is the live-but-unnamed window the callers recover
-	// from. A terminal id is NOT the test: a named agent that has not
-	// transitioned yet has none, and refusing there would make the first thing
-	// an operator does to a fresh agent fail.
-	if names, err := d.opt.Store.AgentNames(ctx); err == nil {
-		if _, ok := names[target]; ok {
-			return target, nil
-		}
-	}
-	if id, err := d.rosterAgentID(ctx, target); err == nil && id != "" {
-		return id, nil
-	}
-	return "", fmt.Errorf("no agent known as %q on this machine", target)
-}
-
-// rosterAgentID matches a pane or agent id against the roster this daemon last
-// published. It mirrors frontend.liveRosterAgentID, and is correct here for the
-// reason it is correct there: LiveRoster is scoped to this node, and this node
-// is the one that owns the agent.
-func (d *Daemon) rosterAgentID(ctx context.Context, target string) (string, error) {
 	roster, publishedAt, err := d.opt.Store.LiveRoster(ctx)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: reading this machine's roster: %v", errActionTransient, err)
 	}
 	if !domain.RosterFresh(publishedAt, d.opt.Clock.Now()) {
-		return "", errors.New("the roster is stale")
+		return "", fmt.Errorf("%w: this machine has not published its agent list recently, "+
+			"so it cannot tell which agent %q is now", errActionTransient, target)
 	}
 	for _, r := range roster {
-		if r.AgentID == target || r.PaneID == target {
+		// Either spelling: ResolveAgent maps a short name to its agent id, and
+		// an unresolved target is a pane or agent id the operator typed.
+		if r.AgentID == agentID || r.AgentID == target || r.PaneID == target {
 			return r.AgentID, nil
 		}
 	}
-	return "", nil
+	return "", fmt.Errorf("no agent known as %q is running on this machine", target)
 }
 
 // agentStillTheSame refuses an action whose target pane has been recycled since
