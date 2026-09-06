@@ -9,35 +9,72 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
-// namedAgent gives an agent id a name row AND puts it in a freshly published
-// roster.
+// newAgentHarness starts a daemon whose herdr is ALREADY running agentIDs, and
+// gives each of them a name row.
 //
-// Both halves are required, and the roster is the one that is easy to forget: a
-// name row is permanent and outlives its agent, so the executors deliberately
-// refuse a target that is not also RUNNING here. A helper that only wrote the
-// name row would build the stale-row shape these tests exist to reject.
-func (h *harness) namedAgent(t *testing.T, agentID string) string {
+// Seeding before the daemon starts is what makes these tests deterministic. The
+// executors refuse a target that is not in a fresh live roster, and the only
+// writer of that roster is the daemon's own publish — which hands its listing
+// to a BACKGROUND pass. A test that registered agents afterwards and wrote the
+// roster itself was racing a snapshot the startup reconcile had already taken
+// of an EMPTY herd: PublishRoster REPLACES the herd, so that snapshot retired
+// the agent moments later and the executor then refused it as not running.
+// It stayed green locally and failed on every CI run under the race detector,
+// which is slow enough to lose the race reliably.
+//
+// Seeded here, the startup listing already contains the agents, so no empty
+// snapshot exists and every later publish agrees.
+func newAgentHarness(t *testing.T, agentIDs ...string) *harness {
 	t.Helper()
-	ctx := context.Background()
-	name, err := h.raw.EnsureAgentName(ctx, agentID)
-	if err != nil {
-		t.Fatalf("ensure agent name: %v", err)
+	rows := make([]domain.AgentTransition, 0, len(agentIDs))
+	for _, id := range agentIDs {
+		rows = append(rows, domain.AgentTransition{
+			AgentID: id, PaneID: id, AgentType: "claude", Status: "idle",
+		})
 	}
-	h.liveRoster = append(h.liveRoster, domain.RosterAgent{
-		AgentID: agentID, PaneID: agentID, AgentType: "claude",
-		Status: "idle", SeenAt: time.Now(),
+	h := newHarnessWrapped(t, "", func(fh *fakeHerdr) ports.HerdrPort {
+		fh.setAgents(rows)
+		return fh
 	})
-	if err := h.raw.PublishRoster(ctx, h.liveRoster, time.Now()); err != nil {
-		t.Fatalf("publish roster: %v", err)
+	ctx := context.Background()
+	for _, id := range agentIDs {
+		if _, err := h.raw.EnsureAgentName(ctx, id); err != nil {
+			t.Fatalf("ensure agent name %q: %v", id, err)
+		}
 	}
-	return name
+	h.waitForRoster(t, agentIDs...)
+	return h
+}
+
+// waitForRoster blocks until this node's published roster is fresh and contains
+// every id. It is the precondition the executors check, so asserting it here
+// keeps a failure about the TEST setup from reading like a failure of the
+// behaviour under test.
+func (h *harness) waitForRoster(t *testing.T, agentIDs ...string) {
+	t.Helper()
+	waitFor(t, 5*time.Second, func() bool {
+		roster, publishedAt, err := h.raw.LiveRoster(context.Background())
+		if err != nil || !domain.RosterFresh(publishedAt, time.Now()) {
+			return false
+		}
+		have := map[string]bool{}
+		for _, r := range roster {
+			have[r.AgentID] = true
+		}
+		for _, id := range agentIDs {
+			if !have[id] {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 func TestQueuedRenameRenamesTheAgent(t *testing.T) {
-	h := newHarness(t, "")
-	h.namedAgent(t, "agent-rn1")
+	h := newAgentHarness(t, "agent-rn1")
 
 	payload, _ := json.Marshal(domain.RenamePayload{Name: "reviewer"})
 	id := h.queueAction(domain.AgentAction{
@@ -68,9 +105,7 @@ func TestQueuedRenameRenamesTheAgent(t *testing.T) {
 // unique per node, so an operator on a different machine is otherwise told a
 // name is taken by an agent they cannot see from where they are standing.
 func TestAQueuedRenameCollisionNamesTheNode(t *testing.T) {
-	h := newHarness(t, "")
-	h.namedAgent(t, "agent-rn2")
-	h.namedAgent(t, "agent-rn3")
+	h := newAgentHarness(t, "agent-rn2", "agent-rn3")
 	ctx := context.Background()
 	if err := h.raw.AssignAgentName(ctx, "agent-rn3", "reviewer"); err != nil {
 		t.Fatal(err)
@@ -90,8 +125,7 @@ func TestAQueuedRenameCollisionNamesTheNode(t *testing.T) {
 }
 
 func TestQueuedSetEnabledFlipsAutomation(t *testing.T) {
-	h := newHarness(t, "")
-	h.namedAgent(t, "agent-se1")
+	h := newAgentHarness(t, "agent-se1")
 	ctx := context.Background()
 
 	payload, _ := json.Marshal(domain.SetEnabledPayload{Disabled: true})
@@ -130,8 +164,7 @@ func TestQueuedSetEnabledFlipsAutomation(t *testing.T) {
 // So a busy barrier must hand the claim back, not wait it out. Nothing else can
 // catch this: with the lock free every other test here passes either way.
 func TestTheActionDrainDoesNotBlockOnABusyAgentsBarrier(t *testing.T) {
-	h := newHarness(t, "")
-	h.namedAgent(t, "agent-busy")
+	h := newAgentHarness(t, "agent-busy")
 	ctx := context.Background()
 
 	// Hold the agent's automation barrier the way an in-flight delivery does,
@@ -185,9 +218,8 @@ func TestTheActionDrainDoesNotBlockOnABusyAgentsBarrier(t *testing.T) {
 // operator's surface rendered may be a sync interval old, which is why the
 // compare happens in the executor rather than there.
 func TestARemoteRenameRefusesARecycledTerminal(t *testing.T) {
-	h := newHarness(t, "")
+	h := newAgentHarness(t, "agent-rc1")
 	ctx := context.Background()
-	h.namedAgent(t, "agent-rc1")
 	if _, err := h.raw.SyncAgentTerminalID(ctx, "agent-rc1", "term_new"); err != nil {
 		t.Fatal(err)
 	}
@@ -222,9 +254,8 @@ func TestARemoteRenameRefusesARecycledTerminal(t *testing.T) {
 // safety regression. So the guard is not "refuse the destructive direction" —
 // it is both.
 func TestARemoteSetEnabledRefusesARecycledTerminal(t *testing.T) {
-	h := newHarness(t, "")
+	h := newAgentHarness(t, "agent-rc2")
 	ctx := context.Background()
-	h.namedAgent(t, "agent-rc2")
 	if err := h.raw.SetAgentDisabled(ctx, "agent-rc2", true); err != nil {
 		t.Fatal(err)
 	}
@@ -250,9 +281,8 @@ func TestARemoteSetEnabledRefusesARecycledTerminal(t *testing.T) {
 // path. A machine off for a week would otherwise come back and drain a week-old
 // backlog against whatever agent now holds that pane id.
 func TestAStaleQueuedRenameIsRefusedRatherThanReplayed(t *testing.T) {
-	h := newHarness(t, "")
+	h := newAgentHarness(t, "agent-old")
 	ctx := context.Background()
-	h.namedAgent(t, "agent-old")
 	before, err := h.raw.AgentNames(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -304,9 +334,8 @@ func TestAgentStateKindsAreBoundedByTheIdentityClock(t *testing.T) {
 // different agent. The guard exists already; these kinds are the ones that
 // would silently rename or re-arm that stranger.
 func TestAnAgentStateActionForAnotherNodeIsNotRun(t *testing.T) {
-	h := newHarness(t, "")
+	h := newAgentHarness(t, "agent-fn1")
 	ctx := context.Background()
-	h.namedAgent(t, "agent-fn1")
 	before, err := h.raw.AgentNames(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -340,8 +369,7 @@ func TestAnAgentStateActionForAnotherNodeIsNotRun(t *testing.T) {
 // machinery failing — so it fails at once with a sentence rather than burning
 // the attempt budget over three sweeps.
 func TestAMalformedAgentStatePayloadFailsReadably(t *testing.T) {
-	h := newHarness(t, "")
-	h.namedAgent(t, "agent-bad")
+	h := newAgentHarness(t, "agent-bad")
 	id := h.queueAction(domain.AgentAction{
 		Kind: domain.AgentActionRename, Target: "agent-bad", Payload: "{not json",
 	})
@@ -360,8 +388,7 @@ func TestAMalformedAgentStatePayloadFailsReadably(t *testing.T) {
 // An empty new name is refused rather than written: agentNameRE would reject it
 // anyway, but the message an operator gets should be about their request.
 func TestAQueuedRenameToNothingIsRefused(t *testing.T) {
-	h := newHarness(t, "")
-	h.namedAgent(t, "agent-blank")
+	h := newAgentHarness(t, "agent-blank")
 	payload, _ := json.Marshal(domain.RenamePayload{Name: "   "})
 	id := h.queueAction(domain.AgentAction{
 		Kind: domain.AgentActionRename, Target: "agent-blank", Payload: string(payload),
@@ -454,18 +481,13 @@ func TestEveryAutomationLockCallInAnExecutorIsTimeBoxed(t *testing.T) {
 // `nimble-otter` name row for a pane that had been gone for hours, beside a
 // DIFFERENT machine's live agent of the same name.
 func TestAQueuedActionRefusesAnAgentThatIsNoLongerRunning(t *testing.T) {
-	h := newHarness(t, "")
+	// herdr runs somebody else, never the ghost. Seeded before the daemon
+	// starts, so its own publish is the only roster and never lists the ghost.
+	h := newAgentHarness(t, "someone-else")
 	ctx := context.Background()
-	// A name row and NO roster entry — deliberately not namedAgent, which
-	// publishes one. This is exactly the stale-row shape: the agent is gone,
-	// the row it left behind is not.
+	// A name row with NO agent behind it — the stale-row shape: the agent is
+	// gone, the row it left behind is not.
 	if _, err := h.raw.EnsureAgentName(ctx, "agent-ghost"); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.raw.PublishRoster(ctx, []domain.RosterAgent{{
-		AgentID: "someone-else", PaneID: "someone-else", AgentType: "claude",
-		Status: "idle", SeenAt: time.Now(),
-	}}, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := h.raw.SetAgentDisabled(ctx, "agent-ghost", true); err != nil {
@@ -499,11 +521,14 @@ func TestAQueuedActionRefusesAnAgentThatIsNoLongerRunning(t *testing.T) {
 // A stale roster is transient, not a verdict: the request waits for the next
 // publish rather than being thrown away.
 func TestAQueuedActionWaitsWhileThisMachinesRosterIsStale(t *testing.T) {
-	h := newHarness(t, "")
+	h := newAgentHarness(t, "agent-blind")
 	ctx := context.Background()
-	h.namedAgent(t, "agent-blind")
-	// Publish a roster CONTAINING the agent, but stamped long enough ago that
-	// domain.RosterFresh refuses it — the "alive but blind" state.
+	// The "alive but blind" state, built exactly as it happens: the daemon can
+	// no longer list agents, so it cannot publish a fresh roster — while its
+	// heartbeat, and every terminal id it already stored, stay put. Failing the
+	// listing first is what stops a later publish undoing the aged roster
+	// below.
+	h.herdr.setFailListAgents(true)
 	stale := time.Now().Add(-24 * time.Hour)
 	if err := h.raw.PublishRoster(ctx, []domain.RosterAgent{{
 		AgentID: "agent-blind", PaneID: "agent-blind", AgentType: "claude",
