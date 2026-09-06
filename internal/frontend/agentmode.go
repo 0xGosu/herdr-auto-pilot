@@ -153,6 +153,16 @@ func (a *App) FindLiveAgent(ctx context.Context, target string) (domain.AgentTra
 // nothing and is safe to call against any pane, including one sitting at a
 // modal — such a pane simply reports ErrModeUnreadable.
 func (a *App) AgentMode(ctx context.Context, target string) (ModeReport, error) {
+	// A mode is READ from the agent's own pane, on the machine it runs on, so
+	// a target that only exists on another node has no answer here. Without
+	// this the read falls through to the local roster and — because every
+	// herdr has a pane "1" — can report a completely different agent's mode
+	// under the name the operator typed. UnlessLocal: a target that also
+	// resolves locally is the local agent, which is what the operator standing
+	// at this machine means.
+	if err := a.refuseRemoteTargetUnlessLocal(ctx, target, "reading an agent's mode"); err != nil {
+		return ModeReport{}, err
+	}
 	agent, err := a.FindLiveAgent(ctx, target)
 	if err != nil {
 		return ModeReport{}, err
@@ -240,6 +250,23 @@ func (a *App) readModePane(ctx context.Context, paneID string) (string, error) {
 //  5. The loop stops on what the pane REPORTS. herdr returns success for a chord
 //     it delivers as a bare TAB, so the send's exit code proves nothing.
 func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts ModeOptions) (ModeChange, error) {
+	// The one gate here that is refuseRemoteTarget rather than
+	// refuseRemoteTargetUnlessLocal, and the difference is the whole point.
+	//
+	// This SENDS KEYSTROKES. FindLiveAgent resolves against LiveRoster, which
+	// is scoped to this node — so a target naming an agent on another machine
+	// either finds nothing, or, because an agent id is a herdr pane id and
+	// agent names are unique only PER NODE, finds a different local agent and
+	// rotates ITS permission mode. Silently, and reported as success.
+	//
+	// A local match is therefore not a reason to proceed: it is exactly the
+	// collision. An ambiguous target is refused rather than guessed, which is
+	// the same unique-or-refuse rule domain.MenuKeystroke applies before
+	// answering a menu. The refusal lifts when the rotation moves into a
+	// daemon executor and a set_mode row can be filed under the owning node.
+	if err := a.refuseRemoteTarget(ctx, target, "changing an agent's mode"); err != nil {
+		return ModeChange{}, err
+	}
 	agent, err := a.FindLiveAgent(ctx, target)
 	if err != nil {
 		return ModeChange{}, err

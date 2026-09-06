@@ -35,13 +35,26 @@ type RemoteAgent struct {
 	Location string
 }
 
-// Display is the row's name as the unified surfaces print it: name@node.
-func (r RemoteAgent) Display() string {
-	name := r.Name
-	if name == "" {
-		name = r.AgentID
+// ShortName is the agent's own name, with no node attached, falling back to
+// its id when that machine has not named it.
+//
+// It is what a surface uses when the node is carried by some OTHER column —
+// the Agents tab renders the node label in LOCATION, so repeating it in NAME
+// would spend a third of that column saying the same thing twice.
+func (r RemoteAgent) ShortName() string {
+	if r.Name != "" {
+		return r.Name
 	}
-	return name + "@" + r.NodeLabel
+	return r.AgentID
+}
+
+// Display is the row's name as the unified surfaces print it: name@node.
+//
+// Kept for the surfaces where nothing else carries the node — the Escalations
+// tab's AGENT column (Status.EscalationAgent) is one flat field, so the suffix
+// is the only thing distinguishing two machines' pane "1".
+func (r RemoteAgent) Display() string {
+	return r.ShortName() + "@" + r.NodeLabel
 }
 
 // NodeLabel is the display label for a node id: its label, else the id's

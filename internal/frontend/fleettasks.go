@@ -52,6 +52,31 @@ func (a *App) FleetTaskGroups(ctx context.Context, st Status) []TaskGroup {
 	return groups
 }
 
+// FleetTaskGroupIndex finds the group in groups holding the list node nodeID
+// keeps for the agent named agentName, or -1.
+//
+// It exists so a surface can jump from a remote AGENT to its tasks without
+// touching task-source resolution. That resolution is unusable here by
+// construction: it reads this node's [[task_sources]], and config never enters
+// the database — so the operator's machine has no entry describing another
+// machine's source, and tasklocator.Resolve would mint a db:// locator in the
+// WRONG node's namespace (a list nobody writes). The task_lists rows are the
+// only cross-node evidence there is, which is what these groups already carry.
+//
+// A miss therefore means "that node keeps this agent's list somewhere only it
+// can see" — a file or a gist — not "that agent has no tasks.
+func FleetTaskGroupIndex(groups []TaskGroup, nodeID, agentName string) int {
+	if nodeID == "" || agentName == "" {
+		return -1
+	}
+	for i, g := range groups {
+		if g.NodeID == nodeID && g.Source.Agent == agentName {
+			return i
+		}
+	}
+	return -1
+}
+
 // NodeTaskList resolves `hap task --node <node> <list>` to the locator of a
 // list another node keeps in the shared database. target may be the agent the
 // list feeds, the list's name, or the agent's derived file name; the error for

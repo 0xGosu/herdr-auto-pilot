@@ -278,11 +278,18 @@ func buildCommands() {
 			Name:    "capture",
 			Group:   groupOperate,
 			Summary: "re-run the normal capture pipeline for one live agent",
-			Usage:   []string{"hap capture <agent-name-or-pane-id>"},
+			Usage:   []string{"hap capture [--node <label|id>] <agent-name-or-pane-id>"},
+			Flags: []FlagDoc{
+				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
+			},
 			Details: "Asks the running daemon to classify that agent's pane right now, as if herdr\n" +
 				"had raised an attention event. Use it when an agent looks blocked but nothing\n" +
-				"showed up in `hap escalations`. Requires a running, current daemon.",
-			Examples: []string{"hap capture vivid-falcon", "hap capture %12"},
+				"showed up in `hap escalations`. Requires a running, current daemon.\n" +
+				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"agent on another machine: the request is queued and that machine's daemon runs\n" +
+				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
+				"only on another node is refused rather than guessed — every herdr has a pane 1.",
+			Examples: []string{"hap capture vivid-falcon", "hap capture --node laptop %12"},
 			Next: []Hint{
 				{Cmd: "hap escalations", Why: "see what the capture produced (allow a few seconds)"},
 				{Cmd: "hap audit --limit 10", Why: "see the decision even if it did not escalate"},
@@ -293,11 +300,19 @@ func buildCommands() {
 			Name:    "rename",
 			Group:   groupOperate,
 			Summary: "give an agent a short name used by task sources and `hap task`",
-			Usage:   []string{"hap rename <agent-or-name> <new-name>"},
+			Usage:   []string{"hap rename [--node <label|id>] <agent-or-name> <new-name>"},
+			Flags: []FlagDoc{
+				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
+			},
 			Details: "The first argument is the agent's current pane id or short name. Names are how\n" +
 				"task sources (`--agent`) and `hap task <agent> …` select an agent, so renaming\n" +
-				"an agent re-points those selectors at it.",
-			Examples: []string{"hap rename %12 vivid-falcon", "hap task vivid-falcon list"},
+				"an agent re-points those selectors at it. A name is unique per MACHINE, so a\n" +
+				"remote rename can come back with a different name than you asked for.\n" +
+				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"agent on another machine: the request is queued and that machine's daemon runs\n" +
+				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
+				"only on another node is refused rather than guessed — every herdr has a pane 1.",
+			Examples: []string{"hap rename %12 vivid-falcon", "hap rename --node laptop 1 reviewer"},
 			Next: []Hint{
 				{Cmd: "hap agents", Why: "confirm the new name"},
 				{Cmd: "hap config task-source list", Why: "check which sources select this name"},
@@ -344,10 +359,17 @@ func buildCommands() {
 			Name:    "disable",
 			Group:   groupOperate,
 			Summary: "stop autonomous actions for one agent (it still escalates)",
-			Usage:   []string{"hap disable <agent-name-or-pane-id>"},
+			Usage:   []string{"hap disable [--node <label|id>] <agent-name-or-pane-id>"},
+			Flags: []FlagDoc{
+				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
+			},
 			Details: "Per-agent switch. hap keeps watching and escalating, but never answers that\n" +
-				"agent on its own. `hap pause` is the global equivalent.",
-			Examples: []string{"hap disable vivid-falcon"},
+				"agent on its own. `hap pause` is the global equivalent.\n" +
+				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"agent on another machine: the request is queued and that machine's daemon runs\n" +
+				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
+				"only on another node is refused rather than guessed — every herdr has a pane 1.",
+			Examples: []string{"hap disable vivid-falcon", "hap disable --node laptop reviewer"},
 			Next: []Hint{
 				{Cmd: "hap enable <agent>", Why: "re-enable autonomous actions"},
 				{Cmd: "hap agents", Why: "confirm the automation column"},
@@ -357,12 +379,19 @@ func buildCommands() {
 			},
 		},
 		{
-			Name:     "enable",
-			Group:    groupOperate,
-			Summary:  "re-enable autonomous actions for one agent",
-			Usage:    []string{"hap enable <agent-name-or-pane-id>"},
-			Details:  "Undoes `hap disable`. New agents are enabled by default.",
-			Examples: []string{"hap enable vivid-falcon"},
+			Name:    "enable",
+			Group:   groupOperate,
+			Summary: "re-enable autonomous actions for one agent",
+			Usage:   []string{"hap enable [--node <label|id>] <agent-name-or-pane-id>"},
+			Flags: []FlagDoc{
+				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
+			},
+			Details: "Undoes `hap disable`. New agents are enabled by default.\n" +
+				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"agent on another machine: the request is queued and that machine's daemon runs\n" +
+				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
+				"only on another node is refused rather than guessed — every herdr has a pane 1.",
+			Examples: []string{"hap enable vivid-falcon", "hap enable --node laptop reviewer"},
 			Next: []Hint{
 				{Cmd: "hap agents", Why: "confirm the automation column"},
 				{Cmd: "hap status", Why: "check the global kill switch is not also on"},
@@ -1363,34 +1392,53 @@ func suggest(verb string) string {
 	return hits[0]
 }
 
-// nodeFlag parses an optional `--node <label|id>` for the verbs that can act on
-// another machine, returning the node id ("" = this one) and a " on <label>"
-// suffix for the confirmation line.
+// nodeFlag parses an optional `--node <label|id>` for the verbs that take NO
+// positional arguments (pause, resume), returning the node id ("" = this one)
+// and a " on <label>" suffix for the confirmation line.
 func nodeFlag(ctx context.Context, app *frontend.App, args []string) (nodeID, label string, err error) {
+	rest, nodeID, label, err := splitNodeFlag(ctx, app, args)
+	if err != nil {
+		return "", "", err
+	}
+	if len(rest) > 0 {
+		return "", "", fmt.Errorf("unexpected argument %q (usage: --node <label|id>)", rest[0])
+	}
+	return nodeID, label, nil
+}
+
+// splitNodeFlag is nodeFlag for the verbs that also take positional arguments
+// (rename, enable, disable, capture): it lifts `--node` out and hands the rest
+// back untouched, so each verb keeps its own arity check.
+//
+// The flag is what makes those verbs safe across machines at all. Without it a
+// bare target is ambiguous by construction — an agent id is a herdr pane id and
+// every machine has a pane "1" — which is why refuseRemoteTarget still refuses
+// a bare target found only on another node rather than guessing.
+func splitNodeFlag(ctx context.Context, app *frontend.App, args []string) (rest []string, nodeID, label string, err error) {
 	ref := ""
 	for i := 0; i < len(args); i++ {
 		switch {
 		case args[i] == "--node":
 			if i+1 >= len(args) {
-				return "", "", fmt.Errorf("--node requires a node (label or id)")
+				return nil, "", "", fmt.Errorf("--node requires a node (label or id)")
 			}
 			ref = args[i+1]
 			i++
 		case strings.HasPrefix(args[i], "--node="):
 			ref = strings.TrimPrefix(args[i], "--node=")
 		default:
-			return "", "", fmt.Errorf("unexpected argument %q (usage: --node <label|id>)", args[i])
+			rest = append(rest, args[i])
 		}
 	}
 	if ref == "" {
-		return "", "", nil
+		return rest, "", "", nil
 	}
 	nodeID, err = app.ResolveNode(ctx, ref)
 	if err != nil {
-		return "", "", err
+		return nil, "", "", err
 	}
 	if nodeID == app.Store.NodeID() {
-		return "", "", nil
+		return rest, "", "", nil
 	}
-	return nodeID, " on node " + ref, nil
+	return rest, nodeID, " on node " + ref, nil
 }

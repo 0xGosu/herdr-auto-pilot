@@ -84,6 +84,25 @@ const (
 	// + pane zoom). It is the one kind that types nothing: it moves the
 	// operator's own view, so it is idempotent and never sets SideEffect.
 	AgentActionFocus AgentActionKind = "focus"
+	// AgentActionRename gives an agent a new operator-chosen short name.
+	//
+	// It types nothing, but it is queued for the same reason the pane-driving
+	// kinds are, and the reason is node scoping rather than herdr: agent_names
+	// is UNIQUE(node_id, name), and every statement behind RenameAgent —
+	// ResolveAgent, AssignAgentName's collision probe — is scoped to the
+	// store's OWN node. Only the owning daemon can resolve the operator's
+	// spelling of the agent and answer "is this name free" in the namespace
+	// that matters.
+	AgentActionRename AgentActionKind = "rename"
+	// AgentActionSetEnabled turns automation on or off for one agent.
+	//
+	// Queued for a stronger reason than rename: SetAgentDisabled takes the
+	// per-agent automation flock, and that lock file is MACHINE-LOCAL. It is
+	// one half of the WithAgentAutomation barrier that gives a disable and the
+	// owning daemon's own autonomous action one total order, so a write from
+	// another machine would be a row the owner consumes with no writer ever
+	// having taken the owner's lock — the ordering silently gone.
+	AgentActionSetEnabled AgentActionKind = "set_enabled"
 )
 
 // AgentActionStatus is where a queued action stands.
@@ -118,11 +137,24 @@ func (s AgentActionStatus) Terminal() bool {
 func ValidAgentActionKind(kind AgentActionKind) bool {
 	switch kind {
 	case AgentActionDeliverReply, AgentActionSendTask, AgentActionSetMode, AgentActionCapture,
-		AgentActionFocus:
+		AgentActionFocus, AgentActionRename, AgentActionSetEnabled:
 		return true
 	}
 	return false
 }
+
+// ActionUnsupportedMarker is the phrase every "this build cannot run that kind"
+// refusal contains.
+//
+// It lives here rather than in internal/daemon because BOTH sides need it: the
+// daemon writes the refusal into AgentAction.Error, and the front end that
+// queued the row has to recognise it to say something useful. Under a shared
+// database that surface may be on a DIFFERENT machine than the daemon that
+// refused, so "upgrade with `hap daemon --ensure`" is advice about a host the
+// operator is not sitting at — the front end re-phrases it with the node's
+// label and its published version instead. Matching on a shared constant is
+// what keeps the two spellings from drifting apart.
+const ActionUnsupportedMarker = "this hap daemon does not support that action"
 
 // DeliverReplyPayload is the deliver_reply action's arguments.
 //
@@ -152,6 +184,34 @@ type DeliverReplyPayload struct {
 type FocusPayload struct {
 	TabID  string `json:"tab_id"`
 	PaneID string `json:"pane_id"`
+}
+
+// RenamePayload is the rename action's arguments.
+type RenamePayload struct {
+	Name string `json:"name"`
+}
+
+// SetEnabledPayload is the set_enabled action's arguments.
+//
+// The field is DISABLED rather than "enabled" so the zero value is the safe
+// one: a payload that fails to unmarshal, or one written by a surface that
+// forgot the field, asks for the agent to keep working rather than silently
+// re-arming automation on an agent an operator had benched.
+type SetEnabledPayload struct {
+	Disabled bool `json:"disabled"`
+}
+
+// RenameResult is the rename action's outcome.
+//
+// Name is what the owning node actually stored, which is not always what was
+// asked for. SessionSyncMayRevert reports that the owning node has
+// [agents] sync_claude_session_name on for a claude agent, so its next capture
+// may re-adopt the Claude conversation name over this one. Only that node can
+// answer it — config never enters the database, so the surface that queued the
+// rename cannot read the flag itself.
+type RenameResult struct {
+	Name                 string `json:"name"`
+	SessionSyncMayRevert bool   `json:"session_sync_may_revert"`
 }
 
 // CaptureResult is the capture action's outcome.

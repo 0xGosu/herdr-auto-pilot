@@ -800,7 +800,7 @@ type detailView struct {
 	// clock tick can rebuild its lines against the current clock (the live Age
 	// would otherwise freeze at open time — the build closure captures m by
 	// value). nil for non-agent details.
-	agent *domain.AgentTransition
+	agent *agentRow
 	// task snapshots the checklist item a Tasks-tab detail was opened for, so
 	// the in-overlay actions (e/x/f) act on the item ON SCREEN even if a
 	// background refresh moved the list cursor. nil for non-task details.
@@ -1067,23 +1067,134 @@ func (m Model) semanticSearchCmd(query string) tea.Cmd {
 	}
 }
 
-// visibleAgents applies the Agents tab search filter.
-func (m Model) visibleAgents() []domain.AgentTransition {
-	if m.query[tabAgents] == "" {
-		return m.data.status.MonitoredAgents
+// agentRow is one row of the Agents tab: an agent on this machine, an agent on
+// another machine, or the separator between the two groups.
+//
+// Every DISPLAY value is resolved when the row is built, and that is the safety
+// core of the whole unified list rather than a convenience. Status.AgentName,
+// StatsFor and AgentDisabled are maps keyed by agent id alone — and an agent id
+// IS a herdr pane id, which repeats on every machine sharing the store. A
+// remote row read through those maps would show a LOCAL agent's name, counters
+// and disabled flag whenever the two share an id, and `x` would then disable
+// the wrong agent on the wrong machine. After this, the renderer and every
+// handler read only these fields.
+//
+// Identity for any action is the PAIR (NodeID, AgentID); neither half is an
+// address on its own.
+type agentRow struct {
+	// The embedded transition is what the per-agent handlers already speak.
+	// Remote rows come from domain.RosterAgent.Transition(), which drops only
+	// NodeID — carried here instead.
+	domain.AgentTransition
+	NodeID    string // "" or this node's id: local
+	NodeLabel string // "" for local rows
+	Name      string
+	// Location is the herdr "#<workspace>-<tab>" position for a local agent
+	// and the NODE LABEL for a remote one. A remote machine's workspace/tab
+	// coordinate means nothing on the machine the operator is looking at,
+	// while the node is the one thing they need in order to act on the row.
+	Location string
+	Disabled bool
+	Stale    bool // remote only: that node stopped reporting
+	Stats    domain.AgentStats
+	// sep marks the "── other nodes ──" divider. It is an ordinary row rather
+	// than rendered chrome, which is what keeps window()/listPageSize()'s
+	// one-row-one-line accounting exact — the same shape the Tasks tab uses
+	// for its group headers. Every per-agent key no-ops on it.
+	sep bool
+}
+
+// remote reports that this row belongs to another machine.
+func (r agentRow) remote() bool { return !r.sep && r.NodeID != "" }
+
+// localRow builds the row for an agent on THIS machine.
+//
+// The status maps it reads are keyed by agent id alone, which is only an
+// address for a local agent — that is exactly why it takes an
+// AgentTransition (always local: MonitoredAgents) rather than an id.
+func (m Model) localRow(a domain.AgentTransition) agentRow {
+	st := m.data.status
+	return agentRow{
+		AgentTransition: a,
+		Name:            st.AgentName(a.AgentID),
+		Location:        agentLocation(a, st),
+		Disabled:        st.AgentDisabled(a.AgentID),
+		Stats:           st.StatsFor(a.AgentID),
 	}
-	var out []domain.AgentTransition
-	for _, a := range m.data.status.MonitoredAgents {
-		automation := "enabled"
-		if m.data.status.AgentDisabled(a.AgentID) {
-			automation = "disabled"
+}
+
+// agentRows is the Agents tab's flat row list, before the search filter.
+func (m Model) agentRows() []agentRow {
+	st := m.data.status
+	rows := make([]agentRow, 0, len(st.MonitoredAgents)+len(st.RemoteAgents)+1)
+	for _, a := range st.MonitoredAgents {
+		rows = append(rows, m.localRow(a))
+	}
+	for _, r := range st.RemoteAgents {
+		rows = append(rows, agentRow{
+			AgentTransition: r.Transition(),
+			NodeID:          r.NodeID,
+			NodeLabel:       r.NodeLabel,
+			Name:            r.ShortName(),
+			Location:        r.NodeLabel,
+			Disabled:        r.Disabled,
+			Stale:           r.Stale,
+			Stats:           r.Stats,
+		})
+	}
+	return rows
+}
+
+// visibleAgents applies the Agents tab search filter and inserts the separator.
+//
+// The filter runs over remote rows too. It did not before — remote agents were
+// rendered in a block the filter never saw, so a query showed the whole remote
+// list unfiltered, and a query matching no local agent hid the remote rows
+// entirely by falling into the empty-list branch.
+func (m Model) visibleAgents() []agentRow {
+	var local, remote []agentRow
+	for _, r := range m.agentRows() {
+		if m.query[tabAgents] != "" {
+			automation := "enabled"
+			if r.Disabled {
+				automation = "disabled"
+			}
+			// NodeLabel is searchable so "/laptop" finds one machine's agents.
+			// It is also r.Location for a remote row; passing both costs
+			// nothing and keeps the local rows' Location searchable too.
+			if !m.matchesQuery(tabAgents, r.Name, r.Location, r.AgentID, r.AgentType,
+				r.Status, automation, r.NodeLabel) {
+				continue
+			}
 		}
-		if m.matchesQuery(tabAgents, m.data.status.AgentName(a.AgentID),
-			agentLocation(a, m.data.status), a.AgentID, a.AgentType, a.Status, automation) {
-			out = append(out, a)
+		if r.remote() {
+			remote = append(remote, r)
+		} else {
+			local = append(local, r)
 		}
 	}
-	return out
+	if len(remote) == 0 {
+		return local
+	}
+	out := append(local, agentRow{
+		sep:  true,
+		Name: fmt.Sprintf("── other nodes (%d agents) ──", len(remote)),
+	})
+	return append(out, remote...)
+}
+
+// selectedAgentRow returns the row under the Agents tab cursor, or nil when the
+// cursor is past the end or resting on the separator.
+func (m Model) selectedAgentRow() *agentRow {
+	rows := m.visibleAgents()
+	if m.cursors[m.tab] >= len(rows) {
+		return nil
+	}
+	r := rows[m.cursors[m.tab]]
+	if r.sep {
+		return nil
+	}
+	return &r
 }
 
 // taskRow is one flat row of the Tasks tab: a task-source group header, a
@@ -1143,7 +1254,7 @@ func (m Model) taskRows() []taskRow {
 		if name == "" {
 			name = a.AgentID
 		}
-		for _, idx := range m.agentTaskSourceMatches(a) {
+		for _, idx := range m.agentTaskSourceMatches(m.localRow(a)) {
 			live[idx] = append(live[idx], name)
 		}
 	}
@@ -1546,6 +1657,15 @@ func (m Model) refresh() tea.Cmd {
 // open for, or "" when no agent detail is showing.
 func (m Model) detailAgentID() string {
 	if m.detail == nil || m.detail.agent == nil {
+		return ""
+	}
+	// A REMOTE agent's mode is not readable from here, and asking would be
+	// worse than useless: FillAgentModes reads a pane on THIS machine, and an
+	// agent id is a herdr pane id that repeats across machines — so a remote
+	// id would drive a pane read against whichever local agent happens to
+	// share it, every refresh tick, for a value that is then attributed to the
+	// wrong agent.
+	if m.detail.agent.remote() {
 		return ""
 	}
 	return m.detail.agent.AgentID
@@ -3894,9 +4014,9 @@ func (m Model) focusSelectedTaskAgent() (tea.Model, tea.Cmd) {
 // given task source (config index) — shared by the list and detail `f`.
 func (m Model) focusTaskGroupAgent(group int) (tea.Model, tea.Cmd) {
 	for _, a := range m.data.status.MonitoredAgents {
-		for _, idx := range m.agentTaskSourceMatches(a) {
+		for _, idx := range m.agentTaskSourceMatches(m.localRow(a)) {
 			if idx == group {
-				return m.focusAgent(a)
+				return m.focusAgent(m.localRow(a))
 			}
 		}
 	}
@@ -3908,7 +4028,7 @@ func (m Model) focusTaskGroupAgent(group int) (tea.Model, tea.Cmd) {
 // given task source, mirroring the header's "→ name" annotation.
 func (m Model) taskGroupAgent(group int) *domain.AgentTransition {
 	for _, a := range m.data.status.MonitoredAgents {
-		for _, idx := range m.agentTaskSourceMatches(a) {
+		for _, idx := range m.agentTaskSourceMatches(m.localRow(a)) {
 			if idx == group {
 				return &a
 			}
@@ -4132,7 +4252,7 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 	}
 	var live []string
 	for _, a := range m.data.status.MonitoredAgents {
-		for _, idx := range m.agentTaskSourceMatches(a) {
+		for _, idx := range m.agentTaskSourceMatches(m.localRow(a)) {
 			if idx == r.group {
 				name := m.data.status.AgentName(a.AgentID)
 				if name == "" {
@@ -4149,23 +4269,37 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 // --- Agent rename ---
 
 func (m Model) renameSelected() (tea.Model, tea.Cmd) {
-	agents := m.visibleAgents()
-	if m.cursors[m.tab] >= len(agents) {
+	r := m.selectedAgentRow()
+	if r == nil {
 		return m, nil
 	}
-	agent := agents[m.cursors[m.tab]]
-	current := m.data.status.AgentName(agent.AgentID)
-	target := agent.AgentID
+	return m.renameAgent(*r)
+}
+
+func (m Model) renameAgent(r agentRow) (tea.Model, tea.Cmd) {
+	if msg, ok := m.remoteActionBlocked(r); !ok {
+		m.message = msg
+		return m, nil
+	}
 	app, ctx := m.app, m.ctx
+	nodeID, agentID, label := r.NodeID, r.AgentID, agentSuffix(r)
 	m.beginAction()
 	m.openPrompt(&prompt{
-		label: fmt.Sprintf("rename %s (%s) to", orDash(current), agent.AgentID),
+		label: fmt.Sprintf("rename %s (%s)%s to", orDash(r.Name), r.AgentID, label),
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
-				if err := app.RenameAgent(ctx, target, input); err != nil {
+				res, err := app.RenameAgentOn(ctx, nodeID, agentID, input)
+				if err != nil {
 					return actionResultMsg{err: err}
 				}
-				return actionResultMsg{message: fmt.Sprintf("agent renamed to %q", input)}
+				// The name the OWNING node stored, which is not always the one
+				// asked for — a collision there resolves in a namespace the
+				// operator cannot see from here.
+				msg := fmt.Sprintf("agent renamed to %q%s", res.Name, label)
+				if res.SessionSyncMayRevert {
+					msg += " — that node syncs names from Claude sessions, so it may be re-adopted"
+				}
+				return actionResultMsg{message: msg}
 			}
 		},
 	})
@@ -4173,29 +4307,40 @@ func (m Model) renameSelected() (tea.Model, tea.Cmd) {
 }
 
 func (m Model) disableSelectedAgentPrompt() (tea.Model, tea.Cmd) {
-	agents := m.visibleAgents()
-	if m.cursors[m.tab] >= len(agents) {
+	r := m.selectedAgentRow()
+	if r == nil {
 		return m, nil
 	}
-	return m.disableAgentPrompt(agents[m.cursors[m.tab]])
+	return m.disableAgentPrompt(*r)
 }
 
-func (m Model) disableAgentPrompt(agent domain.AgentTransition) (tea.Model, tea.Cmd) {
-	if m.data.status.AgentDisabled(agent.AgentID) {
+func (m Model) disableAgentPrompt(r agentRow) (tea.Model, tea.Cmd) {
+	if r.Disabled {
 		m.message = "agent is already disabled"
 		return m, nil
 	}
-	app, agentID := m.app, agent.AgentID
-	name := orDash(m.data.status.AgentName(agentID))
+	if msg, ok := m.remoteActionBlocked(r); !ok {
+		m.message = msg
+		return m, nil
+	}
+	app := m.app
+	nodeID, agentID, label := r.NodeID, r.AgentID, agentSuffix(r)
+	name := orDash(r.Name)
 	m.confirm = &confirmation{
-		label: fmt.Sprintf("disable agent %s (%s)? [Y/n]", name, agentID),
+		label: fmt.Sprintf("disable agent %s (%s)%s? [Y/n]", name, agentID, label),
 		onConfirm: func() tea.Cmd {
-			return m.do(fmt.Sprintf("agent %s disabled", name), func(ctx context.Context) error {
-				return app.SetAgentDisabled(ctx, agentID, true)
+			return m.doResult(func(ctx context.Context) (string, error) {
+				if err := app.SetAgentDisabledOn(ctx, nodeID, agentID, true); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("agent %s disabled%s", name, label), nil
 			})
 		},
 		revalidate: func(current Model) (string, bool) {
-			if current.data.status.AgentDisabled(agentID) {
+			// Re-find by the PAIR: an agent id alone is a herdr pane id and
+			// repeats on every machine, so matching on it would revalidate
+			// against a local stranger.
+			if current.agentDisabledOn(nodeID, agentID) {
 				return "agent is already disabled", false
 			}
 			return "", true
@@ -4205,47 +4350,118 @@ func (m Model) disableAgentPrompt(agent domain.AgentTransition) (tea.Model, tea.
 }
 
 func (m Model) enableSelectedAgent() (tea.Model, tea.Cmd) {
-	agents := m.visibleAgents()
-	if m.cursors[m.tab] >= len(agents) {
+	r := m.selectedAgentRow()
+	if r == nil {
 		return m, nil
 	}
-	return m.enableAgent(agents[m.cursors[m.tab]])
+	return m.enableAgent(*r)
 }
 
-func (m Model) enableAgent(agent domain.AgentTransition) (tea.Model, tea.Cmd) {
-	if !m.data.status.AgentDisabled(agent.AgentID) {
+func (m Model) enableAgent(r agentRow) (tea.Model, tea.Cmd) {
+	if !r.Disabled {
 		m.message = "agent is already enabled"
 		return m, nil
 	}
-	name := orDash(m.data.status.AgentName(agent.AgentID))
+	if msg, ok := m.remoteActionBlocked(r); !ok {
+		m.message = msg
+		return m, nil
+	}
+	app := m.app
+	nodeID, agentID, label := r.NodeID, r.AgentID, agentSuffix(r)
+	name := orDash(r.Name)
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("agent %s enabled", name), func(ctx context.Context) error {
-		return m.app.SetAgentDisabled(ctx, agent.AgentID, false)
+	return m, m.doResult(func(ctx context.Context) (string, error) {
+		if err := app.SetAgentDisabledOn(ctx, nodeID, agentID, false); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("agent %s enabled%s", name, label), nil
 	})
 }
 
+// agentDisabledOn answers "is this agent disabled" for a (node, agent) pair,
+// which is the only form of the question that has one answer under a shared
+// database.
+func (m Model) agentDisabledOn(nodeID, agentID string) bool {
+	if nodeID == "" || nodeID == m.data.status.NodeID {
+		return m.data.status.AgentDisabled(agentID)
+	}
+	for _, r := range m.data.status.RemoteAgents {
+		if r.NodeID == nodeID && r.AgentID == agentID {
+			return r.Disabled
+		}
+	}
+	return false
+}
+
+// agentDetailTitle names the agent the `v` overlay is open for. A remote one
+// carries its machine, because a bare pane id is the same string on every one.
+func agentDetailTitle(r agentRow) string {
+	if r.remote() {
+		return fmt.Sprintf("Agent %s on %s", r.AgentID, r.NodeLabel)
+	}
+	return fmt.Sprintf("Agent %s", r.AgentID)
+}
+
+// agentSuffix names the machine in a message about a remote agent, and says
+// nothing at all for a local one.
+func agentSuffix(r agentRow) string {
+	if !r.remote() {
+		return ""
+	}
+	return " on node " + r.NodeLabel
+}
+
+// remoteActionBlocked refuses an action against an agent whose node has stopped
+// reporting, BEFORE anything is queued.
+//
+// The App refuses the same case (requireLiveDaemonFor), but only after the
+// operator has waited out a round trip that was never going to happen. Saying
+// so immediately is the difference between "that machine is down" and a
+// mysterious pause. The row's own Stale flag is the wider evidence — it also
+// covers a node whose daemon heartbeats but whose roster publisher has stalled,
+// which means the pane the row describes may no longer exist.
+func (m Model) remoteActionBlocked(r agentRow) (string, bool) {
+	if !r.remote() || !r.Stale {
+		return "", true
+	}
+	return fmt.Sprintf("node %s has stopped reporting — nothing there would run this; "+
+		"check that machine's daemon", r.NodeLabel), false
+}
+
 // focusAgent asks herdr to jump to the agent's exact pane (tab focus + zoom).
-func (m Model) focusAgent(a domain.AgentTransition) (tea.Model, tea.Cmd) {
-	if a.TabID == "" || a.PaneID == "" {
+//
+// For a REMOTE row this moves that machine's herdr, not this one's. The banner
+// has to say so: the operator presses a key, their own screen does not change,
+// and without the sentence the only reasonable reading is that nothing worked.
+func (m Model) focusAgent(r agentRow) (tea.Model, tea.Cmd) {
+	if r.TabID == "" || r.PaneID == "" {
 		m.message = "no location known for this agent"
 		return m, nil
 	}
+	if msg, ok := m.remoteActionBlocked(r); !ok {
+		m.message = msg
+		return m, nil
+	}
 	m.beginAction()
-	app, tabID, paneID := m.app, a.TabID, a.PaneID
+	app, nodeID, tabID, paneID := m.app, r.NodeID, r.TabID, r.PaneID
 	// "asked", not "focused": the request is handed to the daemon and this
 	// returns without waiting, so a success here means the request was queued
 	// — not that herdr moved. A failure lands in `hap audit`.
-	return m, m.do("asked herdr to focus this agent", func(ctx context.Context) error {
-		return app.FocusAgent(ctx, tabID, paneID)
+	msg := "asked herdr to focus this agent"
+	if r.remote() {
+		msg = fmt.Sprintf("asked node %s to focus this agent in ITS herdr — your view here has not moved", r.NodeLabel)
+	}
+	return m, m.do(msg, func(ctx context.Context) error {
+		return app.FocusAgentOn(ctx, nodeID, tabID, paneID)
 	})
 }
 
 func (m Model) focusSelected() (tea.Model, tea.Cmd) {
-	agents := m.visibleAgents()
-	if m.cursors[m.tab] >= len(agents) {
+	r := m.selectedAgentRow()
+	if r == nil {
 		return m, nil
 	}
-	return m.focusAgent(agents[m.cursors[m.tab]])
+	return m.focusAgent(*r)
 }
 
 // focusAgentByID resolves an audit record's stable agent id to its current
@@ -4254,7 +4470,7 @@ func (m Model) focusSelected() (tea.Model, tea.Cmd) {
 func (m Model) focusAgentByID(agentID string) (tea.Model, tea.Cmd) {
 	for _, agent := range m.data.status.MonitoredAgents {
 		if agent.AgentID == agentID {
-			return m.focusAgent(agent)
+			return m.focusAgent(m.localRow(agent))
 		}
 	}
 	m.message = "no location known for this agent"
@@ -4324,12 +4540,12 @@ func (m Model) viewDaemonStderr() (tea.Model, tea.Cmd) {
 func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 	switch m.tab {
 	case tabAgents:
-		if agents := m.visibleAgents(); m.cursors[m.tab] < len(agents) {
-			a := agents[m.cursors[m.tab]]
+		if r := m.selectedAgentRow(); r != nil {
+			a := *r
 			build := func(width int, _ bool) []string { return m.agentDetailLines(a, width) }
 			m.message, m.status = "", nil
 			m.detail = &detailView{
-				title: fmt.Sprintf("Agent %s", a.AgentID),
+				title: agentDetailTitle(a),
 				lines: build(m.wrapWidth(), false),
 				build: build,
 				agent: &a,
@@ -4710,45 +4926,69 @@ func (m Model) detailPreviewField(lines []string, width int, label, value string
 	return lines
 }
 
-func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
+// agentDetailLines renders the `v` overlay for one agent, local or remote.
+//
+// Several fields are LOCAL-ONLY and are suppressed rather than rendered wrong
+// for a remote row. Workspaces/Tabs, AgentMode and AgentCwd are all maps keyed
+// by an id in THIS node's namespace, and herdr ids repeat across machines — so
+// a remote row read through them would show a local stranger's workspace, mode
+// and working directory. Absence here means "this machine cannot see it",
+// which is the honest answer; the node and its own location label are shown
+// instead.
+func (m Model) agentDetailLines(r agentRow, w int) []string {
+	a := r.AgentTransition
 	var lines []string
-	lines = m.detailField(lines, w, "Short name", orDash(m.data.status.AgentName(a.AgentID)))
+	lines = m.detailField(lines, w, "Short name", orDash(r.Name))
 	lines = m.detailField(lines, w, "Agent id", a.AgentID)
-	lines = m.detailField(lines, w, "Workspace", locationLabel(a.WorkspaceID,
-		func() (string, int, bool) {
-			ws, ok := m.data.status.Workspaces[a.WorkspaceID]
-			return ws.Label, ws.Number, ok
-		}))
-	lines = m.detailField(lines, w, "Tab", locationLabel(a.TabID,
-		func() (string, int, bool) {
-			tab, ok := m.data.status.Tabs[a.TabID]
-			return tab.Label, tab.Number, ok
-		}))
+	if r.remote() {
+		lines = m.detailField(lines, w, "Node", r.NodeLabel)
+		lines = m.detailField(lines, w, "Location", r.Location)
+		if r.Stale {
+			lines = m.detailField(lines, w, "Reporting", "that node has stopped reporting")
+		}
+	} else {
+		lines = m.detailField(lines, w, "Workspace", locationLabel(a.WorkspaceID,
+			func() (string, int, bool) {
+				ws, ok := m.data.status.Workspaces[a.WorkspaceID]
+				return ws.Label, ws.Number, ok
+			}))
+		lines = m.detailField(lines, w, "Tab", locationLabel(a.TabID,
+			func() (string, int, bool) {
+				tab, ok := m.data.status.Tabs[a.TabID]
+				return tab.Label, tab.Number, ok
+			}))
+	}
 	lines = m.detailField(lines, w, "Pane", a.PaneID)
 	lines = m.detailField(lines, w, "Type", a.AgentType)
-	// Permission mode: how much this agent asks before acting. Read from the
-	// indicator it paints in its own composer footer, so the row is absent
-	// whenever that footer was covered (a standing approval) or the agent type
-	// has no such toggle — an unreadable mode is never rendered as a default.
-	lines = m.detailField(lines, w, "Mode", string(m.data.status.AgentMode(a.AgentID)))
-	// Working directory: which checkout/worktree this agent is actually in —
-	// the fastest way to tell two same-named agents apart. Best-effort, so the
-	// row is simply absent when herdr cannot report one (detailField skips
-	// empty values).
-	lines = m.detailField(lines, w, "Working dir", m.data.status.AgentCwd(a.AgentID))
+	if !r.remote() {
+		// Permission mode: how much this agent asks before acting. Read from the
+		// indicator it paints in its own composer footer, so the row is absent
+		// whenever that footer was covered (a standing approval) or the agent type
+		// has no such toggle — an unreadable mode is never rendered as a default.
+		// A remote agent's footer is on another machine's screen and this process
+		// may not read a pane at all, so the row is absent there too.
+		lines = m.detailField(lines, w, "Mode", string(m.data.status.AgentMode(a.AgentID)))
+		// Working directory: which checkout/worktree this agent is actually in —
+		// the fastest way to tell two same-named agents apart. Best-effort, so the
+		// row is simply absent when herdr cannot report one (detailField skips
+		// empty values).
+		lines = m.detailField(lines, w, "Working dir", m.data.status.AgentCwd(a.AgentID))
+	}
 	status := a.Status
-	if m.data.status.AgentDisabled(a.AgentID) {
+	if r.Disabled {
 		status += " [DISABLED]"
 	}
 	lines = m.detailField(lines, w, "Status", status)
-	lines = m.detailField(lines, w, "Task source", m.agentTaskSources(a))
+	if !r.remote() {
+		lines = m.detailField(lines, w, "Task source", m.agentTaskSources(r))
+	}
 	if !a.At.IsZero() {
 		lines = m.detailField(lines, w, "Last transition", a.At.Format(time.RFC3339))
 	}
 	// Lifetime stats (auto-answered, escalated, operator confirmed/corrected)
 	// and the live age since first seen. Rendered as strings so zero counts
 	// still show (detailField skips empty values).
-	s := m.data.status.StatsFor(a.AgentID)
+	s := r.Stats
 	lines = m.detailField(lines, w, "Escalations", strconv.Itoa(s.Escalations))
 	lines = m.detailField(lines, w, "Auto-sends", strconv.Itoa(s.AutoSends))
 	lines = m.detailField(lines, w, "Operator confirmed", strconv.Itoa(s.Confirmed))
@@ -4763,7 +5003,17 @@ func (m Model) agentDetailLines(a domain.AgentTransition, w int) []string {
 // daemon may skip a completed/unreadable source in favor of another one — or
 // because a source's selectors are broad enough to also apply to other
 // agents (an empty/type-level Agent selector, or a wildcard Workspace).
-func (m Model) agentTaskSourceMatches(a domain.AgentTransition) []int {
+// agentTaskSourceMatches lists this node's task sources feeding the agent.
+//
+// It answers nothing for a REMOTE row and says so by construction: it reads
+// m.data.cfg, and config never enters the database, so this machine has no
+// entry describing another machine's source. A remote agent's tasks are found
+// through the fleet task lists instead (showAgentTasks).
+func (m Model) agentTaskSourceMatches(r agentRow) []int {
+	if r.remote() {
+		return nil
+	}
+	a := r.AgentTransition
 	var indices []int
 	for i, src := range m.data.cfg.TaskSources {
 		// One matcher for "does this source feed this agent" — the same one
@@ -4779,8 +5029,8 @@ func (m Model) agentTaskSourceMatches(a domain.AgentTransition) []int {
 
 // agentTaskSources returns the configured task-source paths matching a live
 // agent (see agentTaskSourceMatches), joined for display; "N/A" if none.
-func (m Model) agentTaskSources(a domain.AgentTransition) string {
-	indices := m.agentTaskSourceMatches(a)
+func (m Model) agentTaskSources(r agentRow) string {
+	indices := m.agentTaskSourceMatches(r)
 	if len(indices) == 0 {
 		return "N/A"
 	}
@@ -4799,8 +5049,8 @@ func (m Model) agentTaskSources(a domain.AgentTransition) string {
 // readable, another broken) reports the plain count of what could be read,
 // mirroring frontend.PendingTasks. Pending is "not done", matching the Tasks
 // tab's own header — so an in-progress "[-]" item counts as neither.
-func (m Model) agentTaskCount(a domain.AgentTransition) string {
-	indices := m.agentTaskSourceMatches(a)
+func (m Model) agentTaskCount(r agentRow) string {
+	indices := m.agentTaskSourceMatches(r)
 	if len(indices) == 0 {
 		return "-"
 	}
@@ -5868,11 +6118,11 @@ func autoSendRequested(fields []string) bool {
 // showSelectedAgentTasks jumps to the Tasks tab for the agent under the
 // cursor (t on the Agents list), mirroring focusSelected's "f".
 func (m Model) showSelectedAgentTasks() (tea.Model, tea.Cmd) {
-	agents := m.visibleAgents()
-	if m.cursors[m.tab] >= len(agents) {
+	r := m.selectedAgentRow()
+	if r == nil {
 		return m, nil
 	}
-	return m.showAgentTasks(agents[m.cursors[m.tab]])
+	return m.showAgentTasks(*r)
 }
 
 // showAgentTasks jumps to the Tasks tab with the given agent's task source
@@ -5883,8 +6133,11 @@ func (m Model) showSelectedAgentTasks() (tea.Model, tea.Cmd) {
 // destructive clear, selecting one is safe to guess, so the first match wins
 // and the banner names the rest. Removing a task source stays on the Config
 // tab ("x: remove").
-func (m Model) showAgentTasks(a domain.AgentTransition) (tea.Model, tea.Cmd) {
-	indices := m.agentTaskSourceMatches(a)
+func (m Model) showAgentTasks(r agentRow) (tea.Model, tea.Cmd) {
+	if r.remote() {
+		return m.showRemoteAgentTasks(r)
+	}
+	indices := m.agentTaskSourceMatches(r)
 	if len(indices) == 0 {
 		m.message = "no task source configured for this agent — add one on the Config tab (t)"
 		m.scrollCursorIntoView() // the hint line shrinks the page
@@ -5922,6 +6175,53 @@ func (m Model) showAgentTasks(a domain.AgentTransition) (tea.Model, tea.Cmd) {
 			len(indices), strings.Join(paths, ", "))
 	}
 	m.scrollCursorIntoView() // after the banner: it shrinks the page by 2
+	return m, nil
+}
+
+// showRemoteAgentTasks jumps to the Tasks tab for an agent on another machine.
+//
+// It never touches task-source resolution, and that is a correctness
+// requirement rather than a shortcut. m.data.cfg holds THIS node's
+// [[task_sources]]; config never enters the database, so this machine has no
+// entry describing another machine's source, and deriving a locator locally
+// would mint one in the wrong node's namespace — a list nobody writes. The
+// fleet task groups (frontend.FleetTaskGroups, built from the task_lists rows
+// that actually sync) are the only cross-node evidence there is.
+//
+// A miss therefore means that node keeps the list somewhere only it can see —
+// a file or a gist — not that the agent has no tasks. Saying "add a task
+// source on the Config tab" would be wrong twice over: it names this machine's
+// config, and the operator has nothing to fix here.
+func (m Model) showRemoteAgentTasks(r agentRow) (tea.Model, tea.Cmd) {
+	k := frontend.FleetTaskGroupIndex(m.data.fleetTasks, r.NodeID, r.Name)
+	if k < 0 {
+		m.message = fmt.Sprintf("node %s keeps no task list for %s in the shared database — "+
+			"only sources whose provider is %q are visible from another machine",
+			r.NodeLabel, orDash(r.Name), config.ProviderSQLite)
+		m.scrollCursorIntoView() // the hint line shrinks the page
+		return m, nil
+	}
+	// Fleet groups are laid out after this node's own, at len(m.data.tasks)+k.
+	group := len(m.data.tasks) + k
+
+	m.detail = nil
+	m.tab = tabTasks
+	m.searching = false
+	m.message = ""
+	cursor, ok := m.taskGroupHeaderRow(group)
+	if !ok && m.query[tabTasks] != "" {
+		m.setQuery(tabTasks, "")
+		cursor, ok = m.taskGroupHeaderRow(group)
+	}
+	m.offsets[tabTasks] = 0
+	if !ok {
+		m.cursors[m.tab] = 0
+		m.message = fmt.Sprintf("node %s's list for %s isn't loaded yet — it appears on the next refresh",
+			r.NodeLabel, orDash(r.Name))
+		return m, nil
+	}
+	m.cursors[m.tab] = cursor
+	m.scrollCursorIntoView()
 	return m, nil
 }
 
@@ -6639,55 +6939,48 @@ func (m Model) renderAgents(b *strings.Builder) {
 	now := m.renderNow()
 	start, end := m.window(len(agents))
 	for i := start; i < end; i++ {
-		a := agents[i]
-		name := oneLine(orDash(m.data.status.AgentName(a.AgentID)), agentNameColWidth)
-		s := m.data.status.StatsFor(a.AgentID)
-		status := a.Status
-		if m.data.status.AgentDisabled(a.AgentID) {
-			status = "DISABLED"
+		r := agents[i]
+		var line string
+		if r.sep {
+			// The separator is dropped rather than wrapped, like every row.
+			line = m.styles().help.Render(oneLine(r.Name, rowWidth))
+			fmt.Fprintln(b, line)
+			continue
 		}
-		line := fmt.Sprintf(agentsRowFmt,
-			name, oneLine(agentLocation(a, m.data.status), 12), a.AgentType, status,
-			oneLine(m.agentTaskCount(a), 7),
-			strconv.Itoa(s.Escalations), strconv.Itoa(s.AutoSends),
-			strconv.Itoa(s.Confirmed), strconv.Itoa(s.Corrections),
-			formatAge(s.FirstSeen, now))
-		line = oneLine(line, rowWidth)
-		if i == m.cursors[m.tab] {
+		line = oneLine(fmt.Sprintf(agentsRowFmt,
+			oneLine(orDash(r.Name), agentNameColWidth), oneLine(r.Location, 12), r.AgentType,
+			agentRowStatus(r), oneLine(m.agentTaskCount(r), 7),
+			strconv.Itoa(r.Stats.Escalations), strconv.Itoa(r.Stats.AutoSends),
+			strconv.Itoa(r.Stats.Confirmed), strconv.Itoa(r.Stats.Corrections),
+			formatAge(r.Stats.FirstSeen, now)), rowWidth)
+		switch {
+		case i == m.cursors[m.tab]:
+			// Selected wins over faint: the cursor must be visible on a remote
+			// row, which is the whole point of the rows being reachable.
 			line = m.styles().selected.Render(line)
+		case r.remote():
+			line = m.styles().help.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
 	m.renderMoreRows(b, len(agents)-end)
-	m.renderRemoteAgents(b, end == len(agents), rowWidth, now)
 }
 
-// renderRemoteAgents lists the OTHER nodes' agents under this machine's, on the
-// last page only, so the paging window stays true for the rows the cursor can
-// reach. They are view-only here: every per-agent key acts on this machine's
-// herdr, and a remote agent's own machine is where those run.
-func (m Model) renderRemoteAgents(b *strings.Builder, lastPage bool, rowWidth int, now time.Time) {
-	remote := m.data.status.RemoteAgents
-	if !lastPage || len(remote) == 0 {
-		return
+// agentRowStatus renders the STATUS column.
+//
+// The stale marker is one character on purpose. agentsRowFmt gives STATUS
+// exactly ten columns, so "DISABLED stale" (14) would shift every column after
+// it for the whole table — and the previous truncate-to-eight fix made the word
+// invisible for every status longer than two characters, which is all of them.
+func agentRowStatus(r agentRow) string {
+	status := r.Status
+	if r.Disabled {
+		status = "DISABLED"
 	}
-	// The section line is dropped rather than wrapped, like every list row.
-	fmt.Fprintln(b, m.styles().help.Render(oneLine(fmt.Sprintf("── other nodes (%d agents) ──", len(remote)), rowWidth)))
-	for _, r := range remote {
-		status := r.Status
-		if r.Disabled {
-			status = "DISABLED"
-		}
-		if r.Stale {
-			status = oneLine(status+" stale", 8)
-		}
-		line := fmt.Sprintf(agentsRowFmt,
-			oneLine(r.Display(), agentNameColWidth), oneLine(r.Location, 12), r.AgentType, status,
-			"-", strconv.Itoa(r.Stats.Escalations), strconv.Itoa(r.Stats.AutoSends),
-			strconv.Itoa(r.Stats.Confirmed), strconv.Itoa(r.Stats.Corrections),
-			formatAge(r.Stats.FirstSeen, now))
-		fmt.Fprintln(b, m.styles().help.Render(oneLine(line, rowWidth)))
+	if r.Stale {
+		status = oneLine(status, 9) + "*"
 	}
+	return status
 }
 
 // formatAge renders the elapsed time since firstSeen as HH:MM:SS (hours may
