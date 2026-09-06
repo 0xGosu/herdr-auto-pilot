@@ -313,10 +313,17 @@ them no longer exists; and the roster and herdr locations, which republish
 within a minute. An escalation claimed as `auto_accepting` returns to
 `escalated`.
 
-**"Once" is recorded in the shared database**, in `legacy_imports`, inside the
-import's own transaction; `<state>/turso/imported-from-sqlite` is only a local
-cache of that fact. That row is what stops a later restart re-importing and
-duplicating every audit row under fresh ids.
+**Two separate things stop a second import, and the difference matters when you
+change databases.** `legacy_imports` in the shared database holds a row per
+node, written inside the import's own transaction, so a crash between the commit
+and any bookkeeping cannot duplicate every audit row under fresh ids. But
+`<state>/turso/imported-from-sqlite` is checked FIRST and returns on its own, so
+it is a skip condition in its own right rather than a cache of that row — and
+there is one marker per state dir, not per database. Pointing an
+already-imported machine at a **different or reset** Turso database therefore
+skips the import silently: you get an empty store while the local
+`herd-auto-prompter.db` still holds everything. Delete the marker to run the
+import again against the new database.
 
 The legacy `herd-auto-prompter.db` is left untouched, so reverting is the switch
 backwards plus the same daemon restart — the old store comes back intact:
@@ -1247,8 +1254,10 @@ graduating or demoting it at `graduation_n`) and `0` resets it.
 Escalations, Audit and pause/resume tables do this because a turso-engine id is
 18 digits and printing it whole shifts every later column out from under its
 header. The leading `…` is the tell; an id short enough to print whole keeps
-its `#`. Press `v` for the detail, which carries the id in full, and every CLI
-listing prints it in full too. **The truncated form is not something to type at
-`hap confirm`** — those verbs take the whole id. `/` still finds a row by the
-digits you can see, because the filter reads the full id and matches on
-substring.
+its `#`. On **Escalations and Audit** press `v` for the detail, which carries
+the id in full. The pause/resume tab has **no** detail view, so read a kill
+event's full id from `hap kill-history` — no command takes one as an argument in
+any case. Every CLI listing prints ids in full. **The truncated form is not
+something to type at `hap confirm`** — those verbs take the whole id. `/` still
+finds a row by the digits you can see, because the filter reads the full id and
+matches on substring.
