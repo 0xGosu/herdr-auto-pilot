@@ -8,6 +8,21 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.8.2
+
+- Added full remote agent management to the TUI Agents tab under the turso engine: another machine's agents are now ordinary rows you can select, view, rename, enable, disable and focus — the request is queued and that machine's daemon runs it, so it lands when that node next syncs.
+- Changed the Agents tab LOCATION column: a local agent still shows its herdr `#<workspace>-<tab>` position, a remote one now shows its machine's node label instead — the coordinate that actually helps you find it. The NAME column drops the `@node` suffix, since the node is in LOCATION now.
+- Added `--node <label|id>` to `hap rename`, `hap enable`, `hap disable` and `hap capture`, matching `hap pause --node`. Without it an agent that exists only on another machine is still refused rather than guessed: every herdr has a pane "1".
+- Added "see tasks" for a remote agent whose task source uses the `sqlite` provider — `t` jumps to that machine's list in the shared database. A node keeping its lists in files or gists is invisible from here and now says so instead of pointing at this machine's config.
+- Fixed remote agent rows ignoring the Agents tab search filter, and vanishing entirely when the filter matched no local agent.
+- Fixed the "stale" marker on a remote agent row being truncated away for every status longer than two characters.
+- Changed `hap mode`/`hap agent mode` to refuse a target that names an agent on another machine. It sends keystrokes and resolves against the local herdr, so an agent id or name shared with another node could rotate the wrong agent's permission mode on this machine and report success. Setting a remote agent's mode stays local-only for now.
+- Changed a rename to report the name the owning machine actually stored: agent names are unique per machine, so a remote rename can come back adjusted, and it now warns when that machine syncs names from Claude sessions and may re-adopt.
+- Changed a queued remote action to require the owning machine to be actually looking: it must have published its agent list recently, not merely be reporting in. A daemon that is heartbeating but can no longer see herdr has a frozen view of which agent is on which pane, and herdr reuses pane ids — so acting on that view could rename, or re-enable automation on, a different agent than the one you meant.
+- Fixed a queued rename or enable/disable landing on an agent that is no longer running. An agent's name record outlives the agent, so "a name exists" was never evidence the agent does.
+- Known edge: without `--node`, a bare agent name still resolves against this machine first, and that can match a STALE name row for a pane that no longer exists — so `hap rename <name>` can report success about a dead local agent while the remote one you were looking at is untouched. Use `--node` (or the TUI, which always knows which machine a row is on) when a name exists on more than one machine.
+- Updated the bundled `hap` skill: it documented remote rename/enable/disable/focus as refused, which is no longer true, and now covers `--node`, the queued round trip, the refusals, and what the TUI's Agents tab does for another machine's rows.
+
 ## 0.8.1
 
 - Added a section to the bundled `hap` skill covering the `turso` database engine: how to switch to it, that the engine changes only when a process opens its store (so the daemon must be stopped, not just `--ensure`d, and open TUIs must be reopened), and what the automatic one-time import from the local SQLite database does and does not carry over.
