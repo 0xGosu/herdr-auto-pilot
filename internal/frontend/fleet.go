@@ -31,8 +31,6 @@ type RemoteAgent struct {
 	Stale    bool
 	Disabled bool
 	Stats    domain.AgentStats
-	// Location is the workspace/tab as that machine labels it ("-" unknown).
-	Location string
 }
 
 // ShortName is the agent's own name, with no node attached, falling back to
@@ -137,7 +135,12 @@ func (a *App) fillFleet(ctx context.Context, st *Status) {
 	if err != nil {
 		return
 	}
-	locations := map[string][2]any{}
+	// Deliberately NO per-node LocationsOf lookup here. A remote agent's herdr
+	// "#<workspace>-<tab>" coordinate describes a screen on a machine the
+	// operator is not looking at, so no surface renders it: the Agents tab puts
+	// the NODE in its LOCATION column instead, which is the thing you need in
+	// order to act on the row. Building it anyway cost a store round trip per
+	// remote node on every GetStatus — and the TUI refreshes every two seconds.
 	for _, r := range roster {
 		if r.NodeID == st.NodeID || domain.IsPlaceholderAgent(r.AgentType, r.Status) {
 			continue
@@ -149,14 +152,6 @@ func (a *App) fillFleet(ctx context.Context, st *Status) {
 				node = n
 			}
 		}
-		loc, ok := locations[r.NodeID]
-		if !ok {
-			ws, tabs, _ := a.Store.LocationsOf(ctx, r.NodeID)
-			loc = [2]any{ws, tabs}
-			locations[r.NodeID] = loc
-		}
-		ws, _ := loc[0].(map[string]domain.WorkspaceInfo)
-		tabs, _ := loc[1].(map[string]domain.TabInfo)
 		st.RemoteAgents = append(st.RemoteAgents, RemoteAgent{
 			RosterAgent: r,
 			Name:        st.FleetNames[key],
@@ -164,7 +159,6 @@ func (a *App) fillFleet(ctx context.Context, st *Status) {
 			Stale:       domain.NodeStale(node, now) || !domain.RosterFresh(published[r.NodeID], now),
 			Disabled:    disabled[key],
 			Stats:       stats[key],
-			Location:    locationLabel(r.WorkspaceID, r.TabID, ws, tabs),
 		})
 	}
 	st.PausedNodes = map[string]bool{}
@@ -176,24 +170,6 @@ func (a *App) fillFleet(ctx context.Context, st *Status) {
 			st.PausedNodes[n.ID] = true
 		}
 	}
-}
-
-// locationLabel renders "#<workspace>-<tab>" the way the TUI's agentLocation
-// does, from one node's published labels.
-func locationLabel(wsID, tabID string, ws map[string]domain.WorkspaceInfo, tabs map[string]domain.TabInfo) string {
-	if wsID == "" || tabID == "" {
-		return "-"
-	}
-	w, wok := ws[wsID]
-	t, tok := tabs[tabID]
-	if !wok || !tok || (t.WorkspaceID != "" && t.WorkspaceID != wsID) {
-		return "-"
-	}
-	name := t.Label
-	if name == "" {
-		name = fmt.Sprint(t.Number)
-	}
-	return fmt.Sprintf("#%d-%s", w.Number, name)
 }
 
 // ErrRemoteAgent reports an operation that only the agent's own machine can

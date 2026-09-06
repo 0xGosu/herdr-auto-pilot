@@ -150,7 +150,17 @@ func (d *Daemon) setAgentEnabledAction(ctx context.Context, a domain.AgentAction
 		if _, nameErr := d.opt.Store.EnsureAgentName(ctx, agentID); nameErr != nil {
 			return "", nameErr
 		}
-		return "", d.opt.Store.SetAgentDisabled(ctx, agentID, p.Disabled)
+		// Time-boxed for the same reason the first attempt is: this runs on the
+		// select loop, and the retry takes the same machine-local flock.
+		retryCtx, retryCancel := context.WithTimeout(ctx, agentLockBudget)
+		defer retryCancel()
+		if retryErr := d.opt.Store.SetAgentDisabled(retryCtx, agentID, p.Disabled); retryErr != nil {
+			if errors.Is(retryCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return "", fmt.Errorf("%w: agent %s is mid-action and holds its automation lock", errActionTransient, agentID)
+			}
+			return "", retryErr
+		}
+		return "", nil
 	default:
 		return "", err
 	}

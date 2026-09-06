@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -384,5 +385,49 @@ func TestTheUnsupportedKindRefusalCarriesTheSharedMarker(t *testing.T) {
 	got := h.awaitAction(id)
 	if !strings.Contains(got.Error, domain.ActionUnsupportedMarker) {
 		t.Errorf("error = %q, want it to contain %q", got.Error, domain.ActionUnsupportedMarker)
+	}
+}
+
+// Every call that takes the machine-local automation flock inside an executor
+// must be time-boxed, and this is checked STRUCTURALLY rather than behaviourally.
+//
+// The reason is the bug this test was written for. setAgentEnabledAction takes
+// the lock twice — once on the main path and once in the ErrUnknownAgent
+// recovery that names a live-but-unnamed agent first — and the second call was
+// written with the caller's unbounded ctx. It could not be caught by the
+// barrier test above: SetAgentDisabled acquires the lock BEFORE it can report
+// ErrUnknownAgent, so with the barrier held the first attempt times out and the
+// recovery branch is never reached at all. The window is real (another process
+// can take the lock between the two calls) but too narrow to drive
+// deterministically, and a timing test for it would be flaky rather than
+// useful.
+//
+// So the rule is enforced the way internal/store enforces node scoping: by
+// reading the source. Any SetAgentDisabled call in this file must pass a
+// context derived from agentLockBudget, never the bare ctx.
+func TestEveryAutomationLockCallInAnExecutorIsTimeBoxed(t *testing.T) {
+	src, err := os.ReadFile("agentnames.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(src), "\n")
+	found := 0
+	for i, ln := range lines {
+		if !strings.Contains(ln, "SetAgentDisabled(") {
+			continue
+		}
+		found++
+		// The context argument is the first one; it must be a bounded one.
+		if strings.Contains(ln, "SetAgentDisabled(ctx,") {
+			t.Errorf("agentnames.go:%d takes the per-agent automation flock with the "+
+				"caller's unbounded ctx:\n\t%s\n"+
+				"processAgentActions runs inline on the daemon's select loop, so blocking "+
+				"here stalls every other agent. Derive a context.WithTimeout(ctx, agentLockBudget) "+
+				"and map its deadline to errActionTransient, as the main path does.",
+				i+1, strings.TrimSpace(ln))
+		}
+	}
+	if found == 0 {
+		t.Fatal("no SetAgentDisabled call found in agentnames.go — this guard has gone stale")
 	}
 }
