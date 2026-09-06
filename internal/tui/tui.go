@@ -5180,6 +5180,42 @@ func shortSig(sig string) string {
 	return sig[:16] + "…"
 }
 
+// shortAuditIDDigits is how much of a row id the list columns keep. Five is
+// what the ID column can hold beside its marker, and measurement says it is
+// also enough: over a real 465-row audit log every id was unique in its last
+// five digits, and every pending escalation in its last three.
+const shortAuditIDDigits = 5
+
+// shortAuditID renders a row id for a fixed-width list column.
+//
+// Under the turso engine ids are minted by store.TimeOrderedIDs — 41 bits of
+// milliseconds, 12 of node, 10 of sequence — so they run to 18 digits, three
+// times what the ID column reserves. Printed whole they shove every later
+// column out from under its header AND falsify the escPrefix/audit budget
+// arithmetic, which subtracts a FIXED prefix width to size the last column, so
+// the rationale or action is then clipped to the wrong width. The sqlite
+// engine's AUTOINCREMENT rowids are short and print whole, which is why this
+// only became visible on the turso engine.
+//
+// The TAIL is what distinguishes a snowflake: its high bits are a timestamp
+// every row of one session shares. Measured over that same 465-row log, the
+// last five digits were unique for all 465 while the first TEN agreed on all
+// but 12 — so a git-style leading prefix, which is what hap uses for
+// signatures and node ids, would be useless here.
+//
+// The leading ellipsis is load-bearing, not decoration. Without it "#15968"
+// reads as an id to type at `hap confirm`, which would either fail or — if a
+// short rowid from a pre-turso database happened to equal it — act on the
+// WRONG row. Detail views print the id in full, and so does every CLI listing,
+// which is what scripts parse.
+func shortAuditID(id int64) string {
+	s := strconv.FormatInt(id, 10)
+	if len(s) <= shortAuditIDDigits {
+		return "#" + s
+	}
+	return "…" + s[len(s)-shortAuditIDDigits:]
+}
+
 // --- Config tab editing ---
 
 func (m Model) selectedRule() *ruleItem {
@@ -6772,7 +6808,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		}
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
 		line := fmt.Sprintf(escRowFmt,
-			mark, fmt.Sprintf("#%d", e.ID), humanizeWhen(e.CreatedAt, m.renderNow()), e.SituationType,
+			mark, shortAuditID(e.ID), humanizeWhen(e.CreatedAt, m.renderNow()), e.SituationType,
 			oneLine(orDash(m.agentTypeFor(e)), 8), oneLine(agent, agentNameColWidth),
 			llmConfShort(e.LLMConfidence), m.ruleMarker(e.Signature), frontend.ConfidenceLabel(e.Confidence),
 			oneLine(e.Rationale, rWidth))
@@ -6840,7 +6876,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 			agent = r.AgentID
 		}
 		line := fmt.Sprintf(auditRowFmt,
-			fmt.Sprintf("#%d", r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
+			shortAuditID(r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), agentNameColWidth),
 			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence),
 			frontend.AuditStatusLabel(r),
@@ -6986,8 +7022,8 @@ func (m Model) renderKills(b *strings.Builder) {
 		e := rows[i]
 		// The LABEL, not the raw state: "FSP On" beats "fsp_on" on screen, and
 		// `hap kill-history` still prints the raw value for scripts.
-		line := fmt.Sprintf("#%-4d %-20s %-8s by %s",
-			e.ID, e.CreatedAt.Format(time.RFC3339), domain.KillEventLabel(e), e.Author)
+		line := fmt.Sprintf("%-6s %-20s %-8s by %s",
+			shortAuditID(e.ID), e.CreatedAt.Format(time.RFC3339), domain.KillEventLabel(e), e.Author)
 		// One terminal line per row, or window()/listPageSize()'s row budget
 		// stops matching what is drawn.
 		line = oneLine(line, m.contentWidth())
