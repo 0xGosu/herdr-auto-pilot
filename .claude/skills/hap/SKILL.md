@@ -151,6 +151,7 @@ hap rename brave-otter backend-dev
 hap disable backend-dev           # stop autonomous actions; it still escalates
 hap enable backend-dev
 hap capture backend-dev           # re-run the capture pipeline for one agent now
+# all four take --node <label|id> to reach another machine's agent (see "fleet")
 ```
 
 `cwd` and `mode` are `-` when unreadable. New columns are appended, so existing
@@ -354,12 +355,34 @@ hap escalations                   # rows carry node=<label>
 hap escalations confirm 42        # an escalation from another machine: "queued for node <label>"
 hap pause --node laptop           # pause THAT machine's daemon (resume likewise)
 hap task --node laptop otter list # another machine's `sqlite`-provider task list
+hap rename --node laptop 1 otter  # rename/enable/disable/capture another machine's agent
 ```
 
-Rules are shared, so `hap signatures …` curates them for every machine. Rename,
-enable/disable and focus of another machine's agent are refused — those rows
-belong to its daemon. A machine is named by its `database.node_label`, else its
-hostname, else the first eight characters of its node id.
+Rules are shared, so `hap signatures …` curates them for every machine. A
+machine is named by its `database.node_label`, else its hostname, else the first
+eight characters of its node id.
+
+**`--node` on a per-agent verb.** `rename`, `enable`, `disable` and `capture`
+take it, and it is REQUIRED to reach another machine: without it a bare target
+resolves here first, and every herdr has a pane `1`, so hap refuses rather than
+guess. The request is queued and that machine's daemon runs it, so it lands when
+that node next syncs (up to ~45s) rather than instantly — a timeout means "still
+queued", never "failed". It is refused up front when that machine is not
+reporting in, or is reporting but has not published its agent list recently: it
+cannot then say which agent a pane id names, and herdr reuses pane ids.
+
+Two caveats. An agent NAME is unique per machine, so a remote rename can come
+back with a different name than you asked for (and warns when that machine syncs
+names from Claude sessions and may re-adopt). And setting a remote agent's
+permission MODE is still local-only — `hap mode` sends keystrokes and resolves
+against the local herdr, so it refuses a target that names another machine's
+agent rather than risk rotating the wrong one here.
+
+In the TUI, another machine's agents are ordinary rows on the Agents tab: the
+LOCATION column shows the MACHINE for them (a local agent shows its herdr
+`#<workspace>-<tab>` position instead), and `v` `e` `x` `n` `f` all work. `t`
+(see tasks) works too when that agent's task source uses the `sqlite` provider,
+since that is the only kind of list that syncs.
 
 ## audit
 

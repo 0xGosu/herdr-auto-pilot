@@ -177,20 +177,25 @@ func stripHintFlag(args []string) ([]string, bool) {
 }
 
 func capture(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-		return fmt.Errorf("usage: capture <agent-name-or-pane-id> (see: hap help capture)")
+	rest, nodeID, label, err := splitNodeFlag(ctx, app, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+		return fmt.Errorf("usage: capture [--node <label|id>] <agent-name-or-pane-id> (see: hap help capture)")
 	}
 	// No liveness pre-check here any more: CaptureAgent queues the request for
 	// the daemon and refuses through requireLiveDaemon, which asks strictly
 	// more than this did — a daemon that holds the lock but has stopped making
 	// progress, or one whose binary was replaced underneath it, both read as
-	// "running" to a version compare and drain nothing.
-	agent, err := app.CaptureAgent(ctx, args[0])
+	// "running" to a version compare and drain nothing. With --node the same
+	// question is asked of THAT machine's heartbeat instead.
+	agent, err := app.CaptureAgentOn(ctx, nodeID, rest[0])
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "capture queued for %s (%s, %s); check: hap escalations\n",
-		args[0], agent.AgentID, agent.Status)
+	fmt.Fprintf(out, "capture queued for %s%s (%s, %s); check: hap escalations\n",
+		rest[0], label, agent.AgentID, agent.Status)
 	return nil
 }
 
@@ -796,13 +801,25 @@ func stdinIsTTY() bool {
 }
 
 func rename(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	if len(args) != 2 {
-		return fmt.Errorf("usage: rename <agent-or-name> <new-name> (see: hap agents)")
-	}
-	if err := app.RenameAgent(ctx, args[0], args[1]); err != nil {
+	rest, nodeID, label, err := splitNodeFlag(ctx, app, args)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "agent %q is now named %q (task-source selectors match this name)\n", args[0], args[1])
+	if len(rest) != 2 {
+		return fmt.Errorf("usage: rename [--node <label|id>] <agent-or-name> <new-name> (see: hap agents)")
+	}
+	res, err := app.RenameAgentOn(ctx, nodeID, rest[0], rest[1])
+	if err != nil {
+		return err
+	}
+	// res.Name, not the requested one: agent_names is unique PER NODE, so a
+	// collision resolves in a namespace the operator may not be able to see.
+	fmt.Fprintf(out, "agent %q%s is now named %q (task-source selectors match this name)\n",
+		rest[0], label, res.Name)
+	if res.SessionSyncMayRevert {
+		fmt.Fprintf(out, "note: that node syncs agent names from Claude session names, "+
+			"so this one may be re-adopted on its next capture\n")
+	}
 	return nil
 }
 
@@ -814,13 +831,17 @@ func setAgentDisabled(ctx context.Context, app *frontend.App, out io.Writer,
 		verb = "disable"
 		state = "disabled"
 	}
-	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
-		return fmt.Errorf("usage: %s <agent-name-or-pane-id> (see: hap agents)", verb)
-	}
-	if err := app.SetAgentDisabled(ctx, args[0], disabled); err != nil {
+	rest, nodeID, label, err := splitNodeFlag(ctx, app, args)
+	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "agent %q %s\n", args[0], state)
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+		return fmt.Errorf("usage: %s [--node <label|id>] <agent-name-or-pane-id> (see: hap agents)", verb)
+	}
+	if err := app.SetAgentDisabledOn(ctx, nodeID, rest[0], disabled); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "agent %q%s %s\n", rest[0], label, state)
 	return nil
 }
 

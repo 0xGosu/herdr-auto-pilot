@@ -36,7 +36,14 @@ const maxAgentActionAttempts = 3
 const actionStaleAfter = 2 * time.Minute
 
 // errActionUnsupported reports a kind this build has no executor for.
-var errActionUnsupported = errors.New("this hap daemon does not support that action")
+//
+// Its text is domain.ActionUnsupportedMarker rather than a local string,
+// because the surface that reads it back may be on ANOTHER machine: under a
+// shared database a front end can queue an action for a node running an older
+// hap, and "upgrade with `hap daemon --ensure`" is then advice about a host the
+// operator is not sitting at. Sharing the phrase lets that front end recognise
+// the refusal and re-phrase it with the node's label and version.
+var errActionUnsupported = errors.New(domain.ActionUnsupportedMarker)
 
 // errActionTransient marks a failure that is about the MACHINERY rather than
 // about the request — a locked database, a store write that lost a race.
@@ -99,9 +106,15 @@ func withdrawsCorrection(err error) bool {
 // intent to look; telling them to "answer again" would name a question that
 // was never asked. Nobody polls a focus, so this text only ever reaches the
 // daemon log — which is exactly why it has to be true there.
+// rename and set_enabled are bounded too, on a third ground again: what goes
+// stale is neither a screen nor an intent to look, but the operator's belief
+// about WHICH AGENT this is. See agentStateStaleAfter.
 func staleReason(kind domain.AgentActionKind) string {
-	if kind == domain.AgentActionFocus {
+	switch kind {
+	case domain.AgentActionFocus:
 		return "the view it would have jumped to is no longer the one you asked for; press f again"
+	case domain.AgentActionRename, domain.AgentActionSetEnabled:
+		return "the agent it named may not be the one on that pane id any more; check the agent and ask again"
 	}
 	return "the screen it was decided against can no longer be trusted; look at the agent and answer again"
 }
@@ -110,6 +123,8 @@ func agentActionStaleBound(kind domain.AgentActionKind) time.Duration {
 	switch kind {
 	case domain.AgentActionDeliverReply, domain.AgentActionSendTask, domain.AgentActionFocus:
 		return actionStaleAfter
+	case domain.AgentActionRename, domain.AgentActionSetEnabled:
+		return agentStateStaleAfter
 	}
 	return 0
 }
@@ -238,6 +253,10 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 		return d.focusAgent(ctx, a)
 	case domain.AgentActionCapture:
 		return d.captureAgentAction(ctx, a)
+	case domain.AgentActionRename:
+		return d.renameAgentAction(ctx, a)
+	case domain.AgentActionSetEnabled:
+		return d.setAgentEnabledAction(ctx, a)
 	default:
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)

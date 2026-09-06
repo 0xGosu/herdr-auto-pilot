@@ -130,7 +130,7 @@ func TestDetailViewAgents(t *testing.T) {
 	// (ESCA → AUTO → CONF → CORR), so the two surfaces agree. Asserted over
 	// the full field list, not the rendered viewport: the overlay scrolls, so
 	// the trailing counters need not both fit on the first screen.
-	detail := strings.Join(m.agentDetailLines(m.data.status.MonitoredAgents[0], m.width), "\n")
+	detail := strings.Join(m.agentDetailLines(m.localRow(m.data.status.MonitoredAgents[0]), m.width), "\n")
 	esc, auto := strings.Index(detail, "Escalations"), strings.Index(detail, "Auto-sends")
 	if esc < 0 || auto < 0 {
 		t.Fatalf("detail should show both counters, got Escalations=%d Auto-sends=%d:\n%s", esc, auto, view)

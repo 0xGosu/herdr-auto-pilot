@@ -26,3 +26,10 @@ func (a *App) EnsureListForTest(ctx context.Context, locator, initial string) (b
 func (a *App) TaskSourceLimitForTest(agent, locator string) int {
 	return a.taskSourceLimit(agent, locator)
 }
+
+// RequireLiveDaemonForTest exposes the HEARTBEAT-only gate, so a test can prove
+// the roster-freshness refusal is doing real work: without this the "blind
+// node" case is indistinguishable from a node that simply looks dead.
+func (a *App) RequireLiveDaemonForTest(ctx context.Context, nodeID string) error {
+	return a.requireLiveDaemonFor(ctx, nodeID)
+}
