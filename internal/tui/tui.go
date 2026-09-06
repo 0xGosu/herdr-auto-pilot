@@ -5180,11 +5180,18 @@ func shortSig(sig string) string {
 	return sig[:16] + "…"
 }
 
-// shortAuditIDDigits is how much of a row id the list columns keep. Five is
-// what the ID column can hold beside its marker, and measurement says it is
-// also enough: over a real 465-row audit log every id was unique in its last
-// five digits, and every pending escalation in its last three.
-const shortAuditIDDigits = 5
+// auditIDColWidth is the width of the ID column in the Escalations, Audit and
+// pause/resume tables (the `%-6s` in escRowFmt and auditRowFmt, and the same
+// field in renderKills). shortAuditID is what keeps a row id inside it.
+const auditIDColWidth = 6
+
+// shortAuditIDDigits is how much of a row id the list columns keep: everything
+// the ID column can hold beside the truncation marker. Measured over a real
+// 465-row audit log, five digits were unique for every row and three for every
+// pending escalation — one sample, so read it as "enough at that scale", not as
+// a uniqueness guarantee: the digits are effectively random below the
+// millisecond, so at a few hundred rows two of them CAN render alike.
+const shortAuditIDDigits = auditIDColWidth - 1
 
 // shortAuditID renders a row id for a fixed-width list column.
 //
@@ -6861,10 +6868,18 @@ func (m Model) renderAudit(b *strings.Builder) {
 	// adding a longer status label cannot silently shift the ACTION column.
 	auditRowFmt := fmt.Sprintf("%%-6s %%-14s %%-10s %%-8s %%-15s %%4s %%-6s %%5s %%-%ds  %%s",
 		frontend.AuditStatusWidth)
-	// Every column before ACTION: 6+14+10+8+15+4+6+5 fields, nine gaps, and
-	// the AuditStatusWidth-sized STATUS column (8). Grew by one with the agent
-	// column — see the note on escPrefix.
-	actWidth, _ := m.budget(87, false)
+	// Every column before ACTION: 6+14+10+8+15+4+6+5 = 68 cells of fixed
+	// fields plus ten gap cells (eight single separators and the double before
+	// ACTION) — hand-maintained like escPrefix, so recompute it whenever a
+	// width above changes — and then the STATUS column, ADDED from
+	// frontend.AuditStatusWidth rather than folded in as a number. Folding it
+	// in is what silently defeated "adding a longer status label cannot shift
+	// the ACTION column": the constant was written for an 8-wide STATUS while
+	// AuditStatusWidth is 11, so a row whose action filled its column rendered
+	// two cells past contentWidth and WRAPPED, drawing more terminal lines
+	// than window()/listPageSize() budgeted.
+	const auditFixedPrefix = 78
+	actWidth, _ := m.budget(auditFixedPrefix+frontend.AuditStatusWidth, false)
 	header := fmt.Sprintf(auditRowFmt,
 		"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
 	fmt.Fprintln(b, m.styles().section.Render(header))
@@ -7022,8 +7037,9 @@ func (m Model) renderKills(b *strings.Builder) {
 		e := rows[i]
 		// The LABEL, not the raw state: "FSP On" beats "fsp_on" on screen, and
 		// `hap kill-history` still prints the raw value for scripts.
-		line := fmt.Sprintf("%-6s %-20s %-8s by %s",
-			shortAuditID(e.ID), e.CreatedAt.Format(time.RFC3339), domain.KillEventLabel(e), e.Author)
+		line := fmt.Sprintf("%-*s %-20s %-8s by %s",
+			auditIDColWidth, shortAuditID(e.ID), e.CreatedAt.Format(time.RFC3339),
+			domain.KillEventLabel(e), e.Author)
 		// One terminal line per row, or window()/listPageSize()'s row budget
 		// stops matching what is drawn.
 		line = oneLine(line, m.contentWidth())

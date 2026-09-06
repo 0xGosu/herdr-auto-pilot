@@ -47,7 +47,7 @@ func TestShortAuditIDKeepsTheTail(t *testing.T) {
 // later column out from under its header AND makes that subtraction wrong, so
 // the rationale or action is clipped to a width the row no longer has.
 func TestShortAuditIDNeverOverflowsTheIDColumn(t *testing.T) {
-	const idColumnWidth = 6
+	const idColumnWidth = auditIDColWidth
 	// Walk the whole range a row id can take, from the first sqlite rowid to
 	// past the largest id 41 bits of milliseconds can mint.
 	ids := []int64{1, 9, 10, 458, 12345, 99999, 100000, 123456,
@@ -57,6 +57,34 @@ func TestShortAuditIDNeverOverflowsTheIDColumn(t *testing.T) {
 		if w := runewidth.StringWidth(got); w > idColumnWidth {
 			t.Errorf("shortAuditID(%d) = %q renders %d columns wide, over the %d the ID column reserves",
 				id, got, w, idColumnWidth)
+		}
+	}
+}
+
+// TestAuditRowNeverOverflowsTheContentWidth is the other half of the same
+// invariant: bounding the ID column only helps if the row's FIXED prefix — the
+// number renderAudit hands m.budget to size its last column — is the real one.
+// It was written for an 8-wide STATUS while frontend.AuditStatusWidth is 11, so
+// a row whose ACTION filled its column rendered two cells past contentWidth and
+// wrapped, drawing more terminal lines than window()/listPageSize() budgeted
+// and pushing the help line (and the last rows) off a full screen.
+func TestAuditRowNeverOverflowsTheContentWidth(t *testing.T) {
+	m := testModel(t)
+	m.width, m.height = 120, 40
+	upd, _ := m.Update(refreshMsg{status: m.data.status, audit: []domain.AuditRecord{{
+		ID: snowflakeID, AgentID: "w6:p1", AgentType: "claude",
+		SituationType: domain.SituationChoice, Status: "auto_accepted",
+		// Long enough to fill whatever the last column was sized to.
+		Action: strings.Repeat("x", 400), CreatedAt: time.Now(),
+	}}})
+	m = upd.(Model)
+	m.tab = tabAudit
+	var b strings.Builder
+	m.renderAudit(&b)
+	for _, ln := range strings.Split(strings.TrimRight(b.String(), "\n"), "\n") {
+		if w := runewidth.StringWidth(ln); w > m.contentWidth() {
+			t.Errorf("an audit row renders %d cells wide, over the %d contentWidth allows — it wraps:\n%s",
+				w, m.contentWidth(), ln)
 		}
 	}
 }
