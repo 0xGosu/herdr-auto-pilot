@@ -240,10 +240,112 @@ While paused, situations still classify and escalate — nothing is auto-answere
 — and those escalations carry the rationale `[daemon_paused]`, meaning the
 operator paused automation, not that anything crashed.
 
+## the turso engine (central database)
+
+`database.engine` is `sqlite` (one local file every hap process opens) or
+`turso` (a local sync database the **daemon alone** opens and syncs with a
+Turso Cloud database). Several machines pointed at the same URL become one
+herd — see the next section.
+
+```bash
+hap config set database.turso_database_url libsql://<db>-<org>.turso.io
+hap config set database.turso_auth_token '<token>'   # or leave unset and export TURSO_AUTH_TOKEN
+hap config set database.engine turso
+hap config set database.node_label laptop            # optional; else the hostname
+```
+
+The URL comes from `turso db show <db>`, the token from `turso db tokens create
+<db>`. The token is rendered `(set)` and never printed. The three keys are
+**order-independent** — they are validated when a store is opened, not when a
+key is written, so a half-configured `config.toml` still loads and is still
+repairable from the CLI.
+
+**A config reload does NOT switch engines.** `[database]` is read once, when a
+process opens its store, and **`hap daemon --ensure` only replaces a daemon
+from an older binary or a different path** — so after `config set` the running
+daemon keeps serving the old store and `hap status` looks entirely healthy.
+There is no `--restart`; stop it first:
+
+```bash
+kill -TERM "$(head -1 "$(hap state-dir)/daemon.lock")"
+hap daemon --ensure
+```
+
+**Restart the front ends too — `hap tui` reads `[database]` once, at startup,
+exactly like the daemon.** A TUI left open across the switch keeps reading the
+OLD store, which nothing publishes to any more, so its whole view freezes at the
+moment of the switch. The Agents tab is the one that reads as a bug rather than
+staleness: a roster older than `RosterStaleAfter` (3 minutes) yields **no rows
+at all** by design — a stale row's pane id may since have been recycled onto a
+different process — and the tab prints a bare `no agents detected` with no hint
+that the roster is what is missing, while `hap agents` on the same machine
+lists everything. Quit and reopen the TUI. One-shot CLI verbs are unaffected:
+each starts fresh and opens the current store.
+
+Under turso only the daemon may open the database (the sync engine allows one
+process per file); the TUI, the CLI verbs and the MCP server reach it over
+`<state>/store.sock`. So `the store is served by the hap daemon … and the
+daemon is not reachable` means the daemon is down, not that anything is
+corrupt.
+
+Verify the switch took: `hap status` gains a `fleet sync:` line, and
+`<state>/turso/` and `<state>/store.sock` now exist. A small `unpushed` count
+that keeps moving while `last push` advances is normal, not a stall.
+
+### migrating the local sqlite database
+
+**Automatic, once, on the first turso start.** There is no CLI verb and none is
+needed — the daemon imports the existing local file into the shared store and
+logs it:
+
+```
+imported the local sqlite database into the shared store  decisions=41 audit_rows=459
+```
+
+Carried over: learned rules and their embeddings, decisions, corrections, the
+whole audit log (pending escalations included), agent names, rate counters, task
+handouts and reservations. Ids are re-allocated and every cross-reference
+remapped, in ascending old-id order, so "newest first" listings read the same.
+
+**Deliberately not imported:** in-flight IPC — pending LLM requests and
+decisions, pending or running agent actions — because the daemon that owned
+them no longer exists; and the roster and herdr locations, which republish
+within a minute. An escalation claimed as `auto_accepting` returns to
+`escalated`.
+
+**Two separate things stop a second import, and the difference matters when you
+change databases.** `legacy_imports` in the shared database holds a row per
+node, written inside the import's own transaction, so a crash between the commit
+and any bookkeeping cannot duplicate every audit row under fresh ids. But
+`<state>/turso/imported-from-sqlite` is checked FIRST and returns on its own, so
+it is a skip condition in its own right rather than a cache of that row — and
+there is one marker per state dir, not per database. Pointing an
+already-imported machine at a **different or reset** Turso database therefore
+skips the import silently: you get an empty store while the local
+`herd-auto-prompter.db` still holds everything. Delete the marker to run the
+import again against the new database.
+
+The legacy `herd-auto-prompter.db` is left untouched, so reverting is the switch
+backwards plus the same daemon restart — the old store comes back intact:
+
+```bash
+hap config set database.engine sqlite
+```
+
+Two things to expect when checking a migration:
+
+- **Live counters legitimately differ.** `agent_rate.consecutive_auto` is zeroed
+  the moment a human touches that agent's pane, so a value that moved after the
+  import is correct, not lost.
+- **REAL columns can drift by 1 ULP** (~1e-16) through the turso write path —
+  visible on `audit_log.match_score`, which stores float32 vector scores widened
+  to double. Below any threshold hap compares against; do not read it as
+  corruption.
+
 ## several machines (fleet)
 
-With `[database] engine = "turso"` (see the `database.*` keys) every machine
-pointed at the same Turso Cloud database shares one hap. From any of them:
+With `[database] engine = "turso"` (see above) every machine pointed at the same
+Turso Cloud database shares one hap. From any of them:
 
 ```bash
 hap status                        # fleet sync: …, other nodes: <label> (fresh|stale)
@@ -1147,3 +1249,15 @@ detail offers confirm, resolve, dismiss, and **retry LLM** (the twin of
 `hap escalations retry <id>`). On the Rules tab, `+`/`-` nudge the selected
 rule's confirmation streak (the twin of `hap signatures confirm [--delta N]`,
 graduating or demoting it at `graduation_n`) and `0` resets it.
+
+**A row id shown as `…15968` is truncated to its last five digits** — the
+Escalations, Audit and pause/resume tables do this because a turso-engine id is
+18 digits and printing it whole shifts every later column out from under its
+header. The leading `…` is the tell; an id short enough to print whole keeps
+its `#`. On **Escalations and Audit** press `v` for the detail, which carries
+the id in full. The pause/resume tab has **no** detail view, so read a kill
+event's full id from `hap kill-history` — no command takes one as an argument in
+any case. Every CLI listing prints ids in full. **The truncated form is not
+something to type at `hap confirm`** — those verbs take the whole id. `/` still
+finds a row by the digits you can see, because the filter reads the full id and
+matches on substring.
