@@ -924,10 +924,7 @@ func (a *App) queueGeneratedTaskConfirm(ctx context.Context, audit *domain.Audit
 		return err
 	}
 	// Herdr RECYCLES pane ids, so the pane id is not an address on its own.
-	// Read from the OWNING node's record, never this one's: pane ids repeat
-	// across machines. Best-effort — an unknown id is "not observed", which the
-	// executor treats as no evidence rather than as a mismatch.
-	terminalID, err := a.Store.AgentTerminalIDOn(ctx, orSelf(a, audit.NodeID), audit.AgentID)
+	terminalID, err := a.terminalIDFor(ctx, audit.NodeID, audit.AgentID)
 	if err != nil {
 		return err
 	}
@@ -4218,14 +4215,13 @@ func (a *App) SendTaskToAgentOn(ctx context.Context, nodeID, agentName, locator 
 		NodeID: nodeID, Kind: domain.AgentActionSendTask, Target: agentName,
 		Payload: string(payload), Author: a.Author, CreatedAt: time.Now(),
 	}
-	// Best effort: an unknown terminal is "not observed", which the executor
-	// treats as no evidence rather than as a mismatch. Read from the OWNING
-	// node's record — pane ids repeat across machines.
 	if a.isSelf(nodeID) {
-		if id, err := a.Store.AgentTerminalIDOn(ctx, orSelf(a, nodeID), agentName); err == nil {
-			action.TerminalID = id
+		if action.TerminalID, err = a.terminalIDFor(ctx, nodeID, agentName); err != nil {
+			return err
 		}
 	} else {
+		// The fleet map is the remote namespace's equivalent of ResolveAgent,
+		// which is self-scoped and could only ever answer for this machine.
 		action.TerminalID = a.remoteTerminalID(ctx, nodeID, agentName)
 	}
 	id, err := a.Store.EnqueueAgentAction(ctx, action)
@@ -4325,13 +4321,46 @@ func (a *App) SendTaskForOperator(ctx context.Context, p domain.SendTaskPayload,
 	return nil
 }
 
+// terminalIDFor reads an agent's herdr terminal id out of a node's agent_names
+// row, so a queued action can be refused if the pane has since been recycled
+// under a new terminal. Read from the OWNING node's record, never this one's:
+// pane ids repeat across machines.
+//
+// The target is mapped through ResolveAgent first for THIS node, because
+// agent_names is keyed by agent id while the operator addresses an agent by
+// its short NAME — looking a name up as an id finds nothing and files an
+// action whose guard is silently off. ResolveAgent passes an unknown target
+// through unchanged, so an id addresses itself and naming stays optional; it
+// is self-scoped, which is why another node's target is used as given (the
+// callers that need a remote name resolved go through remoteTerminalID).
+//
+// An ABSENT row yields "", which the executor reads as "not observed" and
+// waves through — an unnamed or never-synced agent still gets its task. A
+// store ERROR is not the same thing and is returned: "we could not ask" is
+// never evidence the pane was not recycled, and filing the action anyway would
+// look guarded while guarding nothing.
+func (a *App) terminalIDFor(ctx context.Context, nodeID, target string) (string, error) {
+	if a.isSelf(nodeID) {
+		id, err := a.Store.ResolveAgent(ctx, target)
+		if err != nil {
+			return "", err
+		}
+		target = id
+	}
+	return a.Store.AgentTerminalIDOn(ctx, orSelf(a, nodeID), target)
+}
+
 // taskSourceRenderFor returns the next-task template and config position of the
 // source this agent keeps at locator — "" and "" when the agent's sources do
 // not include it, which is the default template and no {task_source_index}.
 //
-// Ambiguity leaves the index empty rather than guessing, matching the
-// exactly-one resolution `hap task <name>` applies; the prompt then falls back
-// to naming the agent.
+// The match is on the agent AND the canonical locator, so it is the SOURCE
+// this hand-out came from — not merely one of the agent's. Two sources of one
+// agent resolving to the same list is a duplicate config rather than an
+// ambiguity: both describe the same file, so the first wins and only the
+// printed {task_source_index} differs. An agent whose sources do not include
+// the locator (a --path hand-out, say) gets the default template and no index,
+// and the prompt then addresses the list by the agent's name.
 func (a *App) taskSourceRenderFor(agentName, locator string) (template, sourceIndex string, err error) {
 	cfg, err := a.Config()
 	if err != nil {

@@ -385,6 +385,86 @@ func TestABusyAgentRefusalSurvivesTheQueue(t *testing.T) {
 	}
 }
 
+// A LOCAL task hand-out carries the agent's TERMINAL id.
+//
+// agent_names is keyed by agent id, and `hap task send` addresses an agent by
+// the operator's SPELLING — so looking the terminal up under the name finds
+// nothing and files the action with an empty id. That is not a loud failure:
+// the executor's terminalStillMatches reads an empty id as "not observed" and
+// waves it through, so the recycled-pane guard is simply off. herdr recycles
+// pane ids and an agent id IS a pane id, so the hand-out would then be typed
+// into whatever process now owns that pane.
+//
+// The remote branch already mapped the name through FleetAgentNames; only the
+// local one skipped it, which is why every fleet test still passed.
+func TestALocalTaskHandOutCarriesTheAgentsTerminal(t *testing.T) {
+	app, st := testApp(t)
+	app.InDaemon = true // stand in for a healthy local daemon
+	ctx := context.Background()
+	now := time.Now()
+	if err := st.UpsertNode(ctx, domain.NodeInfo{Label: "here", LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AssignAgentName(ctx, "w1:p1", "vivid-falcon"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SyncAgentTerminalID(ctx, "w1:p1", "term-live"); err != nil {
+		t.Fatal(err)
+	}
+	got := drainOneAction(t, st, domain.AgentActionDone, "")
+
+	if err := app.SendTaskToAgentOn(ctx, "", "vivid-falcon", "/tmp/tasks.md", 1, "write the parser"); err != nil {
+		t.Fatalf("local send = %v, want the daemon's success verdict", err)
+	}
+	a := <-got
+	if a.Kind != domain.AgentActionSendTask || a.Target != "vivid-falcon" {
+		t.Fatalf("queued action = %+v, want a send_task addressed by name", a)
+	}
+	if a.TerminalID != "term-live" {
+		t.Errorf("queued terminal = %q, want term-live — an empty one disarms the recycled-pane guard",
+			a.TerminalID)
+	}
+}
+
+// The REMOTE branch of the same hand-out carries it too.
+//
+// It maps the name through the fleet map rather than ResolveAgent (which is
+// self-scoped), so it was already right — but the local bug shipped green
+// precisely because no test asserted this field, and the symmetric gap is the
+// same one. Note the two panes are both "w1:p1": the terminal is the ONLY
+// thing telling this node's agent from the other's.
+func TestARemoteTaskHandOutCarriesTheAgentsTerminal(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	other := otherNodeStore(t, app)
+	for _, s := range []*store.Store{st, other} {
+		if err := s.UpsertNode(ctx, domain.NodeInfo{Label: "n-" + s.NodeID()[:2], LastSeen: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Same pane id on both machines, named and synced only on the other.
+	if err := st.AssignAgentName(ctx, "w1:p1", "here-falcon"); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.AssignAgentName(ctx, "w1:p1", "faraway-falcon"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.SyncAgentTerminalID(ctx, "w1:p1", "term-remote"); err != nil {
+		t.Fatal(err)
+	}
+	got := drainOneAction(t, other, domain.AgentActionDone, "")
+
+	if err := app.SendTaskToAgentOn(ctx, other.NodeID(), "faraway-falcon",
+		"/tmp/tasks.md", 1, "write the parser"); err != nil {
+		t.Fatalf("remote send = %v, want the owning daemon's success verdict", err)
+	}
+	a := <-got
+	if a.TerminalID != "term-remote" {
+		t.Errorf("queued terminal = %q, want term-remote from the OWNING node's row", a.TerminalID)
+	}
+}
+
 // drainOneAction stands in for the owning node's daemon: it waits for one
 // queued action, claims it, and writes the given verdict. The action it saw is
 // returned on the channel.
