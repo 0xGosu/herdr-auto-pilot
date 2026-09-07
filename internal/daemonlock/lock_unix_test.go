@@ -380,3 +380,159 @@ func TestEnsureFresh(t *testing.T) {
 		})
 	}
 }
+
+// TestRestartReplacesAHolderEnsureFreshWouldKeep is the whole reason --restart
+// exists: EnsureFresh returns early when the running daemon is already this
+// version at this path, so before it nothing in hap could pick up a [database]
+// change — the section is read once, when a process opens its store — without
+// an operator finding the pid and sending SIGTERM by hand. Both calls are
+// driven against the SAME held lock, so the flag is the only difference.
+func TestRestartReplacesAHolderEnsureFreshWouldKeep(t *testing.T) {
+	paths := testPaths(t)
+	release := holdLock(t, paths, fmt.Sprintf("4242\n%s\n/usr/local/bin/hap\n", buildinfo.Version))
+
+	var stopped, started []int
+	stop := func(pid int) error {
+		stopped = append(stopped, pid)
+		release() // a stopped daemon releases the lock; WaitReleased polls for it
+		return nil
+	}
+	start := func() error { started = append(started, 1); return nil }
+
+	if err := daemonlock.EnsureFresh(paths, buildinfo.Version, "/usr/local/bin/hap",
+		300*time.Millisecond, stop, start); err != nil {
+		t.Fatalf("EnsureFresh: %v", err)
+	}
+	if len(stopped) != 0 || len(started) != 0 {
+		t.Fatalf("--ensure must leave a current daemon alone: stopped=%v started=%v", stopped, started)
+	}
+
+	outcome, err := daemonlock.Restart(paths, 300*time.Millisecond, stop, start)
+	if err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	// The outcome is what the CLI reports from, so it must name the daemon it
+	// actually stopped rather than leave the caller to re-read Info() and race
+	// the successor it just started.
+	if !outcome.Replaced || outcome.StoppedPID != 4242 || outcome.StoppedVersion != buildinfo.Version {
+		t.Errorf("outcome = %+v, want the stopped daemon described", outcome)
+	}
+	if len(stopped) != 1 || stopped[0] != 4242 {
+		t.Errorf("--restart must stop the running daemon, stopped=%v", stopped)
+	}
+	if len(started) != 1 {
+		t.Errorf("--restart must start a replacement, started=%v", started)
+	}
+}
+
+// TestRestart covers the rest of the contract by driving the same table shape
+// as TestEnsureFresh. The cases that matter beyond "it stops a current holder"
+// are the ones a parallel implementation would drop: with nothing running it
+// STARTS one (an operator recovering a dead daemon must not need a different
+// verb), and a holder that never exits is an error with no start — starting a
+// second daemon over one still holding the lock is how you get two monitors,
+// or a replacement that dies on Acquire.
+func TestRestart(t *testing.T) {
+	const held = "4242\nv0.1.0\n/usr/local/bin/hap\n"
+	tests := []struct {
+		name        string
+		lockContent string // "" = no daemon running
+		stopFrees   bool
+		stopErr     bool
+		wantErr     bool
+		wantStop    bool
+		wantStart   bool
+	}{
+		{name: "nothing running starts one", wantStart: true},
+		// This case does NOT pin `force`: Restart passes version="", so
+		// `current("v0.1.0", …, "", "")` is false and the holder would be
+		// replaced either way. Only a holder `current` says yes to reaches the
+		// guard — the legacy pid-only lock below, where every string is empty
+		// (verified by mutation: dropping `!force` fails that case alone).
+		{name: "a current-looking holder is still replaced", lockContent: held,
+			stopFrees: true, wantStop: true, wantStart: true},
+		{name: "legacy pid-only holder is replaced", lockContent: "4242\n",
+			stopFrees: true, wantStop: true, wantStart: true},
+		{name: "holder never exits errors without start", lockContent: held,
+			wantStop: true, wantErr: true},
+		{name: "unreadable pid errors without kill", lockContent: "junk\nv0.1.0\n", wantErr: true},
+		{name: "stop failure surfaces without start", lockContent: held,
+			stopErr: true, wantStop: true, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			paths := testPaths(t)
+			var release func()
+			if tc.lockContent != "" {
+				release = holdLock(t, paths, tc.lockContent)
+			}
+			var stopped, started []int
+			stop := func(pid int) error {
+				stopped = append(stopped, pid)
+				if tc.stopErr {
+					return fmt.Errorf("kill refused")
+				}
+				if tc.stopFrees {
+					release()
+				}
+				return nil
+			}
+			start := func() error { started = append(started, 1); return nil }
+
+			outcome, err := daemonlock.Restart(paths, 300*time.Millisecond, stop, start)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Restart error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if got := len(stopped) > 0; got != tc.wantStop {
+				t.Errorf("stop called = %v, want %v", got, tc.wantStop)
+			}
+			if got := len(started) > 0; got != tc.wantStart {
+				t.Errorf("start called = %v, want %v", got, tc.wantStart)
+			}
+			// The outcome is what the CLI reports from: it must describe a
+			// replacement only when one actually happened, and never after an
+			// error (nothing was started, so "stopped … and started" would be
+			// a claim about a herd that has no daemon at all).
+			if outcome.Replaced != (tc.wantStop && !tc.wantErr) {
+				t.Errorf("outcome = %+v, want Replaced=%v", outcome, tc.wantStop && !tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestRestartForcesThroughTheReProbeToo pins the SECOND copy of the force
+// guard. A holder that rewrites its lock file is read once with an unparseable
+// pid, so replaceHolder sleeps 100ms and reads again — and on that path the
+// re-probe re-asks `current`, which a legacy pid-only lock answers yes to.
+// Without `!force` there, a restart returns nil having done nothing while the
+// CLI still reports a fresh daemon and the [database] change never lands.
+func TestRestartForcesThroughTheReProbeToo(t *testing.T) {
+	paths := testPaths(t)
+	release := holdLock(t, paths, "junk\n")
+	// Rewrite the lock content during the re-probe window, the way a daemon
+	// that truncates then rewrites its own lock file does.
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		f, err := os.OpenFile(lockFile(paths), os.O_WRONLY, 0o600)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		f.Truncate(0)
+		f.WriteString("4242\n")
+	}()
+
+	var stopped, started []int
+	outcome, err := daemonlock.Restart(paths, 300*time.Millisecond,
+		func(pid int) error { stopped = append(stopped, pid); release(); return nil },
+		func() error { started = append(started, 1); return nil })
+	if err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if len(stopped) != 1 || stopped[0] != 4242 {
+		t.Errorf("stopped = %v, want the pid the re-probe read", stopped)
+	}
+	if len(started) != 1 || !outcome.Replaced {
+		t.Errorf("started = %v, outcome = %+v, want a replacement", started, outcome)
+	}
+}

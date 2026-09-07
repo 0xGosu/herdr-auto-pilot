@@ -11,6 +11,7 @@ import (
 
 	skilldoc "github.com/0xGosu/herdr-auto-pilot"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 )
 
@@ -98,10 +99,23 @@ func TestDaemonFlagParsingRejectsUnknownAndOrderIndependent(t *testing.T) {
 		{name: "unknown flag", args: []string{"--ensure", "--nope"}, wantErr: "unknown flag"},
 		{name: "unknown flag alone", args: []string{"--replace-onlyy"}, wantErr: "unknown flag"},
 		{name: "replace-only without ensure", args: []string{"--replace-only"}, wantErr: "only applies"},
+		// The three modes each replace the whole run, so a combination has no
+		// honest interpretation — and picking one silently is how `--restart
+		// --replace-only` would end up meaning "stop the daemon", which is not
+		// what either flag is named for.
+		{name: "restart with ensure", args: []string{"--ensure", "--restart"}, wantErr: "alternatives"},
+		{name: "reload with ensure", args: []string{"--reload", "--ensure"}, wantErr: "alternatives"},
+		{name: "restart with reload", args: []string{"--restart", "--reload"}, wantErr: "alternatives"},
+		{name: "restart with replace-only", args: []string{"--restart", "--replace-only"}, wantErr: "only applies"},
+		// A reload is a nudge to a LIVE daemon; with none running it must say
+		// so rather than report success against a dead socket, which is what
+		// control.Nudge on its own would do (a failed nudge is never fatal
+		// there, because the caller has already committed its change).
+		{name: "reload with no daemon", args: []string{"--reload"}, wantErr: "no daemon is running"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := runDaemon(context.Background(), paths, tt.args)
+			err := runDaemon(context.Background(), paths, io.Discard, tt.args)
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("runDaemon(%v) = %v, want an error containing %q", tt.args, err, tt.wantErr)
 			}
@@ -110,8 +124,30 @@ func TestDaemonFlagParsingRejectsUnknownAndOrderIndependent(t *testing.T) {
 
 	// Reversed order must be accepted and must NOT start a daemon (nothing is
 	// running, and --replace-only is in effect).
-	if err := runDaemon(context.Background(), paths, []string{"--replace-only", "--ensure"}); err != nil {
+	if err := runDaemon(context.Background(), paths, io.Discard, []string{"--replace-only", "--ensure"}); err != nil {
 		t.Fatalf("reversed flag order = %v, want it accepted", err)
+	}
+}
+
+// TestRestartRefusesWhileTheCrashLoopBreakerHasGivenUp keeps --restart inside
+// the same breaker --ensure honours. An operator typing it after the daemon
+// gave up, with [embedding] unchanged, is asking for exactly the storm the
+// breaker exists to end — so the refusal is an ERROR here (a person is
+// watching, and a silent no-op reads as "restarted"), naming what clears it.
+func TestRestartRefusesWhileTheCrashLoopBreakerHasGivenUp(t *testing.T) {
+	paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
+	cfg := config.Default()
+	if err := crashguard.Write(paths.StateDir, crashguard.State{
+		GaveUp: true, ConfigDigest: embeddingDigest(cfg),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err := runDaemon(context.Background(), paths, io.Discard, []string{"--restart"})
+	if err == nil || !strings.Contains(err.Error(), "crash-loop breaker") {
+		t.Fatalf("runDaemon --restart = %v, want a crash-loop breaker refusal", err)
+	}
+	if !strings.Contains(err.Error(), "[embedding]") {
+		t.Errorf("the refusal must name what clears the latch, got: %v", err)
 	}
 }
 

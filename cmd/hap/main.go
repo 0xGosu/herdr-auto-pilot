@@ -220,7 +220,7 @@ func run(verb string, args []string) error {
 
 	switch verb {
 	case "daemon":
-		return runDaemon(ctx, paths, args)
+		return runDaemon(ctx, paths, os.Stdout, args)
 	case "embed-worker":
 		// Internal subcommand: the short-lived child that the embedder Client
 		// spawns to run llama.cpp out-of-process. It takes its config from the
@@ -299,14 +299,14 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 	return app, func() { st.Close() }, nil
 }
 
-func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
+func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []string) error {
 	// Flags are parsed as a SET, not by position: `hap daemon --replace-only
 	// --ensure` used to fall through to the foreground daemon, which acquires
 	// the lock and blocks forever — inside scripts/install.sh that would hang
 	// `herdr plugin install`. An unrecognized flag is an error for the same
 	// reason: silently running a foreground daemon is the worst possible
 	// interpretation of a typo.
-	var ensure, replaceOnly bool
+	var ensure, replaceOnly, restart, reload bool
 	for _, arg := range args {
 		switch arg {
 		case "--ensure":
@@ -319,14 +319,31 @@ func runDaemon(ctx context.Context, paths config.Paths, args []string) error {
 			// up on a fresh install (or in CI, where nothing asked for a
 			// monitor at all).
 			replaceOnly = true
+		case "--restart":
+			restart = true
+		case "--reload":
+			reload = true
 		default:
 			return fmt.Errorf("unknown flag for `hap daemon`: %s (see: hap help daemon)", arg)
 		}
 	}
+	// Each mode replaces the whole run, so a combination has no honest
+	// interpretation: refuse rather than silently pick one. --replace-only is
+	// --ensure's modifier alone; a restart is unconditional by definition, and
+	// pairing it with "never start one" describes a stop, which is not what
+	// either flag is named for.
 	if replaceOnly && !ensure {
 		return fmt.Errorf("--replace-only only applies to `hap daemon --ensure`")
 	}
-	if ensure {
+	if n := boolsSet(ensure, restart, reload); n > 1 {
+		return fmt.Errorf("--ensure, --restart and --reload are alternatives; pass one (see: hap help daemon)")
+	}
+	switch {
+	case restart:
+		return restartDaemon(paths, out)
+	case reload:
+		return reloadDaemon(ctx, paths, out)
+	case ensure:
 		return ensureDaemon(paths, replaceOnly)
 	}
 
@@ -615,21 +632,9 @@ func embeddingDigest(cfg config.Config) string {
 }
 
 func ensureDaemon(paths config.Paths, replaceOnly bool) error {
-	// Crash-loop hard stop: after we've given up (still looping even with the
-	// embedder off), decline to respawn until the [embedding] config changes —
-	// this is what actually ends the storm herdr's per-event --ensure would
-	// otherwise sustain.
-	if g, ok := crashguard.Read(paths.StateDir); ok {
-		cfg, _ := config.Load(paths.File())
-		blocked, cleared, reason := crashguard.SpawnBlocked(g, embeddingDigest(cfg))
-		if blocked {
-			slog.Warn("daemon respawn suppressed by crash-loop breaker", "reason", reason)
-			return nil
-		}
-		if g.GaveUp && !cleared.GaveUp {
-			// Config changed since we gave up: lift the latch so this start retries.
-			_ = crashguard.Write(paths.StateDir, cleared)
-		}
+	if blocked, reason := spawnBlocked(paths); blocked {
+		slog.Warn("daemon respawn suppressed by crash-loop breaker", "reason", reason)
+		return nil
 	}
 	if replaceOnlyBowsOut(replaceOnly, func() bool {
 		running, _, _ := daemonlock.Info(paths)
@@ -644,6 +649,171 @@ func ensureDaemon(paths config.Paths, replaceOnly bool) error {
 	return daemonlock.EnsureFresh(paths, buildinfo.Version, self, ensureWaitTimeout, daemonlock.Stop, func() error {
 		return spawnDaemon(paths, self, "daemon")
 	})
+}
+
+// spawnBlocked asks the crash-loop breaker whether a daemon may be started,
+// lifting a give-up latch whose [embedding] config has since changed.
+//
+// Shared by --ensure and --restart on purpose. An operator typing --restart
+// after the breaker gave up, with the config unchanged, is asking for exactly
+// the storm the breaker exists to end — one start, one abort, and they type it
+// again. What differs is only how the refusal is REPORTED: a hook wants it in
+// the log, a person wants it on their terminal.
+func spawnBlocked(paths config.Paths) (bool, string) {
+	g, ok := crashguard.Read(paths.StateDir)
+	if !ok {
+		return false, ""
+	}
+	cfg, _ := config.Load(paths.File())
+	blocked, cleared, reason := crashguard.SpawnBlocked(g, embeddingDigest(cfg))
+	if blocked {
+		return true, reason
+	}
+	if g.GaveUp && !cleared.GaveUp {
+		// Config changed since we gave up: lift the latch so this start retries.
+		_ = crashguard.Write(paths.StateDir, cleared)
+	}
+	return false, ""
+}
+
+// restartDaemon implements `hap daemon --restart`: stop the running daemon
+// whatever binary it came from, and start a fresh one — the answer to a
+// setting that a reload cannot reach, since [database] and [logging] are read
+// once, when a process opens its store.
+func restartDaemon(paths config.Paths, out io.Writer) error {
+	if blocked, reason := spawnBlocked(paths); blocked {
+		return fmt.Errorf("refusing to start a daemon: the crash-loop breaker gave up (%s).\n"+
+			"It clears when the [embedding] section changes — `hap config set embedding.disabled true`\n"+
+			"is the usual escape. `hap status --stderr` prints the crash output", reason)
+	}
+	self, err := selfpath.Resolve()
+	if err != nil {
+		return fmt.Errorf("resolve the hap binary to run as the daemon: %w", err)
+	}
+	return restartWith(paths, out, daemonlock.Stop,
+		func() error { return spawnDaemon(paths, self, "daemon") },
+		func(stoppedPID int) (int, bool) { return awaitDaemonHealth(paths, stoppedPID, restartConfirmWait) })
+}
+
+// restartConfirmWait bounds how long --restart waits for the daemon it started
+// to publish its first heartbeat. It is generous because the wait spans the
+// whole of daemon.New — under `engine = "turso"` that includes opening the sync
+// database and bootstrapping from Turso Cloud, which is seconds on a cold start
+// and is exactly the configuration this flag exists to switch into.
+const restartConfirmWait = 20 * time.Second
+
+// restartWith is restartDaemon's body with its three side effects injected, so
+// a test can assert what it reports without forking a real daemon — or, for
+// stop, without signalling whatever process on the machine happens to own the
+// pid a fixture wrote into the lock file.
+//
+// The reporting is the point. spawnDaemon returns once the FORK succeeded, and
+// every [database] failure — a bad URL, a rejected token, a node-bits collision
+// — exits AFTER the new daemon takes the lock, so "started a fresh one" would
+// be a claim about the herd that nothing observed, made by the one command that
+// had just killed a working daemon to get there. Waiting for a heartbeat proves
+// the successor opened its store; failing to see one is reported as the unknown
+// it is, never as success.
+func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, start func() error, confirm func(stoppedPID int) (int, bool)) error {
+	forgetRestartBoots(paths)
+	outcome, err := daemonlock.Restart(paths, ensureWaitTimeout, stop, start)
+	if err != nil {
+		return err
+	}
+	if outcome.Replaced {
+		fmt.Fprintf(out, "stopped the daemon (pid %d, %s)\n",
+			outcome.StoppedPID, daemonlock.VersionLabel(outcome.StoppedVersion))
+	} else {
+		fmt.Fprintln(out, "no daemon was running")
+	}
+	pid, ok := confirm(outcome.StoppedPID)
+	if !ok {
+		fmt.Fprintf(out, "started a replacement, but it has not reported healthy within %s.\n", restartConfirmWait)
+		fmt.Fprintln(out, "Run `hap status` (add --stderr if it died) — a [database] error exits after the")
+		fmt.Fprintln(out, "daemon has taken the lock, so a failed switch looks exactly like a slow start.")
+		return nil
+	}
+	fmt.Fprintf(out, "started a fresh daemon (pid %d) and it is reporting healthy\n", pid)
+	return nil
+}
+
+// awaitDaemonHealth polls for a heartbeat from a daemon that is neither the one
+// just stopped nor a leftover file, and returns its pid.
+//
+// The old daemon removes its health file on a clean shutdown, but only
+// best-effort — a stale record from the pid we just killed must never read as
+// the successor coming up, hence the stoppedPID check.
+func awaitDaemonHealth(paths config.Paths, stoppedPID int, timeout time.Duration) (int, bool) {
+	deadline := time.Now().Add(timeout)
+	for {
+		if h, ok := daemonhealth.Read(paths.StateDir); ok && h.PID > 0 && h.PID != stoppedPID {
+			return h.PID, true
+		}
+		if time.Now().After(deadline) {
+			return 0, false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// forgetRestartBoots drops the crash-loop breaker's BOOT HISTORY — never a
+// latch — before an operator-typed restart.
+//
+// The breaker counts starts, and three inside 90s auto-disable semantic
+// matching (two more after that stop the daemon entirely, for both --restart
+// and herdr's per-event --ensure). Iterating on a setting is exactly what this
+// flag is for, and `config set` + --restart three times is a normal minute's
+// work: without this, hap answers a run of config edits by latching the
+// embedder off and reporting the herd as crash-looping — a false diagnosis
+// pointing away from the operator's real error, and one only an [embedding]
+// edit clears.
+//
+// Clearing the evidence is safe where clearing a latch would not be:
+// spawnBlocked still refuses to start under EmbeddingOff/GaveUp, and only a
+// human types --restart (the hook runs --ensure), so a genuine crash-loop
+// re-accumulates through the respawns the breaker was built for.
+func forgetRestartBoots(paths config.Paths) {
+	g, ok := crashguard.Read(paths.StateDir)
+	if !ok || len(g.Starts) == 0 {
+		return
+	}
+	g.Starts = nil
+	if err := crashguard.Write(paths.StateDir, g); err != nil {
+		// Not fatal: the worst case is the pre-existing behaviour.
+		slog.Warn("could not clear the crash-loop boot history for this restart", "error", err)
+	}
+}
+
+// reloadDaemon implements `hap daemon --reload`: ask the running daemon to
+// re-read config.toml, the same nudge every `hap config` write sends.
+//
+// It REFUSES when no daemon is running rather than reporting success against a
+// dead socket: control.Nudge's own contract is that a failed nudge is never
+// fatal (a front end has already committed its change to the database), which
+// is the opposite of what an operator asking for a reload needs to hear.
+func reloadDaemon(ctx context.Context, paths config.Paths, out io.Writer) error {
+	running, pid, _ := daemonlock.Info(paths)
+	if !running {
+		return errors.New("no daemon is running, so there is nothing to reload; start one with `hap daemon --restart`")
+	}
+	if err := control.Nudge(ctx, paths.ControlSocketPath(), control.KindReload); err != nil {
+		return fmt.Errorf("nudge the daemon (pid %d) to reload: %w", pid, err)
+	}
+	fmt.Fprintf(out, "asked the daemon (pid %d) to reload config.toml\n", pid)
+	fmt.Fprintln(out, "note: [database] and [logging] are read once, when a process opens its store —")
+	fmt.Fprintln(out, "      changing an engine, URL, token or node label needs `hap daemon --restart`")
+	return nil
+}
+
+// boolsSet counts how many of the given mode flags were passed.
+func boolsSet(flags ...bool) int {
+	var n int
+	for _, f := range flags {
+		if f {
+			n++
+		}
+	}
+	return n
 }
 
 // ensureWaitTimeout bounds how long --ensure waits for a stale daemon to
