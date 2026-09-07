@@ -8,6 +8,14 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.8.6
+
+- Added: confirming an LLM-suggested task now works for an agent on another machine. It used to be refused outright ("this generated-task suggestion belongs to node …"), because the confirm wrote the task list and registered the task source on whichever machine you typed on — and pointed the send at whatever local pane happened to share the agent's id. The owning node's daemon now does that work, wherever you confirm from.
+- Changed: a confirmed task hand-out is recorded in the reservation ledger, so an item marked in-progress for an agent that never starts it is returned to `[ ]` automatically instead of staying stuck. While a hand-out is outstanding that agent is skipped by the idle-task poll until it starts working.
+- Changed: `hap confirm` on an LLM-suggested task now needs a running daemon even without `--send`, since the daemon is what performs the confirm.
+- Added: sending a task from the TUI's Tasks tab now works for a list another machine keeps, instead of refusing with "this list belongs to node …". `hap task send` stays local-only — it reads the list through this machine's task sources.
+- Changed: task hand-outs and generated-task confirms are performed by the daemon, so the TUI and CLI no longer type into agent panes themselves. Two processes can no longer drive one pane, and every hand-out now passes the same idle re-check and per-agent automation lock the daemon's own sends do.
+
 ## 0.8.5
 
 - Changed a remote focus (`f` on another node's agent in the TUI) to push the shared database immediately instead of waiting out the sync loop's write debounce, so the request reaches Turso Cloud in time for the owning node's next pull. The pull interval on that node (`database.turso_sync_interval_seconds`, default 15 s, minimum 5) remains the larger half of the wait.
