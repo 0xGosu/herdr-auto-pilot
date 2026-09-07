@@ -482,6 +482,12 @@ type Daemon struct {
 	// harmless (the sweep skips rows already blanked), and persisting it would
 	// buy nothing. Guarded by d.mu.
 	lastRetentionSweep time.Time
+
+	// lastNodeUpsert throttles the nodes-row write to domain.NodeHeartbeat off
+	// the faster health-file beat. Zero means "never written", so a starting
+	// daemon appears in the fleet on its first beat rather than a minute later.
+	// Guarded by d.mu.
+	lastNodeUpsert time.Time
 }
 
 // idleMark is one agent's parked-since timestamp, pinned to the terminal it
@@ -1056,9 +1062,33 @@ func (d *Daemon) writeHealth(startedAt time.Time) {
 	}
 }
 
-// upsertNode refreshes this node's row in the shared nodes table on every
-// heartbeat: label, version, start time, last seen. It is how other machines
-// learn this one exists and whether its daemon is still reporting.
+// maybeUpsertNode refreshes this node's row at most once per
+// domain.NodeHeartbeat, and is called from the faster health-file beat.
+//
+// The two cadences are separate because they answer different questions. The
+// health FILE says whether this daemon is hung and has to be current to the
+// second; the nodes ROW says whether this machine is still out there, which no
+// reader asks with more precision than domain.NodeStale. Sharing one cadence
+// meant a database row every ten seconds — ungated, always a real change since
+// last_seen differs every time, and on the shared engine one sync push each
+// (the push debounce is shorter than the beat, so nothing coalesced).
+//
+// The first call always writes: a daemon that has just started must appear to
+// the fleet immediately, not after a full interval.
+func (d *Daemon) maybeUpsertNode(startedAt time.Time, now time.Time) {
+	d.mu.Lock()
+	if !d.lastNodeUpsert.IsZero() && now.Sub(d.lastNodeUpsert) < domain.NodeHeartbeat {
+		d.mu.Unlock()
+		return
+	}
+	d.lastNodeUpsert = now
+	d.mu.Unlock()
+	d.upsertNode(startedAt)
+}
+
+// upsertNode refreshes this node's row in the shared nodes table: label,
+// version, start time, last seen. It is how other machines learn this one
+// exists and whether its daemon is still reporting.
 func (d *Daemon) upsertNode(startedAt time.Time) {
 	label := d.opt.NodeLabel
 	if label == "" {
@@ -1167,7 +1197,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.exePath = self
 	}
 	d.writeHealth(startedAt)
-	d.upsertNode(startedAt)
+	// Through the throttle rather than around it: the first call always writes,
+	// and going this way ARMS the interval so the next health beat does not
+	// rewrite the row seconds later.
+	d.maybeUpsertNode(startedAt, startedAt)
 	if d.opt.StateDir != "" {
 		defer func() { _ = daemonhealth.Remove(d.opt.StateDir) }()
 	}
@@ -1312,7 +1345,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				return nil
 			}
 			d.writeHealth(startedAt)
-			d.upsertNode(startedAt)
+			d.maybeUpsertNode(startedAt, d.opt.Clock.Now())
 			// Bound the captured stderr log for a daemon that never restarts.
 			// OpenStderrLog only checks at spawn, so without this a long-lived
 			// process grows it without limit. Two cheap Stats, same as above.
@@ -1328,7 +1361,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			logging.Guard("periodic-sweep", func() error {
 				// Self-throttled to once a day and does its work on a
 				// background goroutine; the call itself is a clock compare.
-				d.maybePruneAuditExcerpts(d.opt.Clock.Now())
+				d.maybeRunRetentionSweep(d.opt.Clock.Now())
 				// Ahead of processCorrections: a delivered reply flips its
 				// correction's Sent flag, and processCorrections both READS
 				// that flag (to arm the unblock check) and marks the row

@@ -615,6 +615,45 @@ func (s *failingStore) AdoptAgentName(ctx context.Context, agentID, base string)
 	return namer.AdoptAgentName(ctx, agentID, base)
 }
 
+// PruneAgedRows forwards the OPTIONAL ports.RowRetentionPort capability, for
+// exactly the reason AdoptAgentName above is forwarded: without it the daemon's
+// type assertion answers false and row retention is silently switched off for
+// the whole suite.
+func (s *failingStore) PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domain.PruneCounts, error) {
+	rp, ok := s.StorePort.(ports.RowRetentionPort)
+	if !ok {
+		return domain.PruneCounts{}, errors.New("wrapped store cannot prune rows")
+	}
+	return rp.PruneAgedRows(ctx, now, cutoff)
+}
+
+// PruneAuditExcerpts, FreelistPages and Vacuum forward ports.RetentionPort for
+// the same reason. All three are needed together: the daemon asserts the
+// interface, not the methods.
+func (s *failingStore) PruneAuditExcerpts(ctx context.Context, now, cutoff time.Time) (int64, error) {
+	rp, ok := s.StorePort.(ports.RetentionPort)
+	if !ok {
+		return 0, errors.New("wrapped store cannot prune excerpts")
+	}
+	return rp.PruneAuditExcerpts(ctx, now, cutoff)
+}
+
+func (s *failingStore) FreelistPages(ctx context.Context) (int64, error) {
+	rp, ok := s.StorePort.(ports.RetentionPort)
+	if !ok {
+		return 0, errors.New("wrapped store cannot report freelist pages")
+	}
+	return rp.FreelistPages(ctx)
+}
+
+func (s *failingStore) Vacuum(ctx context.Context) error {
+	rp, ok := s.StorePort.(ports.RetentionPort)
+	if !ok {
+		return errors.New("wrapped store cannot vacuum")
+	}
+	return rp.Vacuum(ctx)
+}
+
 func (s *failingStore) GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, error) {
 	s.mu.Lock()
 	s.getAuditCalls++

@@ -1325,6 +1325,33 @@ type Logging struct {
 	// a row being compared against this second. See store.PruneAuditExcerpts,
 	// where both are safety controls.
 	AuditExcerptRetentionDays *int `toml:"audit_excerpt_retention_days,omitempty"`
+	// RowRetentionDays is how many days a FINISHED bookkeeping row is kept
+	// before the sweep deletes it outright: completed agent actions, resolved
+	// LLM requests and decisions, processed corrections and retries, superseded
+	// kill events, retired roster rows and confirmed task reservations.
+	//
+	// It is the row-level twin of AuditExcerptRetentionDays and takes the same
+	// three cases, for the same reasons:
+	//   - absent   → DefaultRowRetentionDays
+	//   - 0        → keep nothing finished; every eligible row goes
+	//   - negative → never prune, keeping every finished row forever (the
+	//                behaviour before this setting existed)
+	//
+	// A POINTER for the same reason its neighbour is one: absent and 0 mean
+	// different things, and fillZeroes would read an operator's 0 as "unset".
+	//
+	// It NEVER reaches a row the daemon or an operator may still act on —
+	// see store.PruneAgedRows, where the exemptions are the safety control and
+	// audit_log rows are excluded outright so `hap audit` history stays whole.
+	// The cutoff is also floored at store.RowRetentionFloor, so even 0 cannot
+	// delete a row a live poller is still reading.
+	//
+	// Note that a negative value switches off the WHOLE sweep, including the
+	// retirement of long-dead agent_roster rows — which run on their own short
+	// window and have nothing to do with audit lineage. An operator turning
+	// this off to keep history forever also keeps every retired roster row, so
+	// that table resumes growing with pane churn.
+	RowRetentionDays *int `toml:"row_retention_days,omitempty"`
 }
 
 // AuditExcerptRetention returns the excerpt retention window and whether the
@@ -1345,6 +1372,28 @@ func (l Logging) AuditExcerptRetention() (time.Duration, bool) {
 // DefaultAuditExcerptRetentionDays is how long excerpts are kept when the
 // operator has not said. Roughly how far back `hap audit` is realistically read.
 const DefaultAuditExcerptRetentionDays = 14
+
+// RowRetention returns the finished-row retention window and whether the sweep
+// runs at all, with the same three cases AuditExcerptRetention has.
+func (l Logging) RowRetention() (time.Duration, bool) {
+	days := DefaultRowRetentionDays
+	if l.RowRetentionDays != nil {
+		days = *l.RowRetentionDays
+	}
+	if days < 0 {
+		return 0, false
+	}
+	return time.Duration(days) * 24 * time.Hour, true
+}
+
+// DefaultRowRetentionDays is how long a finished bookkeeping row is kept when
+// the operator has not said.
+//
+// Longer than the excerpt default because these rows are the lineage an audit
+// entry points AT — a correction, the action that delivered it, the LLM request
+// behind it — and an operator reading a month-old audit row should still find
+// what it refers to.
+const DefaultRowRetentionDays = 30
 
 // ValidLogLevels are the accepted Logging.Level values. "warning" is a synonym
 // for "warn" and must stay listed: SlogLevel accepts it, so leaving it out made
@@ -2094,8 +2143,9 @@ func (c *Config) fillZeroes() {
 	if c.Logging.MaxSizeMB <= 0 {
 		c.Logging.MaxSizeMB = d.Logging.MaxSizeMB
 	}
-	// Logging.AuditExcerptRetentionDays is deliberately absent here: it is a
-	// pointer precisely so an explicit 0 ("never prune") survives this pass.
+	// Logging.AuditExcerptRetentionDays and Logging.RowRetentionDays are
+	// deliberately absent here: both are pointers precisely so an explicit 0
+	// ("keep nothing") survives this pass.
 	c.normalizeTaskSources()
 	// Only an EMPTY provider is filled. An unrecognized one is left exactly as
 	// written: coercing it to local_fs would resolve every gist-shaped path

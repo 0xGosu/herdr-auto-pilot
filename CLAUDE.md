@@ -921,6 +921,116 @@ whose manifest carries exactly that version).
   `TestFleetSyncShutdownIsNotHeldByAHungPull`. Front ends draw ids from the daemon over the store
   socket and have NO local fallback: an insert the daemon gave no id for fails with the reason
   (`failedID`), because two processes minting locally in one millisecond collide.
+- **A periodic write is CONDITIONAL, or it is a leak** — the store's every write calls
+  `noteWrite` → `onWrite` → the daemon's `FleetWrites` channel, which arms a **2s-debounced
+  turso push**. So a periodic write that fires more often than that debounce never coalesces:
+  one tick, one row, one push to Turso Cloud, forever, on an install with nothing happening.
+  Two writers were exactly that shape, and each needed a different fix.
+  - **`PublishRoster` compares before it writes.** It UPSERTed every agent row on every
+    publish — every 2s while a TUI is registered, every 60s regardless — and `seen_at` differed
+    each time, so every one was a genuine write storing what was already there (~475k rows/day
+    for ten agents). `rosterRowUnchanged` MIRRORS `upsertRosterRow`'s CASE arms field for field,
+    and the two must change together: a field added to the UPDATE and not to the comparison
+    silently stops being published. Three fields are excluded and each exclusion is reasoned —
+    `seen_at` advances by construction (including it makes every row dirty, which is the whole
+    bug), `cwd`/`cwd_read_at` are never written by a publish at all (`RosterAgentFrom` leaves
+    them zero and the CASE preserves the stored value), and `gone_at` is COMPARED rather than
+    excluded so a returning agent is republished. A **recycled** id is never skipped: its row
+    was DELETEd earlier in the same transaction, so `existing` describes a row that no longer
+    exists — safe today only because a changed `terminal_id` is what triggered the recycle AND
+    is in the compare set, which is a coincidence, so the skip is gated on `recycledIDs`
+    structurally. Roster FRESHNESS is `roster_meta.published_at` (`domain.RosterFresh`), never a
+    per-row `seen_at`, which is why the stamp still happens on every publish — skipping it would
+    make a settled herd read as "no daemon publishing". Not advancing `seen_at` is also more
+    truthful: its one reader outside the store is the TUI's "Last transition", which used to
+    read "now" for an agent that had not moved in an hour. Keep
+    `TestRepublishingASettledHerdWritesNothing` / `TestAChangedAgentIsStillPublished` (the
+    control — without it the first passes for a publish that writes nothing at all) /
+    `TestARecycledPaneIsNeverSkipped` / `TestAReturningAgentIsRepublished` /
+    `TestAReorderedHerdIsRepublished`.
+  - **`domain.NodeHeartbeat` is the ROW cadence and is deliberately SLOWER than
+    `daemonhealth.HeartbeatInterval` — but BOUNDED ABOVE by `daemon.actionStaleAfter`.** They
+    were one constant, so keeping the health FILE current to the second meant a `nodes` row
+    every 10s — ungated on herd size or on anything having changed, since `last_seen` differs
+    every time. The file answers "is this daemon hung" and must be fast; the row answers "is
+    this machine still out there" and no reader asks with more precision than
+    `domain.NodeStale` (three beats). `maybeUpsertNode` throttles it, and its FIRST call always
+    writes so a starting daemon appears in the fleet at once — which is also why `Run`'s
+    startup call goes THROUGH the throttle rather than around it, to arm the interval.
+    **The ceiling is why it is 30s and not the minute the write reduction alone would prefer**:
+    `nodeStaleAfter` is three beats AND is the gate `frontend.requireLiveDaemonFor` refuses a
+    remote confirm on, while a confirm is an operator vouching for a SCREEN whose deliverable
+    life is `actionStaleAfter` (2 minutes). While staleness is the tighter window, a confirm the
+    gate accepts is one the daemon can still honour; a minute inverts that silently. Keep
+    `TestNodeStalenessStaysInsideTheActionBound` (which is what makes the ceiling enforceable —
+    domain cannot import daemon), `TestNodeRowIsWrittenLessOftenThanTheHealthFile` (collapsing
+    the two constants back restores the cost silently) and
+    `TestNodeRowIsNotRewrittenOnEveryHealthBeat`.
+- **Retention has TWO windows, and the exemptions are the safety control** —
+  `PruneAuditExcerpts` blanks one COLUMN (`[logging] audit_excerpt_retention_days`);
+  `PruneAgedRows` deletes finished bookkeeping ROWS (`[logging] row_retention_days`, default 30).
+  Both run on the daemon's one daily throttle and one background goroutine, and the THROTTLE is
+  taken before either config is read so switching one off cannot change the other's cadence; the
+  `VACUUM` runs once at the end, because deleting rows — like blanking a column — only moves
+  bytes to the freelist under `auto_vacuum=0`.
+  - **`audit_log` and `decisions` are never swept.** The excerpt design says outright that the
+    row survives its column "so `hap audit` history stays complete", and `decisions` feeds
+    `CountDecisionsForSignature`, so deleting from it would change LEARNED BEHAVIOUR rather than
+    reclaim space. Both are operator decisions, not cleanup.
+  - Every other exclusion is a row some path still acts on, never one that merely looks recent:
+    a non-terminal `agent_actions` row is the cross-machine control queue itself (and even a
+    terminal one is what `frontend.AwaitAgentAction` returns as `Result`/`Error` — the ONLY way
+    the surface that queued it learns whether it landed, since the control socket carries no
+    reply channel); a `pending` `llm_requests` row is the consult retry guard and a `pending`
+    `llm_decisions` row is one the daemon has not re-gated; an unprocessed `corrections` or
+    `llm_retries` row is queued work, and `PruneAuditExcerpts` reads both. **The newest
+    `kill_events` row per node survives at any age** — only `LatestKillEvent` decides, so
+    deleting it would silently UNPAUSE a paused herd, which is why the filter is `id < MAX(id)`
+    rather than an age test. **An unconfirmed `task_reservations` row survives at any age** —
+    it is what `reclaimStrandedTasks` needs to return an item to `[ ]`, and a `[-]` with no
+    ledger row is treated as somebody else's and never touched again. `corrections` additionally
+    needs `NOT EXISTS` over `agent_actions.correction_id`: that reference has no foreign key
+    behind it and is what makes `UnprocessedCorrections` withhold a correction whose delivery is
+    still queued.
+  - **A finished consult's payloads go on their OWN grace (`LLMPayloadGrace`, an hour), never at
+    the status transition.** `llm_requests.context_json` and `llm_decisions.captured_output` are
+    the bulk of those tables' bytes, but "terminal status" is NOT proof nothing reads them again:
+    neither `GetLLMRequest` nor `LLMDecisionByRequest` filters on status, so `mcpserver.resolveRequest`
+    serving an explicit `request_id` — or an auto-repair on the same request — would be handed an
+    EMPTY context. The grace is separate from the operator's window precisely because that one
+    may be 0. Keep `TestPruneAgedRowsBlanksFinishedConsultPayloadsOnItsOwnGrace` /
+    `…SparesAFreshConsultPayload`.
+  - **The newest `kill_events` row survives PER SCOPE, not per node.** `LatestKillEventOn`
+    reads `WHERE node_id = ? AND scope = 'global'`, and the table carries a SECOND stream —
+    the full self-prompting toggles `frontend.recordFSPToggle` writes, including the daemon's
+    own ceiling stand-down. A survivor guard keyed on `MAX(id)` alone therefore deletes a
+    standing global PAUSE the moment any newer FSP row exists: `LatestKillEvent` returns nil,
+    `KillStateActive` reads false, and the herd resumes with nothing logged. That is the exact
+    trap `LatestKillEventOn`'s own scope filter exists for, and it shipped green here because
+    the first version of the test seeded only `global` rows —
+    `TestPruneAgedRowsNeverDeletesTheNewestKillEvent` now seeds an FSP row after the pause,
+    which is the only thing that makes it discriminate (proved by mutation).
+  - **The cutoff is FLOORED at `RowRetentionFloor`, because 0 is a supported setting.** Without
+    it the cutoff is `now`, and a terminal `agent_actions` row is deletable in the same second
+    it is written — while `frontend.AwaitAgentAction` is still polling it for the only outcome
+    signal it can get. Same shape for a terminal `llm_requests` row the MCP server can still
+    resolve by id. It is a SEPARATE constant from `LLMPayloadGrace` at the same value, the way
+    `PruneAuditExcerpts` has `AuditExcerptDedupMargin`: that one bounds a COLUMN blank against a
+    live reader, this one bounds a ROW delete against a poller. Keep
+    `TestPruneAgedRowsFloorsAnAggressiveCutoff` and `TestZeroRowRetentionStillSparesLiveWork`.
+  - Every statement is node-scoped, and each is issued at its OWN call site rather than from a
+    table of queries: `TestEveryNodeOwnedStatementIsNodeScoped` flattens a CALL's SQL argument,
+    so a query reached through a struct field flattens to `" ? "` and the whole sweep falls
+    outside the guard — silently, in the one file where an unscoped DELETE does the most damage.
+    Hoisting the SQL into package consts does NOT fix that; only a direct literal at the call
+    site does. `TestPruneAgedRowsOnlyTouchesThisNode` covers it behaviourally as well.
+    `RowRetentionPort` is a SEPARATE
+    optional interface from `RetentionPort` (a store that can blank a column need not be able to
+    prune rows), so the daemon suite's `failingStore` must forward it — the usual trap.
+    Keep `TestPruneAgedRowsRemovesOnlyFinishedWork` / `…KeepsRecentFinishedWork` /
+    `…NeverDeletesTheNewestKillEvent` / `…KeepsAnUnconfirmedReservation` /
+    `…KeepsACorrectionItsActionStillReferences` / `…RetiresLongDeadRosterRows` /
+    `TestZeroRowRetentionStillSparesLiveWork` / `TestRowRetentionOffKeepsEveryFinishedRow`.
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).

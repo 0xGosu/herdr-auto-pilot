@@ -49,19 +49,18 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 		// listing this daemon made, and retiring them here would empty every
 		// other node's roster on every sweep.
 		rows, err := tx.QueryContext(ctx,
-			`SELECT agent_id, terminal_id, gone_at FROM agent_roster WHERE node_id = ?`, s.self)
+			`SELECT agent_id, pane_id, tab_id, workspace_id, agent_type, status,
+				terminal_id, list_seq, gone_at
+			 FROM agent_roster WHERE node_id = ?`, s.self)
 		if err != nil {
 			return err
 		}
-		type stored struct {
-			terminal string
-			gone     int64
-		}
-		existing := map[string]stored{}
+		existing := map[string]storedRosterRow{}
 		for rows.Next() {
 			var id string
-			var st stored
-			if err := rows.Scan(&id, &st.terminal, &st.gone); err != nil {
+			var st storedRosterRow
+			if err := rows.Scan(&id, &st.paneID, &st.tabID, &st.workspaceID, &st.agentType,
+				&st.status, &st.terminal, &st.listSeq, &st.gone); err != nil {
 				rows.Close()
 				return err
 			}
@@ -74,6 +73,7 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 
 		live := make(map[string]bool, len(agents))
 		var recycled []any
+		recycledIDs := map[string]bool{}
 		for _, a := range agents {
 			live[a.AgentID] = true
 			// A changed terminal is a NEW agent on a recycled id: keep nothing
@@ -83,6 +83,7 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			prev := existing[a.AgentID].terminal
 			if prev != "" && a.TerminalID != "" && prev != a.TerminalID {
 				recycled = append(recycled, a.AgentID)
+				recycledIDs[a.AgentID] = true
 			}
 		}
 		if len(recycled) > 0 {
@@ -93,6 +94,18 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			}
 		}
 		for i, a := range agents {
+			// An agent whose stored row already says exactly what this publish
+			// would write costs nothing. See rosterRowUnchanged: this is the
+			// difference between one write per agent per publish — every two
+			// seconds while a TUI is open — and one only when something moved.
+			//
+			// A RECYCLED id is never skipped: its row was deleted above, so
+			// the values in `existing` describe a row that no longer exists.
+			if !recycledIDs[a.AgentID] {
+				if st, ok := existing[a.AgentID]; ok && rosterRowUnchanged(st, a, i) {
+					continue
+				}
+			}
 			// The publish is the only caller that KNOWS a position: it holds
 			// herdr's whole listing, in order — and the only one entitled to
 			// bring a retired agent back, for the same reason.
@@ -155,6 +168,65 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 		}
 		return s.upsertRosterRow(ctx, tx, a, rosterSeqUnknown, false)
 	})
+}
+
+// storedRosterRow is the part of a published roster row that a publish can
+// change. cwd and seen_at are deliberately absent — see rosterRowUnchanged.
+type storedRosterRow struct {
+	paneID      string
+	tabID       string
+	workspaceID string
+	agentType   string
+	status      string
+	terminal    string
+	listSeq     int
+	gone        int64
+}
+
+// rosterRowUnchanged reports whether upsertRosterRow would write this row back
+// exactly as it already stands, so the publish can skip it.
+//
+// It mirrors that statement's CASE arms field for field, and the two must be
+// changed together — a field added to the UPDATE and not to this comparison is
+// a field that silently stops being published.
+//
+// The publish is what makes this worth doing at all: it runs every two seconds
+// while a TUI is open and rewrites EVERY agent row, and on a settled herd every
+// one of those writes stores what is already there. `seen_at` was the only
+// reason they differed.
+//
+// Three fields are excluded, each for its own reason:
+//
+//   - seen_at advances on every publish by construction, so including it would
+//     make every row dirty forever — the whole point. Not advancing it on a
+//     no-op publish is also more truthful: its one reader outside this package
+//     is the TUI's "Last transition" field, which today reads "now" for an agent
+//     that has not moved in an hour. Roster FRESHNESS is roster_meta.published_at
+//     (domain.RosterFresh), never a per-row seen_at, and the status-rollback
+//     guard in upsertRosterRow only becomes more permissive as a stored seen_at
+//     ages — in the correct direction, since a later event should win.
+//   - cwd and cwd_read_at are never written by a publish: RosterAgentFrom leaves
+//     them zero and the UPDATE's CASE preserves the stored value. SetRosterCwds
+//     owns that column on its own slower TTL.
+//   - gone_at is compared rather than excluded: an authoritative publish clears
+//     it, so a row returning from the dead must be written even when every other
+//     field matches.
+//
+// A terminal id that this listing did not observe is not evidence of a change,
+// matching the CASE arm that preserves the stored one.
+func rosterRowUnchanged(st storedRosterRow, a domain.RosterAgent, seq int) bool {
+	if st.gone != 0 {
+		return false
+	}
+	if st.terminal != a.TerminalID && a.TerminalID != "" {
+		return false
+	}
+	return st.paneID == a.PaneID &&
+		st.tabID == a.TabID &&
+		st.workspaceID == a.WorkspaceID &&
+		st.agentType == a.AgentType &&
+		st.status == a.Status &&
+		st.listSeq == seq
 }
 
 // upsertRosterRow writes one roster row at the listing position seq, or at

@@ -18,13 +18,87 @@ import (
 // real ones are random, this one is not.
 const otherNodeID = "bbbbbbbbbbbbbbbb"
 
-// TestNodeHeartbeatMatchesDaemonHealth pins the constant the domain cannot
-// import: a node reads as stale after three heartbeats, and the heartbeat is
-// daemonhealth's.
-func TestNodeHeartbeatMatchesDaemonHealth(t *testing.T) {
-	if domain.NodeHeartbeat != daemonhealth.HeartbeatInterval {
-		t.Fatalf("domain.NodeHeartbeat = %v, daemonhealth.HeartbeatInterval = %v; keep them equal",
+// TestNodeRowIsWrittenLessOftenThanTheHealthFile pins the split between the two
+// cadences, which is the whole reason maybeUpsertNode exists.
+//
+// They used to be ONE constant, so keeping the health file current to the second
+// meant writing a database row every ten seconds — ungated, always a real change
+// since last_seen differs every time, and under the shared engine one sync push
+// each (the push debounce is shorter than the beat, so nothing coalesced). An
+// install with no agents at all still pushed to Turso Cloud around the clock.
+//
+// The file answers "is this daemon hung" and must be fast; the row answers "is
+// this machine still out there" and no reader asks with more precision than
+// domain.NodeStale. Collapsing them back into one constant restores that cost
+// silently, so this fails rather than letting it happen.
+func TestNodeRowIsWrittenLessOftenThanTheHealthFile(t *testing.T) {
+	if domain.NodeHeartbeat <= daemonhealth.HeartbeatInterval {
+		t.Fatalf("domain.NodeHeartbeat = %v is not slower than daemonhealth.HeartbeatInterval = %v: "+
+			"the nodes row is back to one write per health beat",
 			domain.NodeHeartbeat, daemonhealth.HeartbeatInterval)
+	}
+}
+
+// TestNodeStalenessStaysInsideTheActionBound pins a relationship the type
+// system cannot express: domain cannot import daemon, so domain sets its own
+// staleness window and this asserts it fits inside the action bound.
+//
+// frontend.requireLiveDaemonFor refuses a remote confirm when the target node
+// reads stale, and a confirm is an operator vouching for what is on an agent's
+// SCREEN. actionStaleAfter is how long that vouching stays deliverable. While
+// staleness is the tighter window, a confirm this gate ACCEPTS is one the
+// daemon can still honour. Slowing NodeHeartbeat past a third of the action
+// bound inverts that silently — the gate starts accepting confirms against
+// nodes that went unwatched for longer than the screen's own bound — which is
+// why the heartbeat is 30s rather than the minute the write reduction alone
+// would have preferred.
+func TestNodeStalenessStaysInsideTheActionBound(t *testing.T) {
+	// Three missed beats is domain's nodeStaleAfter, which is unexported.
+	staleAfter := 3 * domain.NodeHeartbeat
+	if staleAfter > actionStaleAfter {
+		t.Fatalf("node staleness (%v) exceeds actionStaleAfter (%v): a remote confirm "+
+			"would be accepted for a node unwatched longer than the screen it vouches for",
+			staleAfter, actionStaleAfter)
+	}
+}
+
+// TestNodeRowIsNotRewrittenOnEveryHealthBeat drives the throttle directly.
+//
+// The first call always writes, so a starting daemon appears in the fleet at
+// once; a call one health beat later must not, and one a full NodeHeartbeat
+// later must.
+func TestNodeRowIsNotRewrittenOnEveryHealthBeat(t *testing.T) {
+	h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
+		o.NodeLabel = "lab-1"
+	})
+	ctx := context.Background()
+	waitFor(t, 2*time.Second, func() bool {
+		nodes, _ := h.raw.ListNodes(ctx)
+		return len(nodes) == 1
+	})
+
+	seen := func() time.Time {
+		nodes, err := h.raw.ListNodes(ctx)
+		if err != nil || len(nodes) != 1 {
+			t.Fatalf("list nodes: %+v %v", nodes, err)
+		}
+		return nodes[0].LastSeen
+	}
+
+	// Start from a known latch, then step the clock by hand.
+	base := time.Now()
+	h.daemon.maybeUpsertNode(base, base)
+	first := seen()
+
+	h.daemon.maybeUpsertNode(base, base.Add(daemonhealth.HeartbeatInterval))
+	if got := seen(); !got.Equal(first) {
+		t.Errorf("last_seen moved after one health beat (%v → %v): the row is written per beat again",
+			first, got)
+	}
+
+	h.daemon.maybeUpsertNode(base, base.Add(domain.NodeHeartbeat+time.Second))
+	if got := seen(); got.Equal(first) {
+		t.Error("last_seen did not move a full NodeHeartbeat later: the node would read as stale while alive")
 	}
 }
 
@@ -51,10 +125,12 @@ func TestDaemonHeartbeatsItsNodeRow(t *testing.T) {
 	if domain.NodeStale(n, time.Now()) {
 		t.Errorf("a daemon that just started reads as stale: %+v", n)
 	}
-	if domain.NodeStale(n, time.Now().Add(time.Minute)) {
-		// sanity: a minute with no heartbeat IS stale
-	} else {
-		t.Error("a node a minute past its last heartbeat must read as stale")
+	// Sanity on the other side: three missed beats IS stale. Expressed in
+	// heartbeats rather than a literal duration, so retuning the cadence
+	// retunes the assertion with it.
+	if !domain.NodeStale(n, time.Now().Add(3*domain.NodeHeartbeat+time.Second)) {
+		t.Errorf("a node three heartbeats (%v) past its last one must read as stale",
+			3*domain.NodeHeartbeat)
 	}
 }
 

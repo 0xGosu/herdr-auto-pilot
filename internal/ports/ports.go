@@ -91,6 +91,20 @@ type RetentionPort interface {
 	Vacuum(ctx context.Context) error
 }
 
+// RowRetentionPort is implemented by stores that can delete their own FINISHED
+// bookkeeping rows. Optional and SEPARATE from RetentionPort on purpose: a
+// store that can blank a column need not be able to prune rows, and growing the
+// existing interface would break every fake that already implements it.
+//
+// PruneAgedRows deletes completed agent actions, resolved consults, processed
+// corrections and retries, superseded kill events, confirmed task reservations
+// and long-retired roster rows older than cutoff, and blanks the payloads of
+// finished consults. It never touches audit_log or decisions, and every
+// exclusion in the implementation is a safety control rather than a nicety.
+type RowRetentionPort interface {
+	PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domain.PruneCounts, error)
+}
+
 // VisiblePaneReader is implemented by Herdr adapters that can read the pane's
 // current on-screen content (as opposed to ReadPane's consuming "recent"
 // delta). Used to recover a standing numbered menu when delivering an
