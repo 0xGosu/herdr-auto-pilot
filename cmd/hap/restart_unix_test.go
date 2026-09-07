@@ -169,7 +169,12 @@ func TestRestartDoesNotFeedTheCrashLoopBreaker(t *testing.T) {
 // refusal; the last one is the control, without which they could all pass
 // vacuously.
 func TestAwaitDaemonHealthOnlyBelievesTheSuccessor(t *testing.T) {
-	// beat writes a health record and returns the paths it lives in.
+	// beat writes a health record and returns the paths it lives in. Callers
+	// pass a timestamp derived from `since` rather than a second time.Now():
+	// the two calls are microseconds apart, After is strict, and macOS's wall
+	// clock is coarse enough that they can land on the SAME instant — which
+	// refused the successor on macOS while passing on Linux, and would also
+	// have made the two refusal cases below pass for the wrong reason.
 	beat := func(t *testing.T, pid int, at time.Time) config.Paths {
 		t.Helper()
 		paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
@@ -196,7 +201,7 @@ func TestAwaitDaemonHealthOnlyBelievesTheSuccessor(t *testing.T) {
 
 	t.Run("the daemon we stopped never counts", func(t *testing.T) {
 		since := time.Now()
-		paths := beat(t, 4242, time.Now())
+		paths := beat(t, 4242, since.Add(time.Second))
 		holdDaemonLock(t, paths, "4242\nv0.8.3\n/usr/local/bin/hap\n")
 		if _, ok := awaitDaemonHealth(paths, 4242, since, 300*time.Millisecond); ok {
 			t.Fatal("the stopped daemon's own final beat was read as its successor")
@@ -209,7 +214,7 @@ func TestAwaitDaemonHealthOnlyBelievesTheSuccessor(t *testing.T) {
 		// kernel drops the flock with the process while the file it wrote
 		// stays on disk.
 		since := time.Now()
-		paths := beat(t, 5150, time.Now())
+		paths := beat(t, 5150, since.Add(time.Second))
 		if pid, ok := awaitDaemonHealth(paths, 0, since, 300*time.Millisecond); ok {
 			t.Fatalf("a dead daemon's last beat was read as healthy (pid %d)", pid)
 		}
@@ -217,7 +222,7 @@ func TestAwaitDaemonHealthOnlyBelievesTheSuccessor(t *testing.T) {
 
 	t.Run("the successor itself is accepted", func(t *testing.T) {
 		since := time.Now()
-		paths := beat(t, 5150, time.Now())
+		paths := beat(t, 5150, since.Add(time.Second))
 		holdDaemonLock(t, paths, "5150\nv0.8.3\n/usr/local/bin/hap\n")
 		pid, ok := awaitDaemonHealth(paths, 0, since, 2*time.Second)
 		if !ok || pid != 5150 {
