@@ -131,8 +131,9 @@ func buildCommands() {
 				"rotating its token, changing node_label or the log level takes effect only in a NEW\n" +
 				"process. Front ends read their store once too, so reopen `hap tui` after a restart.\n\n" +
 				"--restart does not report success on the fork alone: a [database] error exits AFTER the\n" +
-				"new daemon takes the lock, so it waits for a heartbeat and otherwise tells you it could\n" +
-				"not confirm one — run `hap status --stderr` then. It also does not count as a crash: an\n" +
+				"new daemon takes the lock, so it waits for a heartbeat from the process now holding that\n" +
+				"lock. Failing to see one it says so and EXITS NON-ZERO, so `hap daemon --restart && …`\n" +
+				"never proceeds on an unknown — run `hap status --stderr` then. It also does not count as a crash: an\n" +
 				"operator restarting repeatedly while getting a setting right would otherwise trip the\n" +
 				"crash-loop breaker, which auto-disables semantic matching. A breaker that has already\n" +
 				"given up still refuses the start, naming the [embedding] change that clears it.",

@@ -737,7 +737,13 @@ func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, st
 		fmt.Fprintf(out, "started a replacement, but it has not reported healthy within %s.\n", restartConfirmWait)
 		fmt.Fprintln(out, "Run `hap status` (add --stderr if it died) — a [database] error exits after the")
 		fmt.Fprintln(out, "daemon has taken the lock, so a failed switch looks exactly like a slow start.")
-		return nil
+		// Non-zero, because `hap daemon --restart && <next step>` must not
+		// proceed on an unknown: this command's contract is that it confirms,
+		// and the herd may now have no monitor at all — it stopped one to get
+		// here. ErrUnhealthy is the repo's sentinel for "the human detail is
+		// already printed", so main exits 1 without an "error:" line restating
+		// it.
+		return cli.ErrUnhealthy
 	}
 	fmt.Fprintf(out, "started a fresh daemon (pid %d) and it is reporting healthy\n", pid)
 	return nil
@@ -746,9 +752,10 @@ func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, st
 // awaitDaemonHealth polls for a heartbeat published AFTER since — the instant
 // the successor was started — and returns the pid that published it.
 //
-// Both conditions are load-bearing, and each closes a way of reading a LEFTOVER
-// record as the successor coming up, which would report "healthy" for a daemon
-// that in fact died on the [database] error this whole wait exists to catch:
+// All three conditions are load-bearing, and each closes a way of reading a
+// record that is NOT the successor's as evidence it came up — which would
+// report "healthy" for a daemon that in fact died on the [database] error this
+// whole wait exists to catch:
 //
 //   - The old daemon removes its health file on a clean shutdown, but only
 //     best-effort, so the pid it was killed with is excluded outright.
@@ -758,11 +765,16 @@ func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, st
 //     (daemonhealth.StaleAfter is 35s, so a daemon that died seconds ago still
 //     reads fresh); the honest question is whether the beat was written after
 //     we started something, which no leftover can satisfy.
+//   - And the beat must come from the process still HOLDING THE LOCK. The two
+//     above are both satisfied by a successor that published one heartbeat and
+//     then died — inside this very poll — and the flock is the only evidence
+//     here that the kernel retracts when a process dies, rather than leaving
+//     behind on disk.
 func awaitDaemonHealth(paths config.Paths, stoppedPID int, since time.Time, timeout time.Duration) (int, bool) {
 	deadline := time.Now().Add(timeout)
 	for {
 		if h, ok := daemonhealth.Read(paths.StateDir); ok && h.PID > 0 && h.PID != stoppedPID &&
-			h.HeartbeatAt.After(since) {
+			h.HeartbeatAt.After(since) && holdsTheLock(paths, h.PID) {
 			return h.PID, true
 		}
 		if time.Now().After(deadline) {
@@ -770,6 +782,14 @@ func awaitDaemonHealth(paths config.Paths, stoppedPID int, since time.Time, time
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// holdsTheLock reports whether pid is the daemon currently holding the state
+// dir's lock. Info answers from the flock itself, so a pid that has exited
+// reads as not running however recent its last heartbeat.
+func holdsTheLock(paths config.Paths, pid int) bool {
+	running, holder, _ := daemonlock.Info(paths)
+	return running && holder == pid
 }
 
 // forgetRestartBoots drops the crash-loop breaker's BOOT HISTORY — never a

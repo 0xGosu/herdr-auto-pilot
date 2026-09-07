@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
@@ -101,8 +103,12 @@ func TestRestartReportsWhatItActuallyDid(t *testing.T) {
 			func(int) error { release(); return nil },
 			func() error { return nil },
 			func(int, time.Time) (int, bool) { return 0, false })
-		if err != nil {
-			t.Fatalf("restartWith: %v", err)
+		// Non-zero exit, or `hap daemon --restart && <next step>` proceeds on
+		// an unknown — with the herd possibly left unmonitored, since a daemon
+		// was stopped to get here. The sentinel is what suppresses a redundant
+		// "error:" line over the diagnostic below.
+		if !errors.Is(err, cli.ErrUnhealthy) {
+			t.Fatalf("restartWith = %v, want cli.ErrUnhealthy so the process exits non-zero", err)
 		}
 		if strings.Contains(out.String(), "reporting healthy") {
 			t.Fatalf("an unconfirmed start must not read as healthy, got:\n%s", out.String())
@@ -153,49 +159,69 @@ func TestRestartDoesNotFeedTheCrashLoopBreaker(t *testing.T) {
 	}
 }
 
-// TestAwaitDaemonHealthIgnoresALeftoverRecord is the guard the whole
+// TestAwaitDaemonHealthOnlyBelievesTheSuccessor is the guard the whole
 // confirmation rests on. Reading somebody else's heartbeat as the successor's
 // is not a cosmetic slip: it restores the exact false success --restart exists
 // to remove, reporting "healthy" for a daemon that died on the [database]
-// error, and it reports it from the command that just stopped a working one.
+// error — from the command that just stopped a working one.
 //
-// The pid check alone does not close it, which is why the freshness test is
-// against the restart's own start instant rather than an age: a daemon killed
-// hard seconds ago — or, when nothing was running, any daemon that ever ran
-// here — leaves a record with a different pid that still looks recent.
-func TestAwaitDaemonHealthIgnoresALeftoverRecord(t *testing.T) {
-	paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
-	since := time.Now()
-
-	// A record from a hard-killed predecessor: different pid, written moments
-	// BEFORE this restart, and well inside daemonhealth.StaleAfter.
-	if err := daemonhealth.Write(paths.StateDir, daemonhealth.Health{
-		PID: 1234, Version: "v0.8.3", HeartbeatAt: since.Add(-2 * time.Second),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if pid, ok := awaitDaemonHealth(paths, 0, since, 300*time.Millisecond); ok {
-		t.Fatalf("a leftover heartbeat was read as the successor (pid %d)", pid)
+// Each subtest removes one of the three conditions' evidence and expects a
+// refusal; the last one is the control, without which they could all pass
+// vacuously.
+func TestAwaitDaemonHealthOnlyBelievesTheSuccessor(t *testing.T) {
+	// beat writes a health record and returns the paths it lives in.
+	beat := func(t *testing.T, pid int, at time.Time) config.Paths {
+		t.Helper()
+		paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
+		if err := daemonhealth.Write(paths.StateDir, daemonhealth.Health{
+			PID: pid, Version: "v0.8.3", HeartbeatAt: at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return paths
 	}
 
-	// The successor's own beat, published after the start, is accepted.
-	if err := daemonhealth.Write(paths.StateDir, daemonhealth.Health{
-		PID: 5150, Version: "v0.8.3", HeartbeatAt: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	pid, ok := awaitDaemonHealth(paths, 0, since, 2*time.Second)
-	if !ok || pid != 5150 {
-		t.Fatalf("awaitDaemonHealth = (%d, %v), want the successor's pid — the control that keeps the case above from passing vacuously", pid, ok)
-	}
+	t.Run("a record older than the start is a leftover", func(t *testing.T) {
+		// A hard-killed predecessor: different pid, written seconds BEFORE the
+		// restart and well inside daemonhealth.StaleAfter, so an age test
+		// would wave it through. stoppedPID is 0 here — nothing was running —
+		// which is what makes the pid check alone useless.
+		since := time.Now()
+		paths := beat(t, 1234, since.Add(-2*time.Second))
+		holdDaemonLock(t, paths, "1234\nv0.8.3\n/usr/local/bin/hap\n")
+		if pid, ok := awaitDaemonHealth(paths, 0, since, 300*time.Millisecond); ok {
+			t.Fatalf("a leftover heartbeat was read as the successor (pid %d)", pid)
+		}
+	})
 
-	// The pid we just stopped never counts, however fresh its last beat.
-	if err := daemonhealth.Write(paths.StateDir, daemonhealth.Health{
-		PID: 4242, Version: "v0.8.3", HeartbeatAt: time.Now(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := awaitDaemonHealth(paths, 4242, since, 300*time.Millisecond); ok {
-		t.Fatal("the stopped daemon's own final beat was read as its successor")
-	}
+	t.Run("the daemon we stopped never counts", func(t *testing.T) {
+		since := time.Now()
+		paths := beat(t, 4242, time.Now())
+		holdDaemonLock(t, paths, "4242\nv0.8.3\n/usr/local/bin/hap\n")
+		if _, ok := awaitDaemonHealth(paths, 4242, since, 300*time.Millisecond); ok {
+			t.Fatal("the stopped daemon's own final beat was read as its successor")
+		}
+	})
+
+	t.Run("a beat from a process that no longer holds the lock", func(t *testing.T) {
+		// The successor published one heartbeat and then died — fresh, after
+		// the start, right pid. Only the lock says it is gone, because the
+		// kernel drops the flock with the process while the file it wrote
+		// stays on disk.
+		since := time.Now()
+		paths := beat(t, 5150, time.Now())
+		if pid, ok := awaitDaemonHealth(paths, 0, since, 300*time.Millisecond); ok {
+			t.Fatalf("a dead daemon's last beat was read as healthy (pid %d)", pid)
+		}
+	})
+
+	t.Run("the successor itself is accepted", func(t *testing.T) {
+		since := time.Now()
+		paths := beat(t, 5150, time.Now())
+		holdDaemonLock(t, paths, "5150\nv0.8.3\n/usr/local/bin/hap\n")
+		pid, ok := awaitDaemonHealth(paths, 0, since, 2*time.Second)
+		if !ok || pid != 5150 {
+			t.Fatalf("awaitDaemonHealth = (%d, %v), want the successor's pid — without this the refusals above prove nothing", pid, ok)
+		}
+	})
 }

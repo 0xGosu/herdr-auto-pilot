@@ -27,10 +27,11 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
-// ErrUnhealthy signals that `hap status` found the daemon in an unhealthy
-// state (hung — a held lock with a stale heartbeat). status prints the human
-// detail itself; main maps this sentinel to a non-zero exit WITHOUT an
-// "error:" prefix, so scripted health checks can detect it.
+// ErrUnhealthy signals that the daemon is not in a state the caller asked for:
+// `hap status` found it hung (a held lock with a stale heartbeat), or
+// `hap daemon --restart` could not confirm the daemon it started. Both print
+// the human detail themselves; main maps this sentinel to a non-zero exit
+// WITHOUT an "error:" prefix, so scripted health checks can detect it.
 var ErrUnhealthy = errors.New("daemon unhealthy")
 
 // deprecationOut is where the "this verb moved" note goes. It is stderr rather
