@@ -2224,6 +2224,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "logging.level", TUIEditable: true},
 	{Key: "logging.max_size_mb", TUIEditable: true},
 	{Key: "logging.audit_excerpt_retention_days", TUIEditable: true},
+	{Key: "logging.row_retention_days", TUIEditable: true},
 	{Key: "tui.max_content_width", TUIEditable: true},
 	{Key: "tui.max_content_height", TUIEditable: true},
 	{Key: "tui.theme", TUIEditable: true},
@@ -2429,6 +2430,19 @@ func FieldValue(cfg config.Config, key string) string {
 			return fmt.Sprintf("%d (never prune)", d)
 		case d == 0:
 			return "0 (keep no excerpts)"
+		default:
+			return strconv.Itoa(d)
+		}
+	case "logging.row_retention_days":
+		// Same three answers as its neighbour above, for the same reason.
+		if cfg.Logging.RowRetentionDays == nil {
+			return fmt.Sprintf("%d (default)", config.DefaultRowRetentionDays)
+		}
+		switch d := *cfg.Logging.RowRetentionDays; {
+		case d < 0:
+			return fmt.Sprintf("%d (never prune)", d)
+		case d == 0:
+			return "0 (keep no finished rows)"
 		default:
 			return strconv.Itoa(d)
 		}
@@ -3007,6 +3021,17 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 					"(0 = keep no excerpts, negative = never prune), got %q", value)
 			}
 			cfg.Logging.AuditExcerptRetentionDays = &v
+			return nil
+		case "logging.row_retention_days":
+			// A pointer for the same reason, with the same three meanings: 0
+			// keeps no finished rows, negative never prunes, and removing the
+			// key is what restores the default.
+			v, err := strconv.Atoi(value)
+			if err != nil {
+				return fmt.Errorf("logging.row_retention_days must be an integer "+
+					"(0 = keep no finished rows, negative = never prune), got %q", value)
+			}
+			cfg.Logging.RowRetentionDays = &v
 			return nil
 		case "tui.max_instances":
 			// 0 is "no limit" here, not "restore the default" — the default
