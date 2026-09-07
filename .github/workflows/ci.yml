@@ -1,9 +1,10 @@
 name: CI
 
+# PRs only, deliberately. Every commit that lands on main arrived through a PR
+# that ran this workflow on the same tree, so a push trigger only re-runs it —
+# and main is still never released unverified, because release.yml runs its own
+# full `gate` job on the tag before a single asset is built.
 on:
-  push:
-    branches: [main]
-    tags-ignore: ['**']
   pull_request:
 
 permissions:
@@ -17,8 +18,19 @@ jobs:
   # submodules, no CGO toolchain and no native libraries. Split out of the lint
   # job so a formatting mistake is reported in seconds instead of waiting on
   # (and being maskable by) a ~2min FAISS/llama build.
+  #
+  # Every job carries the same `release/bump-v` guard. That branch is minted by
+  # auto-release.yml and carries nothing but the manifest version bump and the
+  # changelog fragments folded into CHANGELOG.md — there is no code to check, and
+  # the FAISS/llama build plus the two-OS matrix and the race detector cost ~15
+  # minutes of every release for no signal. GitHub cannot filter a pull_request
+  # trigger by HEAD branch (on.pull_request.branches filters the BASE), so the
+  # guard has to be repeated per job. Skipping rather than passing is safe here:
+  # auto-release merges that PR with `gh pr merge --squash --admin`, which
+  # bypasses required status checks, so a skipped job cannot wedge the release.
   format:
     name: Format (gofmt)
+    if: ${{ !startsWith(github.head_ref, 'release/bump-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +52,7 @@ jobs:
   # the CGO code most worth linting.
   lint:
     name: Lint (go vet, golangci-lint)
+    if: ${{ !startsWith(github.head_ref, 'release/bump-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +91,7 @@ jobs:
 
   test:
     name: Tests (${{ matrix.os }})
+    if: ${{ !startsWith(github.head_ref, 'release/bump-v') }}
     strategy:
       matrix:
         # One linux and one macos runner; CGO makes cross-compile checks
@@ -150,6 +164,7 @@ jobs:
 
   corpus-gate:
     name: Allowlist corpus regression gate (NFR-005a)
+    if: ${{ !startsWith(github.head_ref, 'release/bump-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -171,8 +186,11 @@ jobs:
     name: Changelog fragment present
     # Only PRs: a push to main is a merge whose fragment already landed, and
     # the release path deletes fragments, so requiring one there would fail
-    # every bump commit.
-    if: github.event_name == 'pull_request'
+    # every bump commit. The workflow no longer runs on push at all, but the
+    # condition stays as the statement of intent — and it is ANDed with the
+    # bump-branch guard rather than written as a second `if:`, since a job
+    # takes exactly one.
+    if: ${{ github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release/bump-v') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
