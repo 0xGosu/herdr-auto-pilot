@@ -33,6 +33,21 @@ const (
 	// salient text. Daemons predating this kind log and ignore it — the
 	// stale-daemon remedy (`hap daemon --ensure`) applies.
 	KindReembed Kind = "reembed"
+	// KindFleetPush asks the daemon to push the shared database NOW rather
+	// than on the sync loop's write debounce.
+	//
+	// It is the ONE nudge that is not about this node's own queues, and it
+	// deliberately drains none of them: it is filed by a front end that has
+	// just written a row for ANOTHER machine's agent, so every local drain
+	// would be guaranteed to find nothing (they are all node-scoped) while
+	// the attention reconcile a reload carries would re-drive this herd's
+	// parked episodes. A keypress that moves someone else's view must not be
+	// able to raise an escalation here.
+	//
+	// A no-op under the local engine (nothing syncs) and on daemons predating
+	// the kind, which log and ignore it — in both cases the row still travels
+	// on the ordinary debounce, so the cost of a miss is latency only.
+	KindFleetPush Kind = "fleet-push"
 )
 
 // ListenSocket creates an owner-only unix socket at path, removing a stale one
@@ -40,7 +55,8 @@ const (
 func ListenSocket(path string) (net.Listener, error) { return listen(path) }
 
 func validKind(kind Kind) bool {
-	return kind == KindReload || kind == KindWake || kind == KindReembed
+	return kind == KindReload || kind == KindWake || kind == KindReembed ||
+		kind == KindFleetPush
 }
 
 type message struct {

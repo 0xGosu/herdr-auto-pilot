@@ -339,6 +339,13 @@ type Daemon struct {
 	// the channel itself (FleetSync set, SyncEvents nil).
 	syncEvents chan struct{}
 
+	// fleetPushNow carries a control.KindFleetPush nudge to the sync loop,
+	// which pushes at once instead of arming the write debounce. Created only
+	// when FleetSync is set — under the local engine no loop drains it, and a
+	// buffered channel nobody reads would fill on the first nudge and stay
+	// full for the life of the process.
+	fleetPushNow chan struct{}
+
 	// toggleAttempt records, per agent, the signature of the multi-select form
 	// this daemon last started answering — the evidence that lets a later
 	// delivery accept a tab whose boxes are ALREADY ticked. Without it,
@@ -616,8 +623,13 @@ func New(opt Options) (*Daemon, error) {
 		syncEvents = make(chan struct{}, 1)
 		opt.SyncEvents = syncEvents
 	}
+	var fleetPushNow chan struct{}
+	if opt.FleetSync != nil {
+		fleetPushNow = make(chan struct{}, 1)
+	}
 	d := &Daemon{
 		syncEvents:                syncEvents,
+		fleetPushNow:              fleetPushNow,
 		opt:                       opt,
 		taskSnapshots:             map[string]taskSnapshot{},
 		taskReclaimResults:        make(chan taskReclaimOutcome, 32),
@@ -1427,6 +1439,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case kind := <-d.nudges:
 			logging.Guard("nudge", func() error {
 				switch kind {
+				case control.KindFleetPush:
+					// Returns WITHOUT draining anything, and the early return
+					// is the point rather than an optimization — see
+					// control.KindFleetPush. A nil channel is the local
+					// engine, where there is nothing to push.
+					if d.fleetPushNow != nil {
+						select {
+						case d.fleetPushNow <- struct{}{}:
+						default: // one pending push already covers this row
+						}
+					}
+					return nil
 				case control.KindReload:
 					d.reload()
 				case control.KindReembed:

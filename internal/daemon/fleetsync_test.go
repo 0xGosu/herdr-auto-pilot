@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
@@ -101,6 +102,62 @@ func TestFleetSyncPushesAfterAWriteOnce(t *testing.T) {
 	time.Sleep(fleetPushDebounce)
 	if got := sync.pushes.Load(); got != 1 {
 		t.Fatalf("pushes = %d, want exactly one for a burst of writes", got)
+	}
+}
+
+// TestFleetPushNudgePushesAheadOfTheDebounce: a KindFleetPush nudge — filed by
+// a front end that just queued a focus for ANOTHER node's agent — pushes at
+// once instead of waiting out the write debounce, drops the timer that write
+// already armed, and drains none of this node's own queues.
+//
+// The last clause is the one that discriminates: a version of this that fell
+// through to the ordinary nudge handling would still push, and would still
+// pass a test that only counted pushes. What it would also do is run every
+// node-scoped drain (which can only find nothing for a row filed elsewhere)
+// and the attention reconcile, which re-drives this herd's parked episodes —
+// so a keypress moving somebody else's view could raise an escalation here.
+func TestFleetPushNudgePushesAheadOfTheDebounce(t *testing.T) {
+	sync := &fakeFleetSync{}
+	writes := make(chan struct{}, 1)
+	var counting *countingActionStore
+	h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{},
+		func(inner ports.StorePort) ports.StorePort {
+			counting = &countingActionStore{StorePort: inner}
+			return counting
+		},
+		func(o *Options) {
+			o.FleetSync = sync
+			o.FleetSyncInterval = time.Hour // no pulls: every push here is the nudge's
+			o.FleetWrites = writes
+		})
+	if h.daemon.fleetPushNow == nil {
+		t.Fatal("New must create the fleet-push channel when a FleetSync is wired")
+	}
+	// Let the startup drain settle so the count below is the nudge's alone.
+	waitFor(t, 2*time.Second, func() bool { return counting.pending.Load() >= 1 })
+	time.Sleep(50 * time.Millisecond)
+	before := counting.pending.Load()
+
+	// The row's own commit arms the 2s debounce, exactly as production does.
+	writes <- struct{}{}
+	if err := control.Nudge(context.Background(), h.ctlPath, control.KindFleetPush); err != nil {
+		t.Fatal(err)
+	}
+	// Comfortably inside fleetPushDebounce: a push seen here cannot be the
+	// armed timer's.
+	waitFor(t, fleetPushDebounce-time.Second, func() bool { return sync.pushes.Load() >= 1 })
+	if sync.pushes.Load() == 0 {
+		t.Fatal("the fleet-push nudge did not push ahead of the write debounce")
+	}
+	// Past the window the write's timer would have fired in: the nudge's push
+	// carried that write, so the timer must have been dropped.
+	time.Sleep(fleetPushDebounce + 500*time.Millisecond)
+	if got := sync.pushes.Load(); got != 1 {
+		t.Errorf("pushes = %d, want exactly one — the armed debounce timer was not cleared", got)
+	}
+	if got := counting.pending.Load(); got != before {
+		t.Errorf("the fleet-push nudge drained the local action queue %d times; it must drain nothing",
+			got-before)
 	}
 }
 

@@ -2884,12 +2884,39 @@ func TestRetryLLMGateIsKeyedByNode(t *testing.T) {
 	}
 }
 
-// TestFocusRefusesARemoteEscalation: `f` on another node's escalation must not
-// focus the local pane that happens to share its agent id.
-func TestFocusRefusesARemoteEscalation(t *testing.T) {
+// TestFocusOfARemoteEscalationTargetsThatNodesPane: `f` on another node's
+// escalation must never focus the local pane that happens to share its agent
+// id — and it must still focus SOMETHING.
+//
+// This case used to be answered by refusing outright ("focus is local-only"),
+// which satisfied the first half by giving up on the second. The pair is now
+// resolved together: the escalation's (node, agent) names the remote agent's
+// own coordinates, and the request is queued for THAT machine's daemon.
+//
+// The local namesake is the whole fixture. Both a fixed and a node-blind build
+// queue a focus here; only the tab id says which agent it was aimed at.
+func TestFocusOfARemoteEscalationTargetsThatNodesPane(t *testing.T) {
 	m, st, app, _ := retryAppModel(t)
 	ctx := context.Background()
-	_, remoteID := remoteRetryableEscalation(t, app)
+	remoteNode, remoteID := remoteRetryableEscalation(t, app)
+	// That node has to publish where its agent IS, or nothing on this machine
+	// knows which pane the escalation is about.
+	other, err := store.OpenAs(filepath.Join(filepath.Dir(app.ConfigPath), "t.db"), remoteNode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	// The fleet block is skipped below two nodes, so this machine has to be on
+	// the record as well before any remote agent is resolved at all.
+	if err := st.UpsertNode(ctx, domain.NodeInfo{Label: "here", LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.PublishRoster(ctx, []domain.RosterAgent{{
+		AgentID: "w1:pA", PaneID: "w1:pA", TabID: "remote-t9",
+		AgentType: "claude", Status: "idle", SeenAt: time.Now(),
+	}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	upd, _ := m.Update(refreshData(ctx, app))
 	m = upd.(Model)
 	m.tab = tabEscalations
@@ -2900,13 +2927,22 @@ func TestFocusRefusesARemoteEscalation(t *testing.T) {
 	m = selectEscalation(t, m, remoteID)
 	upd, cmd := m.Update(pressKeyMsg("f"))
 	m = upd.(Model)
-	if cmd != nil {
-		t.Error("focus of a remote escalation must issue no command")
+	if cmd == nil {
+		t.Fatalf("focus of a remote escalation issued no command; it was refused with %q", m.message)
 	}
-	if !strings.Contains(m.message, "local-only") || !strings.Contains(m.message, "laptop") {
-		t.Errorf("message = %q, want the local-only refusal naming the node", m.message)
-	}
+	cmd() // the queue write happens in the command, not the keypress
+
+	// PendingAgentActions is node-scoped, so these two reads are the assertion:
+	// nothing filed for this machine, exactly one filed for the other.
 	if got := queuedFocuses(t, st); len(got) != 0 {
 		t.Errorf("a focus was queued for the local namesake: %+v", got)
+	}
+	got := queuedFocuses(t, other)
+	if len(got) != 1 {
+		t.Fatalf("the owning node's queue = %+v, want one focus", got)
+	}
+	if got[0].tabID != "remote-t9" {
+		t.Errorf("focus aimed at tab %q, want remote-t9 — the LOCAL namesake's coordinates were used",
+			got[0].tabID)
 	}
 }
