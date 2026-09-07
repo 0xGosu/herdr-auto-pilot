@@ -8,6 +8,16 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.8.8
+
+- Fixed the TUI Audit tab and `hap audit` labelling another machine's rows with a local
+  agent's name: a herdr pane id repeats on every node sharing the store, so audit rows
+  now resolve the same `name@node` identity the Escalations tab already used — and an
+  audit row from another node no longer borrows a local agent's type
+- Added an `agent=` column to `hap audit`, which never had one; it is appended beside
+  `node=` so nothing parsing the existing tab-separated fields moves
+- Added the node to an audit/escalation detail view when the row came from another machine
+
 ## 0.8.7
 
 - Fixed `agent_roster` growing without bound: retired agents' rows are now deleted on the existing `[logging] row_retention_days` window, with a compact permanent tombstone left behind so a late transition cannot bring a dead agent back live
