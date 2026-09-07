@@ -969,6 +969,15 @@ whose manifest carries exactly that version).
 - **Retention has TWO windows, and the exemptions are the safety control** —
   `PruneAuditExcerpts` blanks one COLUMN (`[logging] audit_excerpt_retention_days`);
   `PruneAgedRows` deletes finished bookkeeping ROWS (`[logging] row_retention_days`, default 30).
+  **`agent_roster` is deliberately NOT swept, and the reason is a real trap**: a retired row is a
+  TOMBSTONE, not dead weight. `upsertRosterRow`'s INSERT arm hardcodes `gone_at = 0` and only its
+  ON CONFLICT arm honours `authoritative`, so the surviving row is the ONLY thing stopping a
+  non-authoritative EVENT from taking the insert path and reviving an agent herdr no longer
+  reports — its own doc comment says so ("its row does not exist yet, so the INSERT applies and
+  gone_at starts at 0"). Deleting aged `gone_at` rows therefore resurrects the agent on the next
+  late event, and `LiveRoster` hands a dead agent to the idle poll and `hap task send` until the
+  next authoritative publish re-retires it. Bounding the table needs a durable tombstone or an
+  event-age/terminal-generation check in `UpsertRosterAgent`, not a delete.
   Both run on the daemon's one daily throttle and one background goroutine, and the THROTTLE is
   taken before either config is read so switching one off cannot change the other's cadence; the
   `VACUUM` runs once at the end, because deleting rows — like blanking a column — only moves
@@ -1029,7 +1038,7 @@ whose manifest carries exactly that version).
     prune rows), so the daemon suite's `failingStore` must forward it — the usual trap.
     Keep `TestPruneAgedRowsRemovesOnlyFinishedWork` / `…KeepsRecentFinishedWork` /
     `…NeverDeletesTheNewestKillEvent` / `…KeepsAnUnconfirmedReservation` /
-    `…KeepsACorrectionItsActionStillReferences` / `…RetiresLongDeadRosterRows` /
+    `…KeepsACorrectionItsActionStillReferences` / `…FloorsAnAggressiveCutoff` /
     `TestZeroRowRetentionStillSparesLiveWork` / `TestRowRetentionOffKeepsEveryFinishedRow`.
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels

@@ -50,18 +50,8 @@ const LLMPayloadGrace = time.Hour
 // against a poller. Retuning either must not silently retune the other.
 const RowRetentionFloor = time.Hour
 
-// RosterGoneRetention is how long a retired agent_roster row is kept after the
-// publish that marked it gone.
-//
-// Retirement is a SOFT delete because herdr recycles pane ids and a row whose
-// terminal changed must replace rather than merge (see PublishRoster). Once the
-// row is older than any reader's freshness window nothing consults it again,
-// and keeping it forever is what made the table grow with pane churn rather
-// than with herd size. Comfortably past domain.RosterStaleAfter.
-const RosterGoneRetention = time.Hour
-
-// PruneAgedRows deletes FINISHED bookkeeping rows older than cutoff, blanks the
-// payloads of finished consults, and retires long-dead roster rows.
+// PruneAgedRows deletes FINISHED bookkeeping rows older than cutoff and blanks
+// the payloads of finished consults.
 //
 // It is the row-level twin of PruneAuditExcerpts, and it follows the same
 // doctrine: the exemptions are the safety control, and every one of them is a
@@ -123,7 +113,6 @@ func (s *Store) PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domai
 	}
 	at := unix(cutoff)
 	payloadAt := unix(now.Add(-LLMPayloadGrace))
-	rosterAt := unix(now.Add(-RosterGoneRetention))
 
 	// count runs one statement and adds its row count to dst, naming the table
 	// in any error.
@@ -201,17 +190,6 @@ func (s *Store) PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domai
 		  WHERE node_id = ? AND confirmed_at != 0 AND confirmed_at < ?`,
 		s.self, at)
 	if err := count("task_reservations", &c.TaskReservations, res, err); err != nil {
-		return c, err
-	}
-
-	// Retired roster rows run on their OWN short window, not the operator's:
-	// nothing reads a row this old, and the table otherwise grows with pane
-	// churn rather than with herd size.
-	res, err = s.db.ExecContext(ctx,
-		`DELETE FROM agent_roster
-		  WHERE node_id = ? AND gone_at != 0 AND gone_at < ?`,
-		s.self, rosterAt)
-	if err := count("agent_roster", &c.RosterRows, res, err); err != nil {
 		return c, err
 	}
 

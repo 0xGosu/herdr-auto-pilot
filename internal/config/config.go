@@ -1328,7 +1328,7 @@ type Logging struct {
 	// RowRetentionDays is how many days a FINISHED bookkeeping row is kept
 	// before the sweep deletes it outright: completed agent actions, resolved
 	// LLM requests and decisions, processed corrections and retries, superseded
-	// kill events, retired roster rows and confirmed task reservations.
+	// kill events and confirmed task reservations.
 	//
 	// It is the row-level twin of AuditExcerptRetentionDays and takes the same
 	// three cases, for the same reasons:
@@ -1345,12 +1345,6 @@ type Logging struct {
 	// audit_log rows are excluded outright so `hap audit` history stays whole.
 	// The cutoff is also floored at store.RowRetentionFloor, so even 0 cannot
 	// delete a row a live poller is still reading.
-	//
-	// Note that a negative value switches off the WHOLE sweep, including the
-	// retirement of long-dead agent_roster rows — which run on their own short
-	// window and have nothing to do with audit lineage. An operator turning
-	// this off to keep history forever also keeps every retired roster row, so
-	// that table resumes growing with pane churn.
 	RowRetentionDays *int `toml:"row_retention_days,omitempty"`
 }
 

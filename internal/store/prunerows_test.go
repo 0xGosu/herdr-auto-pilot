@@ -363,38 +363,6 @@ func TestPruneAgedRowsSparesAFreshConsultPayload(t *testing.T) {
 	}
 }
 
-// TestPruneAgedRowsRetiresLongDeadRosterRows covers the soft-deleted half of
-// agent_roster: retirement is a soft delete because herdr recycles pane ids, so
-// without this the table grows with pane churn rather than with herd size.
-func TestPruneAgedRowsRetiresLongDeadRosterRows(t *testing.T) {
-	s, _ := openTestStore(t)
-	ctx := context.Background()
-	now := time.Now()
-
-	live := []domain.RosterAgent{
-		{AgentID: "pane-1", PaneID: "pane-1", AgentType: "claude", Status: "idle", SeenAt: now},
-		{AgentID: "pane-2", PaneID: "pane-2", AgentType: "claude", Status: "idle", SeenAt: now},
-	}
-	if err := s.PublishRoster(ctx, live, now.Add(-2*RosterGoneRetention)); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	// pane-2 vanishes: marked gone at a time well past the retention window.
-	if err := s.PublishRoster(ctx, live[:1], now.Add(-2*RosterGoneRetention)); err != nil {
-		t.Fatalf("republish: %v", err)
-	}
-
-	counts, err := s.PruneAgedRows(ctx, now, now.Add(-30*24*time.Hour))
-	if err != nil {
-		t.Fatalf("prune: %v", err)
-	}
-	if counts.RosterRows != 1 {
-		t.Errorf("pruned %d roster rows, want 1", counts.RosterRows)
-	}
-	if left := countRows(t, s, "agent_roster"); left != 1 {
-		t.Errorf("%d roster rows left, want 1 (the live agent)", left)
-	}
-}
-
 // TestPruneAgedRowsOnlyTouchesThisNode proves the node scope behaviourally, as
 // the AST test cannot: another machine's daemon owns its rows and is running
 // this same sweep against them.

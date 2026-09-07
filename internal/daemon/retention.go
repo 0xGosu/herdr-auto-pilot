@@ -147,7 +147,7 @@ func (d *Daemon) pruneAgedRows(ctx context.Context, now time.Time) bool {
 		"agent_actions", counts.AgentActions, "llm_requests", counts.LLMRequests,
 		"llm_decisions", counts.LLMDecisions, "corrections", counts.Corrections,
 		"llm_retries", counts.LLMRetries, "kill_events", counts.KillEvents,
-		"task_reservations", counts.TaskReservations, "roster_rows", counts.RosterRows,
+		"task_reservations", counts.TaskReservations,
 		"blanked_consult_payloads", counts.BlankedPayloads)
 	return true
 }

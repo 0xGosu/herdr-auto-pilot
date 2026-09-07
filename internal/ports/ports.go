@@ -97,10 +97,10 @@ type RetentionPort interface {
 // existing interface would break every fake that already implements it.
 //
 // PruneAgedRows deletes completed agent actions, resolved consults, processed
-// corrections and retries, superseded kill events, confirmed task reservations
-// and long-retired roster rows older than cutoff, and blanks the payloads of
-// finished consults. It never touches audit_log or decisions, and every
-// exclusion in the implementation is a safety control rather than a nicety.
+// corrections and retries, superseded kill events and confirmed task
+// reservations older than cutoff, and blanks the payloads of finished
+// consults. It never touches audit_log or decisions, and every exclusion in
+// the implementation is a safety control rather than a nicety.
 type RowRetentionPort interface {
 	PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domain.PruneCounts, error)
 }
