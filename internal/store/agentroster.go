@@ -210,10 +210,10 @@ func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) err
 		default:
 			// A different, known terminal on the same pane id: a new agent,
 			// not the retired one. Drop the tombstone rather than merely
-			// stepping past it — PublishRoster writes tombstones with INSERT
-			// OR IGNORE keyed on (node_id, agent_id), so a stale one left here
-			// would keep the OLD terminal at this agent's own retirement and
-			// silently stop discriminating.
+			// stepping past it — PublishRoster upserts tombstones on
+			// (node_id, agent_id), so a stale one left here would keep the OLD
+			// terminal at this agent's own retirement and silently stop
+			// discriminating.
 			if _, err := tx.ExecContext(ctx,
 				`DELETE FROM agent_roster_tombstones WHERE node_id = ? AND agent_id = ?`,
 				s.self, a.AgentID); err != nil {
