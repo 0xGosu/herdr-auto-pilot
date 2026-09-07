@@ -13,6 +13,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 )
 
 // holdDaemonLock simulates a running daemon: content in the lock file plus a
@@ -60,7 +61,7 @@ func TestRestartReportsWhatItActuallyDid(t *testing.T) {
 		err := restartWith(paths, &out,
 			func(int) error { release(); return nil }, // a stopped daemon frees the lock
 			func() error { started++; return nil },
-			func(int) (int, bool) { return 5150, true })
+			func(int, time.Time) (int, bool) { return 5150, true })
 		if err != nil {
 			t.Fatalf("restartWith: %v", err)
 		}
@@ -80,7 +81,7 @@ func TestRestartReportsWhatItActuallyDid(t *testing.T) {
 		err := restartWith(paths, &out,
 			func(int) error { t.Fatal("nothing was running; stop must not be called"); return nil },
 			func() error { return nil },
-			func(int) (int, bool) { return 5150, true })
+			func(int, time.Time) (int, bool) { return 5150, true })
 		if err != nil {
 			t.Fatalf("restartWith: %v", err)
 		}
@@ -99,7 +100,7 @@ func TestRestartReportsWhatItActuallyDid(t *testing.T) {
 		err := restartWith(paths, &out,
 			func(int) error { release(); return nil },
 			func() error { return nil },
-			func(int) (int, bool) { return 0, false })
+			func(int, time.Time) (int, bool) { return 0, false })
 		if err != nil {
 			t.Fatalf("restartWith: %v", err)
 		}
@@ -135,7 +136,7 @@ func TestRestartDoesNotFeedTheCrashLoopBreaker(t *testing.T) {
 	if err := restartWith(paths, &out,
 		func(int) error { return nil },
 		func() error { return nil },
-		func(int) (int, bool) { return 5150, true }); err != nil {
+		func(int, time.Time) (int, bool) { return 5150, true }); err != nil {
 		t.Fatalf("restartWith: %v", err)
 	}
 	g, ok := crashguard.Read(paths.StateDir)
@@ -149,5 +150,52 @@ func TestRestartDoesNotFeedTheCrashLoopBreaker(t *testing.T) {
 	// defeat the breaker the herdr hook depends on.
 	if !g.EmbeddingOff || g.Reason != "latched earlier" || g.ConfigDigest != "digest" {
 		t.Errorf("a restart must not clear the breaker's latches, got %+v", g)
+	}
+}
+
+// TestAwaitDaemonHealthIgnoresALeftoverRecord is the guard the whole
+// confirmation rests on. Reading somebody else's heartbeat as the successor's
+// is not a cosmetic slip: it restores the exact false success --restart exists
+// to remove, reporting "healthy" for a daemon that died on the [database]
+// error, and it reports it from the command that just stopped a working one.
+//
+// The pid check alone does not close it, which is why the freshness test is
+// against the restart's own start instant rather than an age: a daemon killed
+// hard seconds ago — or, when nothing was running, any daemon that ever ran
+// here — leaves a record with a different pid that still looks recent.
+func TestAwaitDaemonHealthIgnoresALeftoverRecord(t *testing.T) {
+	paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
+	since := time.Now()
+
+	// A record from a hard-killed predecessor: different pid, written moments
+	// BEFORE this restart, and well inside daemonhealth.StaleAfter.
+	if err := daemonhealth.Write(paths.StateDir, daemonhealth.Health{
+		PID: 1234, Version: "v0.8.3", HeartbeatAt: since.Add(-2 * time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if pid, ok := awaitDaemonHealth(paths, 0, since, 300*time.Millisecond); ok {
+		t.Fatalf("a leftover heartbeat was read as the successor (pid %d)", pid)
+	}
+
+	// The successor's own beat, published after the start, is accepted.
+	if err := daemonhealth.Write(paths.StateDir, daemonhealth.Health{
+		PID: 5150, Version: "v0.8.3", HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	pid, ok := awaitDaemonHealth(paths, 0, since, 2*time.Second)
+	if !ok || pid != 5150 {
+		t.Fatalf("awaitDaemonHealth = (%d, %v), want the successor's pid — the control that keeps the case above from passing vacuously", pid, ok)
+	}
+
+	// The pid we just stopped never counts, however fresh its last beat.
+	if err := daemonhealth.Write(paths.StateDir, daemonhealth.Health{
+		PID: 4242, Version: "v0.8.3", HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := awaitDaemonHealth(paths, 4242, since, 300*time.Millisecond); ok {
+		t.Fatal("the stopped daemon's own final beat was read as its successor")
 	}
 }

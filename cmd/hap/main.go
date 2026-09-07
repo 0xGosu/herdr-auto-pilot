@@ -692,7 +692,9 @@ func restartDaemon(paths config.Paths, out io.Writer) error {
 	}
 	return restartWith(paths, out, daemonlock.Stop,
 		func() error { return spawnDaemon(paths, self, "daemon") },
-		func(stoppedPID int) (int, bool) { return awaitDaemonHealth(paths, stoppedPID, restartConfirmWait) })
+		func(stoppedPID int, since time.Time) (int, bool) {
+			return awaitDaemonHealth(paths, stoppedPID, since, restartConfirmWait)
+		})
 }
 
 // restartConfirmWait bounds how long --restart waits for the daemon it started
@@ -714,8 +716,12 @@ const restartConfirmWait = 20 * time.Second
 // had just killed a working daemon to get there. Waiting for a heartbeat proves
 // the successor opened its store; failing to see one is reported as the unknown
 // it is, never as success.
-func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, start func() error, confirm func(stoppedPID int) (int, bool)) error {
+func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, start func() error, confirm func(stoppedPID int, since time.Time) (int, bool)) error {
 	forgetRestartBoots(paths)
+	// Taken before the stop, so it can only ever be EARLIER than the successor
+	// started — the outgoing daemon may beat once more inside this window, but
+	// it is excluded by pid, and one state dir has only these two daemons.
+	since := time.Now()
 	outcome, err := daemonlock.Restart(paths, ensureWaitTimeout, stop, start)
 	if err != nil {
 		return err
@@ -726,7 +732,7 @@ func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, st
 	} else {
 		fmt.Fprintln(out, "no daemon was running")
 	}
-	pid, ok := confirm(outcome.StoppedPID)
+	pid, ok := confirm(outcome.StoppedPID, since)
 	if !ok {
 		fmt.Fprintf(out, "started a replacement, but it has not reported healthy within %s.\n", restartConfirmWait)
 		fmt.Fprintln(out, "Run `hap status` (add --stderr if it died) — a [database] error exits after the")
@@ -737,16 +743,26 @@ func restartWith(paths config.Paths, out io.Writer, stop func(pid int) error, st
 	return nil
 }
 
-// awaitDaemonHealth polls for a heartbeat from a daemon that is neither the one
-// just stopped nor a leftover file, and returns its pid.
+// awaitDaemonHealth polls for a heartbeat published AFTER since — the instant
+// the successor was started — and returns the pid that published it.
 //
-// The old daemon removes its health file on a clean shutdown, but only
-// best-effort — a stale record from the pid we just killed must never read as
-// the successor coming up, hence the stoppedPID check.
-func awaitDaemonHealth(paths config.Paths, stoppedPID int, timeout time.Duration) (int, bool) {
+// Both conditions are load-bearing, and each closes a way of reading a LEFTOVER
+// record as the successor coming up, which would report "healthy" for a daemon
+// that in fact died on the [database] error this whole wait exists to catch:
+//
+//   - The old daemon removes its health file on a clean shutdown, but only
+//     best-effort, so the pid it was killed with is excluded outright.
+//   - A pid check alone is not enough. A daemon killed hard — or simply one
+//     that ran before this restart, when nothing was running and stoppedPID is
+//     0 — leaves a record with a DIFFERENT pid. Age is the wrong test for it
+//     (daemonhealth.StaleAfter is 35s, so a daemon that died seconds ago still
+//     reads fresh); the honest question is whether the beat was written after
+//     we started something, which no leftover can satisfy.
+func awaitDaemonHealth(paths config.Paths, stoppedPID int, since time.Time, timeout time.Duration) (int, bool) {
 	deadline := time.Now().Add(timeout)
 	for {
-		if h, ok := daemonhealth.Read(paths.StateDir); ok && h.PID > 0 && h.PID != stoppedPID {
+		if h, ok := daemonhealth.Read(paths.StateDir); ok && h.PID > 0 && h.PID != stoppedPID &&
+			h.HeartbeatAt.After(since) {
 			return h.PID, true
 		}
 		if time.Now().After(deadline) {
