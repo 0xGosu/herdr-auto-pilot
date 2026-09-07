@@ -36,6 +36,14 @@ type fakeHerdrTUI struct {
 // assertion meaning what it always did. What is typed for a given action —
 // menu digit, answer series, remote-env keystrokes — is covered where it now
 // happens, in internal/daemon's deliverreply tests.
+// liveAgents reads the fake's statuses under its lock — the stand-in drain runs
+// on its own goroutine while a test mutates them.
+func (f *fakeHerdrTUI) liveAgents() []domain.AgentTransition {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]domain.AgentTransition(nil), f.agents...)
+}
+
 func (f *fakeHerdrTUI) recordDelivered(action string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -82,7 +90,7 @@ func correctTestModel(t *testing.T) (Model, *store.Store, *fakeHerdrTUI) {
 		StateDir:   dir,
 		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
 	}
-	startStandInDrain(t, st, fh.recordDelivered)
+	startStandInDrainWithConfirm(t, st, fh.recordDelivered, app, fh)
 	return Model{width: 100, height: 30, app: app, ctx: context.Background()}, st, fh
 }
 
@@ -105,6 +113,21 @@ func makeDaemonLive(t *testing.T, app *frontend.App, stateDir string) {
 // queued action, reports the reply it would have typed to record, and finishes
 // the row so the operator's blocking wait returns.
 func startStandInDrain(t *testing.T, st *store.Store, record func(string)) {
+	t.Helper()
+	startStandInDrainWithConfirm(t, st, record, nil, nil)
+}
+
+// startStandInDrainWithAgents is the stand-in that also answers the one
+// question the real accept_generated_task executor asks herdr: is the agent
+// still parked?
+//
+// A confirm is a QUEUED action now, so the refusal for a busy agent is authored
+// on the owning node and travels back as text. A drain that answered "done" for
+// every kind would report a task delivered to an agent that is mid-conversation
+// — and the TUI's "add to the list instead?" offer, which keys off that
+// refusal, would never appear in any test.
+func startStandInDrainWithConfirm(t *testing.T, st *store.Store, record func(string),
+	app *frontend.App, fh *fakeHerdrTUI) {
 	t.Helper()
 	done := make(chan struct{})
 	// The cleanup must WAIT for the goroutine, not merely signal it. Cleanups
@@ -135,6 +158,10 @@ func startStandInDrain(t *testing.T, st *store.Store, record func(string)) {
 					if !ok {
 						continue
 					}
+					if a.Kind == domain.AgentActionAcceptGeneratedTask && app != nil {
+						standInConfirm(st, a, app, fh)
+						continue
+					}
 					var p domain.DeliverReplyPayload
 					if json.Unmarshal([]byte(a.Payload), &p) == nil && p.Action != "" {
 						record(p.Action)
@@ -149,6 +176,47 @@ func startStandInDrain(t *testing.T, st *store.Store, record func(string)) {
 			time.Sleep(2 * time.Millisecond)
 		}
 	}()
+}
+
+// standInConfirm plays the accept_generated_task executor: the send-time
+// staleness gate (with the shared marker the front end matches to restore the
+// sentinel), then the REAL confirm.
+//
+// Calling the real one matters. These tests assert what a keypress causes — the
+// tasks file written, the source registered, the correction recorded, the task
+// delivered — and all of that now happens on the owning node. A drain that only
+// answered "done" would leave every one of those assertions checking nothing.
+func standInConfirm(st *store.Store, a domain.AgentAction, app *frontend.App, fh *fakeHerdrTUI) {
+	ctx := context.Background()
+	var p domain.AcceptGeneratedTaskPayload
+	_ = json.Unmarshal([]byte(a.Payload), &p)
+	if p.Send {
+		for _, ag := range fh.liveAgents() {
+			if ag.AgentID == a.Target && domain.AgentBusy(ag.Status) {
+				st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed,
+					"agent is no longer idle; "+domain.SuggestionStaleMarker+
+						" (agent status: "+ag.Status+") — dismiss it, or confirm without --send "+
+						"to queue the tasks to the agent's list", "", time.Now())
+				return
+			}
+		}
+	}
+	if err := app.ConfirmGeneratedTaskForOperator(ctx, p.AuditID, p.Send, a.Author, standInHost{fh}); err != nil {
+		st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed, err.Error(), "", time.Now())
+		return
+	}
+	st.FinishAgentAction(ctx, a.ID, domain.AgentActionDone, "", "", time.Now())
+}
+
+// standInHost is the pane access the daemon supplies in production
+// (ports.TaskSendHost).
+type standInHost struct{ fh *fakeHerdrTUI }
+
+func (h standInHost) Cwd(context.Context, string) string { return "" }
+
+func (h standInHost) Send(_ context.Context, _, _, prompt string) error {
+	h.fh.recordDelivered(prompt)
+	return nil
 }
 
 func seedEscalation(t *testing.T, st *store.Store, status string) int64 {

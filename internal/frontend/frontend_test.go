@@ -425,6 +425,86 @@ type fakeHerdr struct {
 	readErr error
 	sendErr error                    // when set, Send fails (delivery failure)
 	agents  []domain.AgentTransition // returned by ListAgents (live statuses)
+	cwd     string                   // returned by the task-send host's Cwd
+}
+
+// fakeTaskSendHost is the pane access the DAEMON supplies in production
+// (ports.TaskSendHost). It is backed by the same fakeHerdr the assertions read,
+// so a test still checks delivery through f.panes / f.inputs / f.sendErr.
+//
+// Its existence is the point of stage 5: internal/frontend holds no adapter, so
+// a test that wants a send has to be handed one — exactly as the real confirm
+// is, and exactly as a TUI or CLI process cannot be.
+type fakeTaskSendHost struct {
+	h   ports.HerdrPort
+	cwd string
+}
+
+// Cwd mirrors the daemon's host: the optional inspector first, preferring the
+// foreground process's directory, then whatever the plain fake was given.
+func (f fakeTaskSendHost) Cwd(ctx context.Context, paneID string) string {
+	if insp, ok := f.h.(ports.InspectorPort); ok {
+		if pi, err := insp.PaneInfo(ctx, paneID); err == nil {
+			if pi.ForegroundCwd != "" {
+				return pi.ForegroundCwd
+			}
+			if pi.Cwd != "" {
+				return pi.Cwd
+			}
+		}
+	}
+	return f.cwd
+}
+
+func (f fakeTaskSendHost) Send(ctx context.Context, paneID, agentType, prompt string) error {
+	return ports.SendToAgent(ctx, f.h, paneID, agentType, prompt)
+}
+
+// sendTask hands one checklist item over the way the OWNING node's daemon does.
+//
+// App.SendTaskToAgentOn no longer delivers: it files a send_task row and waits
+// for that daemon's verdict. A test about the hand-out itself — the freshness
+// guard, the reservation, the rendered prompt, the roll-back — therefore drives
+// the seam the executor calls. The template and the source's config position
+// are no longer arguments: the seam reads them from config, by locator.
+func sendTask(app *frontend.App, ctx context.Context,
+	paneID, agentType, agentName, locator string, index int, text string) error {
+
+	return app.SendTaskForOperator(ctx,
+		domain.SendTaskPayload{Locator: locator, Index: index, TaskText: text},
+		paneID, agentType, agentName, hostFor(app))
+}
+
+// confirmGeneratedTask runs an operator's confirm of a generated-task
+// suggestion the way the owning node's DAEMON runs it.
+//
+// App.Confirm no longer performs the confirm: it files an
+// accept_generated_task row and waits for that daemon's verdict, which is what
+// makes a suggestion raised on another machine answerable at all. A test that
+// wants the confirm ITSELF — the bootstrap-vs-append choice, the source
+// registration, the reserve→send→roll-back order — therefore drives the seam
+// the executor calls. Same code, one layer down, and no fake daemon in the way.
+//
+// Routing is a separate question with its own tests: see
+// TestResolveFilesAGeneratedTaskConfirmUnderItsOwner and
+// TestALocalGeneratedTaskConfirmAlsoQueues.
+func confirmGeneratedTask(app *frontend.App, ctx context.Context, id int64, send bool) error {
+	return app.ConfirmGeneratedTaskForOperator(ctx, id, send, "operator", hostFor(app))
+}
+
+// hostFor builds that host over whatever herdr fake the test installed —
+// including the wrappers several tests use to hook or cancel a send — and
+// answers nil when there is none, which is the "no way to reach a pane" case:
+// the list is written and nothing is delivered.
+func hostFor(app *frontend.App) ports.TaskSendHost {
+	if app.Herdr == nil {
+		return nil
+	}
+	cwd := ""
+	if f, ok := app.Herdr.(*fakeHerdr); ok {
+		cwd = f.cwd
+	}
+	return fakeTaskSendHost{h: app.Herdr, cwd: cwd}
 }
 
 func (f *fakeHerdr) Send(_ context.Context, paneID, input string) error {
@@ -506,7 +586,7 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 		Suggestion: domain.SuggestTaskPrefix + taskText, CreatedAt: time.Now(),
 	})
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -577,7 +657,7 @@ func TestConfirmGeneratedTaskWithoutSendStillWritesSource(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Write missing tests", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(fake.inputs) != 0 {
@@ -620,7 +700,7 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 		Suggestion: suggestion, CreatedAt: time.Now(),
 	})
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -682,7 +762,7 @@ func TestConfirmGeneratedMultipleListsWritesOnlyLastList(t *testing.T) {
 		Suggestion: suggestion, CreatedAt: time.Now(),
 	})
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -725,11 +805,11 @@ func TestConfirmGeneratedTaskIsIdempotent(t *testing.T) {
 		Suggestion: domain.SuggestTaskPrefix + "Do the thing", CreatedAt: time.Now(),
 	})
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 	// Second confirm must fail (already claimed) and change nothing.
-	if err := app.Confirm(ctx, id, true); err == nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err == nil {
 		t.Error("second confirm on a resolved escalation must fail")
 	}
 
@@ -759,7 +839,7 @@ func TestConfirmGeneratedTaskSendFailureRollsBackToPending(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Fix the flaky login test", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, true); err == nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err == nil {
 		t.Fatal("confirm must surface the failed delivery")
 	}
 	body, err := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
@@ -793,7 +873,7 @@ func TestConfirmRepeatedGenerationPreservesMarkers(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: suggestion, CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, first, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, first, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -802,7 +882,7 @@ func TestConfirmRepeatedGenerationPreservesMarkers(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: suggestion, CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, second, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, second, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -830,7 +910,7 @@ func TestConfirmRepeatedGenerationPreservesMarkers(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: suggestion, CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, third, true); err == nil || !strings.Contains(err.Error(), "no longer pending") {
+	if err := confirmGeneratedTask(app, ctx, third, true); err == nil || !strings.Contains(err.Error(), "no longer pending") {
 		t.Fatalf("a --send duplicate must refuse to re-reserve the [-] item, got %v", err)
 	}
 	if len(fake.inputs) != 1 {
@@ -859,7 +939,7 @@ func TestConfirmRegenerationCarriesOverMarkers(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, first, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, first, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -868,7 +948,7 @@ func TestConfirmRegenerationCarriesOverMarkers(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint\nAdd a response cache", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, second, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, second, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -906,7 +986,7 @@ func TestConfirmRegenerationAppendsKeepingReservedMarker(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint\nAdd a response cache", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, first, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, first, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -918,7 +998,7 @@ func TestConfirmRegenerationAppendsKeepingReservedMarker(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Set up the load test rig\nProfile the slow endpoint\nAdd a response cache", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, second, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, second, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -957,7 +1037,7 @@ func TestConfirmRegenerationAppendsKeepingCompletedMarker(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Profile the slow endpoint", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, first, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, first, true); err != nil {
 		t.Fatal(err)
 	}
 	// The agent finishes the delivered task ("[-]" → "[x]").
@@ -979,7 +1059,7 @@ func TestConfirmRegenerationAppendsKeepingCompletedMarker(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Set up the load test rig\nProfile the slow endpoint", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, second, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, second, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -992,44 +1072,6 @@ func TestConfirmRegenerationAppendsKeepingCompletedMarker(t *testing.T) {
 	}
 	if next := domain.NextDeclaredTask(string(body)); next != "2. Set up the load test rig" {
 		t.Errorf("next declared task = %q, want the appended new item — completed work must not be re-queued", next)
-	}
-}
-
-func TestConfirmGeneratedTaskRefusesWhenAgentWorking(t *testing.T) {
-	// If the agent has started working by the time the operator confirms, the
-	// suggestion is stale: no source is created, nothing is sent, and the
-	// escalation stays pending so the operator can dismiss it.
-	app, st := testApp(t)
-	fake := &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w4:p4", Status: "working"}}}
-	app.Herdr = fake
-	app.StateDir = t.TempDir()
-	ctx := context.Background()
-
-	id, _ := st.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: "w4:p4", SituationType: domain.SituationIdle, Trigger: "t",
-		Action: "escalated", Status: "escalated",
-		Suggestion: domain.SuggestTaskPrefix + "Do the thing", CreatedAt: time.Now(),
-	})
-	err := app.Confirm(ctx, id, true)
-	if err == nil {
-		t.Fatal("confirming a stale suggestion for a working agent must fail")
-	}
-	// The sentinel is the contract the TUI keys off to offer "add to list
-	// instead" — a plain error would strand that fallback.
-	if !errors.Is(err, frontend.ErrSuggestionStaleAgentBusy) {
-		t.Errorf("send refusal must wrap ErrSuggestionStaleAgentBusy, got %v", err)
-	}
-	if len(fake.inputs) != 0 {
-		t.Errorf("nothing may be sent to a working agent, got %v", fake.inputs)
-	}
-	cfg, _ := config.Load(app.ConfigPath)
-	if len(cfg.TaskSources) != 0 {
-		t.Errorf("no task source may be created for a stale suggestion, got %d", len(cfg.TaskSources))
-	}
-	// The escalation is untouched (still pending), so it can be dismissed.
-	audit, _ := st.GetAudit(ctx, id)
-	if audit.Status != "escalated" {
-		t.Errorf("escalation must remain pending after a refused confirm, got %q", audit.Status)
 	}
 }
 
@@ -1054,7 +1096,7 @@ func TestConfirmGeneratedTaskAddOnlyWhileAgentWorking(t *testing.T) {
 		Suggestion: domain.SuggestTaskPrefix + "Write missing tests", CreatedAt: time.Now(),
 	})
 
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatalf("add-only confirm must succeed for a working agent: %v", err)
 	}
 	// Nothing delivered to the busy agent's pane.
@@ -1135,7 +1177,7 @@ func TestConfirmGeneratedTaskAppendsToExhaustedSource(t *testing.T) {
 	taskText := "Investigate the flaky auth test and add a retry guard"
 	id := generatedEscalation(t, st, "w1:p1", taskText)
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1185,7 +1227,7 @@ func TestConfirmGeneratedMultipleTasksAppendToExhaustedSource(t *testing.T) {
 	suggestion := "- [ ] Investigate the flaky auth test\n- [ ] Add a retry guard\n- [ ] Backfill unit tests"
 	id := generatedEscalation(t, st, "w1:p1", suggestion)
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(path)
@@ -1211,7 +1253,7 @@ func TestConfirmGeneratedTaskAppendWithoutSend(t *testing.T) {
 	ctx := context.Background()
 	id := generatedEscalation(t, st, "w2:p2", "Write missing tests")
 
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatal(err)
 	}
 	if len(fake.inputs) != 0 {
@@ -1239,10 +1281,10 @@ func TestConfirmGeneratedTaskAppendIsIdempotent(t *testing.T) {
 	ctx := context.Background()
 	id := generatedEscalation(t, st, "w3:p3", "Do the thing")
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Confirm(ctx, id, true); err == nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err == nil {
 		t.Error("second confirm on a resolved escalation must fail")
 	}
 	body, _ := os.ReadFile(path)
@@ -1268,7 +1310,7 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 		}
 		id := generatedEscalation(t, st, "w1:p1", "One more thing")
 
-		if err := app.Confirm(ctx, id, true); err == nil ||
+		if err := confirmGeneratedTask(app, ctx, id, true); err == nil ||
 			!strings.Contains(err.Error(), "maximum number of tasks") {
 			t.Fatalf("confirm on a full list must refuse with the cap error, got %v", err)
 		}
@@ -1291,7 +1333,7 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 		}); err != nil {
 			t.Fatal(err)
 		}
-		if err := app.Confirm(ctx, id, true); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 			t.Fatalf("re-confirm after raising the cap must succeed, got %v", err)
 		}
 		body, _ = os.ReadFile(path)
@@ -1320,7 +1362,7 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 		}
 		id := generatedEscalation(t, st, "w1:p1", "- [ ] first\n- [ ] second\n- [ ] third")
 
-		err := app.Confirm(ctx, id, true)
+		err := confirmGeneratedTask(app, ctx, id, true)
 		if err == nil || !strings.Contains(err.Error(), "maximum number of tasks") {
 			t.Fatalf("a would-be-over-cap append must refuse with the cap error, got %v", err)
 		}
@@ -1349,7 +1391,7 @@ func TestConfirmGeneratedTaskAppendRespectsMaxTasks(t *testing.T) {
 		}
 		id := generatedEscalation(t, st, "w1:p1", "- [ ] first\n- [ ] second")
 
-		if err := app.Confirm(ctx, id, true); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 			t.Fatalf("an append that exactly fills the cap must succeed, got %v", err)
 		}
 		body, _ := os.ReadFile(path)
@@ -1398,7 +1440,7 @@ func TestConfirmGeneratedTaskBootstrapRespectsMaxTasks(t *testing.T) {
 		Suggestion: domain.SuggestTaskPrefix + "one more task", CreatedAt: time.Now(),
 	})
 
-	err := app.Confirm(ctx, id, true)
+	err := confirmGeneratedTask(app, ctx, id, true)
 	if err == nil || !strings.Contains(err.Error(), "maximum number of tasks") {
 		t.Fatalf("a bootstrap confirm over the default cap must refuse, got %v", err)
 	}
@@ -1464,7 +1506,7 @@ func TestConfirmGeneratedTaskBootstrapOverCapNoGrowthNotRefused(t *testing.T) {
 		Suggestion: domain.SuggestTaskPrefix + "task 1", CreatedAt: time.Now(),
 	})
 
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatalf("a no-growth re-confirm of an over-cap file must not be refused, got %v", err)
 	}
 	// The list neither grew nor shrank — still n items, just renumbered.
@@ -1510,7 +1552,7 @@ func TestConfirmGeneratedTaskAppendReservesAndRollsBackOnSendFailure(t *testing.
 	ctx := context.Background()
 	id := generatedEscalation(t, st, "w5:p5", "Deliver me later")
 
-	err := app.Confirm(ctx, id, true)
+	err := confirmGeneratedTask(app, ctx, id, true)
 	if err == nil || !strings.Contains(err.Error(), "sending the task to the agent failed") {
 		t.Fatalf("confirm with a failing send must surface the send error, got %v", err)
 	}
@@ -1540,7 +1582,7 @@ func TestConfirmGeneratedTaskSendRefusedWhenFirstTaskNotPending(t *testing.T) {
 	ctx := context.Background()
 	id := generatedEscalation(t, st, "w6:p6", "Deliver me later")
 
-	err := app.Confirm(ctx, id, true)
+	err := confirmGeneratedTask(app, ctx, id, true)
 	if err == nil || !strings.Contains(err.Error(), "already [x]") {
 		t.Fatalf("confirm with an already-done first task must refuse with the mark, got %v", err)
 	}
@@ -1565,7 +1607,7 @@ func TestConfirmGeneratedTaskAppendDeduplicatesRepeatedSuggestion(t *testing.T) 
 	ctx := context.Background()
 	id := generatedEscalation(t, st, "w7:p7", "- [ ] Same thing\n- [ ] Other thing\n- [ ] Same thing")
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(path)
@@ -1598,7 +1640,7 @@ func TestConfirmGeneratedTaskUsesSourceTemplate(t *testing.T) {
 	}
 	id := generatedEscalation(t, st, "w1:p1", "Ship it")
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 	want := "DO Ship it FROM " + path + " AS " + name
@@ -1622,7 +1664,7 @@ func TestConfirmGeneratedTaskAppendCreatesMissingDeclaredFile(t *testing.T) {
 	}
 	id := generatedEscalation(t, st, "w1:p1", "Bootstrap the declared file")
 
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 	body, err := os.ReadFile(path)
@@ -1668,7 +1710,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 			t.Fatal(err)
 		}
 		id := generatedEscalation(t, st, "w1:p1", "By id")
-		if err := app.Confirm(ctx, id, false); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 			t.Fatal(err)
 		}
 		body, _ := os.ReadFile(path)
@@ -1695,7 +1737,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := app.Confirm(ctx, id, false); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 			t.Fatal(err)
 		}
 		body, _ := os.ReadFile(path)
@@ -1715,6 +1757,9 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 		// The workspace LABEL comes from the daemon's published locations now,
 		// not from a live locator call in this process.
 		seedLocations(t, st, fake.workspaces, nil)
+		// And the agent's own row: the workspace a selector is matched against
+		// comes from the daemon's published roster now, not a live listing.
+		seedRoster(t, st, fake.agents...)
 		name, _ := st.EnsureAgentName(ctx, "w1:p1")
 		path := filepath.Join(t.TempDir(), "declared.md")
 		os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600)
@@ -1722,7 +1767,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 			t.Fatal(err)
 		}
 		id := generatedEscalation(t, st, "w1:p1", "By workspace name")
-		if err := app.Confirm(ctx, id, false); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 			t.Fatal(err)
 		}
 		body, _ := os.ReadFile(path)
@@ -1740,6 +1785,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 		app.Herdr = fake
 		app.StateDir = t.TempDir()
 		ctx := context.Background()
+		seedRoster(t, st, fake.agents...)
 		name, _ := st.EnsureAgentName(ctx, "w1:p1")
 		path := filepath.Join(t.TempDir(), "declared.md")
 		os.WriteFile(path, []byte("- [x] 1. old\n"), 0o600)
@@ -1747,7 +1793,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 			t.Fatal(err)
 		}
 		id := generatedEscalation(t, st, "w1:p1", "By raw workspace id")
-		if err := app.Confirm(ctx, id, false); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 			t.Fatal(err)
 		}
 		body, _ := os.ReadFile(path)
@@ -1782,7 +1828,7 @@ func TestConfirmGeneratedTaskPrefersSourceWithPendingWork(t *testing.T) {
 	}
 	id := generatedEscalation(t, st, "w1:p1", "Go to the live list")
 
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatal(err)
 	}
 	pendingBody, _ := os.ReadFile(pendingPath)
@@ -1815,7 +1861,7 @@ func TestConfirmGeneratedTaskRefusesDuplicateAgentSource(t *testing.T) {
 	}
 	id := generatedEscalation(t, st, "w1:p1", "Do the thing")
 
-	if err := app.Confirm(ctx, id, true); err == nil ||
+	if err := confirmGeneratedTask(app, ctx, id, true); err == nil ||
 		!strings.Contains(err.Error(), "already has a task source") {
 		t.Fatalf("confirm must refuse to register a duplicate agent source, got %v", err)
 	}
@@ -3915,8 +3961,20 @@ func TestSendTaskToAgent(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`- [ ] step one\nstep two`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter",
-		path, "", "3", 1, `step one\nstep two`); err != nil {
+	// {task_source_index} is the source's POSITION in config, read by the seam
+	// rather than handed to it — so the source has to be registered, and three
+	// unrelated ones ahead of it are what make the assertion below prove the
+	// position was derived rather than invented.
+	for _, other := range []string{"a", "b", "c"} {
+		if err := app.AddTaskSource(ctx, other, "",
+			filepath.Join(t.TempDir(), other+".md"), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := app.AddTaskSource(ctx, "brave-otter", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendTask(app, ctx, "w1:p2", "claude", "brave-otter", path, 1, `step one\nstep two`); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.sent) != 1 {
@@ -3940,11 +3998,11 @@ func TestSendTaskToAgent(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`- [x] step one\nstep two`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, `step one\nstep two`); err == nil ||
+	if err := sendTask(app, ctx, "w1:p2", "claude", "n", path, 1, `step one\nstep two`); err == nil ||
 		!strings.Contains(err.Error(), "no longer pending") {
 		t.Errorf("completed task must refuse to send, got %v", err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, "different text"); err == nil ||
+	if err := sendTask(app, ctx, "w1:p2", "claude", "n", path, 1, "different text"); err == nil ||
 		!strings.Contains(err.Error(), "the checklist changed") {
 		t.Errorf("rewritten task must refuse to send, got %v", err)
 	}
@@ -3954,11 +4012,11 @@ func TestSendTaskToAgent(t *testing.T) {
 
 	// Guards: no herdr / no pane.
 	app.Herdr = nil
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, "t"); err == nil {
+	if err := sendTask(app, ctx, "w1:p2", "claude", "n", path, 1, "t"); err == nil {
 		t.Error("nil herdr must refuse")
 	}
 	app.Herdr = h
-	if err := app.SendTaskToAgent(ctx, "", "claude", "n", path, "", "", 1, "t"); err == nil {
+	if err := sendTask(app, ctx, "", "claude", "n", path, 1, "t"); err == nil {
 		t.Error("empty pane must refuse")
 	}
 }
@@ -3979,7 +4037,7 @@ func TestSendTaskToAgentFoldsNestedDetail(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter", path, "", "", 1, "1. Build the widget"); err != nil {
+	if err := sendTask(app, ctx, "w1:p2", "claude", "brave-otter", path, 1, "1. Build the widget"); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.sent) != 1 {
@@ -4004,55 +4062,6 @@ func TestSendTaskToAgentFoldsNestedDetail(t *testing.T) {
 	}
 }
 
-// TestSendTaskToAgentRechecksIdle pins the guard against the window between
-// the caller's status read and delivery: the operator's confirmation (or a
-// --yes script) can be seconds stale, and a task must never land in a working
-// agent's live conversation.
-func TestSendTaskToAgentRechecksIdle(t *testing.T) {
-	newApp := func(t *testing.T, h *sendCaptureHerdr) (*frontend.App, string) {
-		t.Helper()
-		app, _ := testApp(t)
-		app.Herdr = h
-		path := filepath.Join(t.TempDir(), "tasks.md")
-		if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		return app, path
-	}
-	ctx := context.Background()
-	// The agent started working after the caller looked.
-	busy := &sendCaptureHerdr{agents: []domain.AgentTransition{
-		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude", Status: "working"}}}
-	app, path := newApp(t, busy)
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
-		!strings.Contains(err.Error(), "cleanly idle") {
-		t.Errorf("a now-busy agent must refuse, got %v", err)
-	}
-	if len(busy.sent) != 0 {
-		t.Errorf("refused send must not deliver, got %v", busy.sent)
-	}
-	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
-		t.Errorf("refused send must leave the task pending, got %q", data)
-	}
-	// The agent vanished entirely.
-	gone := &sendCaptureHerdr{}
-	app, path = newApp(t, gone)
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
-		!strings.Contains(err.Error(), "no longer live") {
-		t.Errorf("a vanished agent must refuse, got %v", err)
-	}
-	// An unreadable agent list is not an idle agent: fail closed.
-	app, path = newApp(t, nil)
-	app.Herdr = &failingAgentsHerdr{}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
-		!strings.Contains(err.Error(), "nothing was sent") {
-		t.Errorf("an unreadable agent list must refuse, got %v", err)
-	}
-	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
-		t.Errorf("refused send must leave the task pending, got %q", data)
-	}
-}
-
 // TestSendTaskToAgentReservesBeforeDelivering pins the ordering: the item is
 // marked [-] BEFORE the pane receives it, so no guarded failure can be
 // reported after delivery and leave the task [ ] for the daemon to hand out a
@@ -4068,7 +4077,7 @@ func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
 	var atSend string
 	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
 	app.Herdr = &reserveProbeHerdr{sendCaptureHerdr: h, path: path, seen: &atSend}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err != nil {
+	if err := sendTask(app, ctx, "w1:p2", "claude", "otter", path, 1, "work"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(atSend, "- [-] work") {
@@ -4081,7 +4090,7 @@ func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
 		t.Fatal(err)
 	}
 	app2.Herdr = &sendCaptureHerdr{agents: idleAt("w1:p2"), sendErr: errors.New("pane gone")}
-	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2, "", "", 1, "work"); err == nil ||
+	if err := sendTask(app2, ctx, "w1:p2", "claude", "otter", path2, 1, "work"); err == nil ||
 		!strings.Contains(err.Error(), "pane gone") {
 		t.Errorf("a failed delivery must surface its error, got %v", err)
 	}
@@ -4132,7 +4141,7 @@ func TestSendTaskToAgentRollbackIsClaimScoped(t *testing.T) {
 		path:             path,
 		write:            "- [x] work\n", // completed by someone else mid-send
 	}
-	err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work")
+	err := sendTask(app, ctx, "w1:p2", "claude", "otter", path, 1, "work")
 	if err == nil || !strings.Contains(err.Error(), "pane gone") {
 		t.Errorf("the delivery failure must still surface, got %v", err)
 	}
@@ -4156,8 +4165,11 @@ func TestSendTaskToAgentRendersCwd(t *testing.T) {
 		info:             domain.PaneInfo{Cwd: "/repo", ForegroundCwd: "/repo/sub"},
 	}
 	app.Herdr = h
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path,
-		"do {next_task_content} in {cwd}", "", 1, "work"); err != nil {
+	// The template now comes from the SOURCE, which is what the seam reads.
+	if err := app.AddTaskSource(ctx, "otter", "", path, "do {next_task_content} in {cwd}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendTask(app, ctx, "w1:p2", "claude", "otter", path, 1, "work"); err != nil {
 		t.Fatal(err)
 	}
 	// The foreground cwd wins, exactly as the daemon's resolver prefers it.
@@ -4172,8 +4184,10 @@ func TestSendTaskToAgentRendersCwd(t *testing.T) {
 	if err := os.WriteFile(path2, []byte("- [ ] work\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2,
-		"do {next_task_content} in {cwd}", "", 1, "work"); err != nil {
+	if err := app2.AddTaskSource(ctx, "otter", "", path2, "do {next_task_content} in {cwd}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendTask(app2, ctx, "w1:p2", "claude", "otter", path2, 1, "work"); err != nil {
 		t.Errorf("a missing inspector must never block a send, got %v", err)
 	}
 	// Exactly, not Contains: "do work in " is a prefix of a resolved cwd too,
@@ -4390,16 +4404,6 @@ func TestANeverPublishedRosterIsNotAnEmptyHerd(t *testing.T) {
 	}
 }
 
-type failingAgentsHerdr struct{}
-
-func (f *failingAgentsHerdr) Send(context.Context, string, string) error { return nil }
-func (f *failingAgentsHerdr) ReadPane(context.Context, string, int) (string, error) {
-	return "", nil
-}
-func (f *failingAgentsHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
-	return nil, errors.New("herdr unreachable")
-}
-
 // TestAddTaskSourceAutoSendWhenIdleOption pins the option that turns on
 // unprompted hand-out. Unprompted sending is a safety-relevant capability, so
 // it must be reachable ONLY by asking for it: no option, no flag — including
@@ -4449,7 +4453,7 @@ func TestAddTaskSourceAutoSendWhenIdleOption(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := generatedEscalation(t, st, "w9:p9", "Bootstrap a list")
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 	if cfg, err = app.Config(); err != nil {
@@ -6008,7 +6012,7 @@ func TestAcceptingAGeneratedTaskAppendsItsSource(t *testing.T) {
 	}
 	// send=false: the source registration is the part under test, and there is
 	// no live agent to deliver to.
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatalf("confirm generated task: %v", err)
 	}
 

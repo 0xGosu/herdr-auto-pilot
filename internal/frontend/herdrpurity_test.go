@@ -47,6 +47,10 @@ var herdrPorts = map[string]bool{
 	"ChordSender":             true,
 	"FocusPort":               true,
 	"SendToAgent":             true,
+	// TaskSendHost is not an adapter this package may build — it is one it may
+	// RECEIVE. Listed here so the exemption below has to state that, rather
+	// than the type quietly becoming a door around the scan.
+	"TaskSendHost": true,
 }
 
 // herdrPortExemptions lists what each file may still reference, PER SYMBOL,
@@ -60,11 +64,17 @@ var herdrPorts = map[string]bool{
 // ever shrinks" a property of the test rather than of review discipline.
 var herdrPortExemptions = map[string]map[string]string{
 	"internal/frontend/frontend.go": {
-		"Herdr":         "stage 5: the send path reaches the adapter through the field",
-		"HerdrPort":     "stage 6: the field's declared type, once every reader below is gone",
-		"ListAgents":    "stage 5: the confirm staleness check and requireIdleAgent move INTO the send_task executor rather than onto the roster — deciding 'is this agent still idle' from a snapshot up to a sweep old is exactly the fail-open this guard exists to prevent",
-		"InspectorPort": "stage 5: paneCwd renders {cwd} for an outbound task, on the send path",
-		"SendToAgent":   "stage 5: the task hand-out and the generated-task confirm",
+		"TaskSendHost": "PERMANENT, and a weaker claim than the four it replaces: the pane " +
+			"operations are RECEIVED from the daemon, never constructed here. Only cmd/hap's " +
+			"daemon wiring can build one (this package may not import internal/herdr), so a TUI " +
+			"or CLI process holds no path to a pane at all. What stays here is the " +
+			"reserve→send→roll-back ORDERING, which owns the checklist and the config and cannot " +
+			"move without splitting an invariant every comment around it calls load-bearing.",
+		"HerdrPort": "stage 6: the field's declared type, once every reader below is gone",
+	},
+	"internal/frontend/fsp.go": {
+		"TaskSendHost": "PERMANENT, same reason as frontend.go: the two daemon seams take the " +
+			"host as a parameter and hand it straight on.",
 	},
 	"internal/frontend/agentmode.go": {
 		"Herdr":             "stage 4: the mode read and the chord press reach the adapter through the field",

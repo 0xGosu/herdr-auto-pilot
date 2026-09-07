@@ -2813,11 +2813,7 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	if domain.AgentBusy(live.Status) {
 		return fmt.Errorf("agent %s is %s — a task can only be sent to a cleanly idle agent", agent, live.Status)
 	}
-	sourcePath, sourceIndex, err := app.TaskListFor(agent, "")
-	if err != nil {
-		return err
-	}
-	template, err := app.TaskSourceTemplateFor(agent, sourcePath)
+	sourcePath, _, err := app.TaskListFor(agent, "")
 	if err != nil {
 		return err
 	}
@@ -2842,12 +2838,22 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 			return nil
 		}
 	}
-	// No extra wrapping: SendTaskToAgent's errors already state the phase.
-	// It reserves the item before delivering, so an error here is either a
-	// pre-delivery refusal (the agent stopped being idle, the checklist
-	// moved) or a delivery failure whose reservation was rolled back —
-	// either way the task is not in the agent, and retrying is safe.
-	if err := app.SendTaskToAgent(ctx, live.PaneID, live.AgentType, agent, sourcePath, template, sourceIndex, idx, it.Text); err != nil {
+	// Filed for this node's daemon, which resolves the pane, the agent type and
+	// the source's template from its own config and delivers. The busy check
+	// above stays as a fast, friendly refusal; the authoritative one runs in the
+	// executor, against a live listing rather than the roster.
+	//
+	// Remote agents are deliberately not reachable here yet: `hap task` reads
+	// the list through this node's [[task_sources]], which never describes
+	// another machine's. The TUI's Tasks tab, which renders fleet lists from
+	// the shared database, can send them.
+	//
+	// No extra wrapping: the errors already state the phase. The item is
+	// reserved before delivering, so an error here is either a pre-delivery
+	// refusal (the agent stopped being idle, the checklist moved) or a delivery
+	// failure whose reservation was rolled back — either way the task is not in
+	// the agent, and retrying is safe.
+	if err := app.SendTaskToAgentOn(ctx, "", agent, sourcePath, idx, it.Text); err != nil {
 		return err
 	}
 	fmt.Fprintf(out, "task #%d sent to %s and marked [-] in progress\n", idx, agent)

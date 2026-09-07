@@ -7,7 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -42,8 +45,17 @@ func sendTestApp(t *testing.T, status string) (*frontend.App, *sendRecorderHerdr
 	h := &sendRecorderHerdr{agents: []domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: status},
 	}}
-	app := &frontend.App{Store: st, Herdr: h,
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	// A health record that reads as a live daemon: `task send` files a queued
+	// action now, and the front end refuses to file one nothing could execute.
+	if err := daemonhealth.Write(dir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app := &frontend.App{Store: st, Herdr: h, StateDir: dir,
+		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator",
+		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version }}
+	startStandInSendTaskDrain(t, st, app, h)
 	seedRoster(t, st, h.agents...)
 	path := filepath.Join(dir, "tasks.md")
 	if err := os.WriteFile(path, []byte(`- [ ] alpha\nwith detail`+"\n- [x] beta\n"), 0o644); err != nil {

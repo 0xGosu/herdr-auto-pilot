@@ -46,6 +46,31 @@ func SendToAgent(ctx context.Context, h HerdrPort, paneID, agentType, input stri
 	return h.Send(ctx, paneID, input)
 }
 
+// TaskSendHost is the pane access a task hand-out needs, RECEIVED from the
+// daemon rather than held.
+//
+// The checklist and the config live on the operator surface (internal/frontend
+// owns the task-store registry, the [[task_sources]] writer and the
+// reserve→send→rollback ordering), while the pane belongs to the daemon — the
+// one process allowed to drive herdr. Splitting that ordering across the two
+// would break an invariant every comment around it calls load-bearing, so the
+// ordering stays whole and the single step that reaches a pane is handed in.
+//
+// The distinction that makes this safe is CONSTRUCTION, not use: only
+// cmd/hap's daemon wiring can build one (internal/frontend may not import
+// internal/herdr, and App holds no adapter), so a TUI or CLI process has no
+// path to a pane at all. Both are checked by
+// frontend.TestFrontendNeverTouchesHerdr, whose exemption register records
+// exactly this.
+//
+// Cwd is best-effort and returns "" when the adapter cannot answer: an empty
+// {cwd} must never block a send. Send is the point of no return — the daemon's
+// implementation marks the queued action's side_effect immediately before it.
+type TaskSendHost interface {
+	Cwd(ctx context.Context, paneID string) string
+	Send(ctx context.Context, paneID, agentType, prompt string) error
+}
+
 // LocatorPort is implemented by Herdr adapters that can report workspace
 // and tab display metadata (labels, numbers) for locating agents. Optional:
 // callers type-assert and degrade to raw ids when absent.

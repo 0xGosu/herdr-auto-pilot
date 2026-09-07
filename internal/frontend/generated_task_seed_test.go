@@ -49,7 +49,7 @@ func TestBootstrapSeedsTheListWithItsHeaderNotBlank(t *testing.T) {
 		Suggestion: domain.SuggestTaskPrefix + strings.Join(lines, "\n"), CreatedAt: time.Now(),
 	})
 
-	if err := app.Confirm(ctx, id, false); err == nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err == nil {
 		t.Fatal("a suggestion past the cap must refuse, so the seeded list can be inspected")
 	}
 

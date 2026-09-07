@@ -195,7 +195,7 @@ func TestRemoteConfirmReservesThroughTheStore(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Do the thing", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatalf("confirm with a send must succeed against a remote store: %v", err)
 	}
 
@@ -237,7 +237,7 @@ func TestRemoteConfirmRollsBackThroughTheStore(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Do the thing", CreatedAt: time.Now(),
 	})
-	err := app.Confirm(ctx, id, true)
+	err := confirmGeneratedTask(app, ctx, id, true)
 	if err == nil {
 		t.Fatal("a failed send must be reported")
 	}
@@ -284,7 +284,7 @@ func TestRemoteAppendTargetReadsCandidatesThroughTheStore(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Generated task", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -329,7 +329,7 @@ func TestRemoteDerivedSourceStillTakesTheAppendPath(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Generated task", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatalf("a derived remote source must be appended to, not mistaken for the "+
 			"bootstrap list: %v", err)
 	}
@@ -384,7 +384,7 @@ func TestRemoteConfirmAppendsDespiteABrokenRemoteDefault(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Generated task", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 		t.Fatalf("a healthy declared source must still be appended to when the remote "+
 			"DEFAULT is misconfigured: %v", err)
 	}
@@ -415,7 +415,7 @@ func TestRemoteSecondConfirmDoesNotDuplicateItsOwnList(t *testing.T) {
 			Action: "escalated", Status: "escalated",
 			Suggestion: domain.SuggestTaskPrefix + "Alpha task", CreatedAt: time.Now(),
 		})
-		if err := app.Confirm(ctx, id, false); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 			t.Fatalf("confirm %d: %v", n, err)
 		}
 	}

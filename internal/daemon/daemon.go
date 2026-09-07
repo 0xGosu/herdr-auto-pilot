@@ -104,7 +104,38 @@ type Options struct {
 	// self-prompting leaves such escalations for the operator exactly as it
 	// does today. Supplied by cmd/hap from the front-end App, which is where
 	// the checklist/task-source code lives.
-	AcceptGeneratedTask func(ctx context.Context, auditID int64, send bool, screen func(string) error) error
+	AcceptGeneratedTask func(ctx context.Context, auditID int64, send bool,
+		host ports.TaskSendHost, screen func(string) error) error
+	// ConfirmGeneratedTask is an OPERATOR's confirm of the same suggestion,
+	// executed here because every step of it is node-local — the herd the pane
+	// id is matched against, the agent_names row, the checklist, and the
+	// [[task_sources]] entry in a config.toml that never enters the shared
+	// database. It reaches this daemon as an accept_generated_task row, so an
+	// operator can answer from any machine in the fleet.
+	//
+	// Unlike AcceptGeneratedTask it DOES resolve the escalation and DOES write
+	// the correction: an operator's decision is a learning event however far
+	// away they typed it. author is the operator, carried on the queued row,
+	// because the App behind this seam is authored "daemon".
+	//
+	// Optional. nil means the capability was never wired, and the action is
+	// refused with errActionUnsupported rather than silently reported done.
+	ConfirmGeneratedTask func(ctx context.Context, auditID int64, send bool,
+		author string, host ports.TaskSendHost) error
+	// SendTask hands one checklist item an operator picked to a live agent's
+	// pane, rendered through that source's own next-task template. It reaches
+	// this daemon as a send_task row, so an operator can hand out a task on any
+	// machine in the fleet.
+	//
+	// The payload carries only the list and the item; the agent, its type, its
+	// short name and the pane access are resolved HERE and passed in, because
+	// each is node-local and the operator's process cannot answer any of them
+	// for another machine.
+	//
+	// Optional. nil means the capability was never wired, and the action is
+	// refused with errActionUnsupported rather than silently reported done.
+	SendTask func(ctx context.Context, p domain.SendTaskPayload,
+		agentID, agentType, agentName string, host ports.TaskSendHost) error
 	// DisableFSP switches full self-prompting off in config.toml and records
 	// the toggle in the automation history. Called when a [limits] ceiling is
 	// reached and full_self_prompting.honour_limits is set.

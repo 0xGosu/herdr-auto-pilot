@@ -75,6 +75,19 @@ const (
 	// AgentActionSendTask hands one checklist item to a parked agent, through the
 	// same reservation ledger the daemon's own idle hand-outs use.
 	AgentActionSendTask AgentActionKind = "send_task"
+	// AgentActionAcceptGeneratedTask confirms an idle escalation whose suggestion
+	// is an LLM-GENERATED task: it writes the agent's checklist, registers the
+	// task source in that machine's config.toml, and (when send) hands the first
+	// task over.
+	//
+	// Queued for a stronger reason than the pane access it ends in. The work is
+	// node-blind by construction — it matches the audit row's pane id against the
+	// local herd, mints a local agent_names row, writes a local list, and
+	// registers a [[task_sources]] entry in the LOCAL config.toml, which never
+	// enters the shared database. For another node's row every one of those lands
+	// on the wrong machine, and with send, in whichever local pane shares the id.
+	// Only the owning daemon can do any of it.
+	AgentActionAcceptGeneratedTask AgentActionKind = "accept_generated_task"
 	// AgentActionSetMode drives an agent's permission-mode rotation (the Shift+Tab
 	// chord loop). Its result carries which mode was actually reached.
 	AgentActionSetMode AgentActionKind = "set_mode"
@@ -137,7 +150,8 @@ func (s AgentActionStatus) Terminal() bool {
 func ValidAgentActionKind(kind AgentActionKind) bool {
 	switch kind {
 	case AgentActionDeliverReply, AgentActionSendTask, AgentActionSetMode, AgentActionCapture,
-		AgentActionFocus, AgentActionRename, AgentActionSetEnabled:
+		AgentActionFocus, AgentActionRename, AgentActionSetEnabled,
+		AgentActionAcceptGeneratedTask:
 		return true
 	}
 	return false
@@ -228,4 +242,65 @@ type CaptureResult struct {
 	// Status is the parked status the capture was accepted for: blocked,
 	// idle or done. Anything else is refused rather than reported.
 	Status string `json:"status"`
+}
+
+// SuggestionStaleMarker is the phrase every "the agent has started working, so
+// this generated-task suggestion is stale" refusal contains.
+//
+// It lives here for the same reason ActionUnsupportedMarker does: both sides
+// need it. The refusal is authored on the OWNING node — inside the
+// accept_generated_task executor, which is the only process that can ask herdr
+// whether the agent is still parked — and it reaches the operator's surface as
+// AgentAction.Error, a plain string. AwaitAgentAction returns that verbatim
+// through errors.New, so the sentinel is gone by the time the caller sees it.
+//
+// That matters because the refusal is ACTIONABLE rather than terminal: the TUI
+// answers it by offering to add the tasks to the agent's list instead of
+// sending them (confirmWithoutSend), and the CLI names the same fallback. A
+// front end that could not recognise the refusal would surface a bare sentence
+// and lose the offer. Matching on a shared constant is what lets it re-wrap the
+// string back into frontend.ErrSuggestionStaleAgentBusy without the two
+// spellings drifting apart.
+const SuggestionStaleMarker = "the suggested task is stale"
+
+// AcceptGeneratedTaskPayload is the accept_generated_task action's arguments.
+//
+// Like DeliverReplyPayload it carries the audit id and nothing else that could
+// go stale: the suggestion text, the agent, the agent type and the node are all
+// re-read off the audit row by the executor, so a front end's stale view of a
+// row can never decide which tasks get written or where they get sent.
+//
+// Send is the operator's "start now". False means the tasks are added to the
+// list and the daemon's ordinary idle flow delivers the first one — which is
+// why the field is Send rather than "queue only": the zero value adds without
+// touching a pane, so a payload that fails to unmarshal is the harmless half.
+type AcceptGeneratedTaskPayload struct {
+	AuditID int64 `json:"audit_id"`
+	Send    bool  `json:"send"`
+}
+
+// SendTaskPayload is the send_task action's arguments: one checklist item an
+// operator picked out of a list.
+//
+// It carries the list and the item, and deliberately nothing else. The pane,
+// the agent type, the source's next-task template, its config position and
+// {cwd} are all RE-DERIVED by the executor from that node's own config and a
+// live listing — which is the point rather than an economy. A pane id is a
+// herdr id that repeats on every machine and is recycled on one; a template
+// read here would be read out of the operator's config, which never describes
+// another node's sources; and an idleness check made here would be as old as
+// the operator's keypress.
+//
+// TaskText is the reservation IDENTITY, not a display string: reserveTask
+// verifies the item at Index still says this before marking it "[-]", so an
+// insert or reorder between the operator's read and the send refuses instead of
+// handing out the wrong task.
+type SendTaskPayload struct {
+	// Locator is the list's canonical address (a path locally, a gist:// or
+	// db:// URI remotely) — never Source.Path, which under a remote provider is
+	// only a file name and can repeat across gists.
+	Locator string `json:"locator"`
+	// Index is the item's 1-based position in the list.
+	Index    int    `json:"index"`
+	TaskText string `json:"task_text"`
 }

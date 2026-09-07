@@ -34,7 +34,7 @@ func TestBootstrapWritesWhereItRegisters(t *testing.T) {
 			Action: "escalated", Status: "escalated",
 			Suggestion: domain.SuggestTaskPrefix + "Task A", CreatedAt: time.Now(),
 		})
-		if err := app.Confirm(ctx, id, false); err != nil {
+		if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 			t.Fatal(err)
 		}
 
@@ -79,7 +79,7 @@ func TestBootstrapWritesWhereItRegisters(t *testing.T) {
 			Action: "escalated", Status: "escalated",
 			Suggestion: domain.SuggestTaskPrefix + "Task A", CreatedAt: time.Now(),
 		})
-		err := app.Confirm(ctx, id, false)
+		err := confirmGeneratedTask(app, ctx, id, false)
 		if err == nil {
 			t.Fatal("a confirm against an unreachable remote store must FAIL — writing the " +
 				"tasks to a local file while registering a store source leaves the agent " +

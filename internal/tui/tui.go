@@ -4178,11 +4178,12 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 		m.message = "only a pending [ ] task can be sent — this one is done or in progress"
 		return m, nil
 	}
-	// Another node's list: its agent is not in this herd, so the lookup below
-	// would only ever say "no live agent" — say what is actually the case.
+	// Another node's list: file the hand-out for THAT node's daemon. Its agent
+	// is not in this herd, so nothing here can resolve a pane or a template for
+	// it — but the list row carries the agent's name in that node's namespace,
+	// which is the only identity the request needs.
 	if k := r.group - len(m.data.tasks); k >= 0 && k < len(m.data.fleetTasks) {
-		m.message = fmt.Sprintf("this list belongs to node %s — its daemon hands the tasks out; send from that machine", m.data.fleetTasks[k].NodeLabel)
-		return m, nil
+		return m.sendRemoteTaskRow(r, m.data.fleetTasks[k])
 	}
 	agent := m.taskGroupAgent(r.group)
 	if agent == nil {
@@ -4198,27 +4199,57 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 	if name == "" {
 		name = agent.AgentID
 	}
-	// The template comes from the live config, so make sure it still belongs
-	// to the snapshotted file: a task-source change while a detail overlay
-	// was open must not pair one source's text with another's template.
+	// The snapshotted row must still belong to the group it was drawn from: a
+	// task-source change while a detail overlay was open must not send an item
+	// against a list that has moved. The template and the source's config
+	// position are no longer read here at all — the owning daemon resolves both
+	// from its own config, by LOCATOR, which is the same guard one layer down.
 	if r.group >= len(m.data.tasks) || m.data.tasks[r.group].ListAddress() != r.path {
 		m.message = "task sources changed — refresh and retry"
 		return m, nil
 	}
-	template := m.data.tasks[r.group].Source.NextTaskTemplate
 	app := m.app
-	// The group's Index IS the config position (one group per source, in
-	// config order) — threaded through, never recovered by comparing entries.
-	sourceIndex := strconv.Itoa(m.data.tasks[r.group].Index)
-	paneID, agentType, path, text, item := agent.PaneID, agent.AgentType, canonicalTaskPath(r.path), r.itemText, r.item
+	path, text, item := canonicalTaskPath(r.path), r.itemText, r.item
 	send := m.do(fmt.Sprintf("task #%d sent to %s and marked [-] in progress", item, name),
 		func(c context.Context) error {
-			return app.SendTaskToAgent(c, paneID, agentType, name, path, template, sourceIndex, item, text)
+			return app.SendTaskToAgentOn(c, "", name, path, item, text)
 		})
 	// The count rides along: what gets delivered is the FOLDED task, so a label
 	// naming only the item number would take a "y" for more than it showed.
 	m.confirm = &confirmation{
 		label:     fmt.Sprintf("send task #%d%s to %s?", item, detailCount(r.itemDetail), name),
+		onConfirm: func() tea.Cmd { return send },
+	}
+	return m, nil
+}
+
+// sendRemoteTaskRow hands an item on ANOTHER node's list to that node's daemon.
+//
+// It refuses less than the local path does, and deliberately: whether the agent
+// is idle, which pane it is, and what its source's template says are all
+// questions only the owning daemon can answer, so they are asked there and come
+// back as the action's verdict rather than being guessed from a roster row that
+// may be a sync interval old. The one thing checked here is that the row still
+// belongs to the group it was drawn from.
+func (m Model) sendRemoteTaskRow(r taskRow, g frontend.TaskGroup) (tea.Model, tea.Cmd) {
+	name := g.Source.Agent
+	if name == "" {
+		m.message = fmt.Sprintf("node %s does not say which agent this list belongs to", g.NodeLabel)
+		return m, nil
+	}
+	if g.ListAddress() != r.path {
+		m.message = "task sources changed — refresh and retry"
+		return m, nil
+	}
+	app := m.app
+	node, locator, text, item := g.NodeID, g.Locator, r.itemText, r.item
+	send := m.do(fmt.Sprintf("task #%d sent to %s on node %s and marked [-] in progress", item, name, g.NodeLabel),
+		func(c context.Context) error {
+			return app.SendTaskToAgentOn(c, node, name, locator, item, text)
+		})
+	m.confirm = &confirmation{
+		label: fmt.Sprintf("send task #%d%s to %s on node %s?",
+			item, detailCount(r.itemDetail), name, g.NodeLabel),
 		onConfirm: func() tea.Cmd { return send },
 	}
 	return m, nil

@@ -28,7 +28,7 @@ func TestConfirmGeneratedTaskAppendsToBootstrapList(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Task A - fix login", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, first, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, first, false); err != nil {
 		t.Fatal(err)
 	}
 	// A later generation suggests only NEW work — it does NOT re-list Task A.
@@ -37,7 +37,7 @@ func TestConfirmGeneratedTaskAppendsToBootstrapList(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Task B - add tests\nTask C - update docs", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, second, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, second, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -69,7 +69,7 @@ func TestConfirmGeneratedTaskAppendsWhileAgentBusy(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Existing task", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, first, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, first, false); err != nil {
 		t.Fatal(err)
 	}
 	// Agent is now busy; queue a new generated task (send=false).
@@ -79,7 +79,7 @@ func TestConfirmGeneratedTaskAppendsWhileAgentBusy(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Newly queued task", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, second, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, second, false); err != nil {
 		t.Fatalf("queueing to a busy agent must succeed: %v", err)
 	}
 
@@ -113,7 +113,7 @@ func TestConfirmGeneratedTaskSendAppendsAndReservesNewItem(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Old done task", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, first, false); err != nil {
+	if err := confirmGeneratedTask(app, ctx, first, false); err != nil {
 		t.Fatal(err)
 	}
 	// Mark the existing item completed.
@@ -134,7 +134,7 @@ func TestConfirmGeneratedTaskSendAppendsAndReservesNewItem(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "Fresh task", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, second, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, second, true); err != nil {
 		t.Fatalf("confirm+send must succeed: %v", err)
 	}
 
@@ -171,7 +171,7 @@ func TestConfirmGeneratedTaskSendReservesNumberedFirstTask(t *testing.T) {
 		Action: "escalated", Status: "escalated",
 		Suggestion: domain.SuggestTaskPrefix + "- 1. Foo bar", CreatedAt: time.Now(),
 	})
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatalf("confirm+send of a numbered-body task must succeed: %v", err)
 	}
 	body, _ := os.ReadFile(filepath.Join(stateDir, "tasks", name+".md"))
@@ -216,7 +216,7 @@ func TestConfirmGeneratedTaskCollapsesDuplicateKeepingAdvancedMark(t *testing.T)
 				Action: "escalated", Status: "escalated",
 				Suggestion: domain.SuggestTaskPrefix + "Alpha", CreatedAt: time.Now(),
 			})
-			if err := app.Confirm(ctx, first, false); err != nil {
+			if err := confirmGeneratedTask(app, ctx, first, false); err != nil {
 				t.Fatal(err)
 			}
 			// Hand-edit the file to carry the duplicate identity in this order.
@@ -229,7 +229,7 @@ func TestConfirmGeneratedTaskCollapsesDuplicateKeepingAdvancedMark(t *testing.T)
 				Action: "escalated", Status: "escalated",
 				Suggestion: domain.SuggestTaskPrefix + "Beta", CreatedAt: time.Now(),
 			})
-			if err := app.Confirm(ctx, second, false); err != nil {
+			if err := confirmGeneratedTask(app, ctx, second, false); err != nil {
 				t.Fatal(err)
 			}
 			body, _ := os.ReadFile(path)
