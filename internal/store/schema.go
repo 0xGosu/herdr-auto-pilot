@@ -137,6 +137,14 @@ const createAgentRoster = `CREATE TABLE IF NOT EXISTS agent_roster (
 // has to survive. That is why agent_roster went unswept until this table
 // existed (#398, and #395 whose delete had to be backed out).
 //
+// THE INVARIANT: a tombstone never coexists with a LIVE row (gone_at = 0).
+// Every write happens inside the same PublishRoster transaction that sets
+// gone_at, and every clear is paired with a write that sets gone_at = 0 —
+// upsertRosterRow's authoritative arm, or the INSERT arm reached once the wide
+// row has been pruned or deleted as a recycled pane. It is what lets
+// rosterRowUnchanged skip an unchanged row without stranding a tombstone over a
+// live agent, which would silently refuse that agent's every later event.
+//
 // terminal_id is the payload that makes it more than a "never again" flag:
 // herdr recycles pane ids and an agent id IS a pane id, so a genuinely new
 // agent on a retired id carries a different terminal and UpsertRosterAgent

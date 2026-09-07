@@ -279,7 +279,11 @@ type storedRosterRow struct {
 //     owns that column on its own slower TTL.
 //   - gone_at is compared rather than excluded: an authoritative publish clears
 //     it, so a row returning from the dead must be written even when every other
-//     field matches.
+//     field matches. That comparison is also what keeps the skip from stranding
+//     a tombstone: upsertRosterRow deletes one on its authoritative path, and a
+//     row this returns true for is LIVE — which by createAgentRosterTombstones'
+//     invariant never carries one. A tombstone left over a live agent would
+//     silently refuse that agent's every later event.
 //
 // A terminal id that this listing did not observe is not evidence of a change,
 // matching the CASE arm that preserves the stored one.
