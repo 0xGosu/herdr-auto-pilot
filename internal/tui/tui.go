@@ -780,7 +780,15 @@ type detailView struct {
 	// focusAgentID is the agent recorded on an escalation detail. Its current
 	// pane coordinates are resolved from live status when `f` is pressed, so a
 	// background refresh or list-cursor move cannot retarget the action.
+	//
+	// focusNodeID is the machine that agent id belongs to, and it is not
+	// optional bookkeeping: an agent id IS a herdr pane id, so every machine
+	// has a "1". Resolving the id alone against this node's agents focused
+	// THIS herdr's pane 1 for a remote escalation — the wrong agent, silently,
+	// under a success banner. Empty means this node, so a fleet-less install
+	// behaves exactly as before.
 	focusAgentID string
+	focusNodeID  string
 	// ruleDetail marks an escalation/audit overlay, and ruleSignature snapshots
 	// the record's signature so `t: see rule` jumps to the rule of the record ON
 	// SCREEN (same reason as confirmID/focusAgentID). The bool is what gates the
@@ -2378,7 +2386,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.focusAgent(*m.detail.agent)
 			}
 			if m.detail.focusAgentID != "" {
-				return m.focusAgentByID(m.detail.focusAgentID)
+				return m.focusAgentOn(m.detail.focusNodeID, m.detail.focusAgentID)
 			}
 			if r := m.detail.task; r != nil {
 				return m.focusTaskGroupAgent(r.group)
@@ -4378,11 +4386,55 @@ func (m Model) enableAgent(r agentRow) (tea.Model, tea.Cmd) {
 	})
 }
 
+// isSelfNode reports whether nodeID names this installation. An empty node is
+// this one, so every surface that has no fleet in play reads exactly as before.
+//
+// One spelling on purpose: "which machine is this" is asked by the disabled
+// lookup and by agentRowOn, and two copies that drifted would put a remote row
+// and its own automation state on different machines.
+func (m Model) isSelfNode(nodeID string) bool {
+	return nodeID == "" || nodeID == m.data.status.NodeID
+}
+
+// agentRowOn resolves a (node, agent) pair to the row the Agents tab would
+// render for it, local or remote, or nil when nothing live matches.
+//
+// It goes through agentRows() rather than scanning MonitoredAgents, and that is
+// what makes the callers below correct rather than merely wider: a remote row
+// built there already carries TabID/PaneID (from RosterAgent.Transition()),
+// NodeLabel and — the one that matters — Stale, so remoteActionBlocked's
+// "that machine has stopped reporting" gate applies to a focus raised from the
+// Escalations tab exactly as it does to one raised from Agents. That gate was
+// unreachable from Escalations before, because a remote agent was refused
+// outright a step earlier.
+//
+// The match is on the PAIR. An agent id is a herdr pane id and repeats on every
+// machine, so matching the id alone is how a remote escalation ends up focusing
+// a local pane that merely shares its number.
+func (m Model) agentRowOn(nodeID, agentID string) *agentRow {
+	self := m.isSelfNode(nodeID)
+	for _, r := range m.agentRows() {
+		if r.AgentID != agentID {
+			continue
+		}
+		if self {
+			if !r.remote() {
+				return &r
+			}
+			continue
+		}
+		if r.NodeID == nodeID {
+			return &r
+		}
+	}
+	return nil
+}
+
 // agentDisabledOn answers "is this agent disabled" for a (node, agent) pair,
 // which is the only form of the question that has one answer under a shared
 // database.
 func (m Model) agentDisabledOn(nodeID, agentID string) bool {
-	if nodeID == "" || nodeID == m.data.status.NodeID {
+	if m.isSelfNode(nodeID) {
 		return m.data.status.AgentDisabled(agentID)
 	}
 	for _, r := range m.data.status.RemoteAgents {
@@ -4464,17 +4516,28 @@ func (m Model) focusSelected() (tea.Model, tea.Cmd) {
 	return m.focusAgent(*r)
 }
 
-// focusAgentByID resolves an audit record's stable agent id to its current
-// herdr location. Audit rows intentionally do not duplicate pane coordinates,
-// which may change while the TUI is open.
-func (m Model) focusAgentByID(agentID string) (tea.Model, tea.Cmd) {
-	for _, agent := range m.data.status.MonitoredAgents {
-		if agent.AgentID == agentID {
-			return m.focusAgent(m.localRow(agent))
+// focusAgentOn resolves an audit record's stable (node, agent) pair to its
+// current herdr location. Audit rows intentionally do not duplicate pane
+// coordinates, which may change while the TUI is open.
+//
+// The node half is required, not decorative — see agentRowOn.
+func (m Model) focusAgentOn(nodeID, agentID string) (tea.Model, tea.Cmd) {
+	r := m.agentRowOn(nodeID, agentID)
+	if r == nil {
+		// Deliberately not folded into one sentence with the stale-node case
+		// that focusAgent reports: a node that has stopped reporting is
+		// something the operator can go and fix, while an agent that is simply
+		// no longer running is not. Saying "no location known" for both would
+		// hide the actionable half.
+		if !m.isSelfNode(nodeID) {
+			m.message = fmt.Sprintf("no live agent %s on node %s — it may have exited",
+				agentID, m.data.status.NodeLabel(nodeID))
+			return m, nil
 		}
+		m.message = "no location known for this agent"
+		return m, nil
 	}
-	m.message = "no location known for this agent"
-	return m, nil
+	return m.focusAgent(*r)
 }
 
 func (m Model) focusSelectedEscalation() (tea.Model, tea.Cmd) {
@@ -4482,14 +4545,7 @@ func (m Model) focusSelectedEscalation() (tea.Model, tea.Cmd) {
 	if rec == nil {
 		return m, nil
 	}
-	// A remote escalation's agent id may also name a LOCAL pane (herdr's ids
-	// repeat across machines); focusing that would move the operator's view to
-	// the wrong agent — and focus of a remote agent is local-only by design.
-	if rec.NodeID != "" && rec.NodeID != m.data.status.NodeID {
-		m.message = fmt.Sprintf("agent %s is on node %s — focus is local-only", m.data.status.EscalationAgent(*rec), m.data.status.NodeLabel(rec.NodeID))
-		return m, nil
-	}
-	return m.focusAgentByID(rec.AgentID)
+	return m.focusAgentOn(rec.NodeID, rec.AgentID)
 }
 
 // consultKey identifies an agent across the fleet for the pending-consult map.
@@ -4609,7 +4665,7 @@ func (m Model) viewSelected() (tea.Model, tea.Cmd) {
 				if m.canRetry(r) {
 					d.retryID = r.ID
 				}
-				d.focusAgentID = r.AgentID
+				d.focusAgentID, d.focusNodeID = r.AgentID, r.NodeID
 				// Only the Escalations detail offers `b`: disabling a builtin
 				// rule is a response to being blocked by it, and the Audit tab
 				// is a read-only history. The line naming the rule still
