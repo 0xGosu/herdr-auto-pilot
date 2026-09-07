@@ -546,8 +546,10 @@ func buildCommands() {
 				{Name: "--limit", Arg: "N", Default: "30", Desc: "number of records, newest first"},
 			},
 			Details: "Columns: #id, time, status, situation type, action, confidence, LLM score,\n" +
-				"rule mode, rationale. This is the record to read when something was answered\n" +
-				"automatically and you want to know why.",
+				"rule mode, rationale, agent, node. This is the record to read when something\n" +
+				"was answered automatically and you want to know why. On a fleet, agent= reads\n" +
+				"name@node for another machine's row — a herdr pane id repeats across machines,\n" +
+				"so the name alone is not an identity.",
 			Examples: []string{"hap audit", "hap audit --limit 100"},
 			Next: []Hint{
 				{Cmd: "hap signatures show <prefix>", Why: "inspect the rule behind a row"},

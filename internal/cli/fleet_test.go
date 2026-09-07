@@ -331,3 +331,68 @@ func TestRemoteAnswersNameTheNodeAndStatusSplitsTheCount(t *testing.T) {
 		t.Errorf("a remote answer must name the node acting on it:\n%s", out)
 	}
 }
+
+// TestAuditNamesTheAgentAndNeverBorrowsALocalName: `hap audit` gained an
+// agent= token (it had none), and it resolves the pair (node, agent) rather
+// than the agent id alone. A herdr pane id repeats on every machine sharing
+// the store and the audit log spans the fleet, so an id-keyed lookup labels
+// the laptop's row with THIS node's agent — silently, with nothing marking it
+// as another machine's. Both nodes use pane "1" here, which is what makes the
+// case discriminate.
+func TestAuditNamesTheAgentAndNeverBorrowsALocalName(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := st.UpsertNode(ctx, domain.NodeInfo{Label: "here", LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AssignAgentName(ctx, "1", "patient-lemur"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AppendAudit(ctx, domain.AuditRecord{AgentID: "1", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationIdle, Action: "auto:continue", Status: "auto", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	other, err := store.OpenAs(filepath.Join(filepath.Dir(app.ConfigPath), "t.db"), "bbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "laptop", LastSeen: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.AssignAgentName(ctx, "1", "brave-otter"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := other.AppendAudit(ctx, domain.AuditRecord{AgentID: "1", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationIdle, Action: "auto:continue", Status: "auto",
+		CreatedAt: now.Add(time.Second)}); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := run(t, app, "audit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var local, remote string
+	for _, line := range strings.Split(out, "\n") {
+		switch {
+		case strings.Contains(line, "node=here"):
+			local = line
+		case strings.Contains(line, "node=laptop"):
+			remote = line
+		}
+	}
+	if local == "" || remote == "" {
+		t.Fatalf("want one row per node:\n%s", out)
+	}
+	if !strings.Contains(local, "agent=patient-lemur\t") {
+		t.Errorf("local row should name its own agent: %q", local)
+	}
+	if !strings.Contains(remote, "agent=brave-otter@laptop\t") {
+		t.Errorf("remote row should read name@node, got %q", remote)
+	}
+	if strings.Contains(remote, "patient-lemur") {
+		t.Errorf("the laptop's row borrowed this node's agent name: %q", remote)
+	}
+}
