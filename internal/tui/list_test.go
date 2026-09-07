@@ -206,6 +206,50 @@ func TestAuditRowsRenderAgentName(t *testing.T) {
 	}
 }
 
+// TestAuditRowFromAnotherNodeIsNotLabelledWithALocalName: a herdr pane id
+// repeats on every machine sharing the store, and Store.AuditLog spans the
+// fleet — so the id "w1:p1" on the row below belongs to the LAPTOP's agent
+// while this node has an agent at the same id. Resolving through
+// Status.AgentName (keyed on the id alone) renders the local stranger's name
+// with nothing marking it as another machine's; the Escalations tab has used
+// the node-aware lookup since the fleet migration and the Audit tab did not.
+//
+// The single-node fixture above passes either way, which is why this case
+// exists: it is the only one that fails on the bug.
+func TestAuditRowFromAnotherNodeIsNotLabelledWithALocalName(t *testing.T) {
+	m := Model{width: 140, height: 30}
+	msg := refreshMsg{cfg: config.Default()}
+	msg.status.NodeID = "node-here"
+	msg.status.AgentNames = map[string]string{"w1:p1": "patient-lemur"}
+	msg.status.MonitoredAgents = []domain.AgentTransition{{AgentID: "w1:p1", AgentType: "claude"}}
+	msg.status.Nodes = []domain.NodeInfo{{ID: "node-here"}, {ID: "node-there", Label: "laptop"}}
+	msg.status.FleetNames = map[domain.NodeAgent]string{
+		{NodeID: "node-there", AgentID: "w1:p1"}: "brave-otter",
+	}
+	msg.audit = []domain.AuditRecord{{
+		ID: 1, NodeID: "node-there", AgentID: "w1:p1", SituationType: domain.SituationIdle,
+		Status: "auto", Action: "auto:continue", CreatedAt: time.Now(),
+	}}
+	upd, _ := m.Update(msg)
+	m = upd.(Model)
+	m.tab = tabAudit
+
+	view := m.View()
+	if strings.Contains(view, "patient-lemur") {
+		t.Errorf("the laptop's row is labelled with THIS node's agent name:\n%s", view)
+	}
+	// The column caps at agentNameColWidth, so assert the prefix rather than
+	// the whole "brave-otter@laptop".
+	if !strings.Contains(view, "brave-otter@") {
+		t.Errorf("want the laptop's agent name with an @node suffix:\n%s", view)
+	}
+	// agentTypeFor must not borrow the local agent's type either: MonitoredAgents
+	// is this node's herd, so the honest answer for a remote row is "unknown".
+	if strings.Contains(view, "claude") {
+		t.Errorf("the remote row borrowed a local agent's type:\n%s", view)
+	}
+}
+
 func TestEscalationAuditAndRulesListsRenderSingleHeader(t *testing.T) {
 	m := testModel(t)
 

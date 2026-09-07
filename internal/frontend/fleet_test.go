@@ -184,8 +184,8 @@ func TestResolveFilesARemoteEscalationUnderItsOwner(t *testing.T) {
 	// The fleet view labels the row with the laptop's agent.
 	status, _ := app.GetStatus(ctx)
 	esc, _ := app.Escalations(ctx)
-	if len(esc) != 1 || !strings.HasSuffix(status.EscalationAgent(esc[0]), "@laptop") {
-		t.Errorf("escalation label = %q, want …@laptop", status.EscalationAgent(esc[0]))
+	if len(esc) != 1 || !strings.HasSuffix(status.RecordAgent(esc[0]), "@laptop") {
+		t.Errorf("escalation label = %q, want …@laptop", status.RecordAgent(esc[0]))
 	}
 }
 

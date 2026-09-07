@@ -1483,7 +1483,7 @@ func (m Model) filterAudit(t tab, rows []domain.AuditRecord) []domain.AuditRecor
 		if m.matchesQuery(t,
 			fmt.Sprintf("#%d", r.ID), string(r.SituationType), r.Status,
 			frontend.AuditStatusLabel(r),
-			m.data.status.AgentName(r.AgentID), r.AgentID, m.agentTypeFor(r),
+			m.data.status.RecordAgent(r), r.AgentID, m.agentTypeFor(r),
 			r.Action, r.Rationale, r.Suggestion) {
 			out = append(out, r)
 		}
@@ -2955,10 +2955,7 @@ func escalationAlertText(msg refreshMsg) (title, body string) {
 			newest = r
 		}
 	}
-	agent := msg.status.AgentName(newest.AgentID)
-	if agent == "" {
-		agent = newest.AgentID
-	}
+	agent := msg.status.RecordAgent(newest)
 	if agent == "" {
 		// No escalation row to describe (an id-only diff, or a pruned list):
 		// still alert, just without the specifics.
@@ -5217,11 +5214,18 @@ type auditDetailOptions struct {
 
 func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int, opts auditDetailOptions) []string {
 	var lines []string
-	agent := r.AgentID
-	if n := m.data.status.AgentName(r.AgentID); n != "" {
-		agent = fmt.Sprintf("%s (%s)", n, r.AgentID)
+	// RecordAgent already carries the @node suffix for another machine's row;
+	// the pane id alone is not an identity, so it is only ever a parenthetical.
+	agent := m.data.status.RecordAgent(r)
+	if agent != r.AgentID {
+		agent = fmt.Sprintf("%s (%s)", agent, r.AgentID)
 	}
 	lines = m.detailField(lines, w, "When", r.CreatedAt.Format(time.RFC3339))
+	// Only for another machine's row, the way agentDetailLines does it: on a
+	// single-node install every row is this node's and the line says nothing.
+	if r.NodeID != "" && r.NodeID != m.data.status.NodeID {
+		lines = m.detailField(lines, w, "Node", m.data.status.NodeLabel(r.NodeID))
+	}
 	lines = m.detailField(lines, w, "Status", r.Status)
 	// Only worth a line when true: it explains the amber row, and its absence
 	// on an ordinary row is not information the operator needs repeated.
@@ -7145,6 +7149,12 @@ func (m Model) agentTypeFor(r domain.AuditRecord) string {
 	if r.AgentType != "" {
 		return r.AgentType
 	}
+	// MonitoredAgents holds THIS node's agents, keyed by a herdr pane id that
+	// repeats across machines, so a remote row matching one of them would
+	// borrow a local stranger's type. "Unknown" is the honest answer.
+	if r.NodeID != "" && r.NodeID != m.data.status.NodeID {
+		return ""
+	}
 	for _, a := range m.data.status.MonitoredAgents {
 		if a.AgentID == r.AgentID {
 			return a.AgentType
@@ -7188,7 +7198,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		e := esc[i]
 		// name@node for another machine's row: pane ids repeat across
 		// machines, so a local name lookup would mislabel it.
-		agent := m.data.status.EscalationAgent(e)
+		agent := m.data.status.RecordAgent(e)
 		mark := " "
 		if m.marked[e.ID] {
 			mark = "✓"
@@ -7266,10 +7276,10 @@ func (m Model) renderAudit(b *strings.Builder) {
 	start, end := m.window(len(rows))
 	for i := start; i < end; i++ {
 		r := rows[i]
-		agent := m.data.status.AgentName(r.AgentID)
-		if agent == "" {
-			agent = r.AgentID
-		}
+		// RecordAgent, not AgentName: an audit row can come from another node
+		// (Store.AuditLog spans the fleet) and a pane id repeats across
+		// machines, so a name keyed on the id alone mislabels it.
+		agent := m.data.status.RecordAgent(r)
 		line := fmt.Sprintf(auditRowFmt,
 			shortAuditID(r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), agentNameColWidth),

@@ -49,8 +49,8 @@ func (r RemoteAgent) ShortName() string {
 // Display is the row's name as the unified surfaces print it: name@node.
 //
 // Kept for the surfaces where nothing else carries the node — the Escalations
-// tab's AGENT column (Status.EscalationAgent) is one flat field, so the suffix
-// is the only thing distinguishing two machines' pane "1".
+// and Audit tabs' AGENT column (Status.RecordAgent) is one flat field, so the
+// suffix is the only thing distinguishing two machines' pane "1".
 func (r RemoteAgent) Display() string {
 	return r.ShortName() + "@" + r.NodeLabel
 }
@@ -73,20 +73,28 @@ func (st Status) NodeLabel(nodeID string) string {
 	return domain.NodeLabelOrID(domain.NodeInfo{ID: nodeID})
 }
 
-// EscalationAgent is the AGENT column for an escalation row: the local name
-// for this node's rows, name@node for another machine's.
-func (st Status) EscalationAgent(e domain.AuditRecord) string {
-	if e.NodeID == "" || e.NodeID == st.NodeID {
-		if n := st.AgentName(e.AgentID); n != "" {
+// RecordAgent is the AGENT column for ANY audit record — an escalation or a
+// plain audit row: the local name for this node's rows, name@node for another
+// machine's.
+//
+// It is never Status.AgentName: that map is keyed by agent id alone, and an
+// agent id IS a herdr pane id, which repeats on every machine sharing the
+// store. A remote row read through it either falls back to a bare pane id or,
+// when the id collides with a local pane, renders a LOCAL agent's name with
+// nothing marking it as another machine's. Identity is the PAIR
+// (NodeID, AgentID); neither half is an address on its own.
+func (st Status) RecordAgent(r domain.AuditRecord) string {
+	if r.NodeID == "" || r.NodeID == st.NodeID {
+		if n := st.AgentName(r.AgentID); n != "" {
 			return n
 		}
-		return e.AgentID
+		return r.AgentID
 	}
-	name := st.FleetNames[domain.NodeAgent{NodeID: e.NodeID, AgentID: e.AgentID}]
+	name := st.FleetNames[domain.NodeAgent{NodeID: r.NodeID, AgentID: r.AgentID}]
 	if name == "" {
-		name = e.AgentID
+		name = r.AgentID
 	}
-	return name + "@" + st.NodeLabel(e.NodeID)
+	return name + "@" + st.NodeLabel(r.NodeID)
 }
 
 // RemoteNodes reports how many OTHER nodes share the store and how many of
