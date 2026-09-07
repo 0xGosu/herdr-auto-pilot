@@ -1064,6 +1064,10 @@ func buildCommands() {
 				"refused.\n" +
 				"`send` hands a pending item to a live, cleanly idle agent NOW and marks it [-];\n" +
 				"idleness is re-checked at delivery, and a failed send returns the item to [ ].\n" +
+				"The delivery itself is filed for THIS node's daemon, so `send` needs one running\n" +
+				"and reaches only agents on this machine — `--node` does not extend it, because\n" +
+				"`hap task` reads the list through this node's [[task_sources]]. Use the TUI's\n" +
+				"Tasks tab, which renders fleet lists from the shared database, to send remotely.\n" +
 				"Normally you do not need `send`: the daemon hands out the next task by itself.",
 			Examples: []string{
 				"hap task vivid-falcon list",

@@ -197,6 +197,14 @@ func TestOperatorConfirmRecordsAReservation(t *testing.T) {
 	ctx := context.Background()
 
 	st.EnsureAgentName(ctx, "w6:p6")
+	// The roster is what carries the terminal id into the ledger row. Without
+	// it the reservation still lands, but with an empty TerminalID — which both
+	// readers take as "matches any terminal", so the recycled-pane guard below
+	// would be asserting nothing.
+	seedRoster(t, st, domain.AgentTransition{
+		AgentID: "w6:p6", PaneID: "w6:p6", AgentType: "claude",
+		Status: "idle", TerminalID: "term-w6", At: time.Now(),
+	})
 	id, err := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w6:p6", SituationType: domain.SituationIdle, Trigger: "t",
 		Action: "escalated", Status: "escalated",
@@ -221,6 +229,15 @@ func TestOperatorConfirmRecordsAReservation(t *testing.T) {
 	}
 	if !strings.Contains(res[0].TaskText, "Task A - fix login") {
 		t.Errorf("ledger row task = %q, want the item that was handed out", res[0].TaskText)
+	}
+	// herdr recycles pane ids and an agent id IS a pane id, so the terminal is
+	// the only thing telling this hand-out apart from one belonging to a
+	// successor process on the same pane. Both the confirm query and reclaim's
+	// sameTenant read an empty id as "any terminal", so recording it is what
+	// stops a recycled pane confirming — or pinning — its predecessor's item.
+	if res[0].TerminalID != "term-w6" {
+		t.Errorf("ledger row terminal = %q, want term-w6 from the published roster row",
+			res[0].TerminalID)
 	}
 }
 

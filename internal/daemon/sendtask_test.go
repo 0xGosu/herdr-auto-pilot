@@ -136,6 +136,10 @@ func TestAQueuedTaskHandOutRechecksIdle(t *testing.T) {
 			want:   "no longer live",
 		},
 		{
+			// This case also pins that the refusal is TERMINAL, not
+			// errActionTransient: a transient one is retried on the next
+			// sweeps, so the row would still be running when awaitAction
+			// gives up — a timeout rather than the clear failure below.
 			name:   "an unreadable agent list is not an idle agent",
 			failed: true,
 			want:   "cannot confirm",
