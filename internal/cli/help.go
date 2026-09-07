@@ -111,16 +111,33 @@ func buildCommands() {
 			Name:    "daemon",
 			Group:   groupCore,
 			Summary: "run the monitoring daemon (the process that watches agents and answers them)",
-			Usage:   []string{"hap daemon", "hap daemon --ensure", "hap daemon --ensure --replace-only"},
+			Usage:   []string{"hap daemon", "hap daemon --ensure", "hap daemon --ensure --replace-only", "hap daemon --restart", "hap daemon --reload"},
 			Flags: []FlagDoc{
 				{Name: "--ensure", Desc: "start a daemon only if none is running; replace one left by an older binary or a binary at a different path (this is what herdr's event hook runs, and how you pick up a rebuild)"},
 				{Name: "--replace-only", Desc: "with --ensure: replace a running daemon, but never start one when none is running (used by the plugin install step, so installing hap does not bring a daemon up as a side effect)"},
+				{Name: "--restart", Desc: "stop the running daemon whatever binary it came from, and start a fresh one (starts one if none is running) — the only way to pick up a [database] or [logging] change. It waits for the new daemon to report healthy, and says so plainly when it does not"},
+				{Name: "--reload", Desc: "ask the running daemon to re-read config.toml, without restarting it; fails when no daemon is running"},
 			},
-			Details: "Without --ensure the daemon runs in the foreground and holds the state-dir lock.\n" +
-				"Exactly one daemon may run per state dir. After upgrading or rebuilding hap, run\n" +
-				"`hap daemon --ensure` — `hap status` reports a daemon from an older binary as STALE,\n" +
-				"and one whose own binary an upgrade removed as BINARY REMOVED.",
-			Examples: []string{"hap daemon --ensure", "hap status"},
+			Details: "Without a flag the daemon runs in the foreground and holds the state-dir lock.\n" +
+				"Exactly one daemon may run per state dir. --ensure, --restart and --reload are\n" +
+				"alternatives; passing more than one is refused.\n\n" +
+				"After upgrading or rebuilding hap, run `hap daemon --ensure` — `hap status` reports a\n" +
+				"daemon from an older binary as STALE, and one whose own binary an upgrade removed as\n" +
+				"BINARY REMOVED. --ensure does nothing when the running daemon is already this binary,\n" +
+				"which is why a settings change needs one of the two below instead.\n\n" +
+				"--reload vs --restart: most config is re-read on a reload (every `hap config` write\n" +
+				"sends the same nudge). [database] and [logging] are NOT — they are read once, when a\n" +
+				"process opens its store, so switching engine, pointing at a different Turso database,\n" +
+				"rotating its token, changing node_label or the log level takes effect only in a NEW\n" +
+				"process. Front ends read their store once too, so reopen `hap tui` after a restart.\n\n" +
+				"--restart does not report success on the fork alone: a [database] error exits AFTER the\n" +
+				"new daemon takes the lock, so it waits for a heartbeat from the process now holding that\n" +
+				"lock. Failing to see one it says so and EXITS NON-ZERO, so `hap daemon --restart && …`\n" +
+				"never proceeds on an unknown — run `hap status --stderr` then. It also does not count as a crash: an\n" +
+				"operator restarting repeatedly while getting a setting right would otherwise trip the\n" +
+				"crash-loop breaker, which auto-disables semantic matching. A breaker that has already\n" +
+				"given up still refuses the start, naming the [embedding] change that clears it.",
+			Examples: []string{"hap daemon --ensure", "hap daemon --restart", "hap daemon --reload", "hap status"},
 			Next: []Hint{
 				{Cmd: "hap status", Why: "confirm the daemon is running and healthy"},
 				{Cmd: "hap agents", Why: "see which agents it is watching"},

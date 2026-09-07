@@ -54,9 +54,13 @@ func (a *App) requireLiveDaemon() error {
 	h := a.AssessDaemonHealth()
 	switch {
 	case !h.Running:
+		// --ensure is right here and only here: with nothing running it starts
+		// one. The HUNG case below is the one it cannot fix.
 		return fmt.Errorf("%w; start one with `hap daemon --ensure`", ErrDaemonUnavailable)
 	case h.Hung:
-		return fmt.Errorf("%w: the daemon is running but has not made progress for %s; restart it with `hap daemon --ensure`",
+		// --ensure would return early here: a hung daemon is still this
+		// version at this path, so only --restart actually replaces it.
+		return fmt.Errorf("%w: the daemon is running but has not made progress for %s; restart it with `hap daemon --restart`",
 			ErrDaemonUnavailable, h.HeartbeatAge.Round(time.Second))
 	case h.BinaryReplaced:
 		return fmt.Errorf("%w: the daemon's binary was replaced underneath it; hand it over with `hap daemon --ensure`",

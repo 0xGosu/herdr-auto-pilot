@@ -676,7 +676,8 @@ const TursoAuthTokenEnv = "TURSO_AUTH_TOKEN"
 // identical herdr pane ids on two machines never collide.
 //
 // The section is read once, when a process opens its store: a change needs
-// `hap daemon --ensure` (and reopening the TUI). Config itself never enters
+// `hap daemon --restart` (and reopening the TUI) — --ensure leaves a daemon
+// that is already this binary alone. Config itself never enters
 // the database — each machine keeps its own config.toml.
 type Database struct {
 	// Engine is one of ValidDatabaseEngines. Empty means sqlite. An
@@ -1296,7 +1297,7 @@ type Logging struct {
 	// change does NOT take effect on the daemon's config reload. The slog
 	// default handler is installed at startup and swapping it under running
 	// goroutines is not worth the race for a diagnostic setting; restart the
-	// daemon (`hap daemon --ensure`) to apply it.
+	// daemon (`hap daemon --restart`) to apply it.
 	Level string `toml:"level,omitempty"`
 	// MaxSizeMB caps the plugin log before it rotates to a single ".old"
 	// sibling, so roughly twice this is kept on disk. 0 uses the default.

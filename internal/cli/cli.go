@@ -27,10 +27,11 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
-// ErrUnhealthy signals that `hap status` found the daemon in an unhealthy
-// state (hung — a held lock with a stale heartbeat). status prints the human
-// detail itself; main maps this sentinel to a non-zero exit WITHOUT an
-// "error:" prefix, so scripted health checks can detect it.
+// ErrUnhealthy signals that the daemon is not in a state the caller asked for:
+// `hap status` found it hung (a held lock with a stale heartbeat), or
+// `hap daemon --restart` could not confirm the daemon it started. Both print
+// the human detail themselves; main maps this sentinel to a non-zero exit
+// WITHOUT an "error:" prefix, so scripted health checks can detect it.
 var ErrUnhealthy = errors.New("daemon unhealthy")
 
 // deprecationOut is where the "this verb moved" note goes. It is stderr rather
@@ -1005,7 +1006,11 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	// kill switch, or work the queue.
 	var hints []Hint
 	if app.DaemonInfo != nil && (!h.Running || h.Hung || h.VersionStale || h.BinaryReplaced) {
-		hints = append(hints, Hint{Cmd: "hap daemon --ensure", Why: "start, or replace, the daemon"})
+		// --ensure is a no-op for a HUNG daemon at the current version and
+		// path (EnsureFresh returns early on "already the binary we would
+		// start"), which is the state this hint most often fires in, so name
+		// the flag that always acts.
+		hints = append(hints, Hint{Cmd: "hap daemon --restart", Why: "stop the daemon whatever state it is in, and start a fresh one"})
 	}
 	if st.Paused {
 		hints = append(hints, Hint{Cmd: "hap resume", Why: "lift the kill switch so hap answers again"})
@@ -1058,7 +1063,7 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		if problem := st.RosterProblem(); problem != "" {
 			fmt.Fprintf(out, "%s\n", problem)
 			PrintNextSteps(out, []Hint{
-				{Cmd: "hap daemon --ensure", Why: "start the daemon, or replace one that has stopped reporting"},
+				{Cmd: "hap daemon --restart", Why: "start the daemon, or replace one that has stopped reporting"},
 				{Cmd: "hap status", Why: "see whether it is running and subscribed"},
 			})
 			return nil
@@ -1548,8 +1553,13 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		if strings.HasPrefix(key, "database.") {
 			// The store is opened once per process, so a reload cannot apply
 			// this; said on stderr like the other notes, since stdout is parsed.
+			// --ensure is the WRONG verb here and was, until --restart existed,
+			// the only one on offer: the running daemon is already this binary
+			// at this path, so EnsureFresh returns early and the operator is
+			// left with a daemon serving the old store while `hap status` looks
+			// entirely healthy.
 			fmt.Fprintln(deprecationOut, "note: [database] is read when a process opens its store — "+
-				"run `hap daemon --ensure` and reopen the TUI for it to take effect")
+				"run `hap daemon --restart` and reopen the TUI for it to take effect")
 		}
 		PrintNextSteps(out, configHints())
 		return nil
