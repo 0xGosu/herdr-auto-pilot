@@ -278,3 +278,29 @@ type AcceptGeneratedTaskPayload struct {
 	AuditID int64 `json:"audit_id"`
 	Send    bool  `json:"send"`
 }
+
+// SendTaskPayload is the send_task action's arguments: one checklist item an
+// operator picked out of a list.
+//
+// It carries the list and the item, and deliberately nothing else. The pane,
+// the agent type, the source's next-task template, its config position and
+// {cwd} are all RE-DERIVED by the executor from that node's own config and a
+// live listing — which is the point rather than an economy. A pane id is a
+// herdr id that repeats on every machine and is recycled on one; a template
+// read here would be read out of the operator's config, which never describes
+// another node's sources; and an idleness check made here would be as old as
+// the operator's keypress.
+//
+// TaskText is the reservation IDENTITY, not a display string: reserveTask
+// verifies the item at Index still says this before marking it "[-]", so an
+// insert or reorder between the operator's read and the send refuses instead of
+// handing out the wrong task.
+type SendTaskPayload struct {
+	// Locator is the list's canonical address (a path locally, a gist:// or
+	// db:// URI remotely) — never Source.Path, which under a remote provider is
+	// only a file name and can repeat across gists.
+	Locator string `json:"locator"`
+	// Index is the item's 1-based position in the list.
+	Index    int    `json:"index"`
+	TaskText string `json:"task_text"`
+}

@@ -70,11 +70,7 @@ var herdrPortExemptions = map[string]map[string]string{
 			"or CLI process holds no path to a pane at all. What stays here is the " +
 			"reserve→send→roll-back ORDERING, which owns the checklist and the config and cannot " +
 			"move without splitting an invariant every comment around it calls load-bearing.",
-		"Herdr":         "stage 5: the send path reaches the adapter through the field",
-		"HerdrPort":     "stage 6: the field's declared type, once every reader below is gone",
-		"ListAgents":    "stage 5: the confirm staleness check and requireIdleAgent move INTO the send_task executor rather than onto the roster — deciding 'is this agent still idle' from a snapshot up to a sweep old is exactly the fail-open this guard exists to prevent",
-		"InspectorPort": "stage 5: paneCwd renders {cwd} for an outbound task, on the send path",
-		"SendToAgent":   "stage 5: the task hand-out and the generated-task confirm",
+		"HerdrPort": "stage 6: the field's declared type, once every reader below is gone",
 	},
 	"internal/frontend/fsp.go": {
 		"TaskSendHost": "PERMANENT, same reason as frontend.go: the two daemon seams take the " +

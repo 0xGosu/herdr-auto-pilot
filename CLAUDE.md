@@ -385,6 +385,24 @@ whose manifest carries exactly that version).
   - The operator path is deliberately NOT screened (`screen` is nil). The daemon's own sends
     are screened at decide time and an FSP acceptance is screened in the fork because in both
     cases no human saw the text; here one has, and their confirm has always been the gate.
+  - **The manual task hand-out moved the same way** (`send_task`, a kind that had been
+    declared and reserved for it). `SendTaskToAgentOn` carries the list, the item and the
+    agent's NAME — never a pane id, which repeats on every machine — and the executor
+    re-derives the pane, the agent type, the source's `next_task_template`, its config
+    position and `{cwd}` from the owning node's own config and a live listing. Its idle
+    re-check fails CLOSED and TERMINALLY: "we could not ask" is not "it is idle", and an
+    operator blocking on the row must not wait three sweeps to be told what the first attempt
+    knew. `taskSourceRenderFor` matches by LOCATOR, not by agent alone, or one source's item
+    would render through another's template — the hazard the TUI used to guard with its own
+    snapshot check. `hap task send` is local-only for now (it reads the list through THIS
+    node's `[[task_sources]]`, which never describes another machine's); the TUI's Tasks tab,
+    which renders fleet lists out of the shared database, can hand out a remote node's item.
+  - **The four stage-5 exemptions are retired** — `Herdr`, `ListAgents`, `InspectorPort` and
+    `SendToAgent` are gone from `herdrpurity_test.go`'s `frontend.go` entry, which means
+    `requireIdleAgent` and `paneCwd` had to be DELETED rather than left unused: the scan is on
+    the selector, not on reachability. What replaces them is one PERMANENT entry for
+    `ports.TaskSendHost`, and it is a weaker claim by construction — a received capability,
+    not a held one.
   - Test trap: `internal/daemon` may not import `internal/frontend`, so its tests drive a FAKE
     seam and can only prove the EXECUTOR's guards. The confirm's own behaviour is proved in
     `internal/frontend`, which calls `ConfirmGeneratedTaskForOperator` directly — and the TUI

@@ -4178,124 +4178,175 @@ func (a *App) TaskSourceTemplateFor(agent, sourcePath string) (string, error) {
 	return "", nil
 }
 
-// requireIdleAgent re-resolves the agent behind paneID and refuses unless it
-// is still cleanly idle. The caller's own status read is stale by then — as
-// old as the operator's confirmation, or as a --yes script's earlier check —
-// and delivering into a working agent's live conversation is exactly what the
-// idle-only rule exists to prevent. An unreadable agent list fails CLOSED:
-// "we could not ask" is not "it is idle" (the same boundary as
-// Status.AgentsKnown).
-func (a *App) requireIdleAgent(ctx context.Context, paneID, agentName string) error {
-	agents, err := a.Herdr.ListAgents(ctx)
+// SendTaskToAgentOn files one checklist item an operator picked for the node
+// that owns the list, and waits for that daemon's verdict.
+//
+// It replaces a nine-argument SendTaskToAgent that resolved everything in the
+// operator's process — the pane, the agent type, the source's template and its
+// config position — and then typed into the pane itself. Every one of those is
+// node-local: a pane id is a herdr id that repeats on every machine, agent
+// names are unique only per node, and config never enters the shared database.
+// So a task on another node's list could not be sent at all, and a LOCAL one
+// was sent by a process that had no business driving a pane.
+//
+// Only the list and the item travel. agentName is the operator's spelling,
+// resolved on the owning node; locator is the list's canonical address, never
+// Source.Path.
+//
+// Queued for a local node too, deliberately — see queueGeneratedTaskConfirm for
+// why the isSelf fast path the per-agent verbs use is wrong for anything that
+// ends in a send.
+func (a *App) SendTaskToAgentOn(ctx context.Context, nodeID, agentName, locator string,
+	index int, taskText string) error {
+
+	if strings.TrimSpace(agentName) == "" {
+		return fmt.Errorf("no agent known for this task source")
+	}
+	if strings.TrimSpace(locator) == "" {
+		return fmt.Errorf("no task list known for this agent")
+	}
+	if err := a.requireLiveDaemonFor(ctx, nodeID); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(domain.SendTaskPayload{
+		Locator: tasklocator.Canonical(locator), Index: index, TaskText: taskText,
+	})
 	if err != nil {
-		return fmt.Errorf("cannot confirm %s is still idle, so nothing was sent: %w", agentName, err)
+		return err
 	}
-	for _, ag := range agents {
-		if ag.PaneID != paneID {
-			continue
-		}
-		if domain.AgentBusy(ag.Status) {
-			return fmt.Errorf("agent %s is %s — a task can only be sent to a cleanly idle agent",
-				agentName, ag.Status)
-		}
-		return nil
+	action := domain.AgentAction{
+		NodeID: nodeID, Kind: domain.AgentActionSendTask, Target: agentName,
+		Payload: string(payload), Author: a.Author, CreatedAt: time.Now(),
 	}
-	return fmt.Errorf("agent %s is no longer live — refresh and retry", agentName)
+	// Best effort: an unknown terminal is "not observed", which the executor
+	// treats as no evidence rather than as a mismatch. Read from the OWNING
+	// node's record — pane ids repeat across machines.
+	if a.isSelf(nodeID) {
+		if id, err := a.Store.AgentTerminalIDOn(ctx, orSelf(a, nodeID), agentName); err == nil {
+			action.TerminalID = id
+		}
+	} else {
+		action.TerminalID = a.remoteTerminalID(ctx, nodeID, agentName)
+	}
+	id, err := a.Store.EnqueueAgentAction(ctx, action)
+	if err != nil {
+		return err
+	}
+	if a.isSelf(nodeID) {
+		a.nudge(ctx, control.KindWake)
+	} else {
+		a.nudge(ctx, control.KindReload)
+	}
+	_, err = a.AwaitAgentAction(ctx, id, a.awaitTimeoutFor(nodeID))
+	return a.explainRemoteFailure(ctx, nodeID, err)
 }
 
-// SendTaskToAgent delivers one specific pending checklist item to a live
-// agent's pane, rendered through the task source's next-task template — the
-// operator-initiated twin of the daemon's idle-time declared-task send.
+// SendTaskForOperator delivers that item, on the owning node. It is the
+// daemon's seam (daemon.Options.SendTask), wired in cmd/hap.
 //
-// The order here is load-bearing: the agent is re-checked idle, then the item
-// is RESERVED (verified and marked [-] under the file lock), and only then
-// delivered. Marking after delivery would mean a guarded failure could be
-// reported once the pane already had the task, leaving the item [ ] — which
-// the daemon's idle flow would then hand out a second time. Reserving first
-// makes the failure modes safe in the other direction: a send that fails
-// rolls the item back to [ ], and a rollback that also fails leaves it [-],
-// which merely parks the task (the daemon only ever sends [ ] items) instead
-// of duplicating work in the agent.
+// The order here is load-bearing: the agent has been re-checked idle by the
+// executor, then the item is RESERVED (verified and marked [-] under the list
+// lock), and only then delivered. Marking after delivery would mean a guarded
+// failure could be reported once the pane already had the task, leaving the
+// item [ ] — which the daemon's idle flow would then hand out a second time.
+// Reserving first makes the failure modes safe in the other direction: a send
+// that fails rolls the item back to [ ], and a rollback that also fails leaves
+// it [-], which merely parks the task (the daemon only ever sends [ ] items)
+// instead of duplicating work in the agent.
 //
 // As an operator action it is exempt from the pause switch, matching
 // Resolve/Confirm.
-func (a *App) SendTaskToAgent(ctx context.Context, paneID, agentType, agentName, sourcePath, template, sourceIndex string, index int, taskText string) error {
-	if a.Herdr == nil {
+func (a *App) SendTaskForOperator(ctx context.Context, p domain.SendTaskPayload,
+	agentID, agentType, agentName string, host ports.TaskSendHost) error {
+
+	if host == nil {
 		return fmt.Errorf("herdr unavailable — cannot send")
 	}
-	if paneID == "" {
+	if agentID == "" {
 		return fmt.Errorf("no pane known for this agent")
 	}
-	if err := a.requireIdleAgent(ctx, paneID, agentName); err != nil {
+	// The template and the source's config position are read HERE, from THIS
+	// node's config, and matched by LOCATOR rather than by agent alone: an
+	// agent can only have one source, but resolving by name and then rendering
+	// an item that came from a different list would pair one source's text with
+	// another's template — the hazard the TUI used to guard with its own
+	// "task sources changed" snapshot check.
+	template, sourceIndex, err := a.taskSourceRenderFor(agentName, p.Locator)
+	if err != nil {
 		return err
 	}
-	// Resolve {cwd} before reserving: it shells out to herdr, and a failure
-	// here should not have to unwind a reservation. Only when the template
-	// the prompt will actually render through references it.
 	cwd := ""
 	if strings.Contains(domain.TemplateOrDefault(template), "{cwd}") {
-		cwd = a.paneCwd(ctx, paneID)
+		cwd = host.Cwd(ctx, agentID)
 	}
 	// Reserve the item AND fold its nested sub-items from the SAME locked
 	// snapshot, so the delivered detail always describes the item just marked
 	// [-] — even under a concurrent edit. Fold by the RESERVED index (the exact
 	// position reserveTask verified by text), never a separate post-reserve read:
 	// an insert/delete/reorder between reserve and that read could make the index
-	// point at a different item and send the wrong detail. taskText stays the
+	// point at a different item and send the wrong detail. TaskText stays the
 	// reservation identity regardless.
 	folded := ""
-	if _, err := a.mutateTask(sourcePath, func(content string) (string, error) {
-		out, rerr := reserveTask(index, taskText)(content)
+	if _, err := a.mutateTask(p.Locator, func(content string) (string, error) {
+		out, rerr := reserveTask(p.Index, p.TaskText)(content)
 		if rerr != nil {
 			return out, rerr
 		}
-		folded = domain.FoldTaskContentAt(content, index)
+		folded = domain.FoldTaskContentAt(content, p.Index)
 		return out, nil
 	}); err != nil {
 		// Name the phase: reserveTask's own refusals are self-describing, but
 		// a lock/read/write failure would otherwise surface as a bare os
 		// error in a flow whose first question is "did it send?".
-		return fmt.Errorf("reserving task #%d (nothing was sent): %w", index, err)
+		return fmt.Errorf("reserving task #%d (nothing was sent): %w", p.Index, err)
 	}
 	// Path is the DISPLAY address ({task_list_path}), never the locator: under a
 	// remote provider the locator is a gist:// string, which is not something an
 	// operator or an agent can act on. Remote selects the default template that
 	// omits the --path clause, since --path reads a local file.
 	prompt := domain.DeclaredTask{
-		Task: taskText, Content: folded,
-		Path:     tasklocator.Display(sourcePath),
-		Remote:   tasklocator.Remote(sourcePath),
+		Task: p.TaskText, Content: folded,
+		Path:     tasklocator.Display(p.Locator),
+		Remote:   tasklocator.Remote(p.Locator),
 		Template: template, AgentName: agentName, Cwd: cwd,
 		SourceIndex: sourceIndex,
 	}.Prompt()
-	if err := ports.SendToAgent(ctx, a.Herdr, paneID, agentType, prompt); err != nil {
-		if _, rbErr := a.mutateTask(sourcePath, releaseTask(index, taskText)); rbErr != nil {
+	if f := a.deliverReserved(ctx, host, agentID, agentType, prompt, 0,
+		func(rc context.Context) error {
+			_, err := a.mutateTaskWithin(rc, p.Locator, releaseTask(p.Index, p.TaskText))
+			return err
+		}); f != nil {
+		if f.Rollback != nil {
 			return fmt.Errorf("send failed (%w) and task #%d could not be returned to [ ] (%v) — "+
-				"it stays [-] and no agent will pick it up until you clear it", err, index, rbErr)
+				"it stays [-] and no agent will pick it up until you clear it", f.Send, p.Index, f.Rollback)
 		}
-		return err
+		return f.Send
 	}
 	return nil
 }
 
-// paneCwd resolves the pane's working directory for {cwd}, preferring the
-// foreground process's cwd exactly as the daemon's declared-task path does,
-// so one template renders the same whoever sends it. Best-effort: the
-// inspector is an optional herdr capability and an empty {cwd} must never
-// block a send.
-func (a *App) paneCwd(ctx context.Context, paneID string) string {
-	insp, ok := a.Herdr.(ports.InspectorPort)
-	if !ok {
-		return ""
-	}
-	pi, err := insp.PaneInfo(ctx, paneID)
+// taskSourceRenderFor returns the next-task template and config position of the
+// source this agent keeps at locator — "" and "" when the agent's sources do
+// not include it, which is the default template and no {task_source_index}.
+//
+// Ambiguity leaves the index empty rather than guessing, matching the
+// exactly-one resolution `hap task <name>` applies; the prompt then falls back
+// to naming the agent.
+func (a *App) taskSourceRenderFor(agentName, locator string) (template, sourceIndex string, err error) {
+	cfg, err := a.Config()
 	if err != nil {
-		return ""
+		return "", "", err
 	}
-	if pi.ForegroundCwd != "" {
-		return pi.ForegroundCwd
+	want := tasklocator.Canonical(locator)
+	for i, src := range cfg.TaskSources {
+		if src.Agent != agentName {
+			continue
+		}
+		if a.sourceLocatorMatches(cfg, src, agentName, want) {
+			return src.NextTaskTemplate, strconv.Itoa(i), nil
+		}
 	}
-	return pi.Cwd
+	return "", "", nil
 }
 
 // readChecklist reads and parses a checklist file.

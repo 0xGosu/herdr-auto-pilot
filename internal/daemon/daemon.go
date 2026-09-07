@@ -122,6 +122,20 @@ type Options struct {
 	// refused with errActionUnsupported rather than silently reported done.
 	ConfirmGeneratedTask func(ctx context.Context, auditID int64, send bool,
 		author string, host ports.TaskSendHost) error
+	// SendTask hands one checklist item an operator picked to a live agent's
+	// pane, rendered through that source's own next-task template. It reaches
+	// this daemon as a send_task row, so an operator can hand out a task on any
+	// machine in the fleet.
+	//
+	// The payload carries only the list and the item; the agent, its type, its
+	// short name and the pane access are resolved HERE and passed in, because
+	// each is node-local and the operator's process cannot answer any of them
+	// for another machine.
+	//
+	// Optional. nil means the capability was never wired, and the action is
+	// refused with errActionUnsupported rather than silently reported done.
+	SendTask func(ctx context.Context, p domain.SendTaskPayload,
+		agentID, agentType, agentName string, host ports.TaskSendHost) error
 	// DisableFSP switches full self-prompting off in config.toml and records
 	// the toggle in the automation history. Called when a [limits] ceiling is
 	// reached and full_self_prompting.honour_limits is set.

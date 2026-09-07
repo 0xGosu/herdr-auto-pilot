@@ -588,8 +588,12 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		// and handed in (ports.TaskSendHost), which is why the front-end
 		// packages hold no herdr adapter of their own.
 		ConfirmGeneratedTask: fspApp.ConfirmGeneratedTaskForOperator,
-		MatchIndexDir:        filepath.Join(paths.StateDir, "match-index"),
-		StateDir:             paths.StateDir,
+		// And the operator's manual task hand-out, for the same reason: the
+		// list, the agent's short name and the source's template are all
+		// node-local, so only the owning daemon can render and deliver one.
+		SendTask:      fspApp.SendTaskForOperator,
+		MatchIndexDir: filepath.Join(paths.StateDir, "match-index"),
+		StateDir:      paths.StateDir,
 		// The shared database's sync engine and its write signal (turso only;
 		// both nil under sqlite, and the loop never runs).
 		FleetSync:         fleet,

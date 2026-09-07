@@ -260,6 +260,8 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 		return d.setAgentEnabledAction(ctx, a)
 	case domain.AgentActionAcceptGeneratedTask:
 		return d.acceptGeneratedTaskAction(ctx, a)
+	case domain.AgentActionSendTask:
+		return d.sendTaskAction(ctx, a)
 	default:
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)

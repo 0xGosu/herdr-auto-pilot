@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -13,7 +14,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/mattn/go-runewidth"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -1525,7 +1528,38 @@ func sendTaskModel(t *testing.T) (Model, *captureHerdr, string) {
 	// The fake must report the agent too: the send re-checks it is still idle
 	// against herdr immediately before delivering, not against this snapshot.
 	h := &captureHerdr{agents: live}
-	m := Model{width: 100, height: 30, app: &frontend.App{Herdr: h}}
+	// A real store, a config on disk and a stand-in daemon: the send is a
+	// QUEUED action now, so it needs somewhere to file the row, a daemon that
+	// reads as live, and something to drain it. The drain runs the REAL
+	// hand-out, or the assertions below — the rendered template, the item
+	// marked [-], the roll-back — would be checking nothing.
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	cfgPath := filepath.Join(dir, "config.toml")
+	if err := config.Save(cfgPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PublishRoster(context.Background(), rosterFrom(live), time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AssignAgentName(context.Background(), "w6:p1", "brave-otter"); err != nil {
+		t.Fatal(err)
+	}
+	if err := daemonhealth.Write(dir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	app := &frontend.App{Store: st, Herdr: h, ConfigPath: cfgPath, StateDir: dir, Author: "operator",
+		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version }}
+	startStandInSendTaskDrain(t, st, app, h)
+	// A real ctx: the send now reaches the store, and database/sql blocks
+	// forever on a nil one rather than failing.
+	m := Model{width: 100, height: 30, app: app, ctx: context.Background()}
 	upd, _ := m.Update(refreshMsg{
 		status: frontend.Status{
 			AgentsKnown:     true,
@@ -2356,9 +2390,127 @@ func TestTasksTabRendersFleetGroupsAfterConfiguredOnes(t *testing.T) {
 	if len(m.markedTaskTargets()) != 1 || m.markedTaskTargets()[0].path != "db://"+other+"/badger.md" {
 		t.Errorf("marked targets = %+v, want the fleet item by its locator", m.markedTaskTargets())
 	}
-	// Space advanced the cursor to #2; back up onto #1 and try to send it.
+	// Space advanced the cursor to #2; back up onto #1 and send it.
+	//
+	// It used to be refused here ("this list belongs to node laptop — its
+	// daemon hands the tasks out; send from that machine"), because nothing in
+	// this process could resolve that node's pane, its agent's short name or
+	// its source's template. The hand-out is filed for that node's daemon now,
+	// so what this asks for is the CONFIRMATION naming where it is going —
+	// which is also the operator's last chance to notice it is not local.
 	m = press(t, m, "up", "enter")
-	if !strings.Contains(m.message, "belongs to node laptop") {
-		t.Errorf("sending a fleet item must be refused naming the node, got message %q", m.message)
+	if m.confirm == nil || !strings.Contains(m.confirm.label, "on node laptop") {
+		t.Errorf("sending a fleet item must confirm, naming the node, got %+v (message %q)",
+			m.confirm, m.message)
 	}
+	if !strings.Contains(m.confirm.label, "badger") {
+		t.Errorf("the confirmation must name the agent, got %q", m.confirm.label)
+	}
+}
+
+// rosterFrom publishes the live agents the way the daemon does, so the executor
+// side of a queued hand-out can resolve the operator's spelling of the agent.
+func rosterFrom(live []domain.AgentTransition) []domain.RosterAgent {
+	now := time.Now()
+	rows := make([]domain.RosterAgent, 0, len(live))
+	for _, a := range live {
+		rows = append(rows, domain.RosterAgentFrom(a, now))
+	}
+	return rows
+}
+
+// startStandInSendTaskDrain plays the owning node's daemon for one test: it
+// claims each queued send_task, applies the idle re-check the executor applies,
+// and then runs the REAL hand-out.
+//
+// The TUI no longer delivers anything itself — enter/y on the Tasks tab files a
+// send_task row and waits for a verdict — so without a drain these tests would
+// wait out the action timeout, and without the real hand-out behind it their
+// assertions would be checking nothing.
+func startStandInSendTaskDrain(t *testing.T, st *store.Store, app *frontend.App, h *captureHerdr) {
+	t.Helper()
+	done, stopped := make(chan struct{}), make(chan struct{})
+	// Wait for the goroutine rather than merely signalling it: cleanups run
+	// LIFO, so a bare signal lets this keep querying while st.Close() and
+	// t.TempDir()'s RemoveAll are already running behind it.
+	t.Cleanup(func() { close(done); <-stopped })
+	go func() {
+		defer close(stopped)
+		ctx := context.Background()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			acts, err := st.PendingAgentActions(ctx)
+			if err == nil {
+				for _, a := range acts {
+					if a.Kind != domain.AgentActionSendTask {
+						continue
+					}
+					if ok, _ := st.ClaimAgentAction(ctx, a.ID, time.Now()); !ok {
+						continue
+					}
+					standInSendTask(ctx, st, a, app, h)
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+}
+
+func standInSendTask(ctx context.Context, st *store.Store, a domain.AgentAction,
+	app *frontend.App, h *captureHerdr) {
+
+	fail := func(msg string) {
+		st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed, msg, "", time.Now())
+	}
+	var p domain.SendTaskPayload
+	if err := json.Unmarshal([]byte(a.Payload), &p); err != nil {
+		fail(err.Error())
+		return
+	}
+	agentID, err := st.ResolveAgent(ctx, a.Target)
+	if err != nil || agentID == "" {
+		fail("no agent known as " + a.Target + " is running on this machine")
+		return
+	}
+	agents, err := h.ListAgents(ctx)
+	if err != nil {
+		fail("cannot confirm " + a.Target + " is still idle, so nothing was sent: " + err.Error())
+		return
+	}
+	agentType := ""
+	found := false
+	for _, ag := range agents {
+		if ag.AgentID != agentID {
+			continue
+		}
+		found, agentType = true, ag.AgentType
+		if domain.AgentBusy(ag.Status) {
+			fail("agent " + a.Target + " is " + ag.Status +
+				" — a task can only be sent to a cleanly idle agent")
+			return
+		}
+	}
+	if !found {
+		fail("agent " + a.Target + " is no longer live — refresh and retry")
+		return
+	}
+	if err := app.SendTaskForOperator(ctx, p, agentID, agentType, a.Target, tuiSendHost{h}); err != nil {
+		fail(err.Error())
+		return
+	}
+	st.FinishAgentAction(ctx, a.ID, domain.AgentActionDone, "", "", time.Now())
+}
+
+// tuiSendHost is the pane access the daemon supplies in production
+// (ports.TaskSendHost).
+type tuiSendHost struct{ h *captureHerdr }
+
+func (t tuiSendHost) Cwd(context.Context, string) string { return "" }
+
+func (t tuiSendHost) Send(ctx context.Context, paneID, _, prompt string) error {
+	return t.h.Send(ctx, paneID, prompt)
 }

@@ -279,3 +279,84 @@ func TestConfirmNoSuggestionStillFails(t *testing.T) {
 		t.Fatalf("confirm error = %v, want the ordinary no-suggestion refusal", err)
 	}
 }
+
+// startStandInSendTaskDrain plays the owning node's daemon for a `task send`:
+// it claims each queued send_task, applies the idle re-check the executor
+// applies, and then runs the REAL hand-out.
+//
+// `hap task <agent> send N` files an action and waits for a verdict now, so
+// without a drain these tests would wait out the action timeout, and without
+// the real hand-out their assertions — the rendered prompt, the item marked
+// [-], the roll-back — would be checking nothing.
+func startStandInSendTaskDrain(t *testing.T, st *store.Store, app *frontend.App, h *sendRecorderHerdr) {
+	t.Helper()
+	done, stopped := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(done); <-stopped })
+	go func() {
+		defer close(stopped)
+		ctx := context.Background()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			acts, err := st.PendingAgentActions(ctx)
+			if err == nil {
+				for _, a := range acts {
+					if a.Kind != domain.AgentActionSendTask {
+						continue
+					}
+					if ok, _ := st.ClaimAgentAction(ctx, a.ID, time.Now()); !ok {
+						continue
+					}
+					standInSendTask(ctx, st, a, app, h)
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+}
+
+func standInSendTask(ctx context.Context, st *store.Store, a domain.AgentAction,
+	app *frontend.App, h *sendRecorderHerdr) {
+
+	fail := func(msg string) {
+		st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed, msg, "", time.Now())
+	}
+	var p domain.SendTaskPayload
+	if err := json.Unmarshal([]byte(a.Payload), &p); err != nil {
+		fail(err.Error())
+		return
+	}
+	agentID, err := st.ResolveAgent(ctx, a.Target)
+	if err != nil || agentID == "" {
+		agentID = a.Target
+	}
+	agents, err := h.ListAgents(ctx)
+	if err != nil {
+		fail("cannot confirm " + a.Target + " is still idle, so nothing was sent: " + err.Error())
+		return
+	}
+	agentType, found := "", false
+	for _, ag := range agents {
+		if ag.AgentID != agentID {
+			continue
+		}
+		found, agentType = true, ag.AgentType
+		if domain.AgentBusy(ag.Status) {
+			fail("agent " + a.Target + " is " + ag.Status +
+				" — a task can only be sent to a cleanly idle agent")
+			return
+		}
+	}
+	if !found {
+		fail("agent " + a.Target + " is no longer live — refresh and retry")
+		return
+	}
+	if err := app.SendTaskForOperator(ctx, p, agentID, agentType, a.Target, cliStandInHost{h}); err != nil {
+		fail(err.Error())
+		return
+	}
+	st.FinishAgentAction(ctx, a.ID, domain.AgentActionDone, "", "", time.Now())
+}

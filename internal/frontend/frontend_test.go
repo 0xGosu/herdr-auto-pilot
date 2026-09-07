@@ -440,10 +440,39 @@ type fakeTaskSendHost struct {
 	cwd string
 }
 
-func (f fakeTaskSendHost) Cwd(context.Context, string) string { return f.cwd }
+// Cwd mirrors the daemon's host: the optional inspector first, preferring the
+// foreground process's directory, then whatever the plain fake was given.
+func (f fakeTaskSendHost) Cwd(ctx context.Context, paneID string) string {
+	if insp, ok := f.h.(ports.InspectorPort); ok {
+		if pi, err := insp.PaneInfo(ctx, paneID); err == nil {
+			if pi.ForegroundCwd != "" {
+				return pi.ForegroundCwd
+			}
+			if pi.Cwd != "" {
+				return pi.Cwd
+			}
+		}
+	}
+	return f.cwd
+}
 
 func (f fakeTaskSendHost) Send(ctx context.Context, paneID, agentType, prompt string) error {
 	return ports.SendToAgent(ctx, f.h, paneID, agentType, prompt)
+}
+
+// sendTask hands one checklist item over the way the OWNING node's daemon does.
+//
+// App.SendTaskToAgentOn no longer delivers: it files a send_task row and waits
+// for that daemon's verdict. A test about the hand-out itself — the freshness
+// guard, the reservation, the rendered prompt, the roll-back — therefore drives
+// the seam the executor calls. The template and the source's config position
+// are no longer arguments: the seam reads them from config, by locator.
+func sendTask(app *frontend.App, ctx context.Context,
+	paneID, agentType, agentName, locator string, index int, text string) error {
+
+	return app.SendTaskForOperator(ctx,
+		domain.SendTaskPayload{Locator: locator, Index: index, TaskText: text},
+		paneID, agentType, agentName, hostFor(app))
 }
 
 // confirmGeneratedTask runs an operator's confirm of a generated-task
@@ -3932,8 +3961,20 @@ func TestSendTaskToAgent(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`- [ ] step one\nstep two`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter",
-		path, "", "3", 1, `step one\nstep two`); err != nil {
+	// {task_source_index} is the source's POSITION in config, read by the seam
+	// rather than handed to it — so the source has to be registered, and three
+	// unrelated ones ahead of it are what make the assertion below prove the
+	// position was derived rather than invented.
+	for _, other := range []string{"a", "b", "c"} {
+		if err := app.AddTaskSource(ctx, other, "",
+			filepath.Join(t.TempDir(), other+".md"), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := app.AddTaskSource(ctx, "brave-otter", "", path, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendTask(app, ctx, "w1:p2", "claude", "brave-otter", path, 1, `step one\nstep two`); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.sent) != 1 {
@@ -3957,11 +3998,11 @@ func TestSendTaskToAgent(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`- [x] step one\nstep two`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, `step one\nstep two`); err == nil ||
+	if err := sendTask(app, ctx, "w1:p2", "claude", "n", path, 1, `step one\nstep two`); err == nil ||
 		!strings.Contains(err.Error(), "no longer pending") {
 		t.Errorf("completed task must refuse to send, got %v", err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, "different text"); err == nil ||
+	if err := sendTask(app, ctx, "w1:p2", "claude", "n", path, 1, "different text"); err == nil ||
 		!strings.Contains(err.Error(), "the checklist changed") {
 		t.Errorf("rewritten task must refuse to send, got %v", err)
 	}
@@ -3971,11 +4012,11 @@ func TestSendTaskToAgent(t *testing.T) {
 
 	// Guards: no herdr / no pane.
 	app.Herdr = nil
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "n", path, "", "", 1, "t"); err == nil {
+	if err := sendTask(app, ctx, "w1:p2", "claude", "n", path, 1, "t"); err == nil {
 		t.Error("nil herdr must refuse")
 	}
 	app.Herdr = h
-	if err := app.SendTaskToAgent(ctx, "", "claude", "n", path, "", "", 1, "t"); err == nil {
+	if err := sendTask(app, ctx, "", "claude", "n", path, 1, "t"); err == nil {
 		t.Error("empty pane must refuse")
 	}
 }
@@ -3996,7 +4037,7 @@ func TestSendTaskToAgentFoldsNestedDetail(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "brave-otter", path, "", "", 1, "1. Build the widget"); err != nil {
+	if err := sendTask(app, ctx, "w1:p2", "claude", "brave-otter", path, 1, "1. Build the widget"); err != nil {
 		t.Fatal(err)
 	}
 	if len(h.sent) != 1 {
@@ -4021,55 +4062,6 @@ func TestSendTaskToAgentFoldsNestedDetail(t *testing.T) {
 	}
 }
 
-// TestSendTaskToAgentRechecksIdle pins the guard against the window between
-// the caller's status read and delivery: the operator's confirmation (or a
-// --yes script) can be seconds stale, and a task must never land in a working
-// agent's live conversation.
-func TestSendTaskToAgentRechecksIdle(t *testing.T) {
-	newApp := func(t *testing.T, h *sendCaptureHerdr) (*frontend.App, string) {
-		t.Helper()
-		app, _ := testApp(t)
-		app.Herdr = h
-		path := filepath.Join(t.TempDir(), "tasks.md")
-		if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		return app, path
-	}
-	ctx := context.Background()
-	// The agent started working after the caller looked.
-	busy := &sendCaptureHerdr{agents: []domain.AgentTransition{
-		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude", Status: "working"}}}
-	app, path := newApp(t, busy)
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
-		!strings.Contains(err.Error(), "cleanly idle") {
-		t.Errorf("a now-busy agent must refuse, got %v", err)
-	}
-	if len(busy.sent) != 0 {
-		t.Errorf("refused send must not deliver, got %v", busy.sent)
-	}
-	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
-		t.Errorf("refused send must leave the task pending, got %q", data)
-	}
-	// The agent vanished entirely.
-	gone := &sendCaptureHerdr{}
-	app, path = newApp(t, gone)
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
-		!strings.Contains(err.Error(), "no longer live") {
-		t.Errorf("a vanished agent must refuse, got %v", err)
-	}
-	// An unreadable agent list is not an idle agent: fail closed.
-	app, path = newApp(t, nil)
-	app.Herdr = &failingAgentsHerdr{}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err == nil ||
-		!strings.Contains(err.Error(), "nothing was sent") {
-		t.Errorf("an unreadable agent list must refuse, got %v", err)
-	}
-	if data, _ := os.ReadFile(path); !strings.Contains(string(data), "- [ ] work") {
-		t.Errorf("refused send must leave the task pending, got %q", data)
-	}
-}
-
 // TestSendTaskToAgentReservesBeforeDelivering pins the ordering: the item is
 // marked [-] BEFORE the pane receives it, so no guarded failure can be
 // reported after delivery and leave the task [ ] for the daemon to hand out a
@@ -4085,7 +4077,7 @@ func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
 	var atSend string
 	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
 	app.Herdr = &reserveProbeHerdr{sendCaptureHerdr: h, path: path, seen: &atSend}
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work"); err != nil {
+	if err := sendTask(app, ctx, "w1:p2", "claude", "otter", path, 1, "work"); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(atSend, "- [-] work") {
@@ -4098,7 +4090,7 @@ func TestSendTaskToAgentReservesBeforeDelivering(t *testing.T) {
 		t.Fatal(err)
 	}
 	app2.Herdr = &sendCaptureHerdr{agents: idleAt("w1:p2"), sendErr: errors.New("pane gone")}
-	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2, "", "", 1, "work"); err == nil ||
+	if err := sendTask(app2, ctx, "w1:p2", "claude", "otter", path2, 1, "work"); err == nil ||
 		!strings.Contains(err.Error(), "pane gone") {
 		t.Errorf("a failed delivery must surface its error, got %v", err)
 	}
@@ -4149,7 +4141,7 @@ func TestSendTaskToAgentRollbackIsClaimScoped(t *testing.T) {
 		path:             path,
 		write:            "- [x] work\n", // completed by someone else mid-send
 	}
-	err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path, "", "", 1, "work")
+	err := sendTask(app, ctx, "w1:p2", "claude", "otter", path, 1, "work")
 	if err == nil || !strings.Contains(err.Error(), "pane gone") {
 		t.Errorf("the delivery failure must still surface, got %v", err)
 	}
@@ -4173,8 +4165,11 @@ func TestSendTaskToAgentRendersCwd(t *testing.T) {
 		info:             domain.PaneInfo{Cwd: "/repo", ForegroundCwd: "/repo/sub"},
 	}
 	app.Herdr = h
-	if err := app.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path,
-		"do {next_task_content} in {cwd}", "", 1, "work"); err != nil {
+	// The template now comes from the SOURCE, which is what the seam reads.
+	if err := app.AddTaskSource(ctx, "otter", "", path, "do {next_task_content} in {cwd}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendTask(app, ctx, "w1:p2", "claude", "otter", path, 1, "work"); err != nil {
 		t.Fatal(err)
 	}
 	// The foreground cwd wins, exactly as the daemon's resolver prefers it.
@@ -4189,8 +4184,10 @@ func TestSendTaskToAgentRendersCwd(t *testing.T) {
 	if err := os.WriteFile(path2, []byte("- [ ] work\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := app2.SendTaskToAgent(ctx, "w1:p2", "claude", "otter", path2,
-		"do {next_task_content} in {cwd}", "", 1, "work"); err != nil {
+	if err := app2.AddTaskSource(ctx, "otter", "", path2, "do {next_task_content} in {cwd}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendTask(app2, ctx, "w1:p2", "claude", "otter", path2, 1, "work"); err != nil {
 		t.Errorf("a missing inspector must never block a send, got %v", err)
 	}
 	// Exactly, not Contains: "do work in " is a prefix of a resolved cwd too,
@@ -4405,16 +4402,6 @@ func TestANeverPublishedRosterIsNotAnEmptyHerd(t *testing.T) {
 	if len(empty.MonitoredAgents) != 0 || len(fresh.MonitoredAgents) != 0 {
 		t.Fatal("both cases must be indistinguishable by agent count — that is the point")
 	}
-}
-
-type failingAgentsHerdr struct{}
-
-func (f *failingAgentsHerdr) Send(context.Context, string, string) error { return nil }
-func (f *failingAgentsHerdr) ReadPane(context.Context, string, int) (string, error) {
-	return "", nil
-}
-func (f *failingAgentsHerdr) ListAgents(context.Context) ([]domain.AgentTransition, error) {
-	return nil, errors.New("herdr unreachable")
 }
 
 // TestAddTaskSourceAutoSendWhenIdleOption pins the option that turns on
