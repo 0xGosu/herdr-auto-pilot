@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.8.5
+
+- Changed a remote focus (`f` on another node's agent in the TUI) to push the shared database immediately instead of waiting out the sync loop's write debounce, so the request reaches Turso Cloud in time for the owning node's next pull. The pull interval on that node (`database.turso_sync_interval_seconds`, default 15 s, minimum 5) remains the larger half of the wait.
+- Added remote focus to the Escalations tab: pressing `f` on another node's escalation now asks that machine's herdr to jump to the pane, where it used to refuse with "focus is local-only".
+- Fixed `f` in an escalation's detail overlay focusing the wrong agent: it resolved the agent id without its node, and an agent id is a herdr pane id, so a remote escalation on pane "1" moved this machine's view to its own pane "1" — a different agent, under a success banner.
+
 ## 0.8.4
 
 - Added `hap daemon --restart`: stops the running daemon whatever binary it came from and starts a fresh one (starting one when none is running). This is the only way to pick up a `[database]` or `[logging]` change — those sections are read once, when a process opens its store, so `hap daemon --ensure` deliberately does nothing when the running daemon is already the current binary, and switching engine, pointing at a different Turso database, rotating its token or changing `node_label` previously needed finding the pid and sending SIGTERM by hand.
