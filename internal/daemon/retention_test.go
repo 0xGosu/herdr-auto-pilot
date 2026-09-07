@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
@@ -36,6 +38,70 @@ func TestEscalationDedupWindowFitsAuditExcerptMargin(t *testing.T) {
 func TestRetentionIntervalIsDailyNotPerSweep(t *testing.T) {
 	if retentionInterval < 24*60*60*1e9 {
 		t.Errorf("retentionInterval = %v, want at least 24h", retentionInterval)
+	}
+}
+
+// The end-to-end shape of #398, through the daemon's own sweep rather than the
+// store call: a retired agent's wide row goes on the row-retention window, and
+// the transition buffered before it vanished still finds nothing to resurrect.
+//
+// Excerpt retention is switched OFF on purpose. The two windows are independent
+// settings and the roster half rides the row half, so this also pins that an
+// operator who keeps every excerpt still gets a bounded agent_roster.
+func TestRowRetentionPrunesARetiredAgentWithoutResurrectingIt(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	retiredAt := now.Add(-30 * 24 * time.Hour)
+	agent := domain.RosterAgent{
+		AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: retiredAt,
+	}
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PublishRoster(ctx, nil, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	excerptDays, rowDays := -1, 7
+	cfg.Logging.AuditExcerptRetentionDays = &excerptDays
+	cfg.Logging.RowRetentionDays = &rowDays
+	d := &Daemon{
+		cfg:         cfg,
+		opt:         Options{Store: st},
+		shutdownCtx: ctx,
+		timers:      map[*time.Timer]struct{}{},
+	}
+	d.maybeRunRetentionSweep(now)
+	d.bg.Wait()
+
+	// Proof the SWEEP took the row, not just that the tombstone works: a direct
+	// prune now finds nothing left to do. Without this the case passes on a
+	// sweep that never touches agent_roster at all, since the tombstone alone
+	// would still refuse the late event below.
+	if c, err := st.PruneAgedRows(ctx, now, now.Add(-24*time.Hour)); err != nil || c.RetiredRoster != 0 {
+		t.Fatalf("the daemon's sweep left %d retired roster row(s) behind (err=%v)", c.RetiredRoster, err)
+	}
+
+	late := agent
+	late.Status = "working"
+	late.SeenAt = now
+	if err := st.UpsertRosterAgent(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	roster, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(roster) != 0 {
+		t.Fatalf("late event resurrected a row row retention pruned: %+v", roster)
 	}
 }
 

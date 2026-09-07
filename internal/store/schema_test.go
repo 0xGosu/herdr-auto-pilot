@@ -46,3 +46,27 @@ func TestMigrateWithCallsTheHookAfterTheLastWrite(t *testing.T) {
 		t.Fatalf("MigrateWith with a refusing hook = %v, want its error", err)
 	}
 }
+
+// TestSchemaCurrentNoticesAMissingRosterTombstoneTable pins the sidecar into
+// the shared-engine schema check. A node that believes the schema is current
+// skips DDL, so omitting this table would make a pre-sidecar database fail only
+// when a retired row was finally pruned or a late event arrived.
+func TestSchemaCurrentNoticesAMissingRosterTombstoneTable(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	if cur, err := s.SchemaCurrent(ctx); err != nil || !cur {
+		t.Fatalf("fresh store: SchemaCurrent = %v, %v", cur, err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE agent_roster_tombstones`); err != nil {
+		t.Fatal(err)
+	}
+	if cur, err := s.SchemaCurrent(ctx); err != nil || cur {
+		t.Fatalf("without agent_roster_tombstones: SchemaCurrent = %v, %v", cur, err)
+	}
+	if err := s.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	if cur, err := s.SchemaCurrent(ctx); err != nil || !cur {
+		t.Fatalf("after Migrate: SchemaCurrent = %v, %v", cur, err)
+	}
+}

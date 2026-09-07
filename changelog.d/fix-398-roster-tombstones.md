@@ -1,0 +1,2 @@
+- Fixed `agent_roster` growing without bound: retired agents' rows are now deleted on the existing `[logging] row_retention_days` window, with a compact permanent tombstone left behind so a late transition cannot bring a dead agent back live
+- Fixed a new agent on a recycled pane id being invisible until the next roster publish — the tombstone records the terminal it was retired under, so a different terminal on the same pane is admitted
