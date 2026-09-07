@@ -19,7 +19,7 @@ func TestTaskSourceEveryBranchPrintsItsOwnFooter(t *testing.T) {
 	countFooters := func(s string) int { return strings.Count(s, "\nNext steps:\n") }
 
 	t.Run("empty listing points at add, not at itself", func(t *testing.T) {
-		app, _ := testApp(t)
+		app, _ := localFSApp(t)
 		out, err := run(t, app, "config", "task-source", "list")
 		if err != nil {
 			t.Fatal(err)
@@ -37,7 +37,7 @@ func TestTaskSourceEveryBranchPrintsItsOwnFooter(t *testing.T) {
 		}
 	})
 
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	if err := app.AddTaskSource(ctx, "brave-otter", "", filepath.Join(dir, "a.md"), ""); err != nil {
@@ -78,7 +78,7 @@ func TestTaskSourceEveryBranchPrintsItsOwnFooter(t *testing.T) {
 // naming that agent would emit a command `resolveTaskSourceRef` refuses — on
 // the very screen that exists to resolve the ambiguity.
 func TestTaskSourceListFooterNeverSuggestsARefusedCommand(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	for _, f := range []string{"a.md", "b.md"} {
@@ -104,7 +104,7 @@ func TestTaskSourceListFooterNeverSuggestsARefusedCommand(t *testing.T) {
 // 3 — so it is refused where it would be written, not worked around at the
 // point of use.
 func TestNumericAgentSelectorIsRefused(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 

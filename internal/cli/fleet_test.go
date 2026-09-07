@@ -220,7 +220,13 @@ func TestSQLiteProviderNeverPrintsGistFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"provider default: sqlite", `db_list=<agent-name>.md (per matched agent)`, `db_list="shared.md"`} {
+	// No "provider default:" header — sqlite is the default now, and a uniform
+	// config on it prints no storage detail at all (the same silence a local_fs
+	// install has always had). What names the backend is the row's own token.
+	if strings.Contains(out, "provider default:") {
+		t.Errorf("a uniform sqlite config must not grow a provider header:\n%s", out)
+	}
+	for _, want := range []string{`db_list=<agent-name>.md (per matched agent)`, `db_list="shared.md"`} {
 		if !strings.Contains(out, want) {
 			t.Errorf("task-source list missing %q:\n%s", want, out)
 		}

@@ -534,7 +534,7 @@ tab-separated stdout is unaffected.
 | `tui.disable_check_for_update` | false | turn off the GitHub release check (TUI only, at most every 6h) |
 | `tui.max_instances` | 1 | how many `hap tui` processes may run; starting one closes the oldest past this cap. `0` = no limit |
 | `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output |
-| `task_source_provider.provider` | `local_fs` | default storage for every task list: `local_fs`, `github_gist`, or `sqlite` (inside hap's database; syncs under the turso engine) |
+| `task_source_provider.provider` | `sqlite` | default storage for every task list: `sqlite` (inside hap's database; syncs under the turso engine), `local_fs` (a markdown file on disk — the only provider where `path` is a filesystem path), or `github_gist`. The default applies to a config file that does not exist yet; an install that already has one is pinned to `local_fs`. |
 | `task_source_provider.env_file` | (none) | file holding `GITHUB_TOKEN` for `github_gist`; read at use time |
 | `task_source_provider.timeout_seconds` | 20 | per remote store call |
 | `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |

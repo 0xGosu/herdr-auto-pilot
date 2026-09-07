@@ -891,6 +891,27 @@ whose manifest carries exactly that version).
   daemon's cwd and CREATE local checklist files while the operator believed their lists were
   remote. A missing `gist_id` is deliberately not a write-time rule either: it would make the keys
   order-dependent to set (`TestValidateTaskSourceAcceptsAMissingGistID` pins the omission).
+  **The TOP-LEVEL key is the opposite: it IS materialized, and that is what made flipping its
+  default safe.** `Default()` names `sqlite` and `Load` pins `local_fs` the moment the config FILE
+  exists — before the decode, so an explicit key still wins and every return carries the pin,
+  including the two error paths and the `AutoAccept.validate()` branch that keeps the decoded
+  config rather than rebuilding it. A post-decode pin misses that third one, and the miss is
+  silent: a typo in the file would move an install's storage backend. `ResolveProvider`'s own
+  literal fallback stays `local_fs` — it is reached only by a `Config{}` assembled in memory,
+  where the posture needing no store handle and no node id is the right answer. And
+  `AnyNonDefaultProvider` cannot be written as "anything but local_fs" any more: there are now TWO
+  postures an operator reaches without touching the setting, so it asks whether the config is
+  MIXED and otherwise stays quiet on either local backend — a naive version turns on the provider
+  column for every new install. Keep `TestAFreshConfigDefaultsToSQLite` /
+  `TestAnExistingConfigWithoutTheKeyStaysLocalFS` (the discriminating one: a config built in
+  memory cannot tell "no file yet" from "a file omitting the key", so it must write a real file) /
+  `TestAZeroConfigStillResolvesLocally`. Note the test suites: `internal/cli` and
+  `internal/frontend` fixtures whose list is a FILE now declare it (`localFSApp`/`localFSCfg`)
+  rather than riding on the default — a suite where every test runs on a local file, where a
+  locator IS a path, is the single reason the locator-is-not-a-path bugs kept shipping green, so
+  `testApp` deliberately stays on the DEFAULT and the sqlite path has its own coverage
+  (`tasksource_sqlite_default_test.go`, the sqlite subtest of
+  `TestBootstrapWritesWhereItRegisters`).
 - **A task-list locator is never handled as a FILE outside the local backend** — `taskfile.Mutate`,
   `MutateWithin` and `WriteFileAtomic` take a path; a locator is not one. Under a remote provider it
   is a `gist://<id>/<file>` URI that `os.Stat` can only fail on, and the failure reads like a missing

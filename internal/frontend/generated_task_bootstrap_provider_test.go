@@ -22,7 +22,7 @@ import (
 // it registers must resolve to the same list.
 func TestBootstrapWritesWhereItRegisters(t *testing.T) {
 	t.Run("local default writes the state-dir file and registers it", func(t *testing.T) {
-		app, st := testApp(t)
+		app, st := localFSApp(t)
 		app.Herdr = &fakeHerdr{}
 		stateDir := t.TempDir()
 		app.StateDir = stateDir
@@ -55,7 +55,7 @@ func TestBootstrapWritesWhereItRegisters(t *testing.T) {
 	})
 
 	t.Run("remote default registers the store file, not the state-dir path", func(t *testing.T) {
-		app, st := testApp(t)
+		app, st := localFSApp(t)
 		app.Herdr = &fakeHerdr{}
 		stateDir := t.TempDir()
 		app.StateDir = stateDir
@@ -92,6 +92,54 @@ func TestBootstrapWritesWhereItRegisters(t *testing.T) {
 		// And it must NOT have written the local bootstrap file.
 		if _, statErr := os.Stat(filepath.Join(stateDir, "tasks", name+".md")); statErr == nil {
 			t.Error("the confirm wrote a local bootstrap file under a remote provider")
+		}
+	})
+
+	t.Run("the sqlite default registers a db locator and writes no file", func(t *testing.T) {
+		// The DEFAULT posture for a fresh install, and the shape this whole
+		// class of bug lives in: a locator is not a path, so a confirm that
+		// still reaches for the filesystem writes the tasks somewhere the
+		// registered source can never read them.
+		app, st := testApp(t)
+		app.Herdr = &fakeHerdr{}
+		stateDir := t.TempDir()
+		app.StateDir = stateDir
+		ctx := context.Background()
+
+		name, _ := st.EnsureAgentName(ctx, "w3:p3")
+		id, _ := st.AppendAudit(ctx, domain.AuditRecord{
+			AgentID: "w3:p3", SituationType: domain.SituationIdle, Trigger: "t",
+			Action: "escalated", Status: "escalated",
+			Suggestion: domain.SuggestTaskPrefix + "Task A", CreatedAt: time.Now(),
+		})
+		if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(stateDir, "tasks", name+".md")); err == nil {
+			t.Error("the confirm wrote a local bootstrap file under the sqlite provider")
+		}
+		cfg, err := config.Load(app.ConfigPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(cfg.TaskSources) != 1 {
+			t.Fatalf("got %d sources, want 1", len(cfg.TaskSources))
+		}
+		src := cfg.TaskSources[0]
+		if src.Path != name+".md" {
+			t.Errorf("registered path = %q, want the store file name %q", src.Path, name+".md")
+		}
+		if src.Provider != "" {
+			t.Errorf("provider = %q, want the inherited default left empty", src.Provider)
+		}
+		// And the tasks are readable back through the store, which is the only
+		// thing that proves the write and the registration agree.
+		items, err := app.ListTasks(name, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(items) != 1 || !strings.Contains(items[0].Text, "Task A") {
+			t.Errorf("items = %+v, want the confirmed task readable through the store", items)
 		}
 	})
 }

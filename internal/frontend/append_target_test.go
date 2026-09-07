@@ -62,7 +62,7 @@ func TestAppendTargetPrecedenceSurvivesTheStoreRewrite(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			app, st := testApp(t)
+			app, st := localFSApp(t)
 			app.Herdr = &fakeHerdr{}
 			dir := t.TempDir()
 			app.StateDir = dir

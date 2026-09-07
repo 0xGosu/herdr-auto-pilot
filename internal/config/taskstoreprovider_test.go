@@ -81,30 +81,93 @@ path = "brave-otter.md"
 	}
 }
 
-func TestTaskSourceProviderDefaultsToLocalFS(t *testing.T) {
+// TestAFreshConfigDefaultsToSQLite: an install with no config file on disk
+// gets the database-backed task store — no file lock behind every checklist
+// write, one list derived per agent, and fleet-visible under turso.
+func TestAFreshConfigDefaultsToSQLite(t *testing.T) {
 	cases := []struct {
 		name string
 		cfg  Config
 	}{
 		{"Default()", Default()},
 		{"missing file", loadConfig(t, filepath.Join(t.TempDir(), "absent.toml"))},
-		{"empty section", loadConfig(t, writeConfig(t, "[task_source_provider]\n"))},
-		{"zero value", Config{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.cfg.ResolveProvider(TaskSource{})
-			if got.Name != ProviderLocalFS {
-				t.Errorf("provider = %q, want %q — task lists must stay local until the "+
-					"operator says otherwise", got.Name, ProviderLocalFS)
+			if got.Name != ProviderSQLite {
+				t.Errorf("provider = %q, want %q", got.Name, ProviderSQLite)
 			}
-			if got.Remote() {
-				t.Error("the default provider must not be remote")
+			if got.Egress() {
+				t.Error("the default provider must make no outbound call")
 			}
 			if tc.cfg.AnyNonDefaultProvider() {
-				t.Error("AnyNonDefaultProvider must be false, or every CLI/TUI surface changes its output")
+				t.Error("a fresh install must not grow a provider column in any CLI/TUI surface")
 			}
 		})
+	}
+}
+
+// TestAnExistingConfigWithoutTheKeyStaysLocalFS is the guard on the default
+// flip, and it is the ONLY shape that discriminates: a config built in memory
+// cannot tell "no file yet" from "a file that omits the key", so the case has
+// to write a real file. An install that predates the flip keeps markdown
+// checklists on disk, and re-pointing it at db:// locators nothing ever wrote
+// would make every one of its lists vanish.
+//
+// The pin is set before the decode, so the error paths — which keep the
+// caller's config rather than rebuilding it — carry it too: a typo in the file
+// must not move an install's storage backend either.
+func TestAnExistingConfigWithoutTheKeyStaysLocalFS(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{name: "no section at all", body: "[logging]\nlevel = \"info\"\n"},
+		{name: "empty section", body: "[task_source_provider]\n"},
+		{name: "sources but no provider key",
+			body: "[[task_sources]]\nagent = \"brave-otter\"\npath = \"/tmp/tasks.md\"\n"},
+		{name: "malformed file", body: "[logging\n", wantErr: true},
+		// The one error path that KEEPS the decoded config rather than
+		// rebuilding it, so a post-decode pin would miss it.
+		{name: "rejected auto-accept section",
+			body: "[escalations.auto_accept]\napproval = \"-3m\"\n", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, tc.body))
+			if tc.wantErr && err == nil {
+				t.Fatal("want an error for this body")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatal(err)
+			}
+			got := cfg.ResolveProvider(TaskSource{})
+			if got.Name != ProviderLocalFS {
+				t.Errorf("provider = %q, want %q — an existing install's lists are files "+
+					"on disk and must stay there", got.Name, ProviderLocalFS)
+			}
+			if got.Remote() {
+				t.Error("a pinned local_fs provider must not be remote")
+			}
+			if cfg.AnyNonDefaultProvider() {
+				t.Error("a pinned install must not grow a provider column either")
+			}
+		})
+	}
+}
+
+// TestAZeroConfigStillResolvesLocally pins ResolveProvider's own fallback: a
+// Config assembled in memory never went through Load or Default, and the
+// file-backed posture is the one that needs no store handle and no node id.
+func TestAZeroConfigStillResolvesLocally(t *testing.T) {
+	got := Config{}.ResolveProvider(TaskSource{})
+	if got.Name != ProviderLocalFS {
+		t.Errorf("provider = %q, want %q", got.Name, ProviderLocalFS)
+	}
+	if (Config{}).AnyNonDefaultProvider() {
+		t.Error("AnyNonDefaultProvider must be false for a zero config")
 	}
 }
 
@@ -234,8 +297,37 @@ func TestAnyNonDefaultProviderDetectsEitherLevel(t *testing.T) {
 				TaskSourceProvider: TaskSourceProvider{Provider: ProviderGitHubGist},
 				TaskSources:        []TaskSource{{Provider: ProviderLocalFS}},
 			},
-			// Still true: the DEFAULT is remote, so a newly minted source would be.
+			// Still true: the source's backend differs from the default, which
+			// is exactly when an operator needs to see which list is where.
 			true,
+		},
+		// The two postures an operator reaches without touching the setting —
+		// a fresh install on sqlite, an older one pinned to local_fs — must
+		// both stay quiet, or every default install grows a provider column.
+		{"uniform sqlite default", Config{TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite}}, false},
+		{
+			"sqlite default with inheriting sources",
+			Config{
+				TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
+				TaskSources:        []TaskSource{{Agent: "a"}, {Agent: "b"}},
+			},
+			false,
+		},
+		{
+			"sqlite default, one source kept on files",
+			Config{
+				TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
+				TaskSources:        []TaskSource{{Agent: "a"}, {Agent: "b", Provider: ProviderLocalFS}},
+			},
+			true,
+		},
+		{
+			"an explicit spelling of the default is not a difference",
+			Config{
+				TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
+				TaskSources:        []TaskSource{{Agent: "a", Provider: ProviderSQLite}},
+			},
+			false,
 		},
 	}
 	for _, tc := range cases {
@@ -282,8 +374,20 @@ func TestTaskSourceProviderRoundTripsThroughSave(t *testing.T) {
 			t.Errorf("an untouched local config must not grow [task_source_provider.github_gist]:\n%s", saved)
 		}
 		if !strings.Contains(saved, `provider = "local_fs"`) {
-			t.Errorf("the default provider is materialized so a saved config names the posture "+
-				"it runs under:\n%s", saved)
+			t.Errorf("the provider is materialized so a saved config names the posture "+
+				"it runs under — and for an install that predates the default flip that "+
+				"posture is local_fs, written out so the pin survives one save:\n%s", saved)
+		}
+	})
+
+	t.Run("a fresh config saves the sqlite posture", func(t *testing.T) {
+		// The counterpart to the case above, and the reason it is not vacuous:
+		// the pin is what makes an EXISTING file save local_fs, while a config
+		// that never had a file names the new default.
+		path := filepath.Join(t.TempDir(), "hap.toml")
+		saved := saveAndRead(t, path, loadConfig(t, path))
+		if !strings.Contains(saved, `provider = "sqlite"`) {
+			t.Errorf("a fresh install must save the sqlite posture:\n%s", saved)
 		}
 	})
 

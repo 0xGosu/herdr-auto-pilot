@@ -156,6 +156,13 @@ func TestGistLocatorRoundTripsThroughParse(t *testing.T) {
 	}
 }
 
+// localCfg is the file-backed posture, named explicitly. config.Default() is
+// no longer it: a fresh install defaults to the sqlite provider, so a test
+// that means "a list that is a file on disk" has to say so.
+func localCfg() config.Config {
+	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderLocalFS}}
+}
+
 func remoteCfg(gistID string) config.Config {
 	return config.Config{TaskSourceProvider: config.TaskSourceProvider{
 		Provider:   config.ProviderGitHubGist,
@@ -177,12 +184,12 @@ func TestResolveAppliesProviderDefaultsAndOverrides(t *testing.T) {
 	}{
 		{
 			name: "local source keeps its canonical path",
-			cfg:  config.Default(), src: config.TaskSource{Path: local},
+			cfg:  localCfg(), src: config.TaskSource{Path: local},
 			agent: "brave-otter", want: tasklocator.Canonical(local),
 		},
 		{
 			name: "local source ignores the agent name",
-			cfg:  config.Default(), src: config.TaskSource{Path: local},
+			cfg:  localCfg(), src: config.TaskSource{Path: local},
 			agent: "", want: tasklocator.Canonical(local),
 		},
 		{
@@ -223,7 +230,7 @@ func TestResolveAppliesProviderDefaultsAndOverrides(t *testing.T) {
 		},
 		{
 			name: "a local source with no path is refused",
-			cfg:  config.Default(), src: config.TaskSource{},
+			cfg:  localCfg(), src: config.TaskSource{},
 			agent: "brave-otter", wantErr: "no path",
 		},
 		{

@@ -1211,7 +1211,7 @@ func TestFilteredSelectionConfirms(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
-	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{Store: st, Herdr: h, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	makeDaemonLive(t, app, dir)
 	startStandInDrain(t, st, h.record)
 	ctx := context.Background()

@@ -18,7 +18,7 @@ import (
 // the other, the lookup silently missed and the source ran UNCAPPED — the cap
 // simply stopped applying, with nothing reporting it.
 func TestSymlinkedSourcePathStillMatchesItsConfigEntry(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 
 	dir := t.TempDir()

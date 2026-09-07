@@ -501,14 +501,14 @@ rewriting a list you wrote is your call.
 
 ### Where task lists are stored
 
-By default a checklist is a file on the machine hap runs on, and nothing about
-it leaves that machine. `[task_source_provider]` sets the **default** storage;
-every `[[task_sources]]` entry may override it, so one agent can keep a local
-checklist while another's lives in a gist:
+By default a checklist lives **inside hap's own database** on the machine hap
+runs on, and nothing about it leaves that machine. `[task_source_provider]` sets
+the **default** storage; every `[[task_sources]]` entry may override it, so one
+agent can keep a checklist as a file on disk while another's lives in a gist:
 
 ```toml
 [task_source_provider]
-provider = "github_gist"                     # "local_fs" (default) | "github_gist"
+provider = "github_gist"                     # "sqlite" (default) | "local_fs" | "github_gist"
 env_file = "~/.config/hap/task_source.env"   # holds GITHUB_TOKEN; read at use time
 timeout_seconds = 20
 refresh_seconds = 30
@@ -542,7 +542,7 @@ matched agent shares one list; leave it out and each gets its own
 `env_file` names (`GITHUB_TOKEN=…`, `gist` scope, mode `0600`), is read when hap
 reaches the store, and never enters `config.toml`.
 
-A third provider, **`sqlite`**, keeps a source's checklist **inside hap's own
+The default provider, **`sqlite`**, keeps a source's checklist **inside hap's own
 database** instead of a file. Nothing leaves the machine under the default
 engine; under the [central database](#central-database-turso) those lists sync
 with everything else, so the Tasks tab and `hap task --node <machine> <agent> …`
@@ -552,9 +552,19 @@ per agent), there is nothing to create and no credential to hold, and the
 daemon that owns a machine is the only one handing its items out — a list is
 never shared between two machines' agents.
 
-Three things stay as they were: a `[[task_sources]]` entry is still what opts an
-agent in, every safety control still applies at delivery, and `local_fs` is
-still the default.
+**Want your lists as markdown files instead?** Pass `--provider local_fs` when
+you add the source, or set `hap config set task_source_provider.provider
+local_fs` once and every inheriting source follows. Only under `local_fs` is
+`path` a filesystem path; under the other two it is a name inside the store, so
+pointing the default at `/home/me/tasks.md` is refused rather than silently
+creating a list somewhere else.
+
+**An install you already have does not move.** The default applies to a
+`config.toml` that does not exist yet; hap pins `local_fs` for any config file
+already on disk, so every checklist you have keeps its path.
+
+Two things stay as they were: a `[[task_sources]]` entry is still what opts an
+agent in, and every safety control still applies at delivery.
 
 **Privacy.** Enabling `github_gist` sends those sources' task lists to GitHub.
 That is the only thing it sends — no pane content, no learned rules, no audit

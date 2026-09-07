@@ -8,6 +8,21 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.0
+
+- **Breaking.** Changed the default task-list backend for NEW installs to `sqlite`: a
+  checklist is a row in hap's own database instead of a markdown file, so `hap task`
+  needs no file lock, each matched agent gets its own list without you naming a path,
+  and under the turso engine the lists are visible fleet-wide
+- An install that already has a `config.toml` keeps `local_fs` — hap pins it on load,
+  before anything else reads the file — so no checklist you already have changes where
+  it lives, and no source changes locator
+- Changed `hap config task-source add` on a fresh install: the `<checklist.md>` argument
+  is now optional (one list per agent is derived), and a filesystem path is refused with
+  a message naming the two ways out — `--provider local_fs`, or omit the path
+- Fixed `hap config task-source add --help` omitting the `sqlite` provider from its
+  `--provider` values and from what `<checklist.md>` means
+
 ## 0.8.8
 
 - Fixed the TUI Audit tab and `hap audit` labelling another machine's rows with a local

@@ -151,7 +151,7 @@ func TestKeypressRestoresTheFastPoll(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	ctx := context.Background()
-	app := &frontend.App{Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{Store: st, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 
 	m := New(ctx, app)
 	m.width, m.height = 100, 30

@@ -41,7 +41,7 @@ func runTestApp(t *testing.T) *frontend.App {
 	return &frontend.App{
 		Store:      st,
 		Herdr:      &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"),
+		ConfigPath: seedLocalFSConfigIn(t, dir),
 		StateDir:   dir,
 		Author:     "operator",
 	}

@@ -901,6 +901,11 @@ func (c Config) ResolveProvider(src TaskSource) ResolvedProvider {
 		out.Name, out.NameInherited = c.TaskSourceProvider.Provider, true
 	}
 	if out.Name == "" {
+		// Reached only by a Config that was never built through Load or
+		// Default (a zero value assembled in memory). The conservative
+		// file-backed posture is the right answer there: it needs no store
+		// handle and no node id, so it can never fail where a caller had no
+		// reason to expect a backend at all.
 		out.Name = ProviderLocalFS
 	}
 	if out.GistID == "" {
@@ -909,22 +914,26 @@ func (c Config) ResolveProvider(src TaskSource) ResolvedProvider {
 	return out
 }
 
-// AnyNonDefaultProvider reports whether anything in this config selects a
-// storage backend other than the built-in local_fs default.
+// AnyNonDefaultProvider reports whether this config's storage is worth
+// printing: any source resolving to a different backend than the default, or a
+// uniform config on a backend that is not one of the two local ones.
 //
 // It is the single predicate gating every "print the provider" branch in the
 // CLI and TUI, which is what keeps an install that has never touched the
-// setting byte-identical in its output.
+// setting byte-identical in its output. That is why it cannot be written as
+// "anything other than local_fs": there are now TWO postures an operator can
+// arrive at without ever touching the setting — a fresh install on sqlite and
+// an older one pinned to local_fs — and neither should grow a provider column.
+// Mixedness still does: a config where one source's backend differs from the
+// rest is exactly when an operator needs to see which is which.
 func (c Config) AnyNonDefaultProvider() bool {
-	if c.TaskSourceProvider.Provider != "" && c.TaskSourceProvider.Provider != ProviderLocalFS {
-		return true
-	}
+	top := c.ResolveProvider(TaskSource{}).Name
 	for _, src := range c.TaskSources {
-		if src.Provider != "" && src.Provider != ProviderLocalFS {
+		if c.ResolveProvider(src).Name != top {
 			return true
 		}
 	}
-	return false
+	return top != ProviderLocalFS && top != ProviderSQLite
 }
 
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
@@ -1159,8 +1168,15 @@ func ValidateTaskSource(cfg Config, src TaskSource) error {
 	// path-shaped value corrupts silently rather than failing.
 	if name := strings.TrimSpace(src.Path); name != "" {
 		if err := ValidateStoreFileName(name); err != nil {
+			// Naming the way OUT matters most under the sqlite provider,
+			// because that is the DEFAULT for a new install: the first thing a
+			// fresh operator does is point a source at a markdown file, and
+			// "this is not a store file name" says what is wrong without
+			// saying what to type instead.
 			return fmt.Errorf("under provider=%s, path names a file INSIDE the store, not a "+
-				"filesystem path: %w", p.Name, err)
+				"filesystem path: %w; for a checklist file on disk pass "+
+				"`--provider %s`, or omit the path to get one list per agent "+
+				"inside the store", p.Name, err, ProviderLocalFS)
 		}
 	}
 	return nil
@@ -1588,11 +1604,21 @@ func Default() Config {
 		Logging: Logging{Level: "info", MaxSizeMB: 16},
 		TUI:     TUI{TerminalBell: true, HerdrNotification: true, MaxInstances: 1},
 		CLI:     CLI{AIAgentFriendlyOutput: true},
-		// Task lists stay on this machine unless the operator says otherwise.
+		// Task lists live in hap's own database unless the operator says
+		// otherwise: no file lock behind every read-modify-write, one list per
+		// agent derived rather than hand-pathed, and — under the turso engine —
+		// visible across the fleet. It stays on this machine either way; the
+		// sqlite provider makes no outbound call (only github_gist does, see
+		// ResolvedProvider.Egress).
+		//
+		// This default reaches an install ONLY through a config file that does
+		// not exist yet. Load pins local_fs for any file already on disk, so
+		// nobody's markdown checklists change locator underneath them.
+		//
 		// Named explicitly rather than left to the zero value so FieldValue
 		// renders something for the registry parity test, and so an operator
 		// reading a saved config sees the posture they are running under.
-		TaskSourceProvider: TaskSourceProvider{Provider: ProviderLocalFS},
+		TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
 		// The local file unless the operator says otherwise, named for the
 		// same two reasons as the provider above.
 		Database: Database{Engine: EngineSQLite},
@@ -1831,13 +1857,27 @@ func Load(path string) (Config, error) {
 	cfg := Default()
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
+		// A fresh install: today's defaults apply, including the sqlite
+		// task-list backend.
 		return cfg, nil
 	}
+	// The file EXISTS from here on, so this is an install that predates the
+	// task-store default flip. An omitted [task_source_provider] provider key
+	// means its lists are markdown FILES on disk: pin local_fs rather than
+	// re-pointing them at db:// locators nothing ever wrote. Set BEFORE the
+	// decode so an explicitly written key still wins, and so EVERY return
+	// below carries the pin — including the two error paths, which keep this
+	// config rather than rebuilding it (a typo in the file must not move an
+	// install's storage backend). With it set here, fillZeroes' own fill only
+	// ever applies to a Default()-sourced config.
+	cfg.TaskSourceProvider.Provider = ProviderLocalFS
 	if err != nil {
 		return cfg, fmt.Errorf("read config: %w", err)
 	}
 	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return Default(), fmt.Errorf("parse config %s: %w", path, err)
+		legacy := Default()
+		legacy.TaskSourceProvider.Provider = ProviderLocalFS
+		return legacy, fmt.Errorf("parse config %s: %w", path, err)
 	}
 	// Every deprecated/removed key is probed from THIS ONE decode. The probes
 	// exist because a key absent from the Config struct is indistinguishable

@@ -41,6 +41,39 @@ func testApp(t *testing.T) (*frontend.App, *store.Store) {
 	}, st
 }
 
+// localFSApp is testApp for a test whose lists are FILES on disk: it seeds a
+// config declaring the local_fs provider, the posture an install that predates
+// the sqlite default runs under.
+//
+// It is a separate helper rather than a change to testApp on purpose. Making
+// testApp local would mean no CLI or frontend test exercises the DEFAULT task
+// store at all, which is the failure this repo keeps rediscovering — every
+// test running on a local file, where a locator IS a path, is the single
+// reason the locator-is-not-a-path bugs kept shipping green.
+func localFSApp(t *testing.T) (*frontend.App, *store.Store) {
+	t.Helper()
+	app, st := testApp(t)
+	seedLocalFSConfig(t, app.ConfigPath)
+	return app, st
+}
+
+// localFSCfg is config.Default() for a fixture whose sources are FILES on
+// disk. Default() means the sqlite provider now, under which a filesystem path
+// is not a legal list name — so a test that saves a path-bearing source has to
+// declare the file backend.
+func localFSCfg() config.Config {
+	cfg := config.Default()
+	cfg.TaskSourceProvider.Provider = config.ProviderLocalFS
+	return cfg
+}
+
+func seedLocalFSConfig(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("[task_source_provider]\nprovider = \"local_fs\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // listedRows returns the rows a listing printed, dropping the trailing
 // "Next steps" footer the CLI adds for its (often AI) callers.
 func listedRows(out string) []string {
@@ -1696,7 +1729,7 @@ func TestTaskStartMarksInProgress(t *testing.T) {
 }
 
 func TestTaskByAgentResolvesSource(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	path := writeTaskFile(t, "- [ ] alpha\n- [ ] beta\n")
 	if err := app.AddTaskSource(context.Background(), "backend", "", path, ""); err != nil {
 		t.Fatal(err)
@@ -1726,7 +1759,7 @@ func TestTaskByAgentResolvesSource(t *testing.T) {
 // prompt only points the agent here, so a listing that omits them leaves the
 // agent with no way to learn `start`/`done`.
 func TestTaskListPrintsManagementHints(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	path := writeTaskFile(t, "- [ ] alpha\n")
 	if err := app.AddTaskSource(context.Background(), "backend", "", path, ""); err != nil {
 		t.Fatal(err)
@@ -1810,7 +1843,7 @@ func TestTaskListHintsQuotePathWithSpace(t *testing.T) {
 }
 
 func TestTaskResolutionErrors(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	pathA := writeTaskFile(t, "- [ ] a\n")
 	pathB := writeTaskFile(t, "- [ ] b\n")
 
@@ -1854,7 +1887,7 @@ func TestTaskResolutionErrors(t *testing.T) {
 // matching several). Bare digits can never be an agent name (herdr names
 // start with a lowercase letter), and '#N' works quoted.
 func TestTaskSourceIndexSelector(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	path := writeTaskFile(t, "- [ ] first job\n- [x] old job\n")
 	// A workspace-scoped source: exactly the shape a name cannot address.
 	if err := app.AddTaskSource(context.Background(), "", "codex-*", path, ""); err != nil {
@@ -1932,7 +1965,7 @@ func TestTaskSourceListShowsAutoSendFlag(t *testing.T) {
 	// visible in `task-source list`; the key itself is config.toml-only, so
 	// this listing is the operator's only confirmation that it took effect.
 	app, _ := testApp(t)
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
 		{Agent: "busy-otter", Path: "/tmp/busy.md", EnableAutoSendTaskWhenIdle: true},
@@ -1977,7 +2010,7 @@ func TestTaskSourceAddAutoSendWhenIdle(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			app, _ := testApp(t)
+			app, _ := localFSApp(t)
 			path := writeTaskFile(t, "- [ ] a\n")
 			out, err := run(t, app, "task-source", append(tc.args, path)...)
 			if err != nil {
@@ -2013,7 +2046,7 @@ func TestTaskSourceAddAutoSendWhenIdle(t *testing.T) {
 // ordering CANNOT enable auto-send — the important half is that it fails
 // loudly instead of adding a source with the flag quietly off.
 func TestTaskSourceAddFlagPlacement(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	path := writeTaskFile(t, "- [ ] a\n")
 
 	_, err := run(t, app, "task-source", "add", path, "--auto-send-when-idle")
@@ -2040,7 +2073,7 @@ func TestTaskSourceAddFlagPlacement(t *testing.T) {
 // TestTaskSourceAddAutoSendIsPerSource guards the blast radius: turning the
 // flag on for one source must not switch on sources added before it.
 func TestTaskSourceAddAutoSendIsPerSource(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	quiet := writeTaskFile(t, "- [ ] a\n")
 	busy := writeTaskFile(t, "- [ ] b\n")
 	if _, err := run(t, app, "task-source", "add", "--agent", "quiet-fox", quiet); err != nil {
@@ -2320,8 +2353,8 @@ func TestTaskRefScreenMatchesDomain(t *testing.T) {
 // config.toml, and a bad key/value/index must be refused rather than silently
 // doing nothing.
 func TestTaskSourceSet(t *testing.T) {
-	app, _ := testApp(t)
-	cfg := config.Default()
+	app, _ := localFSApp(t)
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
 		{Agent: "busy-otter", Path: "/tmp/busy.md"},
@@ -2390,8 +2423,8 @@ func TestTaskSourceSet(t *testing.T) {
 // toggle, including the dual key spelling (dashed CLI form and the raw TOML
 // key) and the pasted "#index" form.
 func TestTaskSourceSetReviewBeforeAutoSend(t *testing.T) {
-	app, _ := testApp(t)
-	cfg := config.Default()
+	app, _ := localFSApp(t)
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
 		{Agent: "busy-otter", Path: "/tmp/busy.md"},
@@ -2438,7 +2471,7 @@ func TestTaskSourceSetReviewBeforeAutoSend(t *testing.T) {
 func TestTaskSourceListShowsLLMReview(t *testing.T) {
 	app, _ := testApp(t)
 	on := true
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "quiet-fox", Path: "/tmp/quiet.md"},
 		{Agent: "busy-otter", Path: "/tmp/busy.md", EnableLLMReviewBeforeAutoSend: &on},
@@ -2477,7 +2510,7 @@ func TestTaskSourceAddLLMReview(t *testing.T) {
 		{name: "flag after path is refused", args: []string{"PATH", "--enable-llm-review-before-auto-send"}, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			app, _ := testApp(t)
+			app, _ := localFSApp(t)
 			path := filepath.Join(t.TempDir(), "tasks.md")
 			if err := os.WriteFile(path, []byte("- [ ] a\n"), 0o600); err != nil {
 				t.Fatal(err)
@@ -2528,7 +2561,7 @@ func TestTaskSourceAddLLMReview(t *testing.T) {
 // escalates now, so both surfaces must accept the pair.
 func TestTaskSourceReviewAndAutoSendComposeCLI(t *testing.T) {
 	// add, with both flags at once.
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	path := filepath.Join(t.TempDir(), "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] a\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -2550,7 +2583,7 @@ func TestTaskSourceReviewAndAutoSendComposeCLI(t *testing.T) {
 
 	// set, from each standing state.
 	on := true
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "reviewer", Path: "/tmp/reviewed.md", EnableLLMReviewBeforeAutoSend: &on},
 		{Agent: "handout", Path: "/tmp/handout.md", EnableAutoSendTaskWhenIdle: true},
@@ -2580,7 +2613,7 @@ func TestTaskSourceReviewAndAutoSendComposeCLI(t *testing.T) {
 // teach a spelling hap is retiring.
 func TestTaskSourceRetiredReviewKeysRefused(t *testing.T) {
 	app, _ := testApp(t)
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{{Agent: "a", Path: "/tmp/a.md"}}
 	if err := config.Save(app.ConfigPath, cfg); err != nil {
 		t.Fatal(err)
@@ -2603,7 +2636,7 @@ func TestTaskSourceRetiredReviewKeysRefused(t *testing.T) {
 // other agent's source pointing at the shared file.
 func TestTaskSourceRemoveDuplicatePath(t *testing.T) {
 	app, _ := testApp(t)
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "alpha", Path: "/tmp/shared.md"},
 		{Agent: "beta", Path: "/tmp/shared.md"},
@@ -2644,7 +2677,7 @@ func TestTaskSourceRemoveDuplicatePath(t *testing.T) {
 // persists to config.toml, and is validated — the CLI half of the parity the
 // TUI add prompt mirrors.
 func TestTaskSourceAddMaxTasks(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	dir := t.TempDir()
 	capped := filepath.Join(dir, "capped.md")
 	plain := filepath.Join(dir, "plain.md")

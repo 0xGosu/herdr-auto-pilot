@@ -42,6 +42,29 @@ func testApp(t *testing.T) (*frontend.App, *store.Store) {
 	}, st
 }
 
+// localFSApp is testApp for a test whose lists are FILES on disk: it seeds a
+// config declaring the local_fs provider, the posture an install that predates
+// the sqlite default runs under.
+//
+// It is a separate helper rather than a change to testApp on purpose. Making
+// testApp local would mean no CLI or frontend test exercises the DEFAULT task
+// store at all, which is the failure this repo keeps rediscovering — every
+// test running on a local file, where a locator IS a path, is the single
+// reason the locator-is-not-a-path bugs kept shipping green.
+func localFSApp(t *testing.T) (*frontend.App, *store.Store) {
+	t.Helper()
+	app, st := testApp(t)
+	seedLocalFSConfig(t, app.ConfigPath)
+	return app, st
+}
+
+func seedLocalFSConfig(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("[task_source_provider]\nprovider = \"local_fs\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // fakeEmbedder is a canned embedder for the standalone re-embed path.
 type fakeEmbedder struct {
 	fail bool
@@ -570,7 +593,7 @@ func TestConfirmGeneratedTaskWritesSourceAndSends(t *testing.T) {
 	// Confirming an idle task suggestion writes a per-agent tasks.md (single
 	// in-progress "[-]" item), registers a matching [[task_sources]] entry,
 	// records the correction, and sends the task to the agent.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	// Route the tasks file into a known state dir.
@@ -644,7 +667,7 @@ func TestConfirmGeneratedTaskWithoutSendStillWritesSource(t *testing.T) {
 	// must leave the first item "[ ]" so the daemon's idle flow can hand it
 	// out later. Regression for issue #156: the item used to be pre-marked
 	// "[-]" at write time, which suppressed the idle resend forever.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -683,7 +706,7 @@ func TestConfirmGeneratedMultipleTasksWritesChecklist(t *testing.T) {
 	// A multiline suggestion (a Markdown checklist from the LLM) is normalized:
 	// ONLY the first task is sent to the agent, so after the send it reads
 	// in-progress "[-]" (reserved at delivery) and the rest stay pending "[ ]".
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -738,7 +761,7 @@ func TestConfirmGeneratedMultipleListsWritesOnlyLastList(t *testing.T) {
 	// LAST list is real work, so only its items reach the checklist and only its
 	// first item is sent. The daemon validated the same raw text with the same
 	// parser, so the two sides cannot disagree about which list won.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -826,7 +849,7 @@ func TestConfirmGeneratedTaskSendFailureRollsBackToPending(t *testing.T) {
 	// A failed --send delivery must roll the reserved item back to "[ ]" so
 	// the daemon's idle flow can retry it — mirroring SendTaskToAgent. Before
 	// issue #156 the item stayed "[-]" and was stranded forever.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{sendErr: errors.New("pane vanished")}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -859,7 +882,7 @@ func TestConfirmRepeatedGenerationPreservesMarkers(t *testing.T) {
 	// duplicate raised before the first confirm registered the source) must
 	// not rewrite the file: resetting a delivered item's "[-]" back to "[ ]"
 	// would re-arm the daemon to send it a second time.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -926,7 +949,7 @@ func TestConfirmRegenerationCarriesOverMarkers(t *testing.T) {
 	// A later generation carrying a DIFFERENT task list rewrites the file, but
 	// items it re-lists keep their progress markers: resetting a delivered
 	// "[-]" to "[ ]" would re-arm the daemon for a duplicate send.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -973,7 +996,7 @@ func TestConfirmRegenerationAppendsKeepingReservedMarker(t *testing.T) {
 	// its position, and the new task lands at the end pending — never reordered
 	// ahead of it, and never reset to "[ ]" (which would re-arm the daemon for a
 	// duplicate send).
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -1024,7 +1047,7 @@ func TestConfirmRegenerationAppendsKeepingCompletedMarker(t *testing.T) {
 	// Same for FINISHED work: an item the agent completed ("[x]", e.g. via
 	// `hap task done`) stays done and in place when a later generation appends
 	// new work — it is never re-queued (issue #183).
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -1082,7 +1105,7 @@ func TestConfirmGeneratedTaskAddOnlyWhileAgentWorking(t *testing.T) {
 	// escalation is resolved (accepted). The daemon delivers the item on the
 	// agent's next idle. This is the "a: add to list" path — the staleness
 	// refusal only applies to a send (issue #180).
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w5:p5", Status: "working"}}}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -1136,7 +1159,9 @@ func TestConfirmGeneratedTaskAddOnlyWhileAgentWorking(t *testing.T) {
 // store, fake herdr, the agent's short name, and the absolute source path.
 func declaredSourceApp(t *testing.T, agentID, content string) (*frontend.App, *store.Store, *fakeHerdr, string, string) {
 	t.Helper()
-	app, st := testApp(t)
+	// Its declared source is a real file on disk, so it declares the file
+	// backend rather than riding on whatever the default happens to be.
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	app.StateDir = t.TempDir()
@@ -1410,7 +1435,7 @@ func TestConfirmGeneratedTaskBootstrapRespectsMaxTasks(t *testing.T) {
 	// max_tasks cap: a file already holding DefaultMaxTasks items refuses one
 	// more generated task instead of growing an unbounded list. Regression for
 	// the gap where only the append + `task add` paths enforced the cap.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -1624,7 +1649,7 @@ func TestConfirmGeneratedTaskUsesSourceTemplate(t *testing.T) {
 	// The append path renders the outbound prompt through the SOURCE's own
 	// next_task_template, like any declared-task send — not the built-in
 	// default the bootstrap path uses.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	app.StateDir = t.TempDir()
@@ -1652,7 +1677,7 @@ func TestConfirmGeneratedTaskUsesSourceTemplate(t *testing.T) {
 func TestConfirmGeneratedTaskAppendCreatesMissingDeclaredFile(t *testing.T) {
 	// A declared source whose file does not exist yet still receives the
 	// tasks at ITS path — never a second bootstrap source.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	app.StateDir = t.TempDir()
@@ -1699,7 +1724,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 	// just the short name, or an id-/type-selected declared source would be
 	// bypassed and bootstrapped into a duplicate.
 	t.Run("agent id selector", func(t *testing.T) {
-		app, st := testApp(t)
+		app, st := localFSApp(t)
 		fake := &fakeHerdr{}
 		app.Herdr = fake
 		app.StateDir = t.TempDir()
@@ -1719,7 +1744,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 		}
 	})
 	t.Run("agent type selector", func(t *testing.T) {
-		app, st := testApp(t)
+		app, st := localFSApp(t)
 		fake := &fakeHerdr{}
 		app.Herdr = fake
 		app.StateDir = t.TempDir()
@@ -1746,7 +1771,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 		}
 	})
 	t.Run("workspace name selector via locator", func(t *testing.T) {
-		app, st := testApp(t)
+		app, st := localFSApp(t)
 		fake := &locatorHerdr{
 			fakeHerdr:  &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w1:p1", Status: "idle", WorkspaceID: "ws-1"}}},
 			workspaces: []domain.WorkspaceInfo{{ID: "ws-1", Label: "codex-main"}},
@@ -1780,7 +1805,7 @@ func TestConfirmGeneratedTaskAppendMatchesDaemonSelectors(t *testing.T) {
 		}
 	})
 	t.Run("workspace raw id fallback without locator", func(t *testing.T) {
-		app, st := testApp(t)
+		app, st := localFSApp(t)
 		fake := &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w1:p1", Status: "idle", WorkspaceID: "ws-1"}}}
 		app.Herdr = fake
 		app.StateDir = t.TempDir()
@@ -1807,7 +1832,7 @@ func TestConfirmGeneratedTaskPrefersSourceWithPendingWork(t *testing.T) {
 	// With several matching sources, the append lands on the one the daemon
 	// would reason about: a source with a pending "[ ]" item beats a fully
 	// completed one, regardless of config order.
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	app.StateDir = t.TempDir()
@@ -1846,7 +1871,7 @@ func TestConfirmGeneratedTaskRefusesDuplicateAgentSource(t *testing.T) {
 	// to a workspace the confirm cannot match falls through to the bootstrap
 	// path — which must REFUSE to register a second source for the same agent
 	// selector (that duplicate is exactly the `hap task` ambiguity of #157).
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	app.StateDir = t.TempDir()
@@ -2680,7 +2705,7 @@ func TestSplitCommand(t *testing.T) {
 }
 
 func TestRemoveByIndexIsValueVerified(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	app.AddNeverAutoPattern(ctx, `(?i)one`)
 	app.AddNeverAutoPattern(ctx, `(?i)two`)
@@ -2820,7 +2845,7 @@ func TestRenameAgentThroughApp(t *testing.T) {
 // TestCLIParityWithSharedLayer proves FR-022: every CLI verb operates on the
 // same shared state the TUI reads.
 func TestCLIParityWithSharedLayer(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	ctx := context.Background()
 
 	run := func(verb string, args ...string) string {
@@ -3953,7 +3978,7 @@ func TestAddTaskMultiline(t *testing.T) {
 // (freshness guard), rendered through the source's template — stored `\n`
 // decoded to real newlines — and delivered to the agent's pane.
 func TestSendTaskToAgent(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	h := &sendCaptureHerdr{agents: idleAt("w1:p2")}
 	app.Herdr = h
 	ctx := context.Background()
@@ -4155,7 +4180,7 @@ func TestSendTaskToAgentRollbackIsClaimScoped(t *testing.T) {
 // differently depending on who sent it.
 func TestSendTaskToAgentRendersCwd(t *testing.T) {
 	ctx := context.Background()
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	path := filepath.Join(t.TempDir(), "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] work\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -4177,7 +4202,7 @@ func TestSendTaskToAgentRendersCwd(t *testing.T) {
 		t.Errorf("{cwd} should render the foreground cwd, got %v", h.sent)
 	}
 	// An adapter without the optional inspector still sends, with {cwd} empty.
-	app2, _ := testApp(t)
+	app2, _ := localFSApp(t)
 	plain := &sendCaptureHerdr{agents: idleAt("w1:p2")}
 	app2.Herdr = plain
 	path2 := filepath.Join(t.TempDir(), "tasks.md")
@@ -4410,7 +4435,7 @@ func TestANeverPublishedRosterIsNotAnEmptyHerd(t *testing.T) {
 // on the bootstrap path that registers a generated task list by itself, which
 // no operator ever opted in for.
 func TestAddTaskSourceAutoSendWhenIdleOption(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	app.Herdr = &fakeHerdr{}
 	app.StateDir = t.TempDir()
 	ctx := context.Background()
@@ -4477,7 +4502,7 @@ func TestAddTaskSourceAutoSendWhenIdleOption(t *testing.T) {
 // distinguishable from "never decided" on disk), and an add that names neither
 // flag lands with review off — the default.
 func TestAddTaskSourceReviewOption(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	plain := filepath.Join(dir, "plain.md")
@@ -4520,7 +4545,7 @@ func TestAddTaskSourceReviewOption(t *testing.T) {
 // switched itself off. The review is now a pre-delivery filter that never
 // escalates, so every write surface must ACCEPT the pair, in either order.
 func TestTaskSourceReviewAndAutoSendCompose(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -4584,7 +4609,7 @@ func TestTaskSourceReviewAndAutoSendCompose(t *testing.T) {
 // living in updateTaskSource: an edit that touches neither delivery-gate flag
 // must never be refused because of them.
 func TestSetTaskSourceMaxTasksIsUngated(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tasks.md")
 	if err := app.AddTaskSource(ctx, "handout", "", path, "", frontend.AutoSendWhenIdle()); err != nil {
@@ -4610,7 +4635,7 @@ func TestSetTaskSourceMaxTasksIsUngated(t *testing.T) {
 // `x` advertises: removing a source retires the config entry only. Source
 // files are often hand-written docs hap never created and could not restore.
 func TestRemoveTaskSourceKeepsChecklistFile(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] keep me\n"), 0o644); err != nil {
@@ -4652,7 +4677,7 @@ func TestRemoveTaskSourceKeepsChecklistFile(t *testing.T) {
 // must refuse 0 — on disk 0 means "unset", so accepting it would silently mean
 // the default rather than the "no cap" an operator typing 0 expects.
 func TestSetTaskSourceSettings(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	first := filepath.Join(dir, "first.md")
@@ -4743,7 +4768,7 @@ func TestSetTaskSourceSettings(t *testing.T) {
 // than retire the wrong agent's source — and the entry the operator DID name
 // is still removable by its new index.
 func TestRemoveTaskSourceDuplicatePathReordered(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	shared := filepath.Join(t.TempDir(), "shared.md")
 	if err := os.WriteFile(shared, []byte("- [ ] a\n"), 0o644); err != nil {
@@ -5589,7 +5614,7 @@ func TestSignaturesBatchAndFallbackAgree(t *testing.T) {
 // on the daemon's first hand-out, which cannot happen until the list holds a
 // task.
 func TestAddTaskCreatesAMissingConfiguredList(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	// A configured source in a directory that does not exist either, so the
 	// create has to build the whole path the way the bootstrap does.
 	path := filepath.Join(t.TempDir(), "nested", "tasks.md")
@@ -5645,7 +5670,7 @@ func TestAddTaskPathTargetStillRefusesAMissingFile(t *testing.T) {
 // failed" while the source had in fact been added, so an operator could
 // re-run it and double-add.
 func TestConfigWriteSucceedsWithNoDaemonListening(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	// A control path that nothing is listening on, which is exactly what a
 	// stopped daemon leaves behind.
 	app.ControlPath = filepath.Join(t.TempDir(), "control.sock")
@@ -5804,7 +5829,7 @@ func TestSetFieldReportsWhetherADaemonTookTheReload(t *testing.T) {
 // operator to this feature. The gate is therefore "this locator belongs to a
 // configured source", which both surfaces satisfy.
 func TestAddTaskCreatesFromTheTUIsLocatorShapedCall(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	// The registry names the agent: for a DERIVED source that is the evidence
 	// the selector is an agent rather than an agent type.
 	if _, err := st.EnsureAgentName(context.Background(), "w1:p1"); err != nil {
@@ -5911,7 +5936,7 @@ func TestTaskGroupsResolvesWhenTheNameRegistryCouldNotBeRead(t *testing.T) {
 // the TUI's locator-shaped call and the cap lookup did not — so a TUI add read
 // max_tasks as UNCAPPED, silently ignoring a limit the operator had set.
 func TestTaskCapAppliesToALocatorShapedAdd(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	path := filepath.Join(t.TempDir(), "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] one\n- [ ] two\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -5938,7 +5963,7 @@ func TestTaskCapAppliesToALocatorShapedAdd(t *testing.T) {
 // the TUI Config tab) and the generated-task bootstrap (accepting an LLM task
 // suggestion, which registers a source as a side effect).
 func TestAddingATaskSourceNeverRenumbersTheExistingOnes(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 
@@ -5985,7 +6010,7 @@ func TestAddingATaskSourceNeverRenumbersTheExistingOnes(t *testing.T) {
 // triggers without naming a source at all — so it is the likeliest place for
 // an insert to creep in. It must append like every other surface.
 func TestAcceptingAGeneratedTaskAppendsItsSource(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 

@@ -28,7 +28,7 @@ func fspTestApp(t *testing.T) *frontend.App {
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{
 		Store:      st,
-		ConfigPath: filepath.Join(dir, "config.toml"),
+		ConfigPath: seedLocalFSConfigIn(t, dir),
 		Author:     "operator",
 	}
 	ctx := context.Background()

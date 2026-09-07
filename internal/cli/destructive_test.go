@@ -91,7 +91,7 @@ func TestClearDataRefusesWithoutYes(t *testing.T) {
 // hap learned; re-deriving them is manual work, so clear-data must not touch
 // them.
 func TestClearDataYesWipesLearnedStateOnly(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	seedSignatures(t, st)
 	ctx := context.Background()
 
@@ -166,7 +166,7 @@ func TestClearDataYesWipesLearnedStateOnly(t *testing.T) {
 // addressed positionally, so an off-by-one here silently retires a different
 // agent's checklist.
 func TestTaskSourceRemoveTargetsTheListedEntry(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	paths := make([]string, 3)
 	for i, agent := range []string{"alpha", "beta", "gamma"} {
@@ -207,7 +207,7 @@ func TestTaskSourceRemoveTargetsTheListedEntry(t *testing.T) {
 // may be reading from a stale terminal, and a non-numeric token is read as an
 // AGENT NAME, which must name exactly one source.
 func TestTaskSourceRemoveRejectsBadIndex(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	path := writeTaskFile(t, "- [ ] only\n")
 	if err := app.AddTaskSource(ctx, "solo", "", path, ""); err != nil {
@@ -258,7 +258,7 @@ func TestTaskSourceRemoveRejectsBadIndex(t *testing.T) {
 // was valid a moment ago can now be out of range. It must fail, not wrap onto
 // the survivor.
 func TestTaskSourceRemoveIndicesShift(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	keep := writeTaskFile(t, "- [ ] keep\n")
 	drop := writeTaskFile(t, "- [ ] drop\n")

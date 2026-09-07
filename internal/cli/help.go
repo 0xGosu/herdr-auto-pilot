@@ -945,7 +945,7 @@ func buildCommands() {
 				{Name: "--auto-send-when-idle", Desc: "also hand out tasks on the periodic idle poll, not only on a herdr attention event"},
 				{Name: "--enable-llm-review-before-auto-send", Desc: "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one"},
 				{Name: "--max-tasks", Arg: "N", Default: "config default", Desc: "cap on how many items this list may hold before task generation stops refilling it"},
-				{Name: "--provider", Arg: "P", Default: "the [task_source_provider] default", Desc: "where THIS source's list is stored: local_fs | github_gist; omit to inherit the default and keep inheriting it"},
+				{Name: "--provider", Arg: "P", Default: "the [task_source_provider] default (sqlite for a new install)", Desc: "where THIS source's list is stored: sqlite | local_fs | github_gist; omit to inherit the default and keep inheriting it"},
 				{Name: "--gist-id", Arg: "ID", Default: "the [task_source_provider.github_gist] default", Desc: "store this source's list in a specific gist instead of the default one (github_gist only)"},
 			},
 			Details: "Flags must come BEFORE the <checklist.md> path — Go's flag parsing stops at the\n" +
@@ -957,6 +957,10 @@ func buildCommands() {
 				"source that names no provider keeps INHERITING the default, so changing the\n" +
 				"default moves it — hap never writes the inherited value into the source.\n" +
 				"The <checklist.md> argument means different things per provider:\n" +
+				"  sqlite       a list NAME inside hap's database (the default). Give one and\n" +
+				"               every agent this source matches shares that list; leave it out\n" +
+				"               and each gets its own \"<agent-name>.md\". A filesystem path is\n" +
+				"               REFUSED here — pass --provider local_fs for a file on disk.\n" +
 				"  local_fs     a filesystem path. REQUIRED.\n" +
 				"  github_gist  a file name INSIDE the gist. Give one and every agent this\n" +
 				"               source matches shares that list; leave it out and each matched\n" +

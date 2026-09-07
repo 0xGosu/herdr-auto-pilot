@@ -15,7 +15,7 @@ import (
 // lists only NEW tasks (not re-listing the existing ones) must APPEND to the
 // agent's bootstrapped list, never replace it (issue #183).
 func TestConfirmGeneratedTaskAppendsToBootstrapList(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -56,7 +56,7 @@ func TestConfirmGeneratedTaskAppendsToBootstrapList(t *testing.T) {
 // (send=false, busy agent) also appends — existing tasks survive and the new
 // ones are added, with nothing delivered to the busy pane (issue #180 + #183).
 func TestConfirmGeneratedTaskAppendsWhileAgentBusy(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -100,7 +100,7 @@ func TestConfirmGeneratedTaskAppendsWhileAgentBusy(t *testing.T) {
 // position, not #1) — the completed item stays "[x]" and the new one is
 // delivered and marked "[-]" (issue #183 reservation-position fix).
 func TestConfirmGeneratedTaskSendAppendsAndReservesNewItem(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -156,7 +156,7 @@ func TestConfirmGeneratedTaskSendAppendsAndReservesNewItem(t *testing.T) {
 // name that same rendered text, not the raw "1. Foo", or it fails spuriously
 // after the escalation is claimed (issue #183 reservation-text fix).
 func TestConfirmGeneratedTaskSendReservesNumberedFirstTask(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{agents: []domain.AgentTransition{{AgentID: "w9:p9", Status: "idle"}}}
 	app.Herdr = fake
 	stateDir := t.TempDir()
@@ -203,7 +203,7 @@ func TestConfirmGeneratedTaskCollapsesDuplicateKeepingAdvancedMark(t *testing.T)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			app, st := testApp(t)
+			app, st := localFSApp(t)
 			fake := &fakeHerdr{}
 			app.Herdr = fake
 			stateDir := t.TempDir()

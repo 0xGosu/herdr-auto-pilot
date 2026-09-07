@@ -337,7 +337,7 @@ func TestRemoteFocusSaysWhoseViewMoved(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 
 	m := fleetModel(t, 0, 1, 30)
-	m.app = &frontend.App{Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	m.app = &frontend.App{Store: st, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	m.ctx = context.Background()
 	m.cursors[tabAgents] = 1
 

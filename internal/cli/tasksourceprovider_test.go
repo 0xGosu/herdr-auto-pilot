@@ -8,11 +8,16 @@ import (
 )
 
 // TestTaskSourceAddPositionalIsRequiredOnlyUnderLocalFS pins the conditional
-// argument: a remote source may derive its file name per agent, so demanding a
-// path there would make the whole per-agent form unreachable from the CLI.
+// argument: a source that is not a file on disk may derive its list name per
+// agent, so demanding a path there would make the whole per-agent form
+// unreachable from the CLI.
+//
+// local_fs is now the exception rather than the default, so the first case has
+// to declare it. The default's own behaviour — a pathless add succeeding on a
+// fresh install — is TestFreshInstallAddsAPathlessSourceAndRoundTripsItsTasks.
 func TestTaskSourceAddPositionalIsRequiredOnlyUnderLocalFS(t *testing.T) {
 	t.Run("local_fs still requires it", func(t *testing.T) {
-		app, _ := testApp(t)
+		app, _ := localFSApp(t)
 		_, err := run(t, app, "task-source", "add", "--agent", "brave-otter")
 		if err == nil {
 			t.Fatal("a source with no path under local_fs must be refused")
@@ -24,7 +29,7 @@ func TestTaskSourceAddPositionalIsRequiredOnlyUnderLocalFS(t *testing.T) {
 	})
 
 	t.Run("an explicit remote provider accepts none", func(t *testing.T) {
-		app, _ := testApp(t)
+		app, _ := localFSApp(t)
 		if _, err := run(t, app, "config", "set",
 			"task_source_provider.github_gist.gist_id", "3f2a1b9c"); err != nil {
 			t.Fatal(err)
@@ -50,7 +55,7 @@ func TestTaskSourceAddPositionalIsRequiredOnlyUnderLocalFS(t *testing.T) {
 	})
 
 	t.Run("an inherited remote provider accepts none and records no override", func(t *testing.T) {
-		app, _ := testApp(t)
+		app, _ := localFSApp(t)
 		for _, kv := range [][2]string{
 			{"task_source_provider.provider", "github_gist"},
 			{"task_source_provider.github_gist.gist_id", "3f2a1b9c"},

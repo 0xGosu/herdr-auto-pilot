@@ -11,8 +11,12 @@ import (
 // compatibility promise: an install that never touched the storage setting must
 // see exactly the output it always saw. Every existing script, and the
 // copy-pasteable "#0" convention, depends on it.
+//
+// "Never touched it" is now TWO postures — an older install pinned to local_fs
+// (this case) and a fresh one on the sqlite default (the case below) — and
+// neither may grow a provider column.
 func TestTaskSourceListIsByteIdenticalWithoutAnyProviderConfigured(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	if _, err := run(t, app, "task-source", "add", "--agent", "brave-otter", "/tmp/tasks.md"); err != nil {
 		t.Fatal(err)
 	}
@@ -151,4 +155,31 @@ func taskSourceRows(out string) []string {
 		}
 	}
 	return rows
+}
+
+// TestTaskSourceListIsQuietOnTheSQLiteDefault is the other half of the
+// compatibility promise: a FRESH install runs on the sqlite provider without
+// ever configuring it, so it must not grow a provider column either. Without
+// this case the predicate could be written as "anything but local_fs" and
+// every new install would print storage detail nobody asked for.
+func TestTaskSourceListIsQuietOnTheSQLiteDefault(t *testing.T) {
+	app, _ := testApp(t)
+	if _, err := run(t, app, "task-source", "add", "--agent", "brave-otter"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := run(t, app, "task-source", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := taskSourceRows(out)
+	want := []string{
+		"#0\tagent=\"brave-otter\" workspace=\"\" db_list=<agent-name>.md (per matched agent) " +
+			"enable_llm_review_before_auto_send=false max_tasks=20",
+	}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Errorf("list output for a fresh install:\n got %q\nwant %q", got, want)
+	}
+	if strings.Contains(out, "provider") {
+		t.Error("a fresh install must not grow a provider column")
+	}
 }

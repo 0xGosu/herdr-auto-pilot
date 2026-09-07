@@ -25,7 +25,7 @@ func sourcePromptModel(t *testing.T) (Model, *frontend.App, string) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	path := filepath.Join(dir, "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] alpha\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -318,7 +318,7 @@ func TestConfigTabEditsTaskSourceSettings(t *testing.T) {
 // edit, resolved through MaxTasksLimit so a config written before the cap was
 // filled in still shows the number the daemon enforces.
 func TestConfigTabSourceRowShowsMaxTasks(t *testing.T) {
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "a1", Path: "/tmp/one.md"},              // unset → default
 		{Agent: "a2", Path: "/tmp/two.md", MaxTasks: 3}, // explicit
@@ -352,7 +352,7 @@ func dupSourceModel(t *testing.T) (Model, *frontend.App, string) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	shared := filepath.Join(dir, "shared.md")
 	if err := os.WriteFile(shared, []byte("- [ ] a\n"), 0o644); err != nil {
 		t.Fatal(err)

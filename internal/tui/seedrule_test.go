@@ -2,7 +2,6 @@ package tui
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -129,7 +128,7 @@ func TestEscalationsHelpAdvertisesBuiltinKeyOnlyWhenOneMatched(t *testing.T) {
 func TestDisableMatchedSeedRuleWritesOnlyThatRule(t *testing.T) {
 	rule := aSeedRule(t)
 	dir := t.TempDir()
-	app := &frontend.App{ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	m := escModelWith(t, config.Default(), []domain.AuditRecord{seedRuleEscalation(7, rule, domain.NeverAutoSeed)})
 	m.ctx = context.Background()
 	m.app = app
@@ -370,7 +369,7 @@ func TestDisableMatchedSeedRuleIsEscalationsOnly(t *testing.T) {
 func TestDisableMatchedSeedRuleCancelChangesNothing(t *testing.T) {
 	rule := aSeedRule(t)
 	dir := t.TempDir()
-	app := &frontend.App{ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	m := escModelWith(t, config.Default(), []domain.AuditRecord{seedRuleEscalation(1, rule, domain.NeverAutoSeed)})
 	m.ctx = context.Background()
 	m.app = app
