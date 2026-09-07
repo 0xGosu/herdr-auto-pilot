@@ -1,0 +1,1 @@
+- Changed a remote focus (`f` on another node's agent in the TUI) to push the shared database immediately instead of waiting out the sync loop's write debounce, so the request reaches Turso Cloud in time for the owning node's next pull. The pull interval on that node (`database.turso_sync_interval_seconds`, default 15 s, minimum 5) remains the larger half of the wait.

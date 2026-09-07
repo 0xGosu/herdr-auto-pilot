@@ -123,6 +123,24 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 			} else {
 				pushTimer.Reset(fleetPushDebounce)
 			}
+		case <-d.fleetPushNow:
+			// An operator's request for ANOTHER node's agent: push at once so
+			// it reaches the shared database in time for that node's next
+			// pull, instead of waiting out the debounce this node's own
+			// bookkeeping is paced by.
+			//
+			// A timer already armed by the same write is dropped — this push
+			// carries everything it would have. The reverse order is harmless
+			// too: a fleetWrites signal arriving just after this arms a timer
+			// that pushes nothing new two seconds later, one wasted round trip
+			// and no correctness question.
+			if pushTimer != nil {
+				pushTimer.Stop()
+				pushTimer, pushC = nil, nil
+			}
+			if !d.fleetRun(ctx, "push", func() { d.fleetPush(sync) }) {
+				return
+			}
 		case <-pushC:
 			pushTimer, pushC = nil, nil
 			if !d.fleetRun(ctx, "push", func() { d.fleetPush(sync) }) {

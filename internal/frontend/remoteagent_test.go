@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 // twoNodes stands both machines up as healthy: a fresh heartbeat (what
@@ -206,6 +209,42 @@ func TestRemoteFocusQueuesWithoutWaiting(t *testing.T) {
 	var fp domain.FocusPayload
 	if err := json.Unmarshal([]byte(acts[0].Payload), &fp); err != nil || fp.PaneID != "7" {
 		t.Errorf("focus payload = %q (%v), want pane 7", acts[0].Payload, err)
+	}
+}
+
+// A remote focus asks its own daemon to push AT ONCE, because the row is only
+// useful once it is in the shared database — the other machine picks it up on
+// its next pull and nothing else here can hurry that.
+//
+// KindReload would be the wrong nudge, and not merely a slower one: it drains
+// queues that are node-scoped (so they could only find nothing for a row filed
+// under another node) and re-drives this herd's parked episodes, which is real
+// work triggered by a keypress that is not about this machine at all.
+func TestRemoteFocusNudgesAFleetPushNotAReload(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	now := time.Now()
+	twoNodes(t, app, st, now)
+
+	got := make(chan control.Kind, 4)
+	sock := filepath.Join(testutil.SocketDir(t), "ctl.sock")
+	srv, err := control.NewServer(sock, func(k control.Kind) { got <- k })
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Close() })
+	app.ControlPath = sock
+
+	if err := app.FocusAgentOn(ctx, otherNode, "t1", "7"); err != nil {
+		t.Fatalf("remote focus: %v", err)
+	}
+	select {
+	case k := <-got:
+		if k != control.KindFleetPush {
+			t.Errorf("nudge kind = %q, want %q", k, control.KindFleetPush)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a remote focus must nudge the daemon to push the shared database")
 	}
 }
 

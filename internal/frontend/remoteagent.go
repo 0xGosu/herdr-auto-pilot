@@ -118,7 +118,14 @@ func (a *App) FocusAgentOn(ctx context.Context, nodeID, tabID, paneID string) er
 	}); err != nil {
 		return err
 	}
-	a.nudge(ctx, control.KindReload)
+	// KindFleetPush, not KindReload: a reload's drains are all node-scoped and
+	// could only find nothing for a row filed under another node, while its
+	// attention reconcile would re-drive this herd for a keypress that is not
+	// about it. What this asks for is the one thing that helps — the row on
+	// the wire now rather than after the push debounce. It still lands on the
+	// other machine's next PULL, which is the larger half of the wait and not
+	// reachable from here.
+	a.nudge(ctx, control.KindFleetPush)
 	return nil
 }
 
@@ -131,9 +138,17 @@ func (a *App) isSelf(nodeID string) bool {
 // runRemoteAction queues one action for another node's daemon and waits for its
 // verdict.
 //
-// The nudge is KindReload rather than KindWake: it cannot reach the other
-// machine's daemon at all. What it does is make THIS node push sooner, so the
-// row reaches the shared database and the remote picks it up on its next pull.
+// No nudge can reach the other machine's daemon, so the local one is nudged
+// only for what it owns: KindReload drains THIS node's queues, which is what
+// makes a verdict pushed back by the remote visible here without waiting for
+// the sweep. It does not hurry the outbound row — the push is driven by the
+// store's own write signal and its debounce, never by a nudge.
+//
+// KindFleetPush would hurry it, and FocusAgentOn uses exactly that. These four
+// deliberately do NOT: each blocks on AwaitAgentAction, so the operator is
+// already waiting out the remote's pull AND its answer's return trip, and the
+// debounce is a rounding error against that. Focus is the one kind that
+// returns immediately, which is what makes its two seconds worth removing.
 func (a *App) runRemoteAction(ctx context.Context, nodeID string, kind domain.AgentActionKind,
 	target, payload string, stampTerminal bool) (string, error) {
 
