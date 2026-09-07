@@ -78,7 +78,8 @@ func (n *NoTaskSourceNotice) Guidance() string {
 	}
 
 	b.WriteString("\nOr give the agent its own checklist:\n")
-	b.WriteString("  hap config task-source add --agent <name> ./docs/tasks.md\n")
+	b.WriteString("  hap config task-source add --agent <name>\n")
+	b.WriteString("  (for a markdown file on disk instead: add --provider local_fs ./docs/tasks.md)\n")
 
 	fmt.Fprintf(&b, "\nNothing to do about this one? Drop it with:\n  hap dismiss %d", n.AuditID)
 	return b.String()

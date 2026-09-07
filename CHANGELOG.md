@@ -20,6 +20,14 @@ assigns. Do not add a heading or an entry by hand.
 - Changed `hap config task-source add` on a fresh install: the `<checklist.md>` argument
   is now optional (one list per agent is derived), and a filesystem path is refused with
   a message naming the two ways out — `--provider local_fs`, or omit the path
+- Added `--agent`, `--workspace` and `--provider` to the TUI's add-task-source prompt,
+  so the pathless per-agent form is expressible there at all: the prompt took the
+  checklist as its FIRST positional field, leaving an operator on a fresh install with
+  nothing to type in its place
+- Changed the "add a task source" guidance printed by `hap task`, `hap confirm`, the
+  help pages and the bundled skill to the pathless form, and it now shows
+  `--provider local_fs` beside the filesystem examples — the commands it suggested
+  failed outright on a fresh install
 - Fixed `hap config task-source add --help` omitting the `sqlite` provider from its
   `--provider` values and from what `<checklist.md>` means
 

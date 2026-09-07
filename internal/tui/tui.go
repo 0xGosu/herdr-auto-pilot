@@ -6091,7 +6091,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.openPrompt(&prompt{
-		label: "add task source: <path> [agent] [workspace] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]",
+		label: "add task source: [<checklist>] [agent] [workspace] [--agent A] [--workspace W] [--provider P] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N]",
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
 				// Flags are spelled exactly like the CLI's and accepted in any
@@ -6105,6 +6105,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 				fields := strings.Fields(input)
 				maxTasks := config.DefaultMaxTasks
 				llmReview := false
+				var flagAgent, flagWorkspace, provider string
 				for i := 0; i < len(fields); i++ {
 					f := fields[i]
 					if f == "--auto-send-when-idle" {
@@ -6117,7 +6118,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 					}
 					// --max-tasks takes a value, written either way round:
 					// "--max-tasks 40" or "--max-tasks=40".
-					if value, ok := maxTasksFlagValue(fields, &i); ok {
+					if value, ok := valueFlag(fields, &i, "--max-tasks"); ok {
 						if value == "" {
 							return actionResultMsg{err: fmt.Errorf(
 								"--max-tasks needs a value (e.g. --max-tasks 40)")}
@@ -6131,31 +6132,85 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 						maxTasks = n
 						continue
 					}
+					// --agent/--workspace name the selector WITHOUT a leading
+					// checklist, which is the only way to express the pathless
+					// per-agent form: positionally the path comes first, so an
+					// operator who wants the default provider to derive one
+					// list per agent has nothing to type in its place.
+					named, err := namedValueFlag(fields, &i, map[string]*string{
+						"--agent":     &flagAgent,
+						"--workspace": &flagWorkspace,
+						"--provider":  &provider,
+					})
+					if err != nil {
+						return actionResultMsg{err: err}
+					}
+					if named {
+						continue
+					}
 					if strings.HasPrefix(f, "-") {
 						return actionResultMsg{err: fmt.Errorf(
-							"unknown flag %q — this prompt takes --auto-send-when-idle and --enable-llm-review-before-auto-send (spelled exactly, no =value) and --max-tasks N (or --max-tasks=N); use the CLI for anything else", f)}
+							"unknown flag %q — this prompt takes --auto-send-when-idle and --enable-llm-review-before-auto-send (spelled exactly, no =value), --max-tasks N (or --max-tasks=N), and --agent A / --workspace W / --provider P (each also as --flag=value); use the CLI for anything else", f)}
 					}
 					parts = append(parts, f)
 				}
-				if len(parts) == 0 {
-					return actionResultMsg{err: fmt.Errorf("expected <path> [agent] [workspace] — no path given")}
-				}
 				if len(parts) > 3 {
 					return actionResultMsg{err: fmt.Errorf(
-						"expected <path> [agent] [workspace] — got %d fields (paths with spaces are not supported here; use the CLI)", len(parts))}
+						"expected [<checklist>] [agent] [workspace] — got %d fields (paths with spaces are not supported here; use the CLI)", len(parts))}
 				}
-				var agent, workspace string
+				if provider != "" && !slices.Contains(config.ValidTaskSourceProviders, provider) {
+					return actionResultMsg{err: fmt.Errorf("--provider must be one of %s, got %q",
+						strings.Join(config.ValidTaskSourceProviders, ", "), provider)}
+				}
+				var path, agent, workspace string
+				if len(parts) > 0 {
+					path = parts[0]
+				}
 				if len(parts) > 1 {
 					agent = parts[1]
 				}
 				if len(parts) > 2 {
 					workspace = parts[2]
 				}
+				// A flag and a positional naming the same field is refused
+				// rather than silently resolved: whichever one lost would be a
+				// selector the operator believes this source carries.
+				if flagAgent != "" {
+					if agent != "" {
+						return actionResultMsg{err: fmt.Errorf(
+							"agent given twice: --agent %s and the positional %q", flagAgent, agent)}
+					}
+					agent = flagAgent
+				}
+				if flagWorkspace != "" {
+					if workspace != "" {
+						return actionResultMsg{err: fmt.Errorf(
+							"workspace given twice: --workspace %s and the positional %q", flagWorkspace, workspace)}
+					}
+					workspace = flagWorkspace
+				}
+				// Whether the checklist is required depends on the provider
+				// this source will actually run under, which may be inherited
+				// — the same rule the CLI applies. Under local_fs it is a
+				// filesystem path and there is nothing to derive; under the
+				// others an empty one means "one list per matched agent".
+				cfg, err := app.Config()
+				if err != nil {
+					return actionResultMsg{err: err}
+				}
+				if path == "" && !cfg.ResolveProvider(config.TaskSource{Provider: provider}).Remote() {
+					return actionResultMsg{err: fmt.Errorf(
+						"a checklist path is required under provider=%s — give one, or pass --provider to a store-backed provider to derive one list per agent",
+						cfg.ResolveProvider(config.TaskSource{Provider: provider}).Name)}
+				}
+				if provider != "" {
+					opts = append(opts, frontend.Provider(provider))
+				}
 				// Passed unconditionally, like the CLI's --max-tasks: a new
 				// source records the review gate it actually runs under rather
 				// than leaving the key absent and the operator guessing.
 				opts = append(opts, frontend.ReviewBeforeAutoSend(llmReview))
-				if err := app.AddTaskSource(ctx, agent, workspace, parts[0], "", opts...); err != nil {
+				if err := app.AddTaskSource(ctx, agent, workspace, path, "", opts...); err != nil {
 					return actionResultMsg{err: err}
 				}
 				// Every setting is echoed back: an operator who typed a flag
@@ -6175,17 +6230,37 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// maxTasksFlagValue recognizes the --max-tasks flag at fields[*i] in either
-// spelling ("--max-tasks 40" or "--max-tasks=40"), advancing *i past a
-// separate value word. A trailing "--max-tasks" with nothing after it returns
-// an empty value, which the caller reports as invalid rather than ignoring —
-// silently dropping it would create the source under the default cap.
-func maxTasksFlagValue(fields []string, i *int) (string, bool) {
+// namedValueFlag matches fields[*i] against any of the value-taking flags in
+// into, storing the value through its pointer. A flag with no value is an
+// error rather than a no-op, for the same reason valueFlag says: a silently
+// dropped --agent would create a source matching EVERY agent.
+func namedValueFlag(fields []string, i *int, into map[string]*string) (bool, error) {
+	for name, dst := range into {
+		value, ok := valueFlag(fields, i, name)
+		if !ok {
+			continue
+		}
+		if value == "" {
+			return false, fmt.Errorf("%s needs a value (e.g. %s brave-otter)", name, name)
+		}
+		*dst = value
+		return true, nil
+	}
+	return false, nil
+}
+
+// valueFlag recognizes a value-taking flag at fields[*i] in either spelling
+// ("--max-tasks 40" or "--max-tasks=40"), advancing *i past a separate value
+// word. A trailing flag with nothing after it returns an empty value, which
+// the caller reports as invalid rather than ignoring — silently dropping
+// --max-tasks would create the source under the default cap, and silently
+// dropping --agent would create one matching every agent.
+func valueFlag(fields []string, i *int, name string) (string, bool) {
 	f := fields[*i]
-	if value, ok := strings.CutPrefix(f, "--max-tasks="); ok {
+	if value, ok := strings.CutPrefix(f, name+"="); ok {
 		return value, true
 	}
-	if f != "--max-tasks" {
+	if f != name {
 		return "", false
 	}
 	if *i+1 < len(fields) {

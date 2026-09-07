@@ -785,7 +785,7 @@ func buildCommands() {
 				"hap config set-threshold approval 0.80",
 				"echo -n \"$ANTHROPIC_API_KEY\" | hap config env set command ANTHROPIC_API_KEY",
 				"hap config rules list",
-				"hap config task-source add --agent vivid-falcon ./docs/tasks.md",
+				"hap config task-source add --agent vivid-falcon",
 			},
 			Next: []Hint{
 				{Cmd: "hap config fields", Why: "list every field and its current value"},
@@ -1000,7 +1000,8 @@ func buildCommands() {
 				"is rewritten on the next save, but the CLI refuses it.\n" +
 				"Use `hap task` to manage the ITEMS inside the file.",
 			Examples: []string{
-				"hap config task-source add --agent vivid-falcon --max-tasks 20 ./docs/tasks.md",
+				"hap config task-source add --agent vivid-falcon --max-tasks 20",
+				"hap config task-source add --agent vivid-falcon --provider local_fs ./docs/tasks.md",
 				"hap config task-source list",
 				"hap config task-source set 0 auto-send-when-idle true",
 				"hap config task-source set 0 enable-llm-review-before-auto-send true",
@@ -1169,7 +1170,7 @@ var workflows = []struct {
 		Title: "Set up a task list for an agent",
 		Steps: []string{
 			"hap rename <pane-id> <name>           # give the agent a stable short name",
-			"hap config task-source add --agent <name> ./docs/tasks.md",
+			"hap config task-source add --agent <name>   # add --provider local_fs ./docs/tasks.md for a file",
 			"hap config task-source list           # confirm it, note the index",
 			"hap task <name> list                  # the agent sees these items",
 		},

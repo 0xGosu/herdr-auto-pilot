@@ -447,16 +447,22 @@ Every option is settable from the CLI at creation time or in place afterwards:
 
 ```sh
 hap config task-source list                                    # every source, with its index
-hap config task-source add --agent backend-dev ./docs/tasks.md
+hap config task-source add --agent backend-dev                 # its own list, derived per agent
+hap config task-source add --agent legacy-fox --provider local_fs ./docs/tasks.md
 hap config task-source add --workspace 'codex-*' --template 'Do: {next_task_content}' \
-    --auto-send-when-idle --enable-llm-review-before-auto-send --max-tasks 40 ./docs/tasks.md
+    --auto-send-when-idle --enable-llm-review-before-auto-send --max-tasks 40
 hap config task-source set backend-dev path /new/tasks.md      # path|agent|workspace|template
 hap config task-source set backend-dev auto-send-when-idle true
 hap config task-source set backend-dev max-tasks 40
 hap config task-source remove <index|agent>
 ```
 
-Flags must come **before** the path — Go stops parsing flags at the first
+The checklist argument is optional under the default `sqlite` provider (leave it
+out for one derived list per matched agent, give a NAME to share one list) and
+required under `local_fs`, where it is a filesystem path. See
+[Where task lists are stored](#where-task-lists-are-stored).
+
+Flags must come **before** the checklist — Go stops parsing flags at the first
 positional argument (hap detects one written after and refuses rather than
 ignoring it).
 
