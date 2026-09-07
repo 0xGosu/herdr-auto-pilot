@@ -114,17 +114,46 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			}
 		}
 		// Everything of ours not in the listing is marked gone, in one statement.
-		var absent []any
+		var absent []string
 		for id, st := range existing {
 			if st.gone == 0 && !live[id] {
 				absent = append(absent, id)
 			}
 		}
 		if len(absent) > 0 {
-			args := append([]any{unix(now), s.self}, absent...)
+			args := []any{unix(now), s.self}
+			for _, id := range absent {
+				args = append(args, id)
+			}
 			if _, err := tx.ExecContext(ctx,
 				`UPDATE agent_roster SET gone_at = ? WHERE node_id = ? AND agent_id IN (`+
 					placeholders(len(absent))+`)`, args...); err != nil {
+				return err
+			}
+			// The tombstone that outlives the wide row once PruneAgedRows
+			// deletes it. It records the terminal the retired agent ran under,
+			// which is what lets UpsertRosterAgent tell a late event about THIS
+			// agent from a genuinely new one on the same recycled pane id.
+			//
+			// Upserted rather than INSERT OR IGNORE: a row only reaches this
+			// statement on the live→gone transition (absent skips gone != 0),
+			// and every path that brings an agent back live clears its
+			// tombstone, so a surviving one would be stale — keeping its
+			// terminal id is the one outcome that silently stops the
+			// discrimination working.
+			values := make([]string, 0, len(absent))
+			tombstones := make([]any, 0, 4*len(absent))
+			for _, id := range absent {
+				values = append(values, "(?, ?, ?, ?)")
+				tombstones = append(tombstones, s.self, id, existing[id].terminal, unix(now))
+			}
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO agent_roster_tombstones
+					(node_id, agent_id, terminal_id, retired_at)
+				VALUES `+strings.Join(values, ",")+`
+				ON CONFLICT(node_id, agent_id) DO UPDATE SET
+					terminal_id = excluded.terminal_id,
+					retired_at = excluded.retired_at`, tombstones...); err != nil {
 				return err
 			}
 		}
@@ -150,10 +179,50 @@ func placeholders(n int) string {
 // and never stamps roster_meta — an event says something about one agent, not
 // about whether the whole view is current, and treating it as a publish would
 // let a single stale event vouch for a roster nothing had reconciled.
+//
+// The tombstone consulted first is what survives PruneAgedRows deleting the
+// wide roster row: upsertRosterRow's INSERT arm hardcodes gone_at = 0, so
+// without SOME record that a full listing retired this agent id, a buffered
+// event takes the insert path and brings a dead agent back live (#398). It is
+// discriminated by TERMINAL id, not by agent id alone — herdr recycles pane
+// ids and an agent id IS a pane id, so a genuinely new agent on a recycled id
+// carries a different terminal and must be admitted, exactly as the
+// prevTerminal branch below admits one whose wide row is still present.
 func (s *Store) UpsertRosterAgent(ctx context.Context, a domain.RosterAgent) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		var prevTerminal string
+		var retiredTerminal string
 		err := tx.QueryRowContext(ctx,
+			`SELECT terminal_id FROM agent_roster_tombstones WHERE node_id = ? AND agent_id = ?`,
+			s.self, a.AgentID).Scan(&retiredTerminal)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return err
+		case retiredTerminal == "" || a.TerminalID == "" || retiredTerminal == a.TerminalID:
+			// The same agent a full listing retired, or an event with nothing
+			// to tell it apart by. An event is not authoritative, so it may
+			// not reintroduce the row; only the next full listing can.
+			//
+			// An unknown terminal on either side blocks rather than admits,
+			// matching the prevTerminal guard below: a legacy row backfilled
+			// with an empty terminal_id must not read as "a different agent".
+			return nil
+		default:
+			// A different, known terminal on the same pane id: a new agent,
+			// not the retired one. Drop the tombstone rather than merely
+			// stepping past it — PublishRoster writes tombstones with INSERT
+			// OR IGNORE keyed on (node_id, agent_id), so a stale one left here
+			// would keep the OLD terminal at this agent's own retirement and
+			// silently stop discriminating.
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM agent_roster_tombstones WHERE node_id = ? AND agent_id = ?`,
+				s.self, a.AgentID); err != nil {
+				return err
+			}
+		}
+
+		var prevTerminal string
+		err = tx.QueryRowContext(ctx,
 			`SELECT terminal_id FROM agent_roster WHERE node_id = ? AND agent_id = ?`, s.self, a.AgentID).Scan(&prevTerminal)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
@@ -295,6 +364,14 @@ func (s *Store) upsertRosterRow(ctx context.Context, tx *sql.Tx,
 			gone_at = `+goneAt,
 		s.self, a.AgentID, a.PaneID, a.TabID, a.WorkspaceID, a.AgentType,
 		a.Status, a.TerminalID, a.Cwd, unix(a.CwdReadAt), unix(a.SeenAt), seq, rosterSeqUnknown)
+	if err != nil {
+		return err
+	}
+	if authoritative {
+		_, err = tx.ExecContext(ctx,
+			`DELETE FROM agent_roster_tombstones WHERE node_id = ? AND agent_id = ?`,
+			s.self, a.AgentID)
+	}
 	return err
 }
 

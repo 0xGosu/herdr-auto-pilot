@@ -66,6 +66,93 @@ func TestPruneAuditExcerptsBlanksOnlyTerminalRows(t *testing.T) {
 	}
 }
 
+// A retired roster row is only deletable because a tombstone survives it. One
+// that has none — a legacy row whose heal has not run, or a damaged database —
+// is the last guard left, so the sweep keeps it.
+func TestPruneAgedRowsKeepsARetiredRosterRowWithNoTombstone(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	retiredAt := now.Add(-30 * 24 * time.Hour)
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO agent_roster
+			(node_id, agent_id, pane_id, agent_type, status, terminal_id, list_seq, seen_at, gone_at)
+		VALUES (?, 'legacy', 'legacy', 'claude', 'idle', 'term-legacy', 0, ?, ?)`,
+		s.self, unix(retiredAt), unix(retiredAt)); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := s.PruneAgedRows(ctx, now, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RetiredRoster != 0 {
+		t.Fatalf("pruned %d retired row(s) without a tombstone; want 0", c.RetiredRoster)
+	}
+	var rows int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM agent_roster WHERE node_id = ? AND agent_id = 'legacy'`, s.self).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("the legacy retired row was deleted without its resurrection guard: %d rows remain", rows)
+	}
+
+	// The control: give it the tombstone the heal would have written and the
+	// same sweep now takes it. Without this the case above passes for a sweep
+	// that never touches agent_roster at all.
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO agent_roster_tombstones (node_id, agent_id, terminal_id, retired_at)
+		VALUES (?, 'legacy', 'term-legacy', ?)`, s.self, unix(retiredAt)); err != nil {
+		t.Fatal(err)
+	}
+	c, err = s.PruneAgedRows(ctx, now, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RetiredRoster != 1 {
+		t.Fatalf("pruned %d retired row(s) with a tombstone; want 1", c.RetiredRoster)
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM agent_roster_tombstones WHERE node_id = ? AND agent_id = 'legacy'`,
+		s.self).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("the sweep deleted the tombstone along with the row: %d remain", rows)
+	}
+}
+
+// A LIVE roster row is not finished bookkeeping at any age. gone_at is the only
+// thing separating the two, so a sweep that forgot the predicate would empty
+// the herd instead of bounding it.
+func TestPruneAgedRowsNeverTouchesALiveRosterRow(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	old := now.Add(-90 * 24 * time.Hour)
+	if err := s.PublishRoster(ctx, []domain.RosterAgent{{
+		AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: old,
+	}}, old); err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.PruneAgedRows(ctx, now, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RetiredRoster != 0 {
+		t.Fatalf("pruned %d live roster row(s); want 0", c.RetiredRoster)
+	}
+	agents, _, err := s.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 {
+		t.Fatalf("an old but live agent was swept out of the roster: %+v", agents)
+	}
+}
+
 // TestPruneAuditExcerptsSparesEscalatedAtAnyAge is a SAFETY invariant, not a
 // preference. AutoAcceptableEscalations selects status='escalated' rows and
 // autoAcceptDeliver passes rec.PaneExcerpt into deliver.Request, where it is the

@@ -126,6 +126,34 @@ const createAgentRoster = `CREATE TABLE IF NOT EXISTS agent_roster (
 	PRIMARY KEY (node_id, agent_id)
 );`
 
+// One row per agent a full listing has retired, outliving the wide
+// agent_roster row that PruneAgedRows deletes.
+//
+// The wide row was itself the resurrection guard — upsertRosterRow's INSERT arm
+// hardcodes gone_at = 0, so with nothing recording the retirement a buffered
+// transition takes the insert path and an agent herdr no longer reports comes
+// back LIVE. Transitions carry no source generation and no reliable event
+// timestamp, so the event cannot be judged on its own age; something per-agent
+// has to survive. That is why agent_roster went unswept until this table
+// existed (#398, and #395 whose delete had to be backed out).
+//
+// terminal_id is the payload that makes it more than a "never again" flag:
+// herdr recycles pane ids and an agent id IS a pane id, so a genuinely new
+// agent on a retired id carries a different terminal and UpsertRosterAgent
+// admits it (clearing the tombstone). It is kept PERMANENTLY and deliberately
+// has no retention of its own — "this terminal on this pane is retired" is true
+// forever, and inventing a grace period would need a bound on how stale a
+// buffered transition can be that nothing in herdr's protocol offers. Four
+// short columns against agent_roster's twelve (cwd included), so the table it
+// bounds shrinks by roughly an order of magnitude.
+const createAgentRosterTombstones = `CREATE TABLE IF NOT EXISTS agent_roster_tombstones (
+	node_id TEXT NOT NULL DEFAULT '',
+	agent_id TEXT NOT NULL,
+	terminal_id TEXT NOT NULL DEFAULT '',
+	retired_at INTEGER NOT NULL,
+	PRIMARY KEY (node_id, agent_id)
+);`
+
 // Workspace and tab display metadata, published alongside the roster. Separate
 // from agent_roster because these are per-LOCATION, not per-agent, and the TUI
 // renders a number as well as a label.
@@ -411,6 +439,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_actions_correction ON agent_actions(correct
 CREATE INDEX IF NOT EXISTS idx_agent_actions_node_status ON agent_actions(node_id, status, id);
 ` + createAgentRoster + `
 CREATE INDEX IF NOT EXISTS idx_agent_roster_live ON agent_roster(node_id, gone_at, list_seq, agent_id);
+` + createAgentRosterTombstones + `
 ` + createHerdrLocations + `
 ` + createRosterMeta + `
 ` + createTaskHandouts + `
@@ -595,6 +624,33 @@ func (s *Store) migrate(between func() error) error {
 			return err
 		}
 	}
+	// Give every already-retired roster row the tombstone PruneAgedRows now
+	// requires before it may delete one. This is a HEAL rather than a one-shot
+	// migration and runs unconditionally on every open, for the same reason
+	// reembed.Reconcile does: a database last written by a build without
+	// tombstones has retired rows that carry no guard, and only re-deriving
+	// them from the wide row — the sole place that information still exists —
+	// restores the invariant. The prune's own EXISTS check keeps such a row
+	// until this has run, so the two together fail safe.
+	//
+	// INSERT OR IGNORE, not an upsert: a tombstone already present is the live
+	// record of this agent's retirement, possibly with a terminal id its wide
+	// row has since lost, and must win over anything re-derived here.
+	//
+	// Scoped to this node although agent_roster is not: under turso another
+	// machine's rows sync in, its own daemon runs this same heal against them,
+	// and PruneAgedRows only ever deletes this node's rows anyway.
+	if err := step(); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO agent_roster_tombstones
+			(node_id, agent_id, terminal_id, retired_at)
+		SELECT node_id, agent_id, terminal_id, gone_at
+		  FROM agent_roster
+		 WHERE node_id = ? AND gone_at != 0`, s.self); err != nil {
+		return fmt.Errorf("migrate backfill roster tombstones: %w", err)
+	}
 	// roster_meta went from one row (id = 1) to one row per node.
 	if has, err := s.hasColumn(ctx, "roster_meta", "node_id"); err != nil {
 		return err
@@ -717,7 +773,7 @@ func (s *Store) SchemaCurrent(ctx context.Context) (bool, error) {
 	// table missing from this list would never be created on any node that
 	// bootstrapped before it existed. (PRAGMA table_info on an absent table
 	// yields no rows, so hasColumn answers false for it.)
-	for _, table := range []string{"roster_meta", "nodes", "task_lists", "legacy_imports"} {
+	for _, table := range []string{"agent_roster_tombstones", "roster_meta", "nodes", "task_lists", "legacy_imports"} {
 		has, err := s.hasColumn(ctx, table, "node_id")
 		if err != nil || !has {
 			return false, err

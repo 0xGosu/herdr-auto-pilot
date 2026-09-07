@@ -88,6 +88,17 @@ const RowRetentionFloor = time.Hour
 //     ledger entry reclaimStrandedTasks needs to return an item to "[ ]"; delete
 //     it and the "[-]" mark is stranded forever, since a "[-]" with no ledger
 //     row is treated as somebody else's and never touched.
+//   - agent_roster: only a RETIRED row (gone_at != 0) that still has its
+//     tombstone in agent_roster_tombstones. A retired roster row is not dead
+//     weight, it is the resurrection guard: upsertRosterRow hardcodes
+//     gone_at = 0 in its INSERT arm, so with the row gone a late
+//     non-authoritative event takes the insert path and an agent herdr no
+//     longer reports comes back LIVE — and LiveRoster feeds the idle poll and
+//     `hap task send`. That is why this table went unswept until the tombstone
+//     sidecar existed (#398, and #395 which had to back the delete out). The
+//     EXISTS guard is the same doctrine as every exemption above: a legacy or
+//     damaged database whose retired row has no tombstone keeps its row, since
+//     the wide row is then the only guard left.
 //
 // audit_log and decisions are deliberately NOT swept. The audit trail's own
 // design says the row survives its excerpt "so `hap audit` history stays
@@ -190,6 +201,20 @@ func (s *Store) PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domai
 		  WHERE node_id = ? AND confirmed_at != 0 AND confirmed_at < ?`,
 		s.self, at)
 	if err := count("task_reservations", &c.TaskReservations, res, err); err != nil {
+		return c, err
+	}
+
+	// The wide roster row for an agent a full listing retired. The tombstone
+	// left behind is what keeps a late event from re-inserting it live, so a
+	// retired row that somehow has none is kept rather than deleted.
+	res, err = s.db.ExecContext(ctx,
+		`DELETE FROM agent_roster
+		  WHERE node_id = ? AND gone_at != 0 AND gone_at < ?
+		    AND EXISTS (SELECT 1 FROM agent_roster_tombstones t
+				WHERE t.node_id = agent_roster.node_id
+				  AND t.agent_id = agent_roster.agent_id)`,
+		s.self, at)
+	if err := count("agent_roster", &c.RetiredRoster, res, err); err != nil {
 		return c, err
 	}
 

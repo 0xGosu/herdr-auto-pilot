@@ -13,6 +13,10 @@ type PruneCounts struct {
 	LLMRetries       int64
 	KillEvents       int64
 	TaskReservations int64
+	// RetiredRoster counts agent_roster rows for agents a full listing has
+	// retired. Their compact tombstones survive the delete — that sidecar is
+	// what makes the row prunable at all (see store.PruneAgedRows).
+	RetiredRoster int64
 	// BlankedPayloads counts finished consult rows whose bulky text was
 	// emptied. Kept apart from the deletions because it is a column update:
 	// the row survives, so an operator reading the audit trail still finds it.
@@ -22,7 +26,7 @@ type PruneCounts struct {
 // Rows is the total number of rows deleted.
 func (p PruneCounts) Rows() int64 {
 	return p.AgentActions + p.LLMRequests + p.LLMDecisions + p.Corrections +
-		p.LLMRetries + p.KillEvents + p.TaskReservations
+		p.LLMRetries + p.KillEvents + p.TaskReservations + p.RetiredRoster
 }
 
 // Empty reports whether the sweep changed nothing at all.

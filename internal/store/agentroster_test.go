@@ -547,6 +547,241 @@ func TestALateEventDoesNotResurrectARetiredAgent(t *testing.T) {
 	}
 }
 
+// The full retired row may be pruned, but its compact tombstone must keep a
+// buffered event from taking the missing-row INSERT path. A full authoritative
+// listing is still allowed to revive the agent and clears that tombstone in the
+// same transaction.
+func TestAnAgedRetiredRosterRowPrunesWithoutLateEventResurrection(t *testing.T) {
+	st := rosterStore(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	retiredAt := now.Add(-48 * time.Hour)
+	agent := domain.RosterAgent{
+		AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: retiredAt,
+	}
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PublishRoster(ctx, nil, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := st.PruneAgedRows(ctx, now, now.Add(-24*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RetiredRoster != 1 {
+		t.Fatalf("pruned %d retired roster rows, want 1", c.RetiredRoster)
+	}
+
+	late := agent
+	late.Status = "working"
+	late.SeenAt = now
+	if err := st.UpsertRosterAgent(ctx, late); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("a late event resurrected a pruned retired agent: %+v", agents)
+	}
+
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, now); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err = st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].AgentID != agent.AgentID {
+		t.Fatalf("authoritative reappearance did not revive the agent: %+v", agents)
+	}
+
+	revivedEvent := agent
+	revivedEvent.Status = "working"
+	revivedEvent.SeenAt = now.Add(time.Second)
+	if err := st.UpsertRosterAgent(ctx, revivedEvent); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err = st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].Status != "working" {
+		t.Fatalf("authoritative revival did not clear the tombstone: %+v", agents)
+	}
+}
+
+// The control for the case above, and the reason the tombstone carries a
+// terminal id at all rather than being a bare "never again" flag.
+//
+// herdr recycles pane ids and an agent id IS a pane id, so once the wide row is
+// pruned the tombstone is the ONLY surviving record of which terminal the
+// retired agent ran under. An event carrying a DIFFERENT one is a genuinely new
+// agent and must land, exactly as it does while the wide row is still present
+// (the prevTerminal delete-and-reinsert path) — otherwise a new agent on a
+// reused pane is invisible until the next authoritative publish.
+//
+// Same-terminal-stays-dead and different-terminal-is-admitted discriminate only
+// as a PAIR: either alone passes on code that answers one way for everything.
+func TestARecycledPaneIsAdmittedPastAPrunedAgentsTombstone(t *testing.T) {
+	st := rosterStore(t)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	retiredAt := now.Add(-48 * time.Hour)
+	agent := domain.RosterAgent{
+		AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: retiredAt,
+	}
+	if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.PublishRoster(ctx, nil, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := st.PruneAgedRows(ctx, now, now.Add(-24*time.Hour)); err != nil || c.RetiredRoster != 1 {
+		t.Fatalf("prune = %d, %v; want one retired row", c.RetiredRoster, err)
+	}
+
+	// A different agent that herdr has given the recycled pane id.
+	fresh := agent
+	fresh.TerminalID = "term-b"
+	fresh.Status = "working"
+	fresh.SeenAt = now
+	if err := st.UpsertRosterAgent(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].TerminalID != "term-b" {
+		t.Fatalf("a new agent on a recycled pane id was blocked by the retired one's tombstone: %+v", agents)
+	}
+
+	// The tombstone is DELETED on the way past rather than merely stepped over,
+	// so this agent's own retirement writes a fresh one naming term-b. A
+	// survivor would still say term-a, and the check below is what notices:
+	// retire and prune again, and a late term-b event must now be refused.
+	if err := st.PublishRoster(ctx, nil, now); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := st.PruneAgedRows(ctx, now.Add(48*time.Hour), now.Add(time.Minute)); err != nil || c.RetiredRoster != 1 {
+		t.Fatalf("second prune = %d, %v; want the recycled agent's row", c.RetiredRoster, err)
+	}
+	stale := fresh
+	stale.SeenAt = now.Add(time.Second)
+	if err := st.UpsertRosterAgent(ctx, stale); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err = st.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("a stale term-a tombstone let the retired term-b agent back: %+v", agents)
+	}
+}
+
+// An event with no terminal id cannot prove it is a different agent, so it is
+// refused — the same "unobserved is never evidence" rule the wide row's
+// prevTerminal guard follows. A legacy tombstone healed from a row that lost
+// its terminal id is the mirror case and blocks for the same reason.
+func TestAnUnidentifiedEventNeverPassesATombstone(t *testing.T) {
+	for _, tc := range []struct{ name, tombstone, event string }{
+		{"event carries no terminal", "term-a", ""},
+		{"tombstone carries no terminal", "", "term-b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := rosterStore(t)
+			ctx := context.Background()
+			now := time.Now().Truncate(time.Millisecond)
+			retiredAt := now.Add(-48 * time.Hour)
+			agent := domain.RosterAgent{
+				AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude",
+				Status: "idle", TerminalID: tc.tombstone, SeenAt: retiredAt,
+			}
+			if err := st.PublishRoster(ctx, []domain.RosterAgent{agent}, retiredAt); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.PublishRoster(ctx, nil, retiredAt); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := st.PruneAgedRows(ctx, now, now.Add(-24*time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			late := agent
+			late.TerminalID = tc.event
+			late.Status = "working"
+			late.SeenAt = now
+			if err := st.UpsertRosterAgent(ctx, late); err != nil {
+				t.Fatal(err)
+			}
+			agents, _, err := st.LiveRoster(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(agents) != 0 {
+				t.Fatalf("an event that could not identify itself passed the tombstone: %+v", agents)
+			}
+		})
+	}
+}
+
+// Tombstones are node-local. A retired pane on one installation must not
+// block a genuinely unknown same-named pane on another installation sharing
+// the database.
+func TestRosterTombstonesDoNotCrossNodeBoundaries(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "t.db")
+	a, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { a.Close() })
+	b, err := store.OpenAs(path, "bbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { b.Close() })
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	retiredAt := now.Add(-48 * time.Hour)
+	agent := domain.RosterAgent{
+		AgentID: "pane-1", PaneID: "pane-1", AgentType: "claude",
+		Status: "idle", TerminalID: "term-a", SeenAt: retiredAt,
+	}
+	if err := a.PublishRoster(ctx, []domain.RosterAgent{agent}, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.PublishRoster(ctx, nil, retiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := a.PruneAgedRows(ctx, now, now.Add(-24*time.Hour)); err != nil || c.RetiredRoster != 1 {
+		t.Fatalf("node A prune = %d, %v; want one retired row", c.RetiredRoster, err)
+	}
+
+	if err := b.UpsertRosterAgent(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	agents, _, err := b.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 1 || agents[0].AgentID != agent.AgentID {
+		t.Fatalf("node B's unknown agent was blocked by node A's tombstone: %+v", agents)
+	}
+	agents, _, err = a.LiveRoster(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(agents) != 0 {
+		t.Fatalf("node A saw node B's agent through its scoped roster: %+v", agents)
+	}
+}
+
 // An agent nothing has published yet still lands from its own event -- the
 // retirement rule bites only rows a publish already retired.
 func TestAnEventStillIntroducesANewAgent(t *testing.T) {

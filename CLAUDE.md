@@ -969,15 +969,49 @@ whose manifest carries exactly that version).
 - **Retention has TWO windows, and the exemptions are the safety control** —
   `PruneAuditExcerpts` blanks one COLUMN (`[logging] audit_excerpt_retention_days`);
   `PruneAgedRows` deletes finished bookkeeping ROWS (`[logging] row_retention_days`, default 30).
-  **`agent_roster` is deliberately NOT swept, and the reason is a real trap**: a retired row is a
-  TOMBSTONE, not dead weight. `upsertRosterRow`'s INSERT arm hardcodes `gone_at = 0` and only its
-  ON CONFLICT arm honours `authoritative`, so the surviving row is the ONLY thing stopping a
-  non-authoritative EVENT from taking the insert path and reviving an agent herdr no longer
-  reports — its own doc comment says so ("its row does not exist yet, so the INSERT applies and
-  gone_at starts at 0"). Deleting aged `gone_at` rows therefore resurrects the agent on the next
-  late event, and `LiveRoster` hands a dead agent to the idle poll and `hap task send` until the
-  next authoritative publish re-retires it. Bounding the table needs a durable tombstone or an
-  event-age/terminal-generation check in `UpsertRosterAgent`, not a delete.
+  **`agent_roster` is swept only because `agent_roster_tombstones` exists, and the trap it
+  answers is still live**: a retired row was itself the resurrection guard, not dead weight.
+  `upsertRosterRow`'s INSERT arm hardcodes `gone_at = 0` and only its ON CONFLICT arm honours
+  `authoritative`, so with nothing recording the retirement a non-authoritative EVENT takes the
+  insert path and revives an agent herdr no longer reports — its own doc comment says so ("its
+  row does not exist yet, so the INSERT applies and gone_at starts at 0") — and `LiveRoster` then
+  hands a dead agent to the idle poll and `hap task send` until the next authoritative publish
+  re-retires it. That is why #395's plain delete had to be backed out (#398). What makes the
+  delete safe is a compact sidecar row written by `PublishRoster` at the live→gone transition,
+  and four bounds are load-bearing:
+  - **The prune requires the tombstone, per row** — `PruneAgedRows`'s `EXISTS` guard. A retired
+    row that has none (a legacy database whose heal has not run, a damaged one) is the last guard
+    left, so it is KEPT. `migrate` re-derives missing tombstones from the wide row on EVERY open,
+    not once, the way `reembed.Reconcile` does — the wide row is the only place that information
+    still exists, and the two together fail safe in the same direction.
+  - **The tombstone is discriminated by TERMINAL id, and storing it without reading it is the
+    silent half of the bug.** herdr recycles pane ids and an agent id IS a pane id, so once the
+    wide row is gone the tombstone is the only surviving record of which terminal was retired. A
+    DIFFERENT, non-empty terminal is a genuinely new agent and `UpsertRosterAgent` admits it —
+    matching the `prevTerminal` delete-and-reinsert path that already handles this while the wide
+    row stands. Blocking on agent id alone makes a new agent on a reused pane invisible until the
+    next publish. An empty terminal on EITHER side blocks: "unobserved is never evidence", the
+    same rule `rosterRowUnchanged` and `upsertRosterRow` follow.
+  - **Admitting DELETES the tombstone.** `PublishRoster` upserts on `(node_id, agent_id)`, so a
+    survivor would keep the OLD terminal at this agent's own retirement and the comparison would
+    silently stop discriminating. Same reason the authoritative revive in `upsertRosterRow`
+    clears it.
+  - **The tombstone is permanent, deliberately, and needs no retention of its own.** "This
+    terminal on this pane is retired" is true forever, and any grace period would need a bound on
+    how stale a buffered herdr transition can be that the protocol does not offer — inventing one
+    reopens the hole. Four short columns against `agent_roster`'s twelve, so the table it bounds
+    still shrinks by roughly an order of magnitude. Keep
+    `TestAnAgedRetiredRosterRowPrunesWithoutLateEventResurrection` /
+    `TestARecycledPaneIsAdmittedPastAPrunedAgentsTombstone` (the two discriminate only as a PAIR
+    — either alone passes on code that answers one way for everything) /
+    `TestAnUnidentifiedEventNeverPassesATombstone` / `TestRosterTombstonesDoNotCrossNodeBoundaries` /
+    `TestPruneAgedRowsKeepsARetiredRosterRowWithNoTombstone` /
+    `TestPruneAgedRowsNeverTouchesALiveRosterRow` /
+    `TestSchemaCurrentNoticesAMissingRosterTombstoneTable` /
+    `TestRowRetentionPrunesARetiredAgentWithoutResurrectingIt`.
+
+  Note `hap gc` does not reclaim roster rows, because it does not call `PruneAgedRows` at all —
+  pre-existing, and the daemon's daily sweep is what bounds the table.
   Both run on the daemon's one daily throttle and one background goroutine, and the THROTTLE is
   taken before either config is read so switching one off cannot change the other's cadence; the
   `VACUUM` runs once at the end, because deleting rows — like blanking a column — only moves

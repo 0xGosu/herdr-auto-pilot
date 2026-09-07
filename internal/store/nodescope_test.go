@@ -25,7 +25,7 @@ var nodeScopedTables = map[string]bool{
 	"agent_names": true, "agent_rate": true, "error_retries": true, "task_handouts": true,
 	"task_reservations": true, "llm_requests": true, "llm_decisions": true, "llm_retries": true,
 	"corrections": true, "kill_events": true, "audit_log": true, "agent_actions": true,
-	"agent_roster": true, "herdr_locations": true, "roster_meta": true, "nodes": true,
+	"agent_roster": true, "agent_roster_tombstones": true, "herdr_locations": true, "roster_meta": true, "nodes": true,
 	"task_lists": true, "legacy_imports": true,
 }
 
@@ -431,12 +431,14 @@ func TestMigrateLegacyDatabaseGainsNodeScope(t *testing.T) {
 		t.Fatalf("create legacy schema: %v", err)
 	}
 	now := time.Now().UnixMilli()
+	retiredAt := now - 2*24*60*60*1000
 	for _, stmt := range []string{
 		`INSERT INTO agent_names (agent_id, name, disabled, terminal_id, created_at) VALUES ('1', 'alpha', 1, 'term-1', ` + fmt.Sprint(now) + `)`,
 		`INSERT INTO agent_rate (agent_id, consecutive_auto) VALUES ('1', 4)`,
 		`INSERT INTO error_retries (error_signature, agent_id, retry_count, updated_at) VALUES ('e', '1', 2, ` + fmt.Sprint(now) + `)`,
 		`INSERT INTO task_handouts (source_path, task_text, attempts, updated_at) VALUES ('/l', 'task', 3, ` + fmt.Sprint(now) + `)`,
 		`INSERT INTO agent_roster (agent_id, pane_id, agent_type, status, terminal_id, list_seq, seen_at) VALUES ('1', '1', 'claude', 'idle', 'term-1', 0, ` + fmt.Sprint(now) + `)`,
+		`INSERT INTO agent_roster (agent_id, pane_id, agent_type, status, terminal_id, list_seq, seen_at, gone_at) VALUES ('retired', 'retired', 'claude', 'idle', 'term-retired', 1, ` + fmt.Sprint(retiredAt) + `, ` + fmt.Sprint(retiredAt) + `)`,
 		`INSERT INTO herdr_locations (kind, id, label, number, workspace_id, seen_at) VALUES ('tab', 't1', 'work', 1, 'w1', ` + fmt.Sprint(now) + `)`,
 		`INSERT INTO roster_meta (id, published_at) VALUES (1, ` + fmt.Sprint(now) + `)`,
 		`INSERT INTO audit_log (agent_id, trigger, situation_type, action_or_escalation, status, created_at) VALUES ('1', 't', 'approval', 'escalated', 'escalated', ` + fmt.Sprint(now) + `)`,
@@ -479,6 +481,17 @@ func TestMigrateLegacyDatabaseGainsNodeScope(t *testing.T) {
 		if len(roster) != 1 || roster[0].NodeID != self || at.IsZero() {
 			t.Errorf("pass %d: roster lost: %+v published %v", pass, roster, at)
 		}
+		var tombstoneTerminal string
+		var tombstoneAt int64
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT terminal_id, retired_at FROM agent_roster_tombstones
+			 WHERE node_id = ? AND agent_id = 'retired'`, self).Scan(&tombstoneTerminal, &tombstoneAt); err != nil {
+			t.Fatalf("pass %d: legacy retired row did not backfill its tombstone: %v", pass, err)
+		}
+		if tombstoneTerminal != "term-retired" || tombstoneAt != retiredAt {
+			t.Errorf("pass %d: backfilled tombstone = %q at %d, want %q at %d",
+				pass, tombstoneTerminal, tombstoneAt, "term-retired", retiredAt)
+		}
 		if _, tabs, _ := s.HerdrLocations(ctx); tabs["t1"].Label != "work" {
 			t.Errorf("pass %d: locations lost: %v", pass, tabs)
 		}
@@ -515,6 +528,7 @@ func TestMigrateLegacyDatabaseGainsNodeScope(t *testing.T) {
 		assertPK(t, s.db, "error_retries", []string{"node_id", "error_signature"})
 		assertPK(t, s.db, "task_handouts", []string{"node_id", "source_path", "task_text"})
 		assertPK(t, s.db, "agent_roster", []string{"node_id", "agent_id"})
+		assertPK(t, s.db, "agent_roster_tombstones", []string{"node_id", "agent_id"})
 		assertPK(t, s.db, "herdr_locations", []string{"node_id", "kind", "id"})
 		assertPK(t, s.db, "roster_meta", []string{"node_id"})
 		assertUniqueIndexOn(t, s.db, "agent_names", []string{"node_id", "name"})
