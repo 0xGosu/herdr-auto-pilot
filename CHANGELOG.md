@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.8.7
+
+- Fixed `agent_roster` growing without bound: retired agents' rows are now deleted on the existing `[logging] row_retention_days` window, with a compact permanent tombstone left behind so a late transition cannot bring a dead agent back live
+- Fixed a new agent on a recycled pane id being invisible until the next roster publish — the tombstone records the terminal it was retired under, so a different terminal on the same pane is admitted
+
 ## 0.8.6
 
 - Added: confirming an LLM-suggested task now works for an agent on another machine. It used to be refused outright ("this generated-task suggestion belongs to node …"), because the confirm wrote the task list and registered the task source on whichever machine you typed on — and pointed the send at whatever local pane happened to share the agent's id. The owning node's daemon now does that work, wherever you confirm from.
