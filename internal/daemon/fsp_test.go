@@ -62,7 +62,8 @@ func (s *fspSeams) disable(_ context.Context, reason string) error {
 // accept mimics the real seam closely enough to matter: it calls the screen
 // callback with a prompt, so a test can prove the daemon refuses the exact
 // outbound text and not merely the raw suggestion.
-func (s *fspSeams) accept(_ context.Context, auditID int64, _ bool, screen func(string) error) error {
+func (s *fspSeams) accept(_ context.Context, auditID int64, _ bool,
+	_ ports.TaskSendHost, screen func(string) error) error {
 	s.mu.Lock()
 	prompt := s.renderedPrompt
 	s.mu.Unlock()

@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -29,8 +32,20 @@ func confirmTestApp(t *testing.T, status, task string) (*frontend.App, *sendReco
 	h := &sendRecorderHerdr{agents: []domain.AgentTransition{
 		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: status},
 	}}
+	// A health record that reads as a live daemon: a generated-task confirm is
+	// a QUEUED action now, and the front end refuses to file one nothing could
+	// execute. These tests are about what `hap confirm` prints when a daemon IS
+	// running.
+	if err := daemonhealth.Write(dir, daemonhealth.Health{
+		PID: os.Getpid(), HeartbeatAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	app := &frontend.App{Store: st, Herdr: h, StateDir: dir,
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator",
+		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
+	}
+	startStandInConfirmDrain(t, st, app, h)
 	name, _ := st.EnsureAgentName(context.Background(), "w1:p1")
 	id, err := st.AppendAudit(context.Background(), domain.AuditRecord{
 		AgentID: "w1:p1", Signature: "sig", Trigger: "t",
@@ -41,6 +56,81 @@ func confirmTestApp(t *testing.T, status, task string) (*frontend.App, *sendReco
 		t.Fatal(err)
 	}
 	return app, h, name, id
+}
+
+// startStandInConfirmDrain plays the owning node's daemon for one test: it
+// claims each queued accept_generated_task, applies the send-time staleness
+// gate the executor applies, and then runs the REAL confirm.
+//
+// The confirm no longer happens in this process — `hap confirm` files an action
+// and waits for a verdict — so without a drain every one of these tests would
+// wait out the action timeout, and without the real confirm behind it their
+// assertions (the tasks file, the resolved escalation, the refusal wording)
+// would be checking nothing.
+func startStandInConfirmDrain(t *testing.T, st *store.Store, app *frontend.App, h *sendRecorderHerdr) {
+	t.Helper()
+	done, stopped := make(chan struct{}), make(chan struct{})
+	// Wait for the goroutine rather than merely signalling it: cleanups run
+	// LIFO, so a bare signal lets this keep querying while st.Close() and
+	// t.TempDir()'s RemoveAll are already running behind it.
+	t.Cleanup(func() { close(done); <-stopped })
+	go func() {
+		defer close(stopped)
+		ctx := context.Background()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			acts, err := st.PendingAgentActions(ctx)
+			if err == nil {
+				for _, a := range acts {
+					if a.Kind != domain.AgentActionAcceptGeneratedTask {
+						continue
+					}
+					if ok, _ := st.ClaimAgentAction(ctx, a.ID, time.Now()); !ok {
+						continue
+					}
+					standInConfirm(ctx, st, a, app, h)
+				}
+			}
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+}
+
+func standInConfirm(ctx context.Context, st *store.Store, a domain.AgentAction,
+	app *frontend.App, h *sendRecorderHerdr) {
+
+	var p domain.AcceptGeneratedTaskPayload
+	_ = json.Unmarshal([]byte(a.Payload), &p)
+	if p.Send {
+		for _, ag := range h.agents {
+			if ag.AgentID == a.Target && domain.AgentBusy(ag.Status) {
+				st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed,
+					"agent is no longer idle; "+domain.SuggestionStaleMarker+
+						" (agent status: "+ag.Status+") — dismiss it, or confirm without --send "+
+						"to queue the tasks to the agent's list", "", time.Now())
+				return
+			}
+		}
+	}
+	if err := app.ConfirmGeneratedTaskForOperator(ctx, p.AuditID, p.Send, a.Author, cliStandInHost{h}); err != nil {
+		st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed, err.Error(), "", time.Now())
+		return
+	}
+	st.FinishAgentAction(ctx, a.ID, domain.AgentActionDone, "", "", time.Now())
+}
+
+// cliStandInHost is the pane access the daemon supplies in production
+// (ports.TaskSendHost).
+type cliStandInHost struct{ h *sendRecorderHerdr }
+
+func (c cliStandInHost) Cwd(context.Context, string) string { return "" }
+
+func (c cliStandInHost) Send(ctx context.Context, paneID, _, prompt string) error {
+	return c.h.Send(ctx, paneID, prompt)
 }
 
 func runConfirm(t *testing.T, app *frontend.App, args ...string) (string, error) {

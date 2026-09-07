@@ -430,7 +430,7 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 		deliver = func() error {
 			var inner error
 			disabled, err := d.opt.Store.WithAgentAutomation(ctx, rec.AgentID, func() {
-				inner = d.opt.AcceptGeneratedTask(ctx, rec.ID, true, func(prompt string) error {
+				inner = d.opt.AcceptGeneratedTask(ctx, rec.ID, true, d.taskSendHost(0), func(prompt string) error {
 					if err := d.screenOutbound(rec.AgentType, prompt); err != nil {
 						// Tagged so autoAcceptDeliveryFailed can tell a SAFETY
 						// refusal from a delivery fault. Both the real seam and

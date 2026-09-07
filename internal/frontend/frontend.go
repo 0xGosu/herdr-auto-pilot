@@ -788,23 +788,13 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// means the sentinel, and the literal spelling must never be learned
 	// as pane text (free text like "do nothing" stays literal).
 	action = domain.NormalizeNoopAction(action)
-	// Confirming an idle task suggestion is not a pane send: it appends the
-	// tasks to the agent's declared task source (or bootstraps a per-agent
-	// tasks.md when none exists) and, when send, hands the first task to the
-	// agent. Handle it before the send-oriented flow below.
+	// Confirming an idle task suggestion is not an ordinary reply: it appends
+	// the tasks to the agent's declared task source (or bootstraps a per-agent
+	// tasks.md when none exists), registers that source in config.toml, and —
+	// when send — hands the first task to the agent. Handle it before the
+	// send-oriented flow below, which only knows how to type an answer.
 	if action == domain.SuggestGenerateTask {
-		// acceptGeneratedTask is node-blind by construction: it matches the
-		// row's pane id against THIS machine's herd, names a local row for it,
-		// writes a local list and registers a local task source. For another
-		// node's row every one of those lands on the wrong machine — and with
-		// send, in whichever local pane shares the id. Until a queued action
-		// carries it to the owner, it is that machine's confirm to give.
-		if self := a.Store.NodeID(); audit.NodeID != "" && audit.NodeID != self {
-			return fmt.Errorf("%w: this generated-task suggestion belongs to node %s — its list and task "+
-				"source live there, so confirm it on that machine (`hap confirm %d`)",
-				ErrRemoteAgent, a.NodeLabelFor(ctx, audit.NodeID), auditID)
-		}
-		return a.acceptGeneratedTask(ctx, audit, send, false, nil)
+		return a.queueGeneratedTaskConfirm(ctx, audit, send)
 	}
 	// willSend is the delivery gate. The correction is recorded FIRST (the
 	// learning event, preserved even when delivery fails) but with Sent=false;
@@ -899,7 +889,96 @@ func orSelf(a *App, nodeID string) string {
 // the task would interrupt it. The tasks can instead be QUEUED by re-confirming
 // with send=false, which succeeds while the agent is busy (the daemon delivers
 // on the next idle). Callers detect this with errors.Is to offer that fallback.
-var ErrSuggestionStaleAgentBusy = errors.New("agent is no longer idle; the suggested task is stale")
+var ErrSuggestionStaleAgentBusy = errors.New("agent is no longer idle; " + domain.SuggestionStaleMarker)
+
+// queueGeneratedTaskConfirm files an operator's generated-task confirm for the
+// node that OWNS the escalation, and waits for that daemon's verdict.
+//
+// It is queued unconditionally, local rows included, which is the same bargain
+// the ordinary reply below strikes ("Delivery is the DAEMON's"). The work is
+// node-blind by construction — it matches the audit row's pane id against a
+// herd, mints an agent_names row, writes a list, registers a [[task_sources]]
+// entry in a config.toml that never enters the shared database, and may type
+// into a pane — so all of it belongs to one machine. Routing only the remote
+// case would leave this process holding a herdr adapter for the local one,
+// which is exactly the capability stage 5 removes: a TUI and a daemon typing
+// into one pane is the race none of the delivery guards can see.
+//
+// Refused BEFORE anything is written when no daemon could run it, for the same
+// reason the reply path refuses: a queued confirm with nothing draining the
+// queue would sit in a healthy-looking table indefinitely.
+//
+// No CorrectionID is carried, and that is load-bearing rather than an omission.
+// The correction is written INSIDE the executor, by claimGeneratedTaskEscalation,
+// in the same run that marks it sent — so there is no window for the
+// withholding filter to protect. Populating the field would instead arm
+// finishWithdrawn: a retry that arrives after attempt 1 already claimed the
+// escalation sees 'resolved', refuses with errEscalationClosed, and that
+// refusal DELETES the correction the first attempt wrote.
+func (a *App) queueGeneratedTaskConfirm(ctx context.Context, audit *domain.AuditRecord, send bool) error {
+	if err := a.requireLiveDaemonFor(ctx, audit.NodeID); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(domain.AcceptGeneratedTaskPayload{AuditID: audit.ID, Send: send})
+	if err != nil {
+		return err
+	}
+	// Herdr RECYCLES pane ids, so the pane id is not an address on its own.
+	// Read from the OWNING node's record, never this one's: pane ids repeat
+	// across machines. Best-effort — an unknown id is "not observed", which the
+	// executor treats as no evidence rather than as a mismatch.
+	terminalID, err := a.Store.AgentTerminalIDOn(ctx, orSelf(a, audit.NodeID), audit.AgentID)
+	if err != nil {
+		return err
+	}
+	id, err := a.Store.EnqueueAgentAction(ctx, domain.AgentAction{
+		NodeID: audit.NodeID, Kind: domain.AgentActionAcceptGeneratedTask,
+		Target: audit.AgentID, TerminalID: terminalID, Payload: string(payload),
+		Author: a.Author, CreatedAt: time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	// KindWake for our own node; for another's, KindReload — it cannot reach
+	// that daemon at all, and what it does is make THIS node push sooner so the
+	// row reaches the shared database before the debounce elapses.
+	if a.isSelf(audit.NodeID) {
+		a.nudge(ctx, control.KindWake)
+	} else {
+		a.nudge(ctx, control.KindReload)
+	}
+	_, err = a.AwaitAgentAction(ctx, id, a.awaitTimeoutFor(audit.NodeID))
+	return a.interpretConfirmFailure(ctx, audit.NodeID, err)
+}
+
+// interpretConfirmFailure turns the executor's bare sentence back into the
+// sentinels this package's callers switch on.
+//
+// AwaitAgentAction returns AgentAction.Error verbatim through errors.New, so
+// every sentinel is gone by the time a surface sees it — and one of them is
+// ACTIONABLE: a refusal because the agent started working is answered by the
+// TUI with "add to the task list instead?" and by the CLI by naming the same
+// fallback. Matching on domain.SuggestionStaleMarker restores that offer.
+// The same shape as explainRemoteFailure, which does it for an older daemon's
+// unsupported-kind refusal, and it runs first for the same reason: a remote
+// node's build being too old is a different answer than the agent being busy.
+func (a *App) interpretConfirmFailure(ctx context.Context, nodeID string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if strings.Contains(err.Error(), domain.SuggestionStaleMarker) {
+		return fmt.Errorf("%w", suggestionStale{err})
+	}
+	return a.explainRemoteFailure(ctx, nodeID, err)
+}
+
+// suggestionStale re-attaches ErrSuggestionStaleAgentBusy to a refusal that
+// crossed the queue as text, keeping the executor's own wording (which names
+// the agent's status and the fallback) as the message.
+type suggestionStale struct{ err error }
+
+func (s suggestionStale) Error() string { return s.err.Error() }
+func (s suggestionStale) Unwrap() error { return ErrSuggestionStaleAgentBusy }
 
 // acceptGeneratedTask confirms an idle task suggestion. When the agent
 // already has a declared task source, the generated tasks refill THAT list:
@@ -916,6 +995,35 @@ var ErrSuggestionStaleAgentBusy = errors.New("agent is no longer idle; the sugge
 // suppresses the idle resend (issue #156). Bootstrap side effects run
 // source-first so a send failure never leaves the agent without the task
 // source that was just established.
+// generatedTaskConfirm carries what differs between the two ways a generated
+// task is accepted: an operator's confirm and full self-prompting's automatic
+// one. They share every step below — the bootstrap-vs-append choice, the
+// remote locator resolution, the append merge that never drops an existing
+// item, source registration, and the reserve→send→roll-back order — because
+// each of those carries an invariant that must not be re-derived per caller.
+type generatedTaskConfirm struct {
+	// send hands the first task to the pane now. Without it the list is left
+	// all-pending and the daemon's idle flow delivers it on the next idle.
+	send bool
+	// automated is the full self-prompting path: the caller has already claimed
+	// the audit row and will finalize it, so neither the status nor a learning
+	// correction is written here.
+	automated bool
+	// author owns the correction this confirm records. It is the OPERATOR, not
+	// the process: the confirm executes inside the daemon, whose own App is
+	// authored "daemon", so an unthreaded author would attribute every remote
+	// operator's decision to the machine that ran it. Empty falls back to
+	// App.Author.
+	author string
+	// host is the pane access, supplied by the daemon. Nil is legal and means
+	// "deliver nothing" — the same shape the old `a.Herdr != nil` guard had, so
+	// a caller with no way to reach a pane still writes the list.
+	host ports.TaskSendHost
+	// screen is the last gate before the pane, called with the EXACT outbound
+	// prompt. Nil on the operator path, where the human is the gate.
+	screen func(string) error
+}
+
 // claimGeneratedTaskEscalation takes ownership of the escalation a
 // generated-task confirm is about to act on, and records the learning event
 // that teaches the idle signature to drive from its declared list. It returns
@@ -933,8 +1041,8 @@ var ErrSuggestionStaleAgentBusy = errors.New("agent is no longer idle; the sugge
 //     'resolved': a machine's decision to act is not evidence the suggestion
 //     was right, so it must not feed the confidence model or push a signature
 //     toward graduation.
-func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.AuditRecord, automated bool) (int64, error) {
-	if automated {
+func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.AuditRecord, opt generatedTaskConfirm) (int64, error) {
+	if opt.automated {
 		return 0, nil
 	}
 	// Atomically CLAIM the escalation. Only the writer that flips
@@ -950,9 +1058,13 @@ func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.Au
 	// Best-effort: the escalation is already resolved and the source
 	// established, so a failed learning write must not fail the confirm — it
 	// only skips a learning event.
+	author := opt.author
+	if author == "" {
+		author = a.Author
+	}
 	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
-		Author: a.Author, CreatedAt: time.Now(),
+		Author: author, CreatedAt: time.Now(),
 	})
 	if corrErr != nil {
 		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
@@ -961,7 +1073,7 @@ func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.Au
 	return corrID, nil
 }
 
-func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord, send, automated bool, screen func(string) error) error {
+func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord, opt generatedTaskConfirm) error {
 	// The suggestion may carry one task or several (plain or as a Markdown
 	// list); normalize into clean bare task strings so the file is always a
 	// well-formed checklist, never raw multiline text written after "- [ ] ".
@@ -984,7 +1096,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// the escalation once the budget is spent — so the feature would delete the
 	// very suggestions it exists to act on, a few minutes after each is raised.
 	want := "escalated"
-	if automated {
+	if opt.automated {
 		want = domain.AuditStatusAutoAccepting
 	}
 	if audit.Status != want {
@@ -1001,20 +1113,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 	// asked to confirm. The matched transition is kept for the declared-source
 	// resolution below (workspace-scoped selectors need the agent's live
 	// workspace) in both cases.
-	var live *domain.AgentTransition
-	if a.Herdr != nil {
-		if agents, lerr := a.Herdr.ListAgents(ctx); lerr == nil {
-			for i, ag := range agents {
-				if ag.AgentID == audit.AgentID {
-					if send && domain.AgentBusy(ag.Status) {
-						return fmt.Errorf("%w (agent status: %s) — dismiss it, or confirm without --send to queue the tasks to the agent's list", ErrSuggestionStaleAgentBusy, ag.Status)
-					}
-					live = &agents[i]
-					break
-				}
-			}
-		}
-	}
+	live := a.liveAgentFor(ctx, audit.AgentID)
 
 	// A short name reads well in the file name and matches the task source
 	// selector; fall back to the agent id when unresolvable.
@@ -1086,7 +1185,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		external = append(external, s)
 	}
 	if s, ok := a.pickAppendTarget(ctx, cfg, name, external); ok {
-		return a.appendGeneratedTasks(ctx, audit, s, name, tasks, send, automated, screen)
+		return a.appendGeneratedTasks(ctx, audit, s, name, tasks, opt, live)
 	}
 	if bootstrapErr != nil {
 		return bootstrapErr
@@ -1136,12 +1235,12 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		return fmt.Errorf("register task source: %w", err)
 	}
 
-	corrID, err := a.claimGeneratedTaskEscalation(ctx, audit, automated)
+	corrID, err := a.claimGeneratedTaskEscalation(ctx, audit, opt)
 	if err != nil {
 		return err
 	}
 
-	if send && a.Herdr != nil {
+	if opt.send && opt.host != nil {
 		// Only the first task is sent — the operator's "start now" task. With
 		// existing tasks preserved above it, that task is no longer necessarily
 		// item #1, so locate it by identity in the merged list and reserve THAT
@@ -1176,8 +1275,8 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// substituted — because a template can frame a benign task into
 		// something those rules refuse, and the raw task text cannot show that.
 		// Refused BEFORE the reservation, so nothing has to be rolled back.
-		if screen != nil {
-			if err := screen(prompt); err != nil {
+		if opt.screen != nil {
+			if err := opt.screen(prompt); err != nil {
 				return fmt.Errorf("the generated task was not sent: %w", err)
 			}
 		}
@@ -1193,7 +1292,7 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		if _, err := a.mutateList(ctx, cfg, path, reserveTask(pos, itemText)); err != nil {
 			return fmt.Errorf("task source created, but reserving task #%d (nothing was sent): %w", pos, err)
 		}
-		resID := a.recordAutomatedReservation(ctx, automated, audit, path, itemText, pos)
+		resID := a.recordTaskReservation(ctx, audit, path, itemText, pos, live)
 		// Render through the same default next-task template used by a declared
 		// task source, so every idle-task handoff includes both the task and
 		// its list. The prompt sends the task text, not the numbered file line.
@@ -1201,19 +1300,16 @@ func (a *App) acceptGeneratedTask(ctx context.Context, audit *domain.AuditRecord
 		// position is read back by the agent-name rule — the same exactly-one
 		// resolution `hap task <name>` applies; ambiguity leaves the index
 		// empty and {task_source_index} falls back to the name.
-		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
-			// WithoutCancel: this is the compensating write for a send that just
-			// failed, and the likeliest reason it failed — the operator quitting
-			// the TUI, or Ctrl-C in the CLI — is the same cancellation that
-			// would abort the release. A remote store actually uses this ctx for
-			// its HTTP calls, so inheriting the dead one guarantees the item is
-			// left stranded at "[-]" exactly when it matters most.
-			a.releaseAutomatedReservation(ctx, resID)
-			if _, rbErr := a.mutateList(context.WithoutCancel(ctx), cfg, path, releaseTask(pos, itemText)); rbErr != nil {
+		if f := a.deliverReserved(ctx, opt.host, audit.AgentID, audit.AgentType, prompt, resID,
+			func(rc context.Context) error {
+				_, err := a.mutateList(rc, cfg, path, releaseTask(pos, itemText))
+				return err
+			}); f != nil {
+			if f.Rollback != nil {
 				return fmt.Errorf("task source created, but sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
-					"it stays [-] and no agent will pick it up until you clear it", err, pos, rbErr)
+					"it stays [-] and no agent will pick it up until you clear it", f.Send, pos, f.Rollback)
 			}
-			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", err)
+			return fmt.Errorf("task source created, but sending the task to the agent failed: %w", f.Send)
 		}
 		// The task was delivered, so flag the correction sent — the same
 		// "answer reached the agent" signal the pane-send path records. Idle is
@@ -1610,9 +1706,9 @@ func (a *App) pickAppendTarget(ctx context.Context, cfg config.Config, name stri
 	return sources[0], true
 }
 
-// recordAutomatedReservation gives an UNATTENDED generated-task hand-out the
-// same durable ownership the daemon's own hand-outs have, returning the ledger
-// row id (0 when none was written).
+// recordTaskReservation gives a generated-task hand-out the same durable
+// ownership the daemon's own hand-outs have, returning the ledger row id
+// (0 when none was written).
 //
 // Without it, a crash between marking the item "[-]" and completing the send
 // strands the task: the audit row is reclaimed to 'escalated' at startup, but
@@ -1622,29 +1718,38 @@ func (a *App) pickAppendTarget(ctx context.Context, cfg config.Config, name stri
 // parked past the grace window — the machinery that already exists for exactly
 // this failure.
 //
-// Only the AUTOMATED path records one. An operator's confirm is attended: the
-// error names the stranded item and a human can clear it, and adding ledger
-// rows there would also start barring manually-confirmed agents from the idle
-// poll until their hand-out settles.
+// EVERY hand-out records one, the operator's confirm included. That used to be
+// the automated path's alone, on the ground that an operator is present to read
+// the error and clear the item by hand. Stage 5 removed that premise: the send
+// now happens inside the OWNING node's daemon, which may be a machine the
+// operator is not sitting at and cannot see the error from, so a hand-out the
+// agent never starts would sit at "[-]" with nothing able to reclaim it.
+//
+// The cost is deliberate and worth naming: agentsAwaitingHandout allows one
+// unconfirmed hand-out per agent, so a confirmed agent is withheld from the
+// idle poll until it goes 'working' (or the row ages out at staleHandoutTTL).
+// A short pause in the poll is a smaller harm than a permanently parked item.
+//
+// TerminalID comes from the daemon's published roster row when there is one.
+// Both readers treat an empty id as "matches any terminal" (the confirm query,
+// and reclaim's sameTenant), so an absent one still confirms and ages normally
+// — it only gives up telling a RECYCLED pane apart, where a busy successor pins
+// the item "[-]" until staleHandoutTTL retires the row with a warning.
+// Degraded, never a wrong send.
 //
 // Best-effort: losing the row costs this hand-out its self-healing (the item
 // stays "[-]" until someone clears it), which is exactly the behavior before
 // the ledger existed — never a double send.
-func (a *App) recordAutomatedReservation(ctx context.Context, automated bool, audit *domain.AuditRecord,
-	locator, taskText string, index int) int64 {
-	if !automated {
-		return 0
+func (a *App) recordTaskReservation(ctx context.Context, audit *domain.AuditRecord,
+	locator, taskText string, index int, live *domain.AgentTransition) int64 {
+
+	terminalID := ""
+	if live != nil {
+		terminalID = live.TerminalID
 	}
 	id, err := a.Store.RecordTaskReservation(ctx, domain.TaskReservation{
 		SourcePath: tasklocator.Canonical(locator), TaskText: taskText, ItemIndex: index,
-		// TerminalID is unknown here — the front end holds no transition. Both
-		// readers treat an empty one as "matches any terminal" (the confirm
-		// query, and reclaim's sameTenant), so the row confirms and ages
-		// normally. The one thing it gives up is telling a RECYCLED pane apart:
-		// if this pane id is later reused by a different terminal, a busy
-		// successor pins the item "[-]" until staleHandoutTTL retires the row
-		// with a warning. Degraded, never a wrong send.
-		AgentID: audit.AgentID, PaneID: audit.AgentID,
+		AgentID: audit.AgentID, PaneID: audit.AgentID, TerminalID: terminalID,
 		AuditID: audit.ID, ReservedAt: time.Now(),
 	})
 	if err != nil {
@@ -1670,6 +1775,83 @@ func (a *App) releaseAutomatedReservation(ctx context.Context, id int64) {
 	}
 }
 
+// liveAgentFor returns the daemon's last published view of an agent, or nil
+// when this node's roster does not carry it.
+//
+// It reads the ROSTER rather than asking herdr, and that is the whole point of
+// stage 5: this package no longer holds an adapter, and a roster row is exactly
+// what the owning daemon publishes for this kind of question.
+//
+// Its callers want the agent's workspace (to resolve a workspace-scoped
+// task-source selector) and its terminal identity (for the hand-out ledger), so
+// absence is not an error — agentWorkspaceTarget already falls back, and an
+// empty terminal id reads as "not observed". It is deliberately NOT how
+// idleness is decided: that is proved by the daemon immediately before the
+// send, against a live listing, because a roster row can be up to a sweep old
+// and "we could not ask" must never read as "it is idle".
+func (a *App) liveAgentFor(ctx context.Context, agentID string) *domain.AgentTransition {
+	roster, _, err := a.Store.LiveRoster(ctx)
+	if err != nil {
+		return nil
+	}
+	for _, r := range roster {
+		if r.AgentID == agentID {
+			tr := r.Transition()
+			return &tr
+		}
+	}
+	return nil
+}
+
+// sendFailure reports a hand-out that did not reach the agent.
+//
+// Two errors rather than one because the caller has to say two different
+// things. A rolled-back item is merely not sent and the operator can retry; an
+// item still sitting at "[-]" is PARKED — no agent will pick it up until a
+// human clears it — and the message has to name that, which is why Rollback is
+// carried separately instead of being folded into Send.
+//
+// The wording itself deliberately stays at the call sites: each names what had
+// already been done when the send failed ("task source created, but …",
+// "tasks appended to %s, but …", or nothing at all for an operator's task
+// send), and those distinctions are what tell an operator how much to undo.
+type sendFailure struct {
+	Send     error
+	Rollback error
+}
+
+// deliverReserved hands an ALREADY-RESERVED task to an agent's pane and undoes
+// the reservation when the send fails.
+//
+// This is the one place in this package that reaches a pane, and it does so
+// through a host supplied by the DAEMON (ports.TaskSendHost) rather than
+// through an adapter of its own — see that type for why the ordering stays here
+// while the pane access is handed in. Every caller has already marked its item
+// "[-]" under the list lock, because reserving after delivery would let the
+// daemon's idle flow hand the same item out a second time.
+//
+// The compensation runs in the order the writes did: the ledger row first
+// (retireReservation), then the item back to "[ ]". A ledger row left behind
+// for an item that is pending again would make reclaimStrandedTasks think a
+// hand-out is still outstanding and bench the agent from the idle poll.
+//
+// release takes its own context. Callers pass one derived with
+// context.WithoutCancel: this is the compensating write for a send that just
+// failed, and the likeliest reason it failed — the operator quitting the TUI,
+// or Ctrl-C in the CLI — is the same cancellation that would abort the release.
+// A remote store really does use that context for its HTTP calls, so inheriting
+// the dead one guarantees the item is stranded at "[-]" exactly when it matters
+// most.
+func (a *App) deliverReserved(ctx context.Context, host ports.TaskSendHost,
+	paneID, agentType, prompt string, resID int64, release func(context.Context) error) *sendFailure {
+
+	if err := host.Send(ctx, paneID, agentType, prompt); err != nil {
+		a.releaseAutomatedReservation(ctx, resID)
+		return &sendFailure{Send: err, Rollback: release(context.WithoutCancel(ctx))}
+	}
+	return nil
+}
+
 // appendGeneratedTasks confirms generated tasks for an agent that already has
 // a declared task source: the tasks are appended to that source's own file.
 // The append runs BEFORE the escalation claim and is idempotent — tasks whose
@@ -1681,7 +1863,8 @@ func (a *App) releaseAutomatedReservation(ctx context.Context, id int64) {
 // load-bearing order: the first task is RESERVED ("[-]" under the file lock)
 // before the send, so the daemon's idle flow can never hand it out mid-send,
 // and a failed send rolls it back to "[ ]".
-func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, target indexedTaskSource, name string, tasks []string, send, automated bool, screen func(string) error) error {
+func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecord, target indexedTaskSource,
+	name string, tasks []string, opt generatedTaskConfirm, live *domain.AgentTransition) error {
 	src := target.src
 	// Resolved through the registry, NOT by absolutizing src.Path. Under a
 	// remote provider src.Path is a bare file name inside the store, so
@@ -1734,7 +1917,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		// copy at reserve time would be AFTER the claim consumed the
 		// escalation, so refuse here, pre-claim, while the operator can still
 		// act on it.
-		if send {
+		if opt.send {
 			for _, it := range items {
 				if it.Text == firstText {
 					if it.Done {
@@ -1780,12 +1963,12 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		return fmt.Errorf("appending the generated tasks to %s failed (nothing was resolved — retry after fixing this): %w", path, err)
 	}
 
-	corrID, err := a.claimGeneratedTaskEscalation(ctx, audit, automated)
+	corrID, err := a.claimGeneratedTaskEscalation(ctx, audit, opt)
 	if err != nil {
 		return err
 	}
 
-	if send && a.Herdr != nil {
+	if opt.send && opt.host != nil {
 		// Only the first task is sent — the operator's "start now" task —
 		// rendered through the SOURCE's template (not the built-in default),
 		// pointing at the declared file. {cwd} is resolved only when the
@@ -1793,7 +1976,7 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 		// herdr shell-out failure should not have to unwind a reservation).
 		cwd := ""
 		if strings.Contains(domain.TemplateOrDefault(src.NextTaskTemplate), "{cwd}") {
-			cwd = a.paneCwd(ctx, audit.AgentID)
+			cwd = opt.host.Cwd(ctx, audit.AgentID)
 		}
 		// Rendered — and screened — BEFORE the reservation. This is the path
 		// where the exact bytes matter most: the prompt goes through the
@@ -1807,22 +1990,25 @@ func (a *App) appendGeneratedTasks(ctx context.Context, audit *domain.AuditRecor
 			AgentName: name, Cwd: cwd,
 			SourceIndex: strconv.Itoa(target.index),
 		}.Prompt()
-		if screen != nil {
-			if err := screen(prompt); err != nil {
+		if opt.screen != nil {
+			if err := opt.screen(prompt); err != nil {
 				return fmt.Errorf("the generated task was not sent: %w", err)
 			}
 		}
 		if _, err := a.mutateTask(path, reserveTask(firstIndex, firstText)); err != nil {
 			return fmt.Errorf("tasks appended to %s, but reserving task #%d (nothing was sent): %w", path, firstIndex, err)
 		}
-		resID := a.recordAutomatedReservation(ctx, automated, audit, path, firstText, firstIndex)
-		if err := ports.SendToAgent(ctx, a.Herdr, audit.AgentID, audit.AgentType, prompt); err != nil {
-			a.releaseAutomatedReservation(ctx, resID)
-			if _, rbErr := a.mutateTask(path, releaseTask(firstIndex, firstText)); rbErr != nil {
+		resID := a.recordTaskReservation(ctx, audit, path, firstText, firstIndex, live)
+		if f := a.deliverReserved(ctx, opt.host, audit.AgentID, audit.AgentType, prompt, resID,
+			func(rc context.Context) error {
+				_, err := a.mutateTaskWithin(rc, path, releaseTask(firstIndex, firstText))
+				return err
+			}); f != nil {
+			if f.Rollback != nil {
 				return fmt.Errorf("sending the task failed (%w) and task #%d could not be returned to [ ] (%v) — "+
-					"it stays [-] and no agent will pick it up until you clear it", err, firstIndex, rbErr)
+					"it stays [-] and no agent will pick it up until you clear it", f.Send, firstIndex, f.Rollback)
 			}
-			return fmt.Errorf("tasks appended to %s, but sending the task to the agent failed: %w", path, err)
+			return fmt.Errorf("tasks appended to %s, but sending the task to the agent failed: %w", path, f.Send)
 		}
 		// Delivered — flag the correction sent so the recently-resolved dedup
 		// window recognizes this confirm (see the bootstrap path for why this is
@@ -3901,11 +4087,22 @@ func resolveTaskSourceForAny(cfg config.Config, spellings ...string) (config.Tas
 // mutator used, so a source stored remotely is edited in place rather than
 // having its file name written to disk.
 func (a *App) mutateTask(locator string, fn func(string) (string, error)) ([]domain.ChecklistItem, error) {
+	return a.mutateTaskWithin(context.Background(), locator, fn)
+}
+
+// mutateTaskWithin is mutateTask under a caller-supplied context.
+//
+// It exists for the compensating writes: a rollback passes
+// context.WithoutCancel so the release of a "[-]" item cannot be aborted by the
+// very cancellation that caused the send to fail. Everything else keeps using
+// mutateTask, whose context.Background() is deliberate — a front-end mutation
+// waits for the list lock rather than giving up on it.
+func (a *App) mutateTaskWithin(ctx context.Context, locator string, fn func(string) (string, error)) ([]domain.ChecklistItem, error) {
 	cfg, err := a.Config()
 	if err != nil {
 		return nil, err
 	}
-	return a.mutateList(context.Background(), cfg, locator, fn)
+	return a.mutateList(ctx, cfg, locator, fn)
 }
 
 // The locked read-modify-write over a checklist file lives in

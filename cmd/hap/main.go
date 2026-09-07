@@ -582,8 +582,14 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		// POSSIBLE.
 		AcceptGeneratedTask: fspApp.AcceptGeneratedTaskAutomatically,
 		DisableFSP:          fspApp.DisableFullSelfPromptingWithReason,
-		MatchIndexDir:       filepath.Join(paths.StateDir, "match-index"),
-		StateDir:            paths.StateDir,
+		// The OPERATOR's confirm of the same suggestion, reaching the daemon as
+		// a queued accept_generated_task row so it can be answered from any
+		// machine in the fleet. The pane access it needs is built by the DAEMON
+		// and handed in (ports.TaskSendHost), which is why the front-end
+		// packages hold no herdr adapter of their own.
+		ConfirmGeneratedTask: fspApp.ConfirmGeneratedTaskForOperator,
+		MatchIndexDir:        filepath.Join(paths.StateDir, "match-index"),
+		StateDir:             paths.StateDir,
 		// The shared database's sync engine and its write signal (turso only;
 		// both nil under sqlite, and the loop never runs).
 		FleetSync:         fleet,

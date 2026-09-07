@@ -331,6 +331,66 @@ whose manifest carries exactly that version).
     discriminate.
   - Test trap: the daemon suite's `failingStore` embeds the ports.StorePort INTERFACE, so every
     type-asserted capability must be forwarded there or the feature is silently off suite-wide.
+- **A front end decides; the DAEMON does** — anything that reaches a live pane, or that is
+  keyed by an identifier only one machine can resolve, is written to `agent_actions` for the
+  node that OWNS it and executed there (`domain.AgentAction`, `daemon.executeAgentAction`).
+  A generated-task confirm is the widest case and the reason the rule is not only about
+  panes: `acceptGeneratedTask` matches the audit row's pane id against a herd (herdr recycles
+  pane ids, so every machine has a pane `1`), mints an `agent_names` row in a node-keyed
+  table, writes the checklist, and registers a `[[task_sources]]` entry in a config.toml that
+  **never enters the shared database**. All of it belongs to one machine, which is why
+  confirming another node's suggestion used to be refused outright.
+  - **It is queued UNCONDITIONALLY, local rows included** (`queueGeneratedTaskConfirm`). The
+    `isSelf` fast path the per-agent verbs use (`RenameAgentOn` and friends run the local verb
+    verbatim) is wrong here for a reason those verbs do not have: this path ends in a pane
+    send, so taking it in-process leaves a TUI or CLI holding a herdr adapter — and a front
+    end and a daemon typing into one pane is the race none of the delivery guards can see.
+    Accepted cost: `hap confirm <id>` without `--send` now needs a live daemon, where it
+    needed none. Keep `TestALocalGeneratedTaskConfirmAlsoQueues`.
+  - **The pane access is RECEIVED, never held** (`ports.TaskSendHost`). The checklist, the
+    config and the reserve→send→roll-back ORDERING stay in `internal/frontend` — splitting
+    that ordering across the seam would break an invariant every comment around it calls
+    load-bearing — while the one step that reaches a pane is a closure the daemon supplies.
+    Only `cmd/hap`'s daemon wiring can build one, so a TUI or CLI process has no path to a
+    pane at all. `herdrpurity_test.go`'s register says exactly this; the entry is PERMANENT
+    and is a weaker claim than the ones it will replace.
+  - **`ConfirmGeneratedTask` and `AcceptGeneratedTask` are two seams on purpose.** The flag
+    they would share is the one that changes what is LEARNED: the automatic path passes
+    `automated=true`, skipping `ResolveEscalation` AND `InsertCorrection`, because a machine's
+    decision to act is not evidence the suggestion was right. An operator's confirm writes
+    both, however far away they typed it — so `author` is threaded from the queued row rather
+    than taken from the daemon's own App, which is authored `"daemon"`. Full self-prompting
+    keeps calling its seam directly rather than queueing: `autoAcceptOne` has already claimed
+    the row into the transient `auto_accepting` status and is already on the owning node.
+  - **`CorrectionID` stays 0 on the queued row.** The correction is written INSIDE the
+    executor, in the same run that marks it sent, so nothing needs the withholding filter —
+    and populating the field would arm `finishWithdrawn`: a retry arriving after attempt 1
+    claimed the escalation refuses with `errEscalationClosed`, and that refusal DELETES the
+    correction attempt 1 wrote.
+  - **`side_effect` is marked inside the host's `Send`, not before the seam.** A row carrying
+    it is FAILED at the next start rather than replayed, with "it may or may not have reached
+    the agent" — true after keystrokes, false before them. An add-only confirm types nothing
+    and both its writes dedupe, so replaying it is harmless. Same reason `focus` marks none.
+    Note the FSP path is handed `taskSendHost(0)`, and the zero guard is load-bearing:
+    marking action 0 is a write against a row that does not exist.
+  - **The staleness gate moved WITH the pane access.** Only the daemon can ask herdr whether
+    the agent is still parked, so `refuseIfAgentBusy` lives there — and its refusal carries
+    `domain.SuggestionStaleMarker` because `AwaitAgentAction` hands `AgentAction.Error` back
+    verbatim through `errors.New`, flattening every sentinel. That one is ACTIONABLE: the TUI
+    answers it by offering to add the tasks to the list instead of sending them, keyed on
+    `errors.Is`. The front end re-wraps on the marker (`interpretConfirmFailure`), the same
+    shape `explainRemoteFailure` uses for an older daemon's unsupported-kind refusal. Keep
+    `TestABusyAgentRefusalSurvivesTheQueue` and `TestAQueuedConfirmRefusesABusyAgentOnlyWhenSending`;
+    both were proved by mutation, and dropping the marker breaks the offer SILENTLY.
+  - The operator path is deliberately NOT screened (`screen` is nil). The daemon's own sends
+    are screened at decide time and an FSP acceptance is screened in the fork because in both
+    cases no human saw the text; here one has, and their confirm has always been the gate.
+  - Test trap: `internal/daemon` may not import `internal/frontend`, so its tests drive a FAKE
+    seam and can only prove the EXECUTOR's guards. The confirm's own behaviour is proved in
+    `internal/frontend`, which calls `ConfirmGeneratedTaskForOperator` directly — and the TUI
+    and CLI suites run a stand-in drain that calls the REAL confirm, or their "the tasks file
+    was written" assertions would check nothing.
+
 - **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +
   log. Wrap new handler/adapter calls in `logging.Guard`.
 - **Safety controls are never bypassed** — LLM submissions and learned rules alike are
@@ -710,15 +770,23 @@ whose manifest carries exactly that version).
     opposite order. `TestFSPGeneratedTaskTakesTheLifecycleBarrier` asserts the barrier is
     TAKEN rather than that a disabled agent is skipped, since Guard 1b makes the latter pass
     either way.
-  - **An unattended hand-out gets a ledger row; an operator's does not.** The reservation
-    marks the item `[-]` before the send, and a crash in that window used to strand it: the
-    audit row is reclaimed to `escalated` at startup but the checklist marker is not, so the
-    retry reads the item as already taken, burns its attempt budget and the escalation is
-    DISMISSED. `recordAutomatedReservation` writes the same `task_reservations` row the
-    daemon's own hand-outs use, so `reclaimStrandedTasks` returns the item to `[ ]` once its
-    agent is parked past the grace window; a rolled-back send retires it again. The operator
-    path deliberately records nothing — a human is present to read the error, and ledger rows
-    there would start barring manually-confirmed agents from the idle poll.
+  - **EVERY generated-task hand-out gets a ledger row, the operator's included.** The
+    reservation marks the item `[-]` before the send, and a crash in that window used to
+    strand it: the audit row is reclaimed to `escalated` at startup but the checklist marker
+    is not, so the retry reads the item as already taken, burns its attempt budget and the
+    escalation is DISMISSED. `recordTaskReservation` writes the same `task_reservations` row
+    the daemon's own hand-outs use, so `reclaimStrandedTasks` returns the item to `[ ]` once
+    its agent is parked past the grace window; a rolled-back send retires it again. The
+    operator path used to record nothing, on the ground that a human was present to read the
+    error — **that premise died with the queued confirm**: the send now happens inside the
+    OWNING node's daemon, on a machine the operator may not be sitting at, so a hand-out the
+    agent never starts would sit at `[-]` with nothing able to reclaim it. The cost is
+    accepted and worth naming, because it is the likeliest support question:
+    `agentsAwaitingHandout` allows ONE unconfirmed hand-out per agent, so a confirmed agent
+    is withheld from the idle poll until it goes `working` or the row ages out at
+    `staleHandoutTTL`. `TerminalID` now comes from the daemon's published roster row
+    (`liveAgentFor`) rather than being left empty, which is what tells a RECYCLED pane apart.
+    Keep `TestOperatorConfirmRecordsAReservation`.
   - **The mode is re-asked immediately before the claim** (`stillPermitted`). The guard chain
     above it does pane READS with a budget in seconds, so an operator switching the mode off
     mid-chain would otherwise still get the send that follows; `WithAgentAutomation` covers

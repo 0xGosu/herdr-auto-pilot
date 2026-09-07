@@ -10,6 +10,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 // FSPFieldKey is the config key for full self-prompting mode. One constant so
@@ -88,7 +89,13 @@ func (a *App) DisableFullSelfPromptingWithReason(ctx context.Context, reason str
 // The side effects it performs before any send (writing the list, registering
 // the source) are idempotent, so a failure returned here is safe for the
 // caller's ordinary delivery retry.
-func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int64, send bool, screen func(string) error) error {
+//
+// host is the pane access, supplied by the daemon: this package holds no herdr
+// adapter of its own (see ports.TaskSendHost). A nil host writes the list and
+// registers the source but delivers nothing, which is the same shape the old
+// `a.Herdr != nil` guard had.
+func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int64, send bool,
+	host ports.TaskSendHost, screen func(string) error) error {
 	audit, err := a.Store.GetAudit(ctx, auditID)
 	if err != nil {
 		return err
@@ -102,7 +109,9 @@ func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int6
 		// guess: everything below writes task lists.
 		return fmt.Errorf("audit record %d no longer carries a generated-task suggestion", auditID)
 	}
-	return a.acceptGeneratedTask(ctx, audit, send, true, screen)
+	return a.acceptGeneratedTask(ctx, audit, generatedTaskConfirm{
+		send: send, automated: true, host: host, screen: screen,
+	})
 }
 
 // recordFSPToggle appends one full self-prompting change to the automation
@@ -197,4 +206,50 @@ func (a *App) fspBlockedReason(ctx context.Context, cfg config.Config) string {
 		return fmt.Sprintf("only %d of %d required graduated (autonomous) rules remain", n, config.MinFSPGraduatedRules)
 	}
 	return ""
+}
+
+// ConfirmGeneratedTaskForOperator performs an OPERATOR's generated-task confirm
+// on the owning node. It is the daemon's seam
+// (daemon.Options.ConfirmGeneratedTask), wired in cmd/hap, and the twin of
+// AcceptGeneratedTaskAutomatically.
+//
+// The two are kept apart deliberately rather than folded behind one flag,
+// because the flag they would share is the one that changes what is LEARNED.
+// The automatic path passes automated=true, which skips both ResolveEscalation
+// and InsertCorrection — a machine's decision to act is not evidence the
+// suggestion was right, which is the whole reason AuditStatusAutoAccepted
+// exists apart from 'resolved'. An operator's confirm is a learning event
+// however far away they typed it, so this path writes both. Reusing the
+// automatic seam here would delete that silently, and no test of the automatic
+// path could notice.
+//
+// author is the operator, threaded from the queued action rather than taken
+// from a.Author: this runs inside the daemon, whose App is authored "daemon",
+// so an unthreaded author would attribute every remote operator's decision to
+// the machine that executed it.
+//
+// screen is deliberately nil. The daemon's own sends are screened at decide
+// time and an FSP acceptance is screened in the fork, because in both cases no
+// human ever saw the text; here one has, and their confirm has always been the
+// gate. Adding the screen would make a suggestion that trips a never-auto
+// pattern unconfirmable with no override.
+func (a *App) ConfirmGeneratedTaskForOperator(ctx context.Context, auditID int64, send bool,
+	author string, host ports.TaskSendHost) error {
+
+	audit, err := a.Store.GetAudit(ctx, auditID)
+	if err != nil {
+		return err
+	}
+	if audit == nil {
+		return fmt.Errorf("audit record %d not found", auditID)
+	}
+	if domain.SuggestedAction(audit) != domain.SuggestGenerateTask {
+		// The executor resolved the suggestion before choosing this branch, so
+		// a mismatch means the row changed underneath it. Refuse rather than
+		// guess: everything below writes task lists.
+		return fmt.Errorf("audit record %d no longer carries a generated-task suggestion", auditID)
+	}
+	return a.acceptGeneratedTask(ctx, audit, generatedTaskConfirm{
+		send: send, author: author, host: host,
+	})
 }

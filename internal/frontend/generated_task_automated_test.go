@@ -55,7 +55,7 @@ func TestAutomatedGeneratedTaskAcceptsAClaimedRow(t *testing.T) {
 	name, _ := st.EnsureAgentName(ctx, "w1:p1")
 	id := seedClaimedGeneratedTask(t, st, "w1:p1", "Task A - fix login")
 
-	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, false, nil); err != nil {
+	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, false, hostFor(app), nil); err != nil {
 		t.Fatalf("accepting a claimed row must succeed, got: %v", err)
 	}
 
@@ -81,7 +81,7 @@ func TestAutomatedGeneratedTaskLeavesTheRowToItsCaller(t *testing.T) {
 	st.EnsureAgentName(ctx, "w2:p2")
 	id := seedClaimedGeneratedTask(t, st, "w2:p2", "Task A - fix login")
 
-	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, false, nil); err != nil {
+	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, false, hostFor(app), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -121,7 +121,7 @@ func TestAutomatedGeneratedTaskRefusesANonGeneratedRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, false, nil); err == nil {
+	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, false, hostFor(app), nil); err == nil {
 		t.Error("a plain approval suggestion must be refused, not accepted as a task")
 	}
 }
@@ -158,7 +158,7 @@ func TestAutomatedGeneratedTaskRecordsAReservation(t *testing.T) {
 	st.EnsureAgentName(ctx, "w5:p5")
 	id := seedClaimedGeneratedTask(t, st, "w5:p5", "Task A - fix login")
 
-	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, true, nil); err != nil {
+	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, true, hostFor(app), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -177,11 +177,20 @@ func TestAutomatedGeneratedTaskRecordsAReservation(t *testing.T) {
 	}
 }
 
-// TestOperatorConfirmRecordsNoReservation: the operator path is ATTENDED — the
-// error names the stranded item and a human can clear it — and adding ledger
-// rows there would also start barring manually-confirmed agents from the idle
-// poll until their hand-out settles.
-func TestOperatorConfirmRecordsNoReservation(t *testing.T) {
+// An OPERATOR's confirm records a hand-out ledger row too.
+//
+// It used to record none, and the reason was sound while the confirm ran in the
+// operator's own process: a human was present, the error named the stranded
+// item, and ledger rows would start barring manually-confirmed agents from the
+// idle poll. Stage 5 removed the premise — the send happens inside the OWNING
+// node's daemon, which may be a machine the operator is not sitting at and
+// cannot read an error from — so a hand-out the agent never starts would sit at
+// "[-]" with nothing able to reclaim it. reclaimStrandedTasks needs this row.
+//
+// The idle-poll cost is real and accepted: agentsAwaitingHandout allows one
+// unconfirmed hand-out per agent, so this agent waits for its next task until
+// it goes 'working' or the row ages out. A short pause beats a parked item.
+func TestOperatorConfirmRecordsAReservation(t *testing.T) {
 	app, st := testApp(t)
 	app.Herdr = &fakeHerdr{}
 	app.StateDir = t.TempDir()
@@ -196,7 +205,7 @@ func TestOperatorConfirmRecordsNoReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := app.Confirm(ctx, id, true); err != nil {
+	if err := confirmGeneratedTask(app, ctx, id, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -204,8 +213,14 @@ func TestOperatorConfirmRecordsNoReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(res) != 0 {
-		t.Errorf("operator confirm wrote %d ledger row(s); it must write none", len(res))
+	if len(res) != 1 {
+		t.Fatalf("operator confirm wrote %d ledger row(s), want exactly 1", len(res))
+	}
+	if res[0].AgentID != "w6:p6" || res[0].AuditID != id {
+		t.Errorf("ledger row = %+v, want it to name this agent and this escalation", res[0])
+	}
+	if !strings.Contains(res[0].TaskText, "Task A - fix login") {
+		t.Errorf("ledger row task = %q, want the item that was handed out", res[0].TaskText)
 	}
 }
 
@@ -221,7 +236,7 @@ func TestAutomatedGeneratedTaskReleasesTheReservationOnAFailedSend(t *testing.T)
 	st.EnsureAgentName(ctx, "w7:p7")
 	id := seedClaimedGeneratedTask(t, st, "w7:p7", "Task A - fix login")
 
-	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, true, nil); err == nil {
+	if err := app.AcceptGeneratedTaskAutomatically(ctx, id, true, hostFor(app), nil); err == nil {
 		t.Fatal("a failed send must be reported")
 	}
 
@@ -261,7 +276,7 @@ func TestAutomatedGeneratedTaskScreensTheSourceTemplatePrompt(t *testing.T) {
 	id := seedClaimedGeneratedTask(t, st, "w8:p8", "tidy the workspace")
 
 	var screened []string
-	err := app.AcceptGeneratedTaskAutomatically(ctx, id, true, func(prompt string) error {
+	err := app.AcceptGeneratedTaskAutomatically(ctx, id, true, hostFor(app), func(prompt string) error {
 		screened = append(screened, prompt)
 		if strings.Contains(prompt, "--no-preserve-root") {
 			return errors.New("matched never-auto")

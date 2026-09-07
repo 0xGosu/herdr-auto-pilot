@@ -121,7 +121,8 @@ func staleReason(kind domain.AgentActionKind) string {
 
 func agentActionStaleBound(kind domain.AgentActionKind) time.Duration {
 	switch kind {
-	case domain.AgentActionDeliverReply, domain.AgentActionSendTask, domain.AgentActionFocus:
+	case domain.AgentActionDeliverReply, domain.AgentActionSendTask, domain.AgentActionFocus,
+		domain.AgentActionAcceptGeneratedTask:
 		return actionStaleAfter
 	case domain.AgentActionRename, domain.AgentActionSetEnabled:
 		return agentStateStaleAfter
@@ -257,6 +258,8 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 		return d.renameAgentAction(ctx, a)
 	case domain.AgentActionSetEnabled:
 		return d.setAgentEnabledAction(ctx, a)
+	case domain.AgentActionAcceptGeneratedTask:
+		return d.acceptGeneratedTaskAction(ctx, a)
 	default:
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)

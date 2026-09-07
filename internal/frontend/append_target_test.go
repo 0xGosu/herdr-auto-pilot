@@ -89,7 +89,7 @@ func TestAppendTargetPrecedenceSurvivesTheStoreRewrite(t *testing.T) {
 				Action: "escalated", Status: "escalated",
 				Suggestion: domain.SuggestTaskPrefix + "Generated task", CreatedAt: time.Now(),
 			})
-			if err := app.Confirm(ctx, id, false); err != nil {
+			if err := confirmGeneratedTask(app, ctx, id, false); err != nil {
 				t.Fatal(err)
 			}
 
