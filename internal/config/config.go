@@ -438,7 +438,11 @@ type LLM struct {
 	// offered — degrades to the answer hap would have given WITHOUT the judge
 	// (the best cosine candidate). The veto is an empty array, or equally a
 	// verdict whose every entry scored below relevance_score_threshold. The run reads
-	// and writes nothing and needs no MCP server; its answer is read from stdout.
+	// and writes nothing; its answer is read from stdout. The shipped recipes
+	// enforce that rather than assume it — the run happens in the MONITORED
+	// AGENT's directory, so claude gets `--tools ""` (which removes the built-in
+	// tools; --permission-mode only governs how permissions are DECIDED) plus
+	// `--strict-mcp-config`, and codex runs under `--sandbox read-only`.
 	//
 	// Placeholders: {self}, {agent_name}, {agent_type}, {cwd}, {situation_type},
 	// {salient}, {candidates}, {pane_excerpt}, {top_k},

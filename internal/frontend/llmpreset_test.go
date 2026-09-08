@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -229,5 +230,59 @@ func TestEveryClaudePresetSurvivesTheArgvNormalizer(t *testing.T) {
 	}
 	if checked == 0 {
 		t.Fatal("no claude preset was checked — fix the walk rather than deleting the test")
+	}
+}
+
+// TestTheJudgePresetGrantsNoTools pins the one claim in this file that a reader
+// cannot verify from the argv at a glance.
+//
+// The re-ranking prompt is answered from its own text — the judge reads nothing
+// and writes nothing — but the run happens in the MONITORED AGENT's directory
+// (llm.run_in_agent_cwd), so "needs no tools" has to be a granted-nothing rather
+// than an unused-anything. Three flags are easy to confuse here:
+// `--strict-mcp-config` isolates MCP servers only, and `--permission-mode`
+// governs how tool permissions are DECIDED, not which tools exist. Only
+// `--tools ""` removes Claude's built-in set.
+//
+// Dropping it would leave a recipe able to read files in someone's project,
+// with the comment above still promising it could not.
+func TestTheJudgePresetGrantsNoTools(t *testing.T) {
+	argv, ok := frontend.LLMPreset(frontend.LLMRerankingCommandKey, frontend.LLMPresetClaude)
+	if !ok {
+		t.Fatal("no claude preset for the re-ranking command")
+	}
+	toolsAt := -1
+	for i, a := range argv {
+		if a == "--tools" {
+			toolsAt = i
+			break
+		}
+	}
+	if toolsAt == -1 {
+		t.Fatal(`the claude judge preset must pass --tools "" — --permission-mode and ` +
+			`--strict-mcp-config do NOT remove Claude's built-in tools, and this run ` +
+			`happens in the monitored agent's own directory`)
+	}
+	if toolsAt+1 >= len(argv) || argv[toolsAt+1] != "" {
+		t.Errorf("--tools carries %q, want the empty string (Claude's documented "+
+			`"disable all tools" value)`, argv[toolsAt+1:])
+	}
+	// And nothing may quietly re-grant them alongside it.
+	for _, a := range argv {
+		if a == "--allowedTools" || a == "--allowed-tools" || a == "--dangerously-skip-permissions" {
+			t.Errorf("the judge preset passes %q, which re-opens the grant --tools \"\" closed", a)
+		}
+	}
+	// The codex recipe is the weaker of the two by design (read-only rather than
+	// nothing) — assert the floor it does have, so removing it is deliberate.
+	codex, ok := frontend.LLMPreset(frontend.LLMRerankingCommandKey, frontend.LLMPresetCodex)
+	if !ok {
+		t.Fatal("no codex preset for the re-ranking command")
+	}
+	if !slices.Contains(codex, "--sandbox") || !slices.Contains(codex, "read-only") {
+		t.Errorf("the codex judge preset must keep its --sandbox read-only floor: %v", codex)
+	}
+	if slices.Contains(codex, "--dangerously-bypass-approvals-and-sandbox") {
+		t.Error("the codex judge preset must not take the bypass flag; it reads and writes nothing")
 	}
 }

@@ -412,8 +412,11 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # scored below `relevance_score_threshold` — so a broken judge can never
 # cost you a rule you already taught it.
 #
-# The run reads nothing, writes nothing and needs no MCP server; its answer is
-# read from stdout. It DOES sit inside the classify->decide path, with the agent
+# The run reads nothing and writes nothing: the claude recipe passes `--tools ""`
+# (which removes the built-in tools outright) alongside `--strict-mcp-config`,
+# and the codex one runs under `--sandbox read-only`. That matters because the
+# CLI runs in the MONITORED AGENT's own directory. Its answer is read from
+# stdout. It DOES sit inside the classify->decide path, with the agent
 # parked while it runs — which is why it has its own short budget and why both
 # recipes name a small, fast model.
 #
@@ -427,6 +430,10 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # reranking_command = [
 #   "claude", "--no-session-persistence", "--model", "sonnet", "--permission-mode", "auto", "-p",
 #   "You are hap's rule-matching judge. hap answers prompts on a coding agent's screen by reusing rules it learned from earlier screens, and an embedding search has proposed the rules below. Your job is to decide which of them — if any — genuinely answers THIS situation.\n\nA rule matches only if answering the current situation with that rule's learned action would be CORRECT. Two screens that merely look alike are not a match: an approval whose target changed (a different service, path, branch, or command), a question with different options, or a different question that happens to share wording are all NON-matches, however similar the text is. Judge what the action would DO, not how the words score.\n\nReturn a JSON array, ordered by relevance score descending, of at most {top_k} entries:\n[{\"id\": <the rule's number>, \"score\": <0-1>}]\n\nOmit any rule you would score below {relevance_score_threshold}. If NO rule genuinely answers this situation, return an empty array [] — that is a valid and expected answer, and it is the whole reason you are being asked. Never pick the least-bad option to avoid returning nothing.\n\nUse ONLY the numbers shown above as ids; do not invent ids and do not name a rule twice. Output ONLY the JSON array and nothing else — no explanation, no code fence, no preamble.\n\nAgent: {agent_name} ({agent_type})\nSituation type: {situation_type}\n\nThe situation to match:\n{salient}\n\nCandidate rules:\n{candidates}",
+#   # No built-in tools and no MCP servers: `--tools ""` is what removes
+#   # Claude's built-in set (--permission-mode governs how permissions are
+#   # decided, not which tools exist), and this run has no use for any of them.
+#   "--tools", "",
 #   "--strict-mcp-config",
 # ]
 

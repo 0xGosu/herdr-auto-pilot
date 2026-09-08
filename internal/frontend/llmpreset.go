@@ -108,7 +108,7 @@ const (
 		"Agent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}"
 
 	// The re-ranking judge. Deliberately the SHORTEST-lived and cheapest of the
-	// four: it reads nothing, writes nothing, needs no MCP server, and its only
+	// four: it reads nothing, writes nothing, needs no tools or MCP server, and its only
 	// output is a JSON array. It also does NOT read AUTO.md — the lessons there
 	// are about how to ANSWER a screen, and this run is not answering one; it is
 	// deciding whether two screens are the same question.
@@ -243,10 +243,22 @@ var llmCommandPresets = map[string]map[string][]string{
 	},
 	// The judge runs on the SMALLEST model of the four, and that is a design
 	// choice rather than thrift: it sits INSIDE the classify→decide path with a
-	// parked agent waiting on it, so latency is part of its correctness. It also
-	// needs no tools at all — no MCP server, no file access, not even the
-	// read-only sandbox the generate recipe takes to reach AUTO.md — because its
-	// entire input is in the prompt and its entire output is a JSON array.
+	// parked agent waiting on it, so latency is part of its correctness.
+	//
+	// It also needs no tools at all: its entire input is in the prompt and its
+	// entire output is a JSON array. Saying so is not enough — it runs in the
+	// MONITORED AGENT's own directory (llm.run_in_agent_cwd), so the grant has
+	// to be CLOSED rather than merely unused, and three flags do different jobs
+	// here. `--strict-mcp-config` isolates MCP servers only. `--permission-mode
+	// auto` governs how tool permissions are DECIDED, not which tools exist. It
+	// is `--tools ""` that removes Claude's built-in set outright, and without
+	// it this recipe could read files in that project.
+	//
+	// The codex recipe passes `--sandbox read-only` instead: `codex exec` with
+	// no policy at all is an untested shape here, and read-only is the tightest
+	// grant the documented recipes are known to run under. That is weaker than
+	// the claude side — it can still READ the agent's project — and it is a
+	// floor rather than a need; tightening it wants a verified codex flag.
 	LLMRerankingCommandKey: {
 		LLMPresetClaude: {
 			"claude",
@@ -257,6 +269,10 @@ var llmCommandPresets = map[string]map[string][]string{
 			"auto",
 			"-p",
 			llmRerankPrompt,
+			// No built-in tools and no MCP servers: the run answers from its
+			// prompt alone, in the monitored agent's directory.
+			"--tools",
+			"",
 			"--strict-mcp-config",
 		},
 		LLMPresetCodex: {
