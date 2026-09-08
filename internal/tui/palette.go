@@ -111,6 +111,10 @@ type styles struct {
 	err         lipgloss.Style
 	ok          lipgloss.Style
 	warn        lipgloss.Style
+	// pending dims a row whose action has been dispatched and not yet
+	// answered. Faint only, no colour: it must read as "not yet actionable" in
+	// every theme, and a hue would compete with warn on the same row.
+	pending lipgloss.Style
 }
 
 func newStyles(p palette) styles {
@@ -131,6 +135,7 @@ func newStyles(p palette) styles {
 		err:         lipgloss.NewStyle().Foreground(p.err),
 		ok:          lipgloss.NewStyle().Foreground(p.ok),
 		warn:        lipgloss.NewStyle().Bold(true).Foreground(p.warn),
+		pending:     lipgloss.NewStyle().Faint(true),
 	}
 }
 
