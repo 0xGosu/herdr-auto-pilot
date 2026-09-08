@@ -209,7 +209,8 @@ hap confirm <id> --send               # the suggestion is right — accept and d
 hap resolve <id> --action TEXT --send # it is wrong — send the right answer instead
 hap resolve <id> --action @noop       # no reply was needed (never sends)
 hap dismiss <id> [<id>...]            # drop it; nothing sent or learned
-hap escalations prune [minutes]       # bulk-dismiss everything older (default 360)
+hap escalations prune [minutes]       # bulk-dismiss everything older, on EVERY node (default 360)
+hap escalations prune --node NODE     # …on one machine only
 hap escalations retry <id>            # re-invoke the LLM on a failed/timed-out consult
 ```
 

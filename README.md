@@ -848,11 +848,16 @@ appends the machine as the last field; escalations carry `node=<label>`.
 
 **What you can do from another machine.** Confirm, answer, correct, dismiss or
 retry an escalation raised there — the owning daemon executes it and the action
-reads `queued for node <label>` until it lands; curate learned rules, which are
+reads `queued for node <label>` until it lands; prune the aged ones on every
+machine at once (`X` on the Escalations tab, or `hap escalations prune`, which
+retires exactly the unified list it shows — `--node <label>` scopes it to one);
+rename, enable, disable, focus or capture a remote agent with `--node <label>`,
+which files the request for the owning daemon; curate learned rules, which are
 shared; pause or resume a machine (`hap pause --node laptop`); read and edit its
-`sqlite`-provider task lists (`hap task --node laptop <agent> list`). Renaming,
-enabling, disabling or focusing a remote agent is refused: those are the owning
-daemon's rows.
+`sqlite`-provider task lists (`hap task --node laptop <agent> list`), including
+reordering them from the TUI's Tasks tab. Changing a remote agent's permission
+MODE is still refused — that one reads the pane it is about to press into, so it
+belongs to the machine watching it.
 
 **How conflicts are avoided.** Every row a machine owns carries its node id
 (herdr pane ids repeat across machines), ids are allocated with node bits, and a

@@ -1472,13 +1472,54 @@ func (s *Store) guardedStatus(ctx context.Context, auditID int64, from, to strin
 }
 
 // DismissEscalationsBefore dismisses every pending escalation created before
-// cutoff, returning how many were dismissed (the front-end prune).
+// cutoff, on EVERY node, returning how many were dismissed (the front-end
+// prune).
+//
+// It spans nodes because the queue it prunes does: PendingEscalations is a
+// fleet read, the TUI's Escalations tab and `hap escalations` render another
+// machine's rows as name@node, and dismissing one by id already works on any
+// node's escalation. A node-scoped prune under a fleet list dismissed a
+// fraction of what the operator was looking at and reported the count as if it
+// had pruned all of it.
+//
+// Nothing here reaches a pane or needs the owning node's config, so this is a
+// direct write rather than an agent_actions request: the case that most wants a
+// fleet prune is aged rows left behind by a machine whose daemon is gone, and a
+// queued action would need that daemon alive to run.
+//
+// Use DismissEscalationsBeforeOn for one node. The two statements are written
+// out separately on purpose — a single query with an optional predicate
+// (`WHERE (? = ” OR node_id = ?)`) would put node_id in the text that
+// TestEveryNodeOwnedStatementIsNodeScoped flattens, so a statement spanning
+// nodes would pass the guard silently.
 func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
 	var dismissed int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
+			`UPDATE audit_log SET status = 'dismissed' WHERE status = 'escalated' AND created_at < ?`,
+			unix(cutoff))
+		if err != nil {
+			return err
+		}
+		dismissed, err = res.RowsAffected()
+		return err
+	})
+	return dismissed, err
+}
+
+// DismissEscalationsBeforeOn is DismissEscalationsBefore for ONE node — the
+// `--node` prune, and the shape the daemon would need if it ever pruned its own
+// queue.
+//
+// The status guard is what keeps it off a row another writer holds: an
+// auto_accepting row is mid-claim on its own machine, and only an escalated one
+// is the operator's to retire.
+func (s *Store) DismissEscalationsBeforeOn(ctx context.Context, cutoff time.Time, nodeID string) (int64, error) {
+	var dismissed int64
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
 			`UPDATE audit_log SET status = 'dismissed' WHERE node_id = ? AND status = 'escalated' AND created_at < ?`,
-			s.self, unix(cutoff))
+			nodeID, unix(cutoff))
 		if err != nil {
 			return err
 		}

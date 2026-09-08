@@ -180,6 +180,13 @@ func TestNodeFlagEqualsFormAndBareFlag(t *testing.T) {
 	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "laptop", LastSeen: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
+	// An EMPTY value is the same mistake the bare flag makes and gets the same
+	// answer, on every verb that takes --node. Falling through as "no flag"
+	// reads as a silent no-op here, and as the WIDER action on a verb whose
+	// unflagged form spans the fleet (`hap escalations prune`).
+	if _, err := run(t, app, "pause", "--node="); err == nil {
+		t.Error("`--node=` with no value must be refused, like the bare `--node`")
+	}
 	out, err := run(t, app, "pause", "--node=laptop")
 	if err != nil || !strings.Contains(out, "automation paused on node laptop") {
 		t.Errorf("pause --node=laptop = %q %v", out, err)

@@ -693,8 +693,12 @@ type FrontendStore interface {
 	// dismissed). Callers apply one-time side effects only on a true claim.
 	ResolveEscalation(ctx context.Context, auditID int64) (bool, error)
 	// DismissEscalationsBefore dismisses every pending escalation created
-	// before cutoff, returning how many were dismissed.
+	// before cutoff on EVERY node, returning how many were dismissed. It spans
+	// nodes because the queue it prunes does — the operator surfaces render the
+	// unified list, and dismissing one row by id already crosses machines.
 	DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error)
+	// DismissEscalationsBeforeOn is DismissEscalationsBefore for one node.
+	DismissEscalationsBeforeOn(ctx context.Context, cutoff time.Time, nodeID string) (int64, error)
 	ClearLearnedData(ctx context.Context) error
 }
 
