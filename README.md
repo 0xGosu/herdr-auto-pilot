@@ -459,6 +459,14 @@ answer and nothing else. `hap status` shows the settings in force, and an
 escalation the judge caused by refusing every candidate reads `rerank_veto` in
 `hap audit` — otherwise it would look identical to nothing having matched.
 
+Like the other LLM commands it runs in the **monitored agent's own directory**
+(`llm.run_in_agent_cwd`), even though it answers from its prompt alone — so the
+presets close that access rather than leave it unused. The claude recipe
+disables Claude's built-in tools outright (`--tools ""`, alongside
+`--strict-mcp-config`); the codex one is weaker, restricting it to `--sandbox
+read-only`, which can still read that project. If you write your own recipe,
+grant it nothing.
+
 ## Task sources
 
 A task source points agents at a checklist file so idle agents get the next
