@@ -15,7 +15,6 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -281,8 +280,10 @@ func (l *Llama) Diagnostics() Diagnostics {
 	return d
 }
 
-// ModelID identifies the loaded model for persistence scoping.
-func (l *Llama) ModelID() string { return filepath.Base(l.modelPath) }
+// ModelID identifies the loaded model for persistence scoping, by its CONTENT
+// rather than its file name — see ModelIDFor for why a name is neither unique
+// enough nor stable enough across a fleet.
+func (l *Llama) ModelID() string { return ModelIDFor(l.modelPath) }
 
 // Dims is the embedding dimensionality (0 before the first success).
 func (l *Llama) Dims() int { return int(l.dims.Load()) }

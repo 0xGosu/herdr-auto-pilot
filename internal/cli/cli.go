@@ -345,16 +345,16 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 		return fmt.Errorf("embedding is disabled in config — nothing to re-embed")
 	}
 	if drift.ModelMissing {
-		return fmt.Errorf("embedding model %s not found — fix embedding.model_path first", drift.ModelID)
+		return fmt.Errorf("embedding model %s not found — fix embedding.model_path first", drift.ModelName)
 	}
 	if !drift.Detected && !*force {
 		fmt.Fprintf(out, "all %d stored signature embeddings match model %s — nothing to do (--force re-runs anyway)\n",
-			drift.Total, drift.ModelID)
+			drift.Total, drift.ModelName)
 		return nil
 	}
 	if drift.Detected {
 		fmt.Fprintf(out, "%d of %d stored signature embeddings need re-compute for model %s\n",
-			drift.Stale, drift.Total, drift.ModelID)
+			drift.Stale, drift.Total, drift.ModelName)
 	}
 
 	if app.DaemonInfo != nil {
@@ -388,7 +388,7 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 		return err
 	}
 	fmt.Fprintf(out, "re-embedded %d, kept %d, downgraded %d (text-only) — model %s\n",
-		res.Reembedded, res.Kept, res.Downgraded, drift.ModelID)
+		res.Reembedded, res.Kept, res.Downgraded, drift.ModelName)
 	if res.TooShort > 0 {
 		// Say what was excluded rather than letting it vanish between the
 		// counts: these rules are matched by text and exact hash from now on.

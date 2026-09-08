@@ -13,7 +13,6 @@ package embedder
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -53,7 +52,7 @@ func (l *Llama) EmbedText(_ context.Context, _ string) ([]float32, error) {
 
 // ModelID identifies the configured model for persistence scoping, matching
 // the real engine, even though nothing is loaded.
-func (l *Llama) ModelID() string { return filepath.Base(l.modelPath) }
+func (l *Llama) ModelID() string { return ModelIDFor(l.modelPath) }
 
 // Dims is always 0: no embed ever succeeds, so callers gate matching off.
 func (l *Llama) Dims() int { return 0 }

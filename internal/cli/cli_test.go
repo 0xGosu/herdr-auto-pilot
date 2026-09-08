@@ -18,6 +18,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/crashguard"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -1174,8 +1175,11 @@ func (f *cliFakeEmbedder) Dims() int       { return 3 }
 func (f *cliFakeEmbedder) Close() error    { return nil }
 
 // setupReembedApp seeds one stale + one current embedding row and points
-// the config at an existing dummy model file.
-func setupReembedApp(t *testing.T, app *frontend.App, st *store.Store) {
+// the config at an existing dummy model file. It returns the model's identity
+// — the CONTENT id embedder.ModelIDFor derives, which is what the drift check
+// compares stored rows against; the fake embedder reports the same one, as the
+// real one would.
+func setupReembedApp(t *testing.T, app *frontend.App, st *store.Store) string {
 	t.Helper()
 	ctx := context.Background()
 	modelPath := filepath.Join(t.TempDir(), "test-model.gguf")
@@ -1186,12 +1190,13 @@ func setupReembedApp(t *testing.T, app *frontend.App, st *store.Store) {
 	if err := os.WriteFile(app.ConfigPath, []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	liveModel := embedder.ModelIDFor(modelPath)
 	for _, e := range []domain.SignatureEmbedding{
 		{Signature: "approval:legacy", SituationType: domain.SituationApproval,
 			AgentType: "claude", Model: "old-model.gguf", Dims: 2, Vector: []float32{1, 0},
 			Salient: "permission:legacy", CreatedAt: time.Now()},
 		{Signature: "approval:current", SituationType: domain.SituationApproval,
-			AgentType: "claude", Model: "test-model.gguf", Dims: 3, Vector: []float32{1, 0, 0},
+			AgentType: "claude", Model: liveModel, Dims: 3, Vector: []float32{1, 0, 0},
 			Salient: "permission:current", CreatedAt: time.Now()},
 	} {
 		if err := st.UpsertSignatureEmbedding(ctx, e); err != nil {
@@ -1199,8 +1204,9 @@ func setupReembedApp(t *testing.T, app *frontend.App, st *store.Store) {
 		}
 	}
 	app.NewEmbedder = func(config.Embedding) ports.EmbedderPort {
-		return &cliFakeEmbedder{id: "test-model.gguf"}
+		return &cliFakeEmbedder{id: liveModel}
 	}
+	return liveModel
 }
 
 func TestSignaturesReembedStandalone(t *testing.T) {
@@ -1240,7 +1246,7 @@ func TestSignaturesReembedStandalone(t *testing.T) {
 
 func TestSignaturesReembedNudgesRunningDaemon(t *testing.T) {
 	app, st := testApp(t)
-	setupReembedApp(t, app, st)
+	liveModel := setupReembedApp(t, app, st)
 	app.DaemonInfo = func() (bool, int, string) { return true, 4242, buildinfo.Version }
 
 	out, err := run(t, app, "signatures", "reembed")
@@ -1251,14 +1257,14 @@ func TestSignaturesReembedNudgesRunningDaemon(t *testing.T) {
 		t.Errorf("running daemon should be nudged, got:\n%s", out)
 	}
 	// The CLI did not write the rows itself — the daemon owns them.
-	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf", 1); n != 1 {
+	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), liveModel, 1); n != 1 {
 		t.Errorf("stale rows = %d, want 1 (untouched by the CLI)", n)
 	}
 }
 
 func TestSignaturesReembedRefusesStaleDaemon(t *testing.T) {
 	app, st := testApp(t)
-	setupReembedApp(t, app, st)
+	liveModel := setupReembedApp(t, app, st)
 	// A running daemon from an older binary would silently ignore the
 	// reembed nudge, so the CLI must refuse and point at --ensure.
 	app.DaemonInfo = func() (bool, int, string) { return true, 4242, "v0.0.1" }
@@ -1268,7 +1274,7 @@ func TestSignaturesReembedRefusesStaleDaemon(t *testing.T) {
 		t.Errorf("stale daemon must refuse with the --ensure remedy, got %v", err)
 	}
 	// The rows are untouched — the CLI did not fall through to standalone.
-	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), "test-model.gguf", 1); n != 1 {
+	if n, _ := st.CountStaleSignatureEmbeddings(context.Background(), liveModel, 1); n != 1 {
 		t.Errorf("stale rows = %d, want 1 (untouched)", n)
 	}
 }
