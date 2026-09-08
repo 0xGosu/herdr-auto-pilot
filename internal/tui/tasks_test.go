@@ -27,7 +27,7 @@ import (
 // in-progress items) and an unreadable one.
 func taskModel(t *testing.T) Model {
 	t.Helper()
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "brave-otter", Path: "/work/tasks.md"},
 		{Agent: "codex", Path: "/work/missing.md"},
@@ -153,7 +153,7 @@ func TestTasksTabSearchKeepsGroupHeaders(t *testing.T) {
 // scroll/viewport tests.
 func tasksListModel(t *testing.T, n, height int) Model {
 	t.Helper()
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{{Agent: "claude", Path: "/work/tasks.md"}}
 	group := frontend.TaskGroup{Source: cfg.TaskSources[0]}
 	for i := 0; i < n; i++ {
@@ -203,7 +203,7 @@ func TestRefreshDataPopulatesTasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	app := &frontend.App{Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	app := &frontend.App{Store: st, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	ctx := context.Background()
 
 	good := filepath.Join(dir, "tasks.md")
@@ -237,6 +237,27 @@ func TestRefreshDataPopulatesTasks(t *testing.T) {
 // exercise the same read-modify-write path the CLI uses. Returns the model
 // on the Tasks tab (rows: header, #1, #2, #3), the App, and the checklist
 // path.
+// seedLocalFSConfigIn writes a config declaring the local_fs provider into dir
+// and returns its path, for a fixture whose checklist is a FILE on disk. The
+// package default is the sqlite provider, under which a filesystem path is not
+// a legal list name at all — so a fixture that writes a .md and points a source
+// at it has to say which backend it means.
+func seedLocalFSConfigIn(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte("[task_source_provider]\nprovider = \"local_fs\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// localFSCfg is config.Default() for a fixture whose sources are files on disk.
+func localFSCfg() config.Config {
+	cfg := config.Default()
+	cfg.TaskSourceProvider.Provider = config.ProviderLocalFS
+	return cfg
+}
+
 func taskAppModel(t *testing.T) (Model, *frontend.App, string) {
 	t.Helper()
 	dir := t.TempDir()
@@ -246,7 +267,7 @@ func taskAppModel(t *testing.T) (Model, *frontend.App, string) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	ctx := context.Background()
 	// A daemon that looked and found nothing — "no agent matches this source",
 	// as opposed to an unpublished roster's "nobody has looked". Only the
@@ -863,7 +884,7 @@ func TestTaskRowCountsNestedDetailAndDetailShowsIt(t *testing.T) {
 		"- [ ] flat task\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter", Path: path}}
 	m := Model{width: 100, height: 30}
 	upd, _ := m.Update(refreshMsg{
@@ -916,7 +937,7 @@ func TestTaskRowDetailMarkerSurvivesNarrowPane(t *testing.T) {
 			"    - it renders\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter", Path: path}}
 	for _, w := range []int{40, 60, 80, 92, 120} {
 		m := Model{width: w, height: 30}
@@ -1423,7 +1444,7 @@ func TestTaskDetailFocusAction(t *testing.T) {
 
 func TestTasksHeaderPathTruncatedKeepsBase(t *testing.T) {
 	longDir := "/very/long/path/segments/that/will/never/fit/on/one/line/of/the/header"
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{{Agent: "claude", Path: longDir + "/checklist.md"}}
 	m := Model{width: 200, height: 30}
 	upd, _ := m.Update(refreshMsg{cfg: cfg, tasks: []frontend.TaskGroup{
@@ -1516,7 +1537,7 @@ func sendTaskModel(t *testing.T) (Model, *captureHerdr, string) {
 		[]byte(`- [ ] write the parser\nstart with the lexer`+"\n- [x] done thing\n- [-] wip thing\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "brave-otter", Path: path, NextTaskTemplate: "DO: {next_task_content} ({agent_name})"},
 		{Agent: "codex", Path: "/work/missing.md"},
@@ -1807,7 +1828,7 @@ func TestTasksMarksPrunedOnRefresh(t *testing.T) {
 // on the group's header row.
 func removeSourceModel(t *testing.T, items []domain.ChecklistItem, groupErr string) Model {
 	t.Helper()
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{{Agent: "brave-otter", Path: "/work/tasks.md"}}
 	m := Model{width: 100, height: 30}
 	upd, _ := m.Update(refreshMsg{
@@ -2126,7 +2147,7 @@ func TestTasksReorderCursorNudgeWithTwoGroups(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	ctx := context.Background()
 	if err := app.AddTaskSource(ctx, "a1", "", first, ""); err != nil {
 		t.Fatal(err)
@@ -2316,7 +2337,7 @@ func TestSendTaskRowRefusesARegroupedDerivedSource(t *testing.T) {
 // one-list-per-agent shape, which reads as an unconfigured source. It must
 // name where the list actually lives, as `hap config task-source list` does.
 func TestConfigTabTaskSourceRowNamesTheProvider(t *testing.T) {
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSourceProvider = config.TaskSourceProvider{
 		Provider:   config.ProviderGitHubGist,
 		EnvFile:    "/etc/hap/task.env",

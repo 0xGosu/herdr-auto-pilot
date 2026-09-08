@@ -80,7 +80,7 @@ func TestEveryTaskSourceFieldIsEditable(t *testing.T) {
 	// keys against the struct: an entry naming a key `set` has no case arm for
 	// — a typo, or an arm deleted later — would otherwise pass green while the
 	// field it claims to cover stayed creation-only.
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	if err := app.AddTaskSource(ctx, "a", "", filepath.Join(t.TempDir(), "t.md"), ""); err != nil {
 		t.Fatal(err)
@@ -115,7 +115,7 @@ func TestEveryTaskSourceFieldIsEditable(t *testing.T) {
 // absolutized in the OPERATOR's process — the daemon runs from the state dir,
 // so a path stored verbatim would resolve somewhere else entirely).
 func TestTaskSourceSelectorsAreEditableInPlace(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	first := filepath.Join(dir, "first.md")
@@ -192,7 +192,7 @@ func TestTaskSourceSelectorsAreEditableInPlace(t *testing.T) {
 // after it and a remembered number silently means a different entry; a name
 // does not move.
 func TestTaskSourceAddressableByAgentName(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	for _, agent := range []string{"brave-otter", "swift-heron"} {
@@ -232,7 +232,7 @@ func TestTaskSourceAddressableByAgentName(t *testing.T) {
 // two sources feeding one agent is legal, and a name that could mean either
 // must be refused rather than resolved to whichever comes first.
 func TestTaskSourceAgentRefRefusesAmbiguity(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	dir := t.TempDir()
 	for _, f := range []string{"a.md", "b.md"} {
@@ -262,7 +262,7 @@ func TestTaskSourceAgentRefRefusesAmbiguity(t *testing.T) {
 // agents a list feeds is exactly the kind of thing an operator should be told
 // about rather than discover from a later listing.
 func TestTaskSourceSetEmptySelectorWidensAndSaysSo(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	if err := app.AddTaskSource(ctx, "brave-otter", "ws", filepath.Join(t.TempDir(), "t.md"), ""); err != nil {
 		t.Fatal(err)
@@ -285,7 +285,7 @@ func TestTaskSourceSetEmptySelectorWidensAndSaysSo(t *testing.T) {
 // so a relative path must be resolved against the OPERATOR's cwd here or it
 // silently names a different file.
 func TestTaskSourceSetPathIsAbsolutized(t *testing.T) {
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	ctx := context.Background()
 	if err := app.AddTaskSource(ctx, "a", "", filepath.Join(t.TempDir(), "x.md"), ""); err != nil {
 		t.Fatal(err)

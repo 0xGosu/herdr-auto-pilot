@@ -49,7 +49,7 @@ func escapedApp(t *testing.T) (*frontend.App, *sendRecorderHerdr, string) {
 		t.Fatal(err)
 	}
 	app := &frontend.App{Store: st, Herdr: h, StateDir: dir,
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator",
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator",
 		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version }}
 	startStandInSendTaskDrain(t, st, app, h)
 	path := filepath.Join(dir, "tasks.md")

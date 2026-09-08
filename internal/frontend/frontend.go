@@ -3939,7 +3939,7 @@ func resolveTaskSourceFor(cfg config.Config, agent string) (config.TaskSource, i
 			// source 0 happens to be agent-scoped.
 			return config.TaskSource{}, 0, fmt.Errorf("no task source is scoped to agent %q; workspace-scoped sources exist but aren't addressable by name — address one by its index, e.g. `hap task %d list` (`hap config task-source list` shows each source's index)", agent, workspaceIdx[0])
 		}
-		return config.TaskSource{}, 0, fmt.Errorf("no task source for agent %q; add one first: hap config task-source add --agent %s <checklist.md>", agent, agent)
+		return config.TaskSource{}, 0, fmt.Errorf("no task source for agent %q; add one first: hap config task-source add --agent %s", agent, agent)
 	default:
 		return config.TaskSource{}, 0, fmt.Errorf("agent %q matches %d task sources (indexes %s); address one by its index, e.g. `hap task %d list`", agent, len(matches), joinInts(matchIdx), matchIdx[0])
 	}

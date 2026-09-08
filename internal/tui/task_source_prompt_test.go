@@ -25,7 +25,7 @@ func sourcePromptModel(t *testing.T) (Model, *frontend.App, string) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	path := filepath.Join(dir, "tasks.md")
 	if err := os.WriteFile(path, []byte("- [ ] alpha\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -117,7 +117,11 @@ func TestTUIAddTaskSourcePromptRejectsBadInput(t *testing.T) {
 		"/tmp/tasks.md --auto-send-when-idle=true",
 		"/tmp/tasks.md -auto-send-when-idle",
 		"/tmp/tasks.md --auto-send-when-idl",
-		"/tmp/tasks.md --agent brave-otter",
+		// --agent is real now, but naming the agent twice is not: whichever
+		// one lost would be a selector the operator believes is set.
+		"/tmp/tasks.md brave-otter --agent calm-badger",
+		"/tmp/tasks.md --agent",
+		"/tmp/tasks.md --provider linear",
 	} {
 		m, app, _ := sourcePromptModel(t)
 		msg := submitSourcePrompt(t, m, input)
@@ -318,7 +322,7 @@ func TestConfigTabEditsTaskSourceSettings(t *testing.T) {
 // edit, resolved through MaxTasksLimit so a config written before the cap was
 // filled in still shows the number the daemon enforces.
 func TestConfigTabSourceRowShowsMaxTasks(t *testing.T) {
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "a1", Path: "/tmp/one.md"},              // unset → default
 		{Agent: "a2", Path: "/tmp/two.md", MaxTasks: 3}, // explicit
@@ -352,7 +356,7 @@ func dupSourceModel(t *testing.T) (Model, *frontend.App, string) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	shared := filepath.Join(dir, "shared.md")
 	if err := os.WriteFile(shared, []byte("- [ ] a\n"), 0o644); err != nil {
 		t.Fatal(err)
@@ -836,5 +840,118 @@ func TestTUIAddTaskSourceAcceptsReviewWithAutoSend(t *testing.T) {
 	src := cfg.TaskSources[0]
 	if !src.ReviewBeforeAutoSendEnabled() || !src.EnableAutoSendTaskWhenIdle {
 		t.Errorf("both flags must survive the add: %+v", src)
+	}
+}
+
+// freshSourcePromptModel is sourcePromptModel on a FRESH install: no config
+// file at all, so the sqlite default is in force and a list is a name inside
+// hap's database rather than a path. sourcePromptModel seeds local_fs, which
+// is why it cannot see any of this.
+func freshSourcePromptModel(t *testing.T) (Model, *frontend.App) {
+	t.Helper()
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
+		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	m := New(context.Background(), app)
+	m.width, m.height = 100, 30
+	return m, app
+}
+
+// TestTUIAddPathlessSourceOnAFreshInstall: the pathless per-agent form is the
+// documented default, and the prompt used to have no way to express it —
+// positionally the checklist comes first, so an operator with no path to give
+// had nothing to type in its place, an empty input was refused, and a
+// filesystem path is refused by the sqlite provider. --agent is the way in.
+func TestTUIAddPathlessSourceOnAFreshInstall(t *testing.T) {
+	m, app := freshSourcePromptModel(t)
+	msg := submitSourcePrompt(t, m, "--agent brave-otter")
+	if msg.err != nil {
+		t.Fatalf("a pathless source must be creatable on a fresh install: %v", msg.err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("got %d sources, want 1", len(cfg.TaskSources))
+	}
+	src := cfg.TaskSources[0]
+	if src.Agent != "brave-otter" {
+		t.Errorf("agent = %q, want brave-otter", src.Agent)
+	}
+	if src.Path != "" {
+		t.Errorf("path = %q, want it left empty so the list name derives per agent", src.Path)
+	}
+	// The inheritance is a live link: writing the resolved provider into the
+	// entry would freeze it, so changing the default would move nothing.
+	if src.Provider != "" {
+		t.Errorf("provider = %q, want the inheritance left empty", src.Provider)
+	}
+	if got := cfg.ResolveProvider(src).Name; got != config.ProviderSQLite {
+		t.Errorf("resolved provider = %q, want %q", got, config.ProviderSQLite)
+	}
+}
+
+// TestTUIAddLocalFileSourceOnAFreshInstall is the symmetric hole: with sqlite
+// the default, a filesystem path is refused, so without --provider the TUI
+// could no longer create a file-backed source at all.
+func TestTUIAddLocalFileSourceOnAFreshInstall(t *testing.T) {
+	m, _ := freshSourcePromptModel(t)
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] alpha\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Without --provider this is refused by the sqlite provider's store-file
+	// rule, and the refusal must name the way out rather than only the fault.
+	msg := submitSourcePrompt(t, m, path+" brave-otter")
+	if msg.err == nil {
+		t.Fatal("a filesystem path under the sqlite default must be refused")
+	}
+	if !strings.Contains(msg.err.Error(), config.ProviderLocalFS) {
+		t.Errorf("the refusal must name local_fs, got %v", msg.err)
+	}
+
+	m, app := freshSourcePromptModel(t)
+	if msg := submitSourcePrompt(t, m, path+" brave-otter --provider local_fs"); msg.err != nil {
+		t.Fatalf("--provider local_fs must make a file-backed source creatable: %v", msg.err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 1 {
+		t.Fatalf("got %d sources, want 1", len(cfg.TaskSources))
+	}
+	if got := cfg.TaskSources[0].Provider; got != config.ProviderLocalFS {
+		t.Errorf("provider = %q, want the explicit override recorded", got)
+	}
+	if got := cfg.TaskSources[0].Path; got != path {
+		t.Errorf("path = %q, want %q", got, path)
+	}
+}
+
+// TestTUIPathlessAddIsStillRefusedUnderLocalFS: the checklist stays REQUIRED
+// where there is nothing to derive, so the relaxation follows the provider
+// rather than being a blanket "path is optional now".
+func TestTUIPathlessAddIsStillRefusedUnderLocalFS(t *testing.T) {
+	m, app, _ := sourcePromptModel(t) // seeds local_fs
+	msg := submitSourcePrompt(t, m, "--agent brave-otter")
+	if msg.err == nil {
+		t.Fatal("a pathless source under local_fs must be refused")
+	}
+	if !strings.Contains(msg.err.Error(), "required") {
+		t.Errorf("the refusal must say a path is required, got %v", msg.err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.TaskSources) != 0 {
+		t.Errorf("a refused add must write nothing, got %+v", cfg.TaskSources)
 	}
 }

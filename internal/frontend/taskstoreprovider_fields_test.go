@@ -134,7 +134,13 @@ func TestProviderFieldValueNeverRendersEmpty(t *testing.T) {
 			}
 		}
 	}
-	if got := frontend.FieldValue(config.Default(), "task_source_provider.provider"); got != config.ProviderLocalFS {
-		t.Errorf("the default provider must render as %q, got %q", config.ProviderLocalFS, got)
+	if got := frontend.FieldValue(config.Default(), "task_source_provider.provider"); got != config.ProviderSQLite {
+		t.Errorf("the default provider must render as %q, got %q", config.ProviderSQLite, got)
+	}
+	// A Config assembled in memory never went through Load or Default, and
+	// ResolveProvider answers local_fs there — the posture that needs neither a
+	// store handle nor a node id.
+	if got := frontend.FieldValue(config.Config{}, "task_source_provider.provider"); got != config.ProviderLocalFS {
+		t.Errorf("a zero config must render as %q, got %q", config.ProviderLocalFS, got)
 	}
 }

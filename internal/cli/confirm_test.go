@@ -21,6 +21,19 @@ import (
 // confirmTestApp wires a store-backed App to a recording herdr fake whose only
 // agent reports the given status, and seeds one LLM-generated-task escalation
 // for it. Returns the app, the fake, the agent's short name, and the audit id.
+// seedLocalFSConfigIn writes a config declaring the local_fs provider into dir
+// and returns its path, for a fixture whose task list is a FILE on disk. The
+// package default is the sqlite provider, under which a filesystem path is not
+// a legal list name at all.
+func seedLocalFSConfigIn(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte("[task_source_provider]\nprovider = \"local_fs\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func confirmTestApp(t *testing.T, status, task string) (*frontend.App, *sendRecorderHerdr, string, int64) {
 	t.Helper()
 	dir := t.TempDir()
@@ -42,7 +55,7 @@ func confirmTestApp(t *testing.T, status, task string) (*frontend.App, *sendReco
 		t.Fatal(err)
 	}
 	app := &frontend.App{Store: st, Herdr: h, StateDir: dir,
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator",
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator",
 		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
 	}
 	startStandInConfirmDrain(t, st, app, h)
@@ -208,7 +221,7 @@ func noTaskSourceApp(t *testing.T) (*frontend.App, *store.Store, int64) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, StateDir: dir,
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	id, err := st.AppendAudit(context.Background(), domain.AuditRecord{
 		AgentID: "w1:p1", Signature: "sig", Trigger: "t",
 		SituationType: domain.SituationIdle, Action: "escalated", Status: "escalated",

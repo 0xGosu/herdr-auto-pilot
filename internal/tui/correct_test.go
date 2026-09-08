@@ -85,7 +85,7 @@ func correctTestModel(t *testing.T) (Model, *store.Store, *fakeHerdrTUI) {
 	app := &frontend.App{
 		Store:      st,
 		Herdr:      fh,
-		ConfigPath: filepath.Join(dir, "config.toml"),
+		ConfigPath: seedLocalFSConfigIn(t, dir),
 		Author:     "operator",
 		StateDir:   dir,
 		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },

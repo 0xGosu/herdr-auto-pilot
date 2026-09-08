@@ -310,7 +310,7 @@ func TestTaskSourceUsageKeysAreAccepted(t *testing.T) {
 
 	// The runtime usage string is unreachable from the registry, so provoke it:
 	// a wrong key prints it alongside the error.
-	app, _ := testApp(t)
+	app, _ := localFSApp(t)
 	seedTaskSource(t, app)
 	_, err := run(t, app, "task-source", "set", "0", "definitely-not-a-key", "1")
 	if err == nil {
@@ -331,7 +331,7 @@ func TestTaskSourceUsageKeysAreAccepted(t *testing.T) {
 	}
 	for _, key := range append(keys, runtimeKeys...) {
 		t.Run(key, func(t *testing.T) {
-			app, _ := testApp(t)
+			app, _ := localFSApp(t)
 			seedTaskSource(t, app)
 			value, ok := values[key]
 			if !ok {
@@ -360,7 +360,7 @@ var seededTaskSource = config.TaskSource{
 
 func seedTaskSource(t *testing.T, app *frontend.App) {
 	t.Helper()
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{seededTaskSource}
 	if err := config.Save(app.ConfigPath, cfg); err != nil {
 		t.Fatal(err)

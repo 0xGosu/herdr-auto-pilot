@@ -593,7 +593,7 @@ func TestAgentsListTaskColumn(t *testing.T) {
 	// "<total> (<pending>)" for the agent's own source; agents with no source
 	// read "-", and an unreadable source must not render a truthful-looking
 	// "0 (0)".
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "brave-otter", Path: "/work/tasks.md"},
 		{Agent: "swift-hawk", Path: "/work/broken.md"},
@@ -705,7 +705,7 @@ func TestSeeAgentTasksFromAgentsListNoMatchIsNoop(t *testing.T) {
 // the cursor — a one-agent fixture would pass even if the cursor were ignored.
 func multiAgentTasksModel(t *testing.T) Model {
 	t.Helper()
-	cfg := config.Default()
+	cfg := localFSCfg()
 	cfg.TaskSources = []config.TaskSource{
 		{Agent: "alpha", Path: "/work/alpha.md"},
 		{Agent: "beta", Path: "/work/beta.md"},
@@ -1234,7 +1234,7 @@ func appModel(t *testing.T) (Model, *frontend.App, *store.Store) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	app := &frontend.App{Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+	app := &frontend.App{Store: st, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	ctx := context.Background()
 	now := time.Now()
 	st.UpsertSignature(ctx, domain.SignatureState{
@@ -1589,7 +1589,7 @@ func TestEscalationDetailEnterConfirmsAndCloses(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
-	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{Store: st, Herdr: h, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	makeDaemonLive(t, app, dir)
 	startStandInDrain(t, st, h.record)
 	ctx := context.Background()
@@ -1657,7 +1657,7 @@ func TestEscalationDetailEnterConfirmsSnapshotNotClampedCursor(t *testing.T) {
 	}
 	t.Cleanup(func() { st.Close() })
 	h := &captureHerdr{}
-	app := &frontend.App{Store: st, Herdr: h, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{Store: st, Herdr: h, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	makeDaemonLive(t, app, dir)
 	startStandInDrain(t, st, h.record)
 	ctx := context.Background()
@@ -2124,7 +2124,7 @@ func TestReembedKey(t *testing.T) {
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{
 		Store:      st,
-		ConfigPath: filepath.Join(dir, "config.toml"),
+		ConfigPath: seedLocalFSConfigIn(t, dir),
 		DaemonInfo: func() (bool, int, string) { return false, 0, "" },
 	}
 	m = driftModel(t, frontend.EmbeddingDrift{Detected: true, Stale: 1, Total: 1})
@@ -2157,7 +2157,7 @@ func retryAppModel(t *testing.T) (Model, *store.Store, *frontend.App, int64) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	ctx := context.Background()
 	id, err := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "t",
@@ -2188,7 +2188,7 @@ func TestDetailViewRetriesFailedLearnFromUserRunOnAuditTab(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	ctx := context.Background()
 	id, err := st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:pA", AgentType: "claude", SituationType: domain.SituationApproval,
@@ -2261,7 +2261,7 @@ func TestRetryLLMListGatedForNonFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: filepath.Join(dir, "config.toml"), Author: "op"}
+	app := &frontend.App{Store: st, Herdr: &captureHerdr{}, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "op"}
 	ctx := context.Background()
 	st.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: "w1:pA", SituationType: domain.SituationApproval, Trigger: "t",
@@ -2701,7 +2701,7 @@ func focusApp(t *testing.T) (*frontend.App, *store.Store) {
 		t.Fatal(err)
 	}
 	return &frontend.App{
-		Store: st, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator",
+		Store: st, ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator",
 		StateDir:   dir,
 		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
 	}, st

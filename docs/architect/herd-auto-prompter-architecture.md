@@ -958,8 +958,9 @@ Exactly two tools:
   `github_gist` task-list backend (`internal/taskstore/gist/gist.go`), which reads
   and writes the checklists of the task sources configured for it — task text
   only — in a gist the operator owns, with a token the operator supplies in
-  `[task_source_provider] env_file`. The default provider is `local_fs`, so an
-  install that never sets one makes neither call beyond the release check. The
+  `[task_source_provider] env_file`. The default provider makes no outbound call —
+  `sqlite` for a new install, `local_fs` for one that predates it — so an install
+  that never sets one makes neither call beyond the release check. The
   no-egress test bans the GitHub SDK by its own import path as well as
   `net/http`, because it checks DIRECT imports and an adapter naming only the SDK
   would otherwise egress while passing. The TUI drives it in the background at most
@@ -1085,7 +1086,7 @@ the sections they gate.
 | **NFR-005** | Auditability completeness | Represent 100% of automated decisions and escalations in the audit log (1:1 action-to-record ratio); no autonomous action without a corresponding record. |
 | **NFR-005a** | Allowlist corpus regression | Maintain and CI-regression-test the irreversible-op corpus so seed patterns match 100% of it; a corpus miss fails the build. |
 | **NFR-006** | LLM fallback timeout | Bound LLM consultation by a configurable timeout; on timeout / missing / unparseable output, fail safe and escalate. |
-| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket, the configured local LLM CLI, the opt-out GitHub release check (`internal/updatecheck`, version numbers only), and — only when the operator explicitly selects them — two opt-in remotes the operator owns: a remote task-list storage provider's API, carrying the task text of the sources configured for it and nothing else; and, under `[database] engine = "turso"`, the operator's own Turso Cloud database, which then holds the WHOLE store (agents, escalations with pane excerpts, audit, learned rules) so several of the operator's machines share one view. The default posture is fully local: the default provider is `local_fs` and the default engine is `sqlite`. Emit no telemetry. |
+| **NFR-007** | Privacy / no telemetry | Keep all data local; make no outbound calls beyond the Herdr socket, the configured local LLM CLI, the opt-out GitHub release check (`internal/updatecheck`, version numbers only), and — only when the operator explicitly selects them — two opt-in remotes the operator owns: a remote task-list storage provider's API, carrying the task text of the sources configured for it and nothing else; and, under `[database] engine = "turso"`, the operator's own Turso Cloud database, which then holds the WHOLE store (agents, escalations with pane excerpts, audit, learned rules) so several of the operator's machines share one view. The default posture is fully local: the default provider (`sqlite`, hap's own database) and the default engine (`sqlite`, a local file) both stay on the machine, and so does the `local_fs` provider an older install is pinned to. Emit no telemetry. |
 | **NFR-008** | Portability | Run on Linux and macOS, avoiding design that precludes a future Windows build. |
 | **NFR-009** | Control-mutation propagation | Reflect a control mutation (esp. pause/kill) issued from TUI/CLI in daemon behavior within a small bounded delay (target ≤ 1 s). |
 

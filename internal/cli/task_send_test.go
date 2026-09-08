@@ -53,7 +53,7 @@ func sendTestApp(t *testing.T, status string) (*frontend.App, *sendRecorderHerdr
 		t.Fatal(err)
 	}
 	app := &frontend.App{Store: st, Herdr: h, StateDir: dir,
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator",
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator",
 		DaemonInfo: func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version }}
 	startStandInSendTaskDrain(t, st, app, h)
 	seedRoster(t, st, h.agents...)

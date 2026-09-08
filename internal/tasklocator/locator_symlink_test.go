@@ -28,7 +28,7 @@ func TestLocalLocatorIsNotSymlinkResolved(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res, err := tasklocator.Resolve(config.Default(),
+	res, err := tasklocator.Resolve(localCfg(),
 		config.TaskSource{Agent: "a", Path: viaLink}, "a", "")
 	if err != nil {
 		t.Fatal(err)

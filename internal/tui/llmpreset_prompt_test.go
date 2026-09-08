@@ -23,7 +23,7 @@ func presetModel(t *testing.T) (Model, *frontend.App) {
 	}
 	t.Cleanup(func() { st.Close() })
 	app := &frontend.App{Store: st, Herdr: &captureHerdr{},
-		ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+		ConfigPath: seedLocalFSConfigIn(t, dir), Author: "operator"}
 	m := New(context.Background(), app)
 	m.width, m.height = 100, 30
 	m.tab = tabConfig

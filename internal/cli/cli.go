@@ -1999,7 +1999,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 			// ran and found empty.
 			PrintNextSteps(out, []Hint{
 				{Cmd: "hap agents", Why: "the agent names `--agent` takes"},
-				{Cmd: "hap config task-source add --agent <name> ./docs/tasks.md", Why: "point an agent at a checklist"},
+				{Cmd: "hap config task-source add --agent <name>", Why: "give an agent its own checklist (add `--provider local_fs ./docs/tasks.md` for a file on disk)"},
 			})
 			return nil
 		}
@@ -2241,7 +2241,7 @@ func resolveTaskSourceRef(cfg config.Config, ref string) (int, error) {
 		// one, which is the state this resolver then refuses to address.
 		return 0, fmt.Errorf("no task source is scoped to agent %q — it may be scoped by the "+
 			"agent's id or type instead, so check `hap config task-source list` and address it "+
-			"by index; or add one: hap config task-source add --agent %s <checklist.md>",
+			"by index; or add one: hap config task-source add --agent %s",
 			token, token)
 	default:
 		idxs := make([]string, len(matches))

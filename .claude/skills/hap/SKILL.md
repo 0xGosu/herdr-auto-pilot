@@ -534,7 +534,7 @@ tab-separated stdout is unaffected.
 | `tui.disable_check_for_update` | false | turn off the GitHub release check (TUI only, at most every 6h) |
 | `tui.max_instances` | 1 | how many `hap tui` processes may run; starting one closes the oldest past this cap. `0` = no limit |
 | `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output |
-| `task_source_provider.provider` | `local_fs` | default storage for every task list: `local_fs`, `github_gist`, or `sqlite` (inside hap's database; syncs under the turso engine) |
+| `task_source_provider.provider` | `sqlite` | default storage for every task list: `sqlite` (inside hap's database; syncs under the turso engine), `local_fs` (a markdown file on disk — the only provider where `path` is a filesystem path), or `github_gist`. The default applies to a config file that does not exist yet; an install that already has one is pinned to `local_fs`. |
 | `task_source_provider.env_file` | (none) | file holding `GITHUB_TOKEN` for `github_gist`; read at use time |
 | `task_source_provider.timeout_seconds` | 20 | per remote store call |
 | `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |
@@ -665,15 +665,24 @@ Deprecated but still loading, migrated on the next config save:
 
 ## task sources
 
-A task source points an agent at a checklist file so idle agents get the next
-unchecked item. `hap config task-source` manages **which file**; `hap task`
+A task source points an agent at a checklist so idle agents get the next
+unchecked item. `hap config task-source` manages **which list**; `hap task`
 manages the **items inside it**.
+
+Under the default `sqlite` provider the checklist argument is OPTIONAL: leave it
+out and each matched agent gets its own list inside hap's database. Give it only
+to share ONE list across the agents a source matches — and then it is a list
+NAME, never a filesystem path. For a markdown file on disk, pass
+`--provider local_fs` (an install that predates the default is pinned there, and
+its sources keep taking a path).
 
 ```bash
 hap config task-source list                                   # every source, with its index
-hap config task-source add --agent backend-dev ./docs/tasks.md
-hap config task-source add --workspace "codex-*" ./docs/tasks.md   # "*" wildcards
-hap config task-source add ./docs/tasks.md                    # any agent, any workspace
+hap config task-source add --agent backend-dev                # its own list, derived per agent
+hap config task-source add --workspace "codex-*"              # "*" wildcards
+hap config task-source add --agent backend-dev shared.md      # share ONE list by name
+hap config task-source add --agent legacy-fox --provider local_fs ./docs/tasks.md
+hap config task-source add                                    # any agent, any workspace
 hap config task-source remove <index|agent>
 ```
 
@@ -712,9 +721,9 @@ resolves against **your** shell's cwd (the daemon runs from the state dir).
 
 ### where task lists are stored
 
-By default a checklist is a file on this machine. `[task_source_provider]` sets
-the **default** storage; each source may override it, so some agents can be
-local and others in a gist at once:
+By default a checklist is a row in hap's own database on this machine.
+`[task_source_provider]` sets the **default** storage; each source may override
+it, so some agents can be files on disk and others in a gist at once:
 
 ```bash
 hap config set task_source_provider.provider github_gist
@@ -755,7 +764,7 @@ handing the next pending `[ ]` item to any matching agent idle for over a
 minute:
 
 ```bash
-hap config task-source add --agent backend-dev --auto-send-when-idle ./docs/tasks.md
+hap config task-source add --agent backend-dev --auto-send-when-idle
 hap config task-source set <index|agent> auto-send-when-idle true
 ```
 

@@ -29,7 +29,7 @@ import (
 // the finished list — is the point: the finished list is non-blank either way,
 // which is why this shipped.
 func TestBootstrapSeedsTheListWithItsHeaderNotBlank(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	app.Herdr = &fakeHerdr{}
 	stateDir := t.TempDir()
 	app.StateDir = stateDir

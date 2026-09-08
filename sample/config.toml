@@ -624,11 +624,15 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # change the value here and every inheriting source moves with it. hap never
 # writes the inherited value back into a source (that would freeze it).
 #
-# Values: "local_fs" (default) | "github_gist" | "sqlite"
+# Values: "sqlite" (default) | "local_fs" | "github_gist"
+#
+# The default applies to a config file that does not exist yet. An install that
+# already has one keeps "local_fs" — hap pins it on load — so no checklist you
+# already have changes where it lives.
 # [task_source_provider]
-# provider = "local_fs"
+# provider = "sqlite"
 
-# ── sqlite ──────────────────────────────────────────────────────────
+# ── sqlite (the default) ────────────────────────────────────────────
 # Keeps each list INSIDE hap's own database (the task_lists table) instead of a
 # file. Under the default engine nothing leaves this machine; under
 # [database] engine = "turso" the lists sync with everything else, so every
@@ -640,11 +644,19 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # hands items out — so two machines' agents never share a queue.
 # provider = "sqlite"
 
+# ── local_fs ────────────────────────────────────────────────────────
+# Each list is a markdown FILE on this machine and `path` is a filesystem path.
+# This is the only provider where that is true: under sqlite and github_gist a
+# path-shaped value is refused rather than silently creating a list elsewhere.
+# Set it here to move every inheriting source, or per source with
+# `hap config task-source add --agent <name> --provider local_fs <checklist.md>`.
+# provider = "local_fs"
+
 # ── github_gist ─────────────────────────────────────────────────────
-# PRIVACY: this sends the task lists of the sources using it to GitHub. The
-# default ("local_fs") keeps every checklist on this machine and makes no
-# outbound call. Nothing else is ever sent: no pane content, no learned rules,
-# no audit log.
+# PRIVACY: this sends the task lists of the sources using it to GitHub. It is
+# the ONLY provider that makes an outbound call — the default ("sqlite") and
+# "local_fs" both keep every checklist on this machine. Nothing else is ever
+# sent: no pane content, no learned rules, no audit log.
 #
 # Every list is a FILE inside ONE gist you already own. hap NEVER creates the
 # gist: make a SECRET gist on github.com, copy the hex id out of its URL, and

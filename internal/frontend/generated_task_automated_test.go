@@ -46,7 +46,7 @@ func seedClaimedGeneratedTask(t *testing.T, st interface {
 // suggestions it exists to act on. A fake seam in the daemon tests can never
 // catch this, which is why the assertion lives here, against the real code.
 func TestAutomatedGeneratedTaskAcceptsAClaimedRow(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	app.Herdr = &fakeHerdr{}
 	stateDir := t.TempDir()
 	app.StateDir = stateDir
@@ -275,7 +275,7 @@ func TestAutomatedGeneratedTaskReleasesTheReservationOnAFailedSend(t *testing.T)
 // the callback. A template can frame a benign task into something the operator's
 // rules refuse, and the raw task text cannot show that.
 func TestAutomatedGeneratedTaskScreensTheSourceTemplatePrompt(t *testing.T) {
-	app, st := testApp(t)
+	app, st := localFSApp(t)
 	fake := &fakeHerdr{}
 	app.Herdr = fake
 	app.StateDir = t.TempDir()

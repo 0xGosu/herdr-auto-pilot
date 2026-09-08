@@ -10,7 +10,8 @@
 //     the operator owns, with a token the operator supplies. No pane content,
 //     no learned rules, no audit history. A source uses it only when
 //     [task_source_provider] (or that source's own `provider`) selects it, and
-//     the default is local_fs.
+//     it is never the default — a new install gets sqlite (hap's own database)
+//     and an older one local_fs, and neither makes an outbound call.
 //  3. internal/store/turso/turso.go — the turso store engine, which syncs the
 //     WHOLE store (agents, escalations with their pane excerpts, audit, learned
 //     rules) with a Turso Cloud database the operator owns, with a token the
