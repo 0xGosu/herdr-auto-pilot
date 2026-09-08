@@ -3938,10 +3938,7 @@ func tabSelectKinds(multi []bool) ([]string, bool) {
 // read keeps the classification snapshot (~10 chars/line is a conservative
 // floor for the line count).
 func (d *Daemon) paneExcerpt(ctx context.Context, cfg config.Config, s domain.Situation) string {
-	chars := cfg.LLM.PaneExcerptChars
-	if chars <= 0 {
-		chars = config.Default().LLM.PaneExcerptChars
-	}
+	chars := excerptCharsFor(cfg)
 	// A multi-tab situation carries the swept aggregate (every question in
 	// order); a fresh read would see only the currently focused tab. Take
 	// the HEAD when it exceeds the excerpt cap — the consult contract says

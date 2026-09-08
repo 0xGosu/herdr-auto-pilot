@@ -517,7 +517,7 @@ func (d *Daemon) startRerank(ctx context.Context, s domain.Situation,
 			// fills its context in its own goroutine. It only picks the CLI's
 			// working directory (llm.run_in_agent_cwd), so an unknown cwd is a
 			// degrade, never a failure.
-			req.Cwd = d.agentCwd(rctx, s)
+			req.Cwd = d.rerankAgentCwd(rctx, s)
 			out, err := rp.Rerank(rctx, req)
 			if err != nil {
 				return err
@@ -655,7 +655,7 @@ func (d *Daemon) handleRerankOutcome(ctx context.Context, res rerankOutcome) {
 // preferring the foreground process's. Empty on any failure: the adapter then
 // falls back to hap's own directory (llm.Adapter.runDir), which is the historic
 // behavior when llm.run_in_agent_cwd cannot be honored.
-func (d *Daemon) agentCwd(ctx context.Context, s domain.Situation) string {
+func (d *Daemon) rerankAgentCwd(ctx context.Context, s domain.Situation) string {
 	insp, ok := d.opt.Herdr.(ports.InspectorPort)
 	if !ok {
 		return ""
@@ -666,10 +666,8 @@ func (d *Daemon) agentCwd(ctx context.Context, s domain.Situation) string {
 			"pane", s.PaneID, "error", err)
 		return ""
 	}
-	if info.ForegroundCwd != "" {
-		return info.ForegroundCwd
-	}
-	return info.Cwd
+	// Same precedence (and trimming) as every other cwd read in the daemon.
+	return agentCwd(info)
 }
 
 // excerptCharsFor is llm.pane_excerpt_chars, defaulted.
