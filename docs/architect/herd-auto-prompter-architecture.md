@@ -549,7 +549,8 @@ fallback chain (each step stamps a `match_method` recorded in the audit log):
      by BM25 and change nothing, while looking like it worked.
    - **A judge FAILURE is not a veto.** Missing binary, timeout, non-zero exit,
      prose with no array, a duplicate or out-of-range id: all degrade to the
-     answer step 3 would have given. Only a literal, well-formed `[]` vetoes.
+     answer step 3 would have given. The veto is an empty array, or equally a
+     verdict whose every entry scored below `llm.relevance_score_threshold`.
 
    The run is a subprocess with a 30-second budget, and `resolveSignature` runs
    on the daemon select loop, so it CANNOT run there. The cosine pass returns a

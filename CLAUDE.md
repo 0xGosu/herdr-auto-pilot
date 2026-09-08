@@ -1186,6 +1186,12 @@ whose manifest carries exactly that version).
   `embedding.similarity_threshold` into a FILTER: every candidate at or above it is
   listed for a one-shot CLI, which returns `[{"id": n, "score": s}]` ordered by
   relevance and hap uses the first. Five bounds are load-bearing:
+  - **A vector-search ERROR is not a cosine miss.** `cosineRerankPass` reports (judged,
+    missed) separately for exactly this: `bm25RetryAllowed` refuses a text retry for any
+    STRUCTURED salient cosine has REFUSED, so collapsing a transient KNN failure into
+    "cosine missed" mints a new key for every approval, choice and error screen — the very
+    population this feature targets. `MatchVector`'s own error branch has always left
+    `cosineMissed` false; this keeps that.
   - **The candidate set is accept-filtered BEFORE the judge sees it.** The same
     closure `resolveSignatureN`'s cosine pass uses — the `min_salient_chars` veto plus
     `remapAllowed`/`ApprovalRemapCompatible` — gates `matcher.VectorCandidates`, so the
@@ -1198,18 +1204,26 @@ whose manifest carries exactly that version).
     like it works. `finishRerank` mints instead (`MatchRerankVeto`).
   - **A judge FAILURE is not a veto.** Missing binary, timeout, non-zero exit, prose with
     no array, a duplicate or out-of-range id all degrade to the answer step 3 would have
-    given (`fallback`, computed BEFORE the run so no error path reconstructs it). Only a
-    literal, well-formed `[]` vetoes — `domain.ErrNoRerankVerdict` is the sentinel that
-    keeps the two apart, and `lastJSONArray` only accepts a region that already
-    unmarshals as `[{id, score}]`, so prose brackets are never an answer.
+    given (`fallback`, computed BEFORE the run so no error path reconstructs it). The veto
+    is an empty array — AND equally a verdict whose every entry scored below
+    `relevance_score_threshold`, which is the same statement. `domain.ErrNoRerankVerdict`
+    is the sentinel keeping the two apart, and `lastJSONArray` only accepts a region that
+    already unmarshals as `[{id, score}]`, so prose brackets are never an answer; the one
+    exception is an empty bracket pair, which under last-wins turns an earlier answer into
+    a veto — the safe direction, since a veto escalates.
   - **It CANNOT run inline.** `resolveSignature` is called from `decideAndAct` on the
     daemon select loop, which serves every agent — the reason the embed call has
     `embed_timeout_ms` and the BM25 pass has `bm25MatchTimeout`. So the cosine pass
     returns a `rerankPlan`, `decideAndAct` suspends, and `handleRerankOutcome` re-enters
     `decideAndActResolved`. One flight per agent keyed on `sig.Raw` (there is no learning
     key yet — resolving it is what the run is for), superseded on a different raw and
-    cancelled wherever a pending capture is (`working`, human interaction, pane recycle);
-    a token check drops a stale verdict. `rerankOutcome` carries `fallback` AND
+    cancelled wherever a pending capture is (`working`, human interaction, pane recycle,
+    `detected`); a token check drops a stale verdict, and `rerankSituationHeldStill`
+    re-reads the pane on resume the way `handleActionReviewOutcome` does — the judge holds
+    the decision for up to 30s, and what resumes can reach `act()`, which maps a learned
+    label to a menu digit against the CAPTURED content. `handleRerankOutcome` also re-asks
+    `RerankingConfigured`, so a verdict already in flight when the operator turned the
+    feature off degrades instead of vetoing. `rerankOutcome` carries `fallback` AND
     `original` because they are not interchangeable: a veto mints from the ORIGINAL, and
     minting from the fallback persists the raw hash while returning the candidate the
     judge just refused.

@@ -1718,6 +1718,10 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// on subscriber reconnect only costs one extra long settle.
 		if tr.Status == "detected" {
 			d.cancelCapture(tr.PaneID)
+			// A judge run in flight belongs to the PREVIOUS tenant of this pane
+			// for exactly the reason the capture does; its verdict would resume
+			// a decision about a screen a different agent replaced.
+			d.cancelRerank(tr.AgentID)
 			d.mu.Lock()
 			delete(d.captureStarted, tr.PaneID)
 			d.mu.Unlock()

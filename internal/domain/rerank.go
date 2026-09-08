@@ -130,11 +130,16 @@ func truncateRerankSalient(s string) string {
 
 // ErrNoRerankVerdict reports that the judge's output carried no JSON array at
 // all. It is deliberately DISTINCT from an empty verdict, and the whole feature
-// rests on that distinction: an empty array is the judge saying "none of these
-// rules matches" (terminal — mint a new signature), while no array at all is
-// the judge failing to answer (degrade to the cosine match hap would have used
-// without it). Conflating them either destroys learned matching on every
+// rests on that distinction: an empty verdict is the judge saying "none of
+// these rules matches" (terminal — mint a new signature), while no array at all
+// is the judge failing to answer (degrade to the cosine match hap would have
+// used without it). Conflating them either destroys learned matching on every
 // malformed reply, or silently ignores the veto the operator turned this on for.
+//
+// Note what counts as the veto: an empty array, AND equally a verdict whose
+// every entry scored below the caller's threshold. The two are the same
+// statement — "nothing here is relevant enough" — and the threshold is passed
+// to the judge in its own prompt precisely so it makes that call itself.
 var ErrNoRerankVerdict = fmt.Errorf("no JSON array found in the judge's output")
 
 // ParseRerankVerdict extracts the judge's ranked answer.
@@ -215,7 +220,13 @@ func ParseRerankVerdict(out string, candidates int, threshold float64, topK int)
 //
 // A region that parses as SOME other JSON array (a bare [1,2,3] the model
 // mentioned in prose) fails the typed unmarshal and is passed over, which is
-// what keeps prose from being mistaken for an answer.
+// what keeps prose from being mistaken for an answer. The ONE exception is an
+// empty bracket pair — "[]", "[ ]", or the "[ ]" of a markdown checkbox — which
+// unmarshals cleanly and therefore reads as the veto. Under last-wins, an empty
+// pair appearing AFTER a well-formed answer converts a match into a veto, and
+// that is the direction to fail in: a veto escalates to a human, where
+// preferring the earlier non-empty array would type an answer the model's last
+// word disowned. TestParseRerankVerdict pins it.
 func lastJSONArray(s string) (string, bool) {
 	var (
 		best     string

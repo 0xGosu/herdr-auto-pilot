@@ -408,7 +408,8 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # Anything that is not a well-formed JSON array — a missing binary, a timeout,
 # a non-zero exit, prose with no array, an id naming a rule that was not offered
 # — degrades to the answer hap would have given WITHOUT the judge (the best
-# cosine match). Only a literal `[]` is the veto, so a broken judge can never
+# cosine match). The veto is an empty array — or a verdict whose every entry
+# scored below `relevance_score_threshold` — so a broken judge can never
 # cost you a rule you already taught it.
 #
 # The run reads nothing, writes nothing and needs no MCP server; its answer is

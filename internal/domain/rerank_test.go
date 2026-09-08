@@ -55,6 +55,16 @@ func TestParseRerankVerdict(t *testing.T) {
 			wantErr: true, wantNoVerdict: true,
 		},
 		{
+			// The safe direction, deliberately: a veto escalates to a human, where
+			// preferring the earlier answer would type a reply the model's last word
+			// disowned. An empty pair unmarshals cleanly, so it is the ONE prose
+			// shape that can override a real answer.
+			name:      "a trailing empty pair overrides an earlier answer",
+			out:       `[{"id": 1, "score": 0.99}]` + "\nOn reflection, none of them fits: []",
+			threshold: 0.95, topK: 3,
+			want: nil,
+		},
+		{
 			name:      "the LAST array wins",
 			out:       `[{"id": 1, "score": 0.99}]` + "\nOn reflection:\n" + `[{"id": 3, "score": 0.96}]`,
 			threshold: 0.95, topK: 3,

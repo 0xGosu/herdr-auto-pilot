@@ -12,6 +12,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
@@ -709,4 +710,234 @@ func salientOf(t *testing.T, pane string) string {
 	t.Helper()
 	s := classifierForTest().Classify("claude", "blocked", pane)
 	return domain.ComputeSignature(s).Salient
+}
+
+// noBatchStore hides ports.BatchDecisionReader, so describeRules takes its
+// per-signature fallback. It exists because the daemon suite's own failingStore
+// embeds the StorePort INTERFACE and therefore already hides every optional
+// capability — which means the two describe paths run in different tests here
+// and could silently disagree.
+type noBatchStore struct{ ports.StorePort }
+
+// TestBothDescribePathsAgree pins the ports.BatchDecisionReader contract at
+// this call site: the batched read and the per-signature loop must produce
+// byte-identical listings.
+//
+// They cannot be allowed to differ, because the listing is BOTH the judge's
+// prompt and the verdict cache's key — two stores that described the same rules
+// differently would ask the model two different questions about one situation
+// and cache the answers separately.
+func TestBothDescribePathsAgree(t *testing.T) {
+	d, _ := rerankHarness(t, &fakeEmbedder{}, rerankCfg)
+	ctx := context.Background()
+	cfg, _, _ := d.snapshot()
+
+	const sig = "approval:described"
+	if err := d.opt.Store.EnsureSignature(ctx, domain.SignatureState{
+		Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+		Mode: domain.ModeAutonomous, UpdatedAt: d.opt.Clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: sig, SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: "yes", Source: domain.SourceOperator,
+			CreatedAt: d.opt.Clock.Now().Add(-time.Duration(3-i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	describe := func() domain.RerankCandidate {
+		cands := []domain.RerankCandidate{{ID: 1, Signature: sig, Salient: "s", Cosine: 0.95}}
+		d.describeRules(ctx, cfg, cands)
+		return cands[0]
+	}
+	if _, ok := d.opt.Store.(ports.BatchDecisionReader); !ok {
+		t.Fatal("premise: the harness store must offer the batched read, or this compares one path with itself")
+	}
+	batched := describe()
+	if batched.TopAction != "yes" || batched.Decisions != 3 || batched.Mode != domain.ModeAutonomous {
+		t.Fatalf("batched description is wrong: %+v", batched)
+	}
+
+	real := d.opt.Store
+	d.opt.Store = noBatchStore{real}
+	t.Cleanup(func() { d.opt.Store = real })
+	if _, ok := d.opt.Store.(ports.BatchDecisionReader); ok {
+		t.Fatal("noBatchStore still exposes the batched read")
+	}
+	if fallback := describe(); fallback != batched {
+		t.Errorf("the two describe paths disagree:\n batched  %+v\n fallback %+v", batched, fallback)
+	}
+}
+
+// TestDescribeRulesStillOffersAnUnreadableRule: a store error must degrade the
+// listing, never shrink it. Dropping a candidate here would silently turn a
+// transient read failure into "this rule is not a match", which is a decision
+// the judge never got to make.
+func TestDescribeRulesStillOffersAnUnreadableRule(t *testing.T) {
+	d, _ := rerankHarness(t, &fakeEmbedder{}, rerankCfg)
+	cfg, _, _ := d.snapshot()
+	cands := []domain.RerankCandidate{
+		{ID: 1, Signature: "approval:never-recorded", Salient: "s", Cosine: 0.95},
+	}
+	d.describeRules(context.Background(), cfg, cands)
+	if len(cands) != 1 || cands[0].Signature != "approval:never-recorded" {
+		t.Fatalf("an undescribable rule was dropped from the listing: %+v", cands)
+	}
+	// And it renders as a real entry the judge can pick, not a blank.
+	if out := domain.RenderRerankCandidates(cands); !strings.Contains(out, "rule 1") {
+		t.Errorf("undescribed rule did not render:\n%s", out)
+	}
+}
+
+// TestADuplicateTransitionDoesNotStartASecondJudge: the same screen arriving
+// twice is one question. Without the raw-hash check the second transition
+// spawns a concurrent run for the same agent, and whichever finishes last wins
+// — two subprocesses to answer the same thing, non-deterministically.
+func TestADuplicateTransitionDoesNotStartASecondJudge(t *testing.T) {
+	sit := approvalWithOpts("run npm install in the web package")
+	sig := domain.ComputeSignature(sit)
+	emb := &fakeEmbedder{vectors: map[string][]float32{sig.Salient: {1, 0, 0, 0}}}
+	d, rr := rerankHarness(t, emb, rerankCfg)
+	cfg, _, _ := d.snapshot()
+	seedRule(t, d, sig.Salient, domain.SituationApproval, "approval:learned", []float32{1, 0, 0, 0})
+
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	rr.rerank = func(ctx context.Context, _ domain.RerankRequest) (string, error) {
+		select {
+		case <-block:
+		case <-ctx.Done():
+		}
+		return `[]`, nil
+	}
+
+	_, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	if plan == nil {
+		t.Fatal("premise: the first pass must hand back a plan")
+	}
+	tr := domain.AgentTransition{AgentID: sit.AgentID, PaneID: sit.PaneID, AgentType: "claude", Status: "blocked"}
+	if !d.startRerank(context.Background(), sit, tr, "agent", sig, sig, plan) {
+		t.Fatal("the first startRerank must take ownership")
+	}
+	waitFor(t, 3*time.Second, func() bool { return len(rr.calls()) == 1 })
+
+	// Same agent, same raw: owned by the live flight, and no second run.
+	if !d.startRerank(context.Background(), sit, tr, "agent", sig, sig, plan) {
+		t.Error("a duplicate transition must report the situation as owned, not fall through to an inline decision")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := len(rr.calls()); n != 1 {
+		t.Errorf("judge calls = %d, want 1 — a duplicate transition started a second run", n)
+	}
+	d.cancelRerank(sit.AgentID)
+}
+
+// TestANewSituationSupersedesTheJudgeInFlight: the pane moved on, so the old
+// question is moot. The old run must be CANCELLED (not merely forgotten) or it
+// keeps a subprocess alive for a screen nothing will act on, and the registry
+// must end up holding the new flight — a blind delete would leave the newer run
+// unregistered, so a third transition would start a second concurrent judge.
+func TestANewSituationSupersedesTheJudgeInFlight(t *testing.T) {
+	sit := approvalWithOpts("run npm install in the web package")
+	sig := domain.ComputeSignature(sit)
+	other := approvalWithOpts("delete the build cache directory")
+	otherSig := domain.ComputeSignature(other)
+	if sig.Raw == otherSig.Raw {
+		t.Fatal("premise: the two situations must hash differently")
+	}
+	emb := &fakeEmbedder{}
+	d, rr := rerankHarness(t, emb, rerankCfg)
+	cfg, _, _ := d.snapshot()
+	seedRule(t, d, sig.Salient, domain.SituationApproval, "approval:learned", []float32{0, 0, 0, 1})
+
+	cancelled := make(chan struct{}, 2)
+	block := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+	rr.rerank = func(ctx context.Context, _ domain.RerankRequest) (string, error) {
+		select {
+		case <-block:
+		case <-ctx.Done():
+			cancelled <- struct{}{}
+		}
+		return `[]`, nil
+	}
+
+	_, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	if plan == nil {
+		t.Fatal("premise: the first pass must hand back a plan")
+	}
+	tr := domain.AgentTransition{AgentID: sit.AgentID, PaneID: sit.PaneID, AgentType: "claude", Status: "blocked"}
+	d.startRerank(context.Background(), sit, tr, "agent", sig, sig, plan)
+	waitFor(t, 3*time.Second, func() bool { return len(rr.calls()) == 1 })
+
+	// A DIFFERENT raw on the same agent supersedes.
+	d.startRerank(context.Background(), other, tr, "agent", otherSig, otherSig, plan)
+	select {
+	case <-cancelled:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the superseded run was never cancelled — it keeps a subprocess alive for a dead screen")
+	}
+	d.mu.RLock()
+	fl, ok := d.rerankInFlight[sit.AgentID]
+	d.mu.RUnlock()
+	if !ok || fl.raw != otherSig.Raw {
+		t.Errorf("registry holds %+v (ok=%v), want the NEW flight on %q", fl, ok, otherSig.Raw)
+	}
+	d.cancelRerank(sit.AgentID)
+}
+
+// TestRefreshKnowledgeClearsTheVerdictCache: a fleet pull brings rules learned
+// on other machines, so the candidate set a cached verdict was judged against
+// no longer describes what the matcher would return.
+func TestRefreshKnowledgeClearsTheVerdictCache(t *testing.T) {
+	d, _ := rerankHarness(t, &fakeEmbedder{}, rerankCfg)
+	d.storeRerankVerdict("k", []domain.RerankResult{{ID: 1, Score: 1}})
+	if _, ok := d.cachedRerankVerdict("k"); !ok {
+		t.Fatal("premise: the verdict must be cached")
+	}
+	d.RefreshKnowledge()
+	if _, ok := d.cachedRerankVerdict("k"); ok {
+		t.Error("a knowledge refresh must drop every cached verdict")
+	}
+}
+
+// TestAVectorSearchErrorIsNotACosineRefusal is the regression guard for the one
+// way this feature could quietly degrade the chain it sits in.
+//
+// bm25RetryAllowed refuses a text retry for any STRUCTURED salient cosine has
+// REFUSED, so reporting a transient KNN failure as a refusal mints a brand-new
+// key for exactly the approval/choice/error screens the judge exists to match.
+// The un-configured path cannot see this — only a judge-configured daemon whose
+// matcher is broken can.
+func TestAVectorSearchErrorIsNotACosineRefusal(t *testing.T) {
+	sit := approvalWithOptions("run npm install in the web package")
+	sig := domain.ComputeSignature(sit)
+	// A DIMENSION MISMATCH: the embedder answers with 3 components while the
+	// index holds 4, so VectorCandidates errors while text matching is
+	// untouched — the shape a model swap racing a resolve produces, and the
+	// only one that isolates a search error from a search miss.
+	emb := &fakeEmbedder{vectors: map[string][]float32{sig.Salient: {1, 0, 0}}}
+	d, rr := rerankHarness(t, emb, rerankCfg)
+	cfg, _, _ := d.snapshot()
+	seedApprovalRules(t, d, 24) // real IDF spread; see seedRule's comment
+	// Identical salient, so BM25 scores it top the moment it is allowed to run.
+	seedRule(t, d, sig.Salient, domain.SituationApproval, "approval:learned", []float32{1, 0, 0, 0})
+	rr.rerank = func(context.Context, domain.RerankRequest) (string, error) {
+		t.Error("a broken vector search must not reach the judge")
+		return `[]`, nil
+	}
+
+	got, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	if plan != nil {
+		t.Fatal("a failed search must not defer anything")
+	}
+	if got.Match.Method != domain.MatchBM25 || got.Signature != "approval:learned" {
+		t.Fatalf("a search ERROR was treated as a cosine refusal: method=%q signature=%q — "+
+			"bm25RetryAllowed then refuses the text retry and this approval mints a new key",
+			got.Match.Method, got.Signature)
+	}
 }

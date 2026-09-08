@@ -294,14 +294,18 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 				return remapAllowed(s, sig, h)
 			}
 			if cfg.RerankingConfigured() {
-				resolved, plan, judged := d.cosineRerankPass(ctx, cfg, sig, s, scope, vec, vecModel, accept)
+				resolved, plan, judged, missed := d.cosineRerankPass(ctx, cfg, sig, s, scope, vec, vecModel, accept)
 				if judged {
 					return resolved, plan
 				}
-				// Nothing cleared similarity_threshold: identical to the
-				// ordinary cosine miss, so fall through to BM25 exactly as an
-				// un-configured daemon would.
-				cosineMissed = true
+				// missed is true ONLY when the search ran cleanly and found
+				// nothing above the threshold — the ordinary cosine miss. A
+				// search ERROR leaves it false, exactly as MatchVector's error
+				// branch does below, because bm25RetryAllowed refuses a text
+				// retry for a STRUCTURED salient cosine has REFUSED: reporting a
+				// transient KNN failure as a refusal would mint a new key for
+				// every approval, choice and error screen.
+				cosineMissed = missed
 			} else {
 				hit, ok, err := d.matcher.MatchVector(ctx, vec, scope, accept)
 				switch {

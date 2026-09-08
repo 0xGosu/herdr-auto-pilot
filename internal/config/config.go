@@ -436,7 +436,8 @@ type LLM struct {
 	// Anything that is not a well-formed array — a missing binary, a timeout, a
 	// non-zero exit, prose with no array, an id naming a rule that was not
 	// offered — degrades to the answer hap would have given WITHOUT the judge
-	// (the best cosine candidate). Only a literal [] is the veto. The run reads
+	// (the best cosine candidate). The veto is an empty array, or equally a
+	// verdict whose every entry scored below relevance_score_threshold. The run reads
 	// and writes nothing and needs no MCP server; its answer is read from stdout.
 	//
 	// Placeholders: {self}, {agent_name}, {agent_type}, {cwd}, {situation_type},
