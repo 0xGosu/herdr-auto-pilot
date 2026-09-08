@@ -3291,9 +3291,33 @@ func (m *Model) openNoticeDetail(notice *frontend.NoTaskSourceNotice) {
 // detail overlay's y, acting on the record it snapshotted rather than the live
 // cursor (and never on the list's marks, which the overlay does not show).
 func (m Model) confirmIDWithoutSend(id int64) (tea.Model, tea.Cmd) {
+	// Claimed here rather than at the caller, the way confirmAuditID is: the
+	// overlay's y is the list's y in another surface, and a guard that lived in
+	// the key handler would have to be repeated at each door to the same action
+	// — which is how this one came to be the door with no guard on it.
+	ids := []int64{id}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
+	app, ctx, wg := m.app, m.ctx, m.inflight
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("confirmed #%d — learned, nothing sent (the agent is not answered)", id),
-		func(ctx context.Context) error { return m.app.Confirm(ctx, id, false) })
+	// Written out rather than routed through m.do, which builds its own result
+	// and so cannot carry the claim back.
+	m.message = m.beginSending(ids)
+	if wg != nil {
+		wg.Add(1)
+	}
+	return m, func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		if err := app.Confirm(ctx, id, false); err != nil {
+			return actionResultMsg{err: err, sent: ids}
+		}
+		return actionResultMsg{sent: ids, message: fmt.Sprintf(
+			"confirmed #%d — learned, nothing sent (the agent is not answered)", id)}
+	}
 }
 
 // openAddPrompt asks whether to queue a stale generated-task suggestion onto the
@@ -3404,10 +3428,30 @@ func (m Model) openSendPrompt(id int64, action string) (tea.Model, tea.Cmd) {
 // dismissByID dismisses one escalation by id — used by the detail overlay.
 // The list uses deleteEscalations for its marked/cursor batch semantics.
 func (m Model) dismissByID(id int64) (tea.Model, tea.Cmd) {
+	// The overlay's x, and the same reasoning as confirmIDWithoutSend above:
+	// deleteEscalations guards the list's x, so leaving this door open means a
+	// row already in flight can still be dismissed out from under its own
+	// answer.
+	ids := []int64{id}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
+	app, ctx, wg := m.app, m.ctx, m.inflight
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("dismissed #%d", id), func(ctx context.Context) error {
-		return m.app.Dismiss(ctx, id)
-	})
+	m.message = m.beginSending(ids)
+	if wg != nil {
+		wg.Add(1)
+	}
+	return m, func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		if err := app.Dismiss(ctx, id); err != nil {
+			return actionResultMsg{err: err, sent: ids}
+		}
+		return actionResultMsg{message: fmt.Sprintf("dismissed #%d", id), sent: ids}
+	}
 }
 
 // retryByID re-invokes the LLM on one escalation by id (list and detail).
@@ -3552,8 +3596,13 @@ func (m *Model) releaseSending(ids []int64) {
 // — can resolve the escalation while this request is in flight, and then the
 // row simply leaves the queue. Without this the id would sit in the map for the
 // life of the TUI. Called on every refresh, where the queue is re-read anyway.
+//
+// A FAILED refresh carries no escalations at all, and "we could not read the
+// queue" is not "the row left it": pruning there would drop every live claim,
+// un-dim the rows and let a second press queue the same answer again — exactly
+// what the claim exists to prevent.
 func (m *Model) pruneSending() {
-	if len(m.sending) == 0 {
+	if len(m.sending) == 0 || m.data.err != nil {
 		return
 	}
 	next := make(map[int64]bool, len(m.sending))

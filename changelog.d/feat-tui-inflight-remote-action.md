@@ -7,4 +7,5 @@
   nothing to tell "it is on its way" from "the key did not register".
 - Fixed a second press on a row already being answered queueing the work twice.
   It is now refused, saying the answer is already in flight. Covers every row
-  action: confirm+send, confirm-only, correct, retry LLM and delete.
+  action from both the list and the detail overlay: confirm+send, confirm-only,
+  correct, retry LLM and delete.

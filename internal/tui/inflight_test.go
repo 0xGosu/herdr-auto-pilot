@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -158,6 +159,82 @@ func TestARowThatLeavesTheQueueDropsItsClaim(t *testing.T) {
 	upd, _ = m.Update(data)
 	if upd.(Model).sending[oldID] {
 		t.Error("a row that left the queue kept its claim forever")
+	}
+}
+
+// A FAILED refresh carries no escalations at all, and "we could not read the
+// queue" is not "the row left it". Pruning there would drop every live claim,
+// un-dim the rows, and let a second press queue the same answer again — the
+// prune undoing exactly what the claim exists to do.
+func TestAFailedRefreshKeepsEveryClaim(t *testing.T) {
+	m, app, _, oldID, _ := escalationsModel(t)
+
+	upd, _ := m.confirmAuditID(oldID)
+	m = upd.(Model)
+	if !m.sending[oldID] {
+		t.Fatal("the row was not claimed")
+	}
+	// The shape a store or daemon read error produces: an error and no rows.
+	data := refreshData(context.Background(), app)
+	data.err = errors.New("store unavailable")
+	data.escalations = nil
+	upd, _ = m.Update(data)
+	if !upd.(Model).sending[oldID] {
+		t.Error("a failed refresh dropped a live claim — a second press would re-answer the row")
+	}
+}
+
+// The overlay's y and x are the list's y and x in another surface, so they need
+// the same guard. The claim lives in the FUNCTION rather than the key handler
+// for exactly this reason: a guard repeated per door is a guard that gets
+// missed at one of them.
+func TestTheDetailOverlayDoorsAreGuardedToo(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(Model, int64) (tea.Model, tea.Cmd)
+	}{
+		{"overlay y (confirm only)", func(m Model, id int64) (tea.Model, tea.Cmd) {
+			return m.confirmIDWithoutSend(id)
+		}},
+		{"overlay x (dismiss)", func(m Model, id int64) (tea.Model, tea.Cmd) {
+			return m.dismissByID(id)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, _, _, oldID, _ := escalationsModel(t)
+
+			upd, cmd := tc.run(m, oldID)
+			got := upd.(Model)
+			if cmd == nil {
+				t.Fatalf("the first press raised no command: %q", got.message)
+			}
+			if !got.sending[oldID] {
+				t.Fatal("the overlay door took no claim")
+			}
+			upd, cmd = tc.run(got, oldID)
+			if cmd != nil {
+				t.Fatal("a row already in flight was answered a second time from the overlay")
+			}
+			if msg := upd.(Model).message; !strings.Contains(msg, "already being answered") {
+				t.Errorf("banner = %q, want the in-flight refusal", msg)
+			}
+		})
+	}
+}
+
+// And their results release the claim, like every other path.
+func TestTheDetailOverlayDoorsReleaseTheirClaims(t *testing.T) {
+	m, _, _, oldID, _ := escalationsModel(t)
+
+	upd, cmd := m.confirmIDWithoutSend(oldID)
+	m = upd.(Model)
+	res, ok := cmd().(actionResultMsg)
+	if !ok || len(res.sent) != 1 || res.sent[0] != oldID {
+		t.Fatalf("the overlay confirm must carry its own claim, got %+v", res)
+	}
+	upd, _ = m.Update(res)
+	if upd.(Model).sending[oldID] {
+		t.Error("the overlay confirm leaked its claim")
 	}
 }
 
