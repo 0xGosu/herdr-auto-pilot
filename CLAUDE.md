@@ -1336,6 +1336,46 @@ whose manifest carries exactly that version).
   under `<state>/match-index` is a disposable cache (mem-only scorch does NOT serve KNN — keep
   it disk-backed). Embed calls are stall-guarded and latch a degraded mode after 5 consecutive
   failures (a fixed constant, not configurable).
+- **Learned signatures are FLEET-WIDE, and the embedding model's id is the only thing that
+  scopes them** — `signatures`, `signature_embeddings` and `signature_snapshots` carry NO
+  `node_id` (one row per rule, keyed by the signature), and `decisions` is deliberately absent
+  from `nodeScopedTables` so `CountDecisionsForSignature` graduates a rule on the fleet's
+  evidence rather than one machine's. Exact hash and BM25 are model-independent and therefore
+  cross-machine by construction; a peer's newly learned rule becomes matchable HERE through
+  `fleetPull` → `RefreshKnowledge`, which re-runs `reembed.Reconcile` and republishes the whole
+  bleve index (rebuilding from the store, rather than adding rows, is also what makes a rule
+  DELETED elsewhere disappear here). Do not add a `node_id` to any of them.
+  - **`embedder.ModelIDFor` is therefore a fleet-wide identity, and both halves are
+    load-bearing.** It digests the model FILE. `filepath.Base` failed BOTH ways at once, and
+    both failures are silent. *Not unique enough*: two genuinely different 384-dimension models
+    each installed as `model.gguf` reported the same id, so `Reconcile`'s skip condition
+    (`r.Model == emb.ModelID() && len(r.Vector) == res.Dims`) KEPT the foreign vector and cosine
+    then compared vectors from unrelated models — a hazard no equality filter downstream can
+    catch, because the strings agree. *Not stable enough*: one operator pointing
+    `[embedding] model_path` at a renamed copy of the bundled model gave that node a different
+    id for the same model, so each node read the other's rows as stale, re-embedded them and
+    pushed them back — an unbounded rewrite ping-pong through Turso Cloud (every store write
+    arms the 2s-debounced push) plus a permanent "N rules need re-compute" nag in every TUI.
+    Hence the id carries no file name at all. Unreadable falls back to the base name, never `""`:
+    an empty id compares unequal to every stored row, so a model-less install would report drift
+    no re-embed could clear — and that fallback is NOT cached, or an install whose model arrives
+    later keeps the legacy scheme for the life of the process.
+  - **Anything that compares a stored row's model must resolve the id the SAME way.**
+    `frontend.embeddingDrift` computes it from the path with no embedder in hand, so it calls
+    `embedder.ModelIDFor` rather than taking the base name itself; the two drifting apart is
+    silent and permanent (every row reads stale forever, and `hap signatures reembed` re-embeds
+    every rule on every run without ever clearing it — the trap
+    `store.CountStaleSignatureEmbeddings`'s comment describes). `EmbeddingDrift.ModelName` is a
+    DISPLAY field only; `ModelID` is the comparison key. Keep
+    `TestDriftUsesTheEmbeddersOwnModelIdentity` (proved by mutation),
+    `TestTwoDifferentModelsWithTheSameFileNameGetDifferentIDs`,
+    `TestTheSameModelAtDifferentPathsGetsTheSameID` and `TestTheFallbackIsNotLatched`.
+  - Known and NOT fixed: a fleet whose nodes run genuinely different models, or disagree on
+    `embedding.min_salient_chars`, still ping-pongs — `Reconcile` rewrites peers' rows on every
+    pull, and the below-floor stripping loop (which runs ahead of the warm gate) does the same.
+    The vector is stored per SIGNATURE, not per (signature, model), so ignoring foreign rows at
+    match time instead would confine cosine to rows each node embedded itself. A uniform fleet —
+    every install running the bundled model — is unaffected either way.
 - **A short PANE-TAIL salient is never embedded — on EITHER side of the comparison** — below
   `embedding.min_salient_chars` (default 100, on the masked salient) matching uses BM25 instead.
   **STRUCTURED salients are exempt at any length, and that exemption is load-bearing**: they are

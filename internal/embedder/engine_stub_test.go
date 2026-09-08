@@ -4,6 +4,7 @@ package embedder
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -28,8 +29,20 @@ func TestStubEngineUnavailable(t *testing.T) {
 	if !l.Degraded() {
 		t.Error("Degraded() = false, want true (the stub can never serve an embed)")
 	}
-	// ModelID still resolves for diagnostics/persistence scoping.
+	// ModelID still resolves for diagnostics/persistence scoping. The path does
+	// not exist, so this is ModelIDFor's unreadable fallback.
 	if l.ModelID() != "custom-model.gguf" {
 		t.Errorf("ModelID() = %q, want custom-model.gguf", l.ModelID())
+	}
+}
+
+// TestStubModelIDIsContentDerived: the stub never embeds, but it shares the
+// identity helper so `hap status` on a no-CGO build reports the same id a real
+// build would.
+func TestStubModelIDIsContentDerived(t *testing.T) {
+	path := writeModel(t, t.TempDir(), "model.gguf", "stub model weights")
+	got := NewEngine(config.Embedding{ModelPath: path}).ModelID()
+	if !strings.HasPrefix(got, modelIDPrefix) {
+		t.Fatalf("stub ModelID() = %q, want a content id", got)
 	}
 }

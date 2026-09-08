@@ -19,6 +19,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
@@ -114,18 +115,21 @@ func writeEmbeddingConfig(t *testing.T, app *frontend.App) string {
 func TestEmbeddingDrift(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
-	writeEmbeddingConfig(t, app)
+	modelPath := writeEmbeddingConfig(t, app)
+	// The comparison key is the model's CONTENT id, not its file name — a row is
+	// current only if it was minted by the same identity the embedder reports.
+	liveModel := embedder.ModelIDFor(modelPath)
 
 	// No rows yet: no drift.
 	d, err := app.EmbeddingDrift(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.Detected || d.ModelMissing || d.ModelID != "test-model.gguf" {
+	if d.Detected || d.ModelMissing || d.ModelID != liveModel || d.ModelName != "test-model.gguf" {
 		t.Errorf("empty store must not drift: %+v", d)
 	}
 
-	seedEmbeddingRow(t, st, "current", "test-model.gguf", []float32{1, 0, 0})
+	seedEmbeddingRow(t, st, "current", liveModel, []float32{1, 0, 0})
 	seedEmbeddingRow(t, st, "legacy", "old-model.gguf", []float32{1, 0})
 	d, err = app.EmbeddingDrift(ctx)
 	if err != nil {
@@ -167,6 +171,36 @@ func TestEmbeddingDrift(t *testing.T) {
 	}
 	if d.Detected || d.ModelID != "" {
 		t.Errorf("disabled embedding must report zero drift: %+v", d)
+	}
+}
+
+// TestDriftUsesTheEmbeddersOwnModelIdentity: the drift check and the embedder
+// must resolve the model id the SAME way. They are computed in different
+// packages from the same path, so it is easy to move one and not the other —
+// and the failure is silent and permanent: every stored row reads stale, the
+// TUI nags forever, and `hap signatures reembed` re-embeds every rule on every
+// run without ever clearing it (the trap store.CountStaleSignatureEmbeddings
+// documents). Seeding the row with the EMBEDDER's id and asserting no drift is
+// what pins the two together.
+func TestDriftUsesTheEmbeddersOwnModelIdentity(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	modelPath := writeEmbeddingConfig(t, app)
+
+	// The id the production embedder would persist for this model.
+	minted := embedder.New(config.Embedding{ModelPath: modelPath}).ModelID()
+	seedEmbeddingRow(t, st, "minted-by-the-embedder", minted, []float32{1, 0, 0})
+
+	d, err := app.EmbeddingDrift(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.Stale != 0 || d.Detected {
+		t.Fatalf("a row minted by the live embedder reads as drifted: %+v (drift id %q vs embedder id %q)",
+			d, d.ModelID, minted)
+	}
+	if d.ModelName != "test-model.gguf" {
+		t.Errorf("ModelName = %q, want the readable file name for display", d.ModelName)
 	}
 }
 
@@ -217,11 +251,13 @@ func TestRequestReembedRequiresDaemon(t *testing.T) {
 func TestReembedStandalone(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
-	writeEmbeddingConfig(t, app)
+	liveModel := embedder.ModelIDFor(writeEmbeddingConfig(t, app))
 	seedEmbeddingRow(t, st, "legacy", "old-model.gguf", []float32{1, 0})
-	seedEmbeddingRow(t, st, "current", "test-model.gguf", []float32{1, 0, 0})
+	// The "current" row and the fake embedder both carry the model's CONTENT id
+	// — what a real embedder reports and what the drift check compares against.
+	seedEmbeddingRow(t, st, "current", liveModel, []float32{1, 0, 0})
 	app.NewEmbedder = func(config.Embedding) ports.EmbedderPort {
-		return &fakeEmbedder{dims: 3, id: "test-model.gguf"}
+		return &fakeEmbedder{dims: 3, id: liveModel}
 	}
 
 	// Refused while a daemon runs (it owns signature_embeddings writes).

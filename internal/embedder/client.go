@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -302,8 +301,10 @@ func (c *Client) Diagnostics() Diagnostics {
 	return d
 }
 
-// ModelID identifies the loaded model for persistence scoping.
-func (c *Client) ModelID() string { return filepath.Base(c.modelPath) }
+// ModelID identifies the loaded model for persistence scoping, by its CONTENT
+// rather than its file name — see ModelIDFor. Client is the daemon's production
+// embedder, so this is the id that actually reaches signature_embeddings.model.
+func (c *Client) ModelID() string { return ModelIDFor(c.modelPath) }
 
 // Dims is the embedding dimensionality (0 before the first successful embed).
 func (c *Client) Dims() int { return int(c.dims.Load()) }

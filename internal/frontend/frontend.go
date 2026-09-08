@@ -423,13 +423,21 @@ func (a *App) embeddingStatus(ctx context.Context, cfg config.Config) string {
 
 // EmbeddingDrift reports whether stored signature embeddings were produced
 // by a different model than the currently configured one. Detection is by
-// model id (gguf basename): replacing the model file IN PLACE under the
-// same name is not detected here (a dims change is still caught by the
-// daemon's reconcile at its next index init; a same-dims in-place swap
-// silently mixes vector spaces).
+// model id, which is a digest of the model FILE (embedder.ModelIDFor) — so
+// two different models installed under the same name no longer read as one.
+// The id is resolved once per path per process, so replacing the model file IN
+// PLACE is still not detected until the next start or `[embedding]` reload (a
+// dims change is caught by the daemon's reconcile at its next index init; a
+// same-dims in-place swap silently mixes vector spaces).
+//
+// ModelID must be resolved the SAME way the embedder resolves its own, or every
+// stored row reads stale forever and no re-embed can clear it — the permanent
+// drift the store's CountStaleSignatureEmbeddings comment warns about. That is
+// why this calls embedder.ModelIDFor rather than taking the base name itself.
 type EmbeddingDrift struct {
 	Detected     bool   // stale rows exist and embedding is enabled
-	ModelID      string // basename of the resolved model path
+	ModelID      string // content identity of the resolved model (comparison key)
+	ModelName    string // base name of the resolved model path (for display)
 	ModelMissing bool   // model file absent — a re-embed cannot run yet
 	Total        int64  // all signature_embeddings rows
 	Stale        int64  // rows a re-embed would rewrite
@@ -452,7 +460,8 @@ func (a *App) embeddingDrift(ctx context.Context, cfg config.Config) (EmbeddingD
 		return d, nil
 	}
 	modelPath := embedder.ResolveModelPath(cfg.Embedding)
-	d.ModelID = filepath.Base(modelPath)
+	d.ModelID = embedder.ModelIDFor(modelPath)
+	d.ModelName = filepath.Base(modelPath)
 	if _, err := os.Stat(modelPath); err != nil {
 		d.ModelMissing = true
 	}

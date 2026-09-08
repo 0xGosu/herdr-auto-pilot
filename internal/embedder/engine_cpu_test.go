@@ -166,13 +166,41 @@ func TestEmbedMissingModelDegrades(t *testing.T) {
 	}
 }
 
-func TestModelIDIsBasename(t *testing.T) {
-	l := NewEngine(config.Embedding{ModelPath: "/x/y/custom-model.gguf"})
+// TestModelIDFallsBackToTheBasename covers the UNREADABLE branch: the path does
+// not exist, so the id is the file name (see ModelIDFor — a model-less install
+// must keep its previous behaviour rather than report an id nothing can ever
+// match). An empty ModelPath still reaches the engine as the bundled default;
+// that is asserted on the PATH rather than on the id, because whether that file
+// happens to be present is what decides which branch the id takes — and
+// ResolveModelPath's own resolution rules are covered by
+// TestResolveModelPathExpandsAndFallsBack.
+func TestModelIDFallsBackToTheBasename(t *testing.T) {
+	l := NewEngine(config.Embedding{ModelPath: filepath.Join(t.TempDir(), "custom-model.gguf")})
 	if l.ModelID() != "custom-model.gguf" {
 		t.Errorf("ModelID = %q", l.ModelID())
 	}
 	def := NewEngine(config.Embedding{})
-	if def.ModelID() != DefaultModelFile {
-		t.Errorf("default ModelID = %q, want %q", def.ModelID(), DefaultModelFile)
+	if def.modelPath != ResolveModelPath(config.Embedding{}) {
+		t.Errorf("engine model path = %q, want the resolved default %q",
+			def.modelPath, ResolveModelPath(config.Embedding{}))
+	}
+	if filepath.Base(def.modelPath) != DefaultModelFile {
+		t.Errorf("default model file = %q, want %q", filepath.Base(def.modelPath), DefaultModelFile)
+	}
+}
+
+// TestEngineModelIDIsContentDerived pins the engine's wiring to ModelIDFor:
+// two models that differ only in their CONTENT must not share an id, which is
+// the whole point (see modelid.go).
+func TestEngineModelIDIsContentDerived(t *testing.T) {
+	a := writeModel(t, filepath.Join(t.TempDir(), "a"), "model.gguf", "engine model A")
+	b := writeModel(t, filepath.Join(t.TempDir(), "b"), "model.gguf", "engine model B")
+	ida := NewEngine(config.Embedding{ModelPath: a}).ModelID()
+	idb := NewEngine(config.Embedding{ModelPath: b}).ModelID()
+	if ida == idb {
+		t.Fatalf("two different models share the engine id %q", ida)
+	}
+	if !strings.HasPrefix(ida, modelIDPrefix) {
+		t.Fatalf("engine ModelID = %q, want a content id", ida)
 	}
 }
