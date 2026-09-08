@@ -4191,6 +4191,10 @@ func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
 	// Nothing below this point reads the source's config, so refusing a fleet
 	// row here left an advertised key dead on every remote list, and said
 	// "no longer loaded" about one that was on screen.
+	// Unlike the other three fleet call sites, this one needs no branch for the
+	// synthetic error group FleetTaskGroups returns when the store cannot be
+	// read: its only rows are a header and an error line, both with item 0, so
+	// the guard above has already refused them.
 	g, ok := m.taskGroupAt(r.group)
 	if !ok {
 		m.message = "this task source is no longer loaded — refreshing"
