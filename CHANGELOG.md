@@ -8,6 +8,17 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.3
+
+- Added `llm.reranking_command`: an optional LLM judge that re-ranks the learned rules an embedding search found. With it set, `embedding.similarity_threshold` becomes a filter rather than the decision — every rule at or above it is shown to the judge, which answers with the ones that genuinely match, and hap uses the first. An empty answer means no rule matches, so the situation is learned as new instead of inheriting a rule that only looked similar; the BM25 text fallback is skipped there, since it would otherwise re-admit the rule the judge just refused. Off by default, and a judge that fails, times out or answers unparseably falls back to the match hap would have made without it, so a broken judge never costs you a rule you already taught it.
+- Added `llm.reranking_top_k` (3), `llm.relevance_score_threshold` (0.95), `llm.reranking_max_candidates` (10) and `llm.reranking_timeout_seconds` (30), plus `--preset claude` / `--preset codex` recipes and a `reranking_command` scope for `hap config env`. The re-ranking timeout deliberately does not inherit `timeout_seconds`: the agent stays parked and unanswered while the judge runs.
+- Added a `hap status` line naming the re-ranking settings in force, and an escalation raised because the judge refused every candidate now reports `rerank_veto` in `hap audit` — otherwise a veto is indistinguishable from nothing having matched.
+- Changed the re-ranking judge to stay silent while the herd is paused: the kill switch is checked before the judge is launched, so pausing stops it spending tokens on decisions that escalate anyway.
+- Changed a re-ranking verdict that was still being computed when the config reloaded or a fleet sync brought new rules to be discarded rather than applied: it answers a question that no longer stands, and the decision falls back to the match hap would have made without the judge.
+- Changed the shipped judge recipes to grant the run nothing: the claude preset now passes `--tools ""` so Claude's built-in tools are removed outright, alongside `--strict-mcp-config`, and the codex one runs read-only. The judge answers from its prompt alone but runs in the monitored agent's own project directory, so the grant is closed rather than merely unused.
+- Changed the re-ranker to use the judge's whole ranked answer rather than only its top pick: the judge scores how well a rule fits the screen and cannot see whether that rule has graduated, so its best match is often one hap may not act on yet. Each rule it affirmed is now tried in order and the first that resolves on its own is used; when none can, the best match is still what you are asked about. No safety control is skipped along the way — the kill switch, never-auto patterns, the irreversible-command heuristic and the rate guard refuse every candidate or none.
+- Changed `llm.reranking_max_candidates` to default to 20 (was 10), so the judge sees a deeper field and has more to fall back to, and `llm.reranking_top_k` is now refused below 1 — omit the key to get the default of 3.
+
 ## 0.9.2
 
 - Added immediate feedback on the Escalations tab when you answer a row. The
