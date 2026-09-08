@@ -1181,6 +1181,145 @@ whose manifest carries exactly that version).
     `…NeverDeletesTheNewestKillEvent` / `…KeepsAnUnconfirmedReservation` /
     `…KeepsACorrectionItsActionStillReferences` / `…FloorsAnAggressiveCutoff` /
     `TestZeroRowRetentionStillSparesLiveWork` / `TestRowRetentionOffKeepsEveryFinishedRow`.
+- **An LLM judge may only ever NARROW what cosine already admitted, and it may
+  never run on the select loop** — `llm.reranking_command` (off by default) turns
+  `embedding.similarity_threshold` into a FILTER: every candidate at or above it is
+  listed for a one-shot CLI, which returns `[{"id": n, "score": s}]` ordered by
+  relevance and hap WALKS it. Six bounds are load-bearing:
+  - **The judge ranks by RELEVANCE and cannot see a rule's learned STATE, so the head is
+    not always actionable.** Its best match is routinely one hap may not act on — shadow
+    mode, below its confidence threshold, an option the screen no longer offers — and only
+    `domain.Decide` knows. `walkRankedDecision` therefore tries each affirmed rule in order
+    and takes the first whose decision is not an escalation; when none is, the HEAD
+    escalates, because that is the rule the operator should be asked about. This cannot
+    loosen a safety control by construction: every gate that does not depend on the
+    SIGNATURE — kill switch, never-auto, suspected-irreversible, rate guard — is fixed in
+    the shared `DecideInput` and vetoes every candidate or none, so the walk lands back on
+    the head. Only the learning-derived refusals vary, which is exactly what it is for.
+    `llm.reranking_top_k` is the DEPTH of that walk, not just a prompt cap, which is why
+    `hap config set` refuses anything below 1 (0 is not "use the default" here) and
+    `RerankTopK` floors an omitted or hand-edited value. Rule provenance is written after
+    the walk, for the rule that ACTED, not for every candidate it looked at. Keep
+    `TestTheEngineFallsBackToALowerRankedRule` / `TestTheBestMatchIsWhatEscalatesWhenNothingCanAct` /
+    `TestASingleRankedRuleBehavesExactlyAsBefore` / `TestTheWalkNeverOutrunsASafetyVeto`.
+  - **The kill switch is asked for HERE, not inherited.** Every other LLM subprocess in
+    the daemon is reached only because `Decide` asked for it, and `Decide` already has
+    `killActive` from `readDecisionState` — but `startRerank` spawns BEFORE that read, so
+    an ungated judge leaves a PAUSED herd launching a subprocess per attention event per
+    parked agent, for decisions that escalate regardless. Refusing is not a degrade: the
+    caller carries on with the cosine fallback, which is what hap answered before this
+    feature existed. A read error refuses too, for the same reason auto-accept's kill
+    re-check fails closed. Keep `TestAPausedHerdNeverSpawnsTheJudge`.
+  - **The resume re-reads the pane, and its drop is SILENT** — `rerankSituationHeldStill`
+    discards the decision and logs one INFO line, leaving the pane to the next attention
+    event. That is the right direction (the alternative resumes a 30-second-old decision
+    into a live menu) but it is also the branch most able to disable the feature without
+    anyone noticing, so it is covered directly rather than through the pipeline tests,
+    which only ever exercise the pass. It carries `handleActionReviewOutcome`'s asymmetry:
+    idle matches on situation TYPE alone, because an idle signature hashes a masked
+    content head that legitimately differs between the original `--source recent` capture
+    and this `--source visible` re-read — comparing signatures there drops every idle
+    resume. The transition's status falls back to the situation's own, since an empty one
+    would mismatch on type and drop everything while every test still passed. Keep
+    `TestARerankResumeDropsAPaneThatMovedOn` / `…ToleratesIdleDrift`.
+  - **A vector-search ERROR is not a cosine miss.** `cosineRerankPass` reports (judged,
+    missed) separately for exactly this: `bm25RetryAllowed` refuses a text retry for any
+    STRUCTURED salient cosine has REFUSED, so collapsing a transient KNN failure into
+    "cosine missed" mints a new key for every approval, choice and error screen — the very
+    population this feature targets. `MatchVector`'s own error branch has always left
+    `cosineMissed` false; this keeps that.
+  - **The candidate set is accept-filtered BEFORE the judge sees it.** The same
+    closure `resolveSignatureN`'s cosine pass uses — the `min_salient_chars` veto plus
+    `remapAllowed`/`ApprovalRemapCompatible` — gates `matcher.VectorCandidates`, so the
+    judge can never pick a candidate the ordinary pass would have refused. Those gates
+    exist because similarity alone bridges two different approval screens that share a
+    verb (#155); delegating them to a model puts the wrong answer into a pane.
+  - **An EMPTY verdict is TERMINAL and skips BM25.** Step 4 of the chain runs "equally
+    when the vector search ran cleanly but found nothing above similarity_threshold", so
+    a veto that fell through is re-admitted by text and the feature is a no-op that looks
+    like it works. `finishRerank` mints instead (`MatchRerankVeto`).
+  - **A judge FAILURE is not a veto.** Missing binary, timeout, non-zero exit, prose with
+    no array, a duplicate or out-of-range id all degrade to the answer step 3 would have
+    given (`fallback`, computed BEFORE the run so no error path reconstructs it). The veto
+    is an empty array — AND equally a verdict whose every entry scored below
+    `relevance_score_threshold`, which is the same statement. `domain.ErrNoRerankVerdict`
+    is the sentinel keeping the two apart, and `lastJSONArray` only accepts a region that
+    already unmarshals as `[{id, score}]`, so prose brackets are never an answer; the one
+    exception is an empty bracket pair, which under last-wins turns an earlier answer into
+    a veto — the safe direction, since a veto escalates.
+  - **It CANNOT run inline.** `resolveSignature` is called from `decideAndAct` on the
+    daemon select loop, which serves every agent — the reason the embed call has
+    `embed_timeout_ms` and the BM25 pass has `bm25MatchTimeout`. So the cosine pass
+    returns a `rerankPlan`, `decideAndAct` suspends, and `handleRerankOutcome` re-enters
+    `decideAndActResolved`. One flight per agent keyed on `sig.Raw` (there is no learning
+    key yet — resolving it is what the run is for), superseded on a different raw and
+    cancelled wherever a pending capture is (`working`, human interaction, pane recycle,
+    `detected`); a token check drops a stale verdict, and `rerankSituationHeldStill`
+    re-reads the pane on resume the way `handleActionReviewOutcome` does — the judge holds
+    the decision for up to 30s, and what resumes can reach `act()`, which maps a learned
+    label to a menu digit against the CAPTURED content. `handleRerankOutcome` also re-asks
+    `RerankingConfigured`, so a verdict already in flight when the operator turned the
+    feature off degrades instead of vetoing. `rerankOutcome` carries `fallback` AND
+    `original` because they are not interchangeable: a veto mints from the ORIGINAL, and
+    minting from the fallback persists the raw hash while returning the candidate the
+    judge just refused.
+  - **Only an ESCALATION row carries `match_method`** (`daemon.escalate`, the sole writer),
+    which predates this feature — so `MatchRerankVeto` is visible in `hap audit` while
+    `MatchRerank` on a delivered row is not. The chosen-rule case is covered by the audit
+    row's `signature` (it names the rule the judge picked) plus one Debug line; do not
+    "fix" this by adding provenance to the auto path without deciding what that does for
+    every existing cosine/bm25 delivery too.
+  - **An IN-FLIGHT run is invalidated by the same events the cache is** (`invalidateRerank`,
+    called from `reloadWith` and `RefreshKnowledge`). Clearing only the cache leaves the
+    hole in its most confusing form: a run started under the old command, prompt or
+    threshold finishes seconds later, passes the per-agent token check — which is about
+    SUPERSESSION, not staleness — applies its answer, and REPOPULATES the cache that was
+    just emptied. A refresh can also DELETE the very rule the verdict names. Each flight
+    carries the `rerankGen` it started under and `handleRerankOutcome` degrades an older
+    one to the cosine fallback. It degrades rather than CANCELS on purpose: a reload
+    follows every `hap config set`, and cancelling would drop a pending decision outright
+    instead of answering it the way an unjudged daemon would.
+    **Two bounds make the counter actually work, and both were proved by mutation.**
+    `invalidateRerank` bumps UNCONDITIONALLY — no "nothing to invalidate" fast path — because
+    a verdict IN TRANSIT is in neither map: `handleRerankOutcome` removes the flight before
+    its visible-pane read, a herdr shell-out wide enough for the fleet-sync goroutine's
+    `RefreshKnowledge` to land inside, and an idle check would then see two empty maps, skip
+    the bump, and let the pre-refresh verdict commit against a generation that never moved.
+    And the generation check and the cache write are ONE critical section
+    (`commitRerankVerdict`): split, an invalidation landing between them commits and caches a
+    pre-invalidation verdict anyway, which no fast-path change reaches. `finishRerank` runs
+    outside the lock on a verdict that was current at that instant — what a linearization
+    point means. `cancelRerank` keeps its own fast path: it is per-EVENT and keyed on one
+    agent, where a missing entry really does mean nothing to cancel. Keep
+    `TestAnInvalidatedVerdictIsNeitherAppliedNorCached` and its control
+    `TestACurrentVerdictIsStillAppliedAndCached` (without the control the first passes on
+    an implementation that discards every verdict) /
+    `TestARefreshLandingInsideTheResumeStillInvalidatesTheVerdict` (deterministic, via the
+    fake herdr's read gate) / `TestTheGenerationCheckAndTheCacheWriteAreOneCriticalSection`.
+  - **The verdict cache keys on the RENDERED listing, never the candidate signatures.**
+    A parked pane re-captures on every attention event, so a cache is required — but the
+    listing carries each rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what
+    makes the judge say "yes, reuse this", and all of those move under an UNCHANGED
+    signature set every time a decision is recorded. Keying on the set alone serves a
+    rule's pre-correction verdict until the set itself happens to change. Cleared on ANY
+    reload and on `RefreshKnowledge`, unconditionally — never gated on a section compare
+    the way `reloadEmbedder`'s port swap is, or turning the judge off and on again
+    resurrects the answers it gave before.
+
+  `match.VectorCandidates` exists for this and re-expresses `MatchVector` rather than
+  duplicating it: `MatchVector`'s "return the first accepted candidate" is sound only
+  because the list is in descending cosine, so first-acceptable is also highest-scoring
+  and one threshold test over the returned hit is correct — a re-ranker breaks that, so
+  the threshold moves to a caller that sees every candidate. Keep
+  `TestRerankingOffLeavesTheChainUnchanged` (if any pre-existing semantic test needs its
+  expectations edited, the gating is wrong) /
+  `TestRerankEmptyVerdictMintsANewSignatureAndSkipsBM25` /
+  `TestRerankJudgeFailureDegradesToCosine` / `TestRerankCandidatesAreAcceptFilteredBeforeTheJudge` /
+  `TestRerankDoesNotStallTheSelectLoop` / `TestRerankVerdictIsCachedPerCandidateSet` /
+  `TestRerankNeverRunsWithoutACandidateAboveThreshold` / `TestRerankJudgesASingleCandidate`,
+  and in `internal/domain` the `ParseRerankVerdict` table (whose two decisive rows are
+  "empty array" and "prose with no array" — the same output to a careless reader, opposite
+  outcomes here).
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).

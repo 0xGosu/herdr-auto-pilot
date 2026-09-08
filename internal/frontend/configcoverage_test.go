@@ -37,6 +37,7 @@ var configListCommands = map[string]string{
 	"llm.command_env":                 "hap config env set command",
 	"llm.task_generate_command_env":   "hap config env set task_generate_command",
 	"llm.learn_from_user_command_env": "hap config env set learn_from_user_command",
+	"llm.reranking_command_env":       "hap config env set reranking_command",
 }
 
 // configListsExemptFromCLI are list sections deliberately without a command.

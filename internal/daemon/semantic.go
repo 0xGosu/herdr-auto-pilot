@@ -143,22 +143,67 @@ func bm25RetryAllowed(sig domain.SignatureResult, cosineMissed bool) bool {
 	return !cosineMissed || !domain.StructuredSalient(sig.Salient)
 }
 
-// resolveSignature maps a freshly computed signature to its learning key:
+// rerankPlan carries everything a deferred LLM-as-a-judge run needs, so the
+// goroutine that runs the judge holds no matcher, store or embedder state.
+//
+// It exists because resolveSignature runs ON THE DAEMON SELECT LOOP. Every step
+// of the chain is either pure or stall-guarded for exactly that reason (the
+// embed call has embed_timeout_ms, the BM25 pass has bm25MatchTimeout), and a
+// subprocess with a 30-second budget cannot be one of them: it would hold up
+// every other agent's transitions for the length of the run. So the cosine pass
+// stops here, hands back the plan, and the decision resumes on the outcome
+// channel — the same shape startActionReview uses for the pre-delivery review.
+type rerankPlan struct {
+	// candidates are the accept-filtered hits at or above similarity_threshold,
+	// in descending cosine, already numbered 1..N for the judge.
+	candidates []domain.RerankCandidate
+	// rendered is the exact listing the judge is shown. It is both the
+	// {candidates} substitution and the verdict cache key's input, so the two
+	// can never describe different prompts.
+	rendered string
+	// vec / vecModel are carried so an EMPTY verdict can mint the signature with
+	// its vector, exactly as the no-match path does. Without them a vetoed
+	// situation would be persisted vectorless and could never become a cosine
+	// candidate for anything later.
+	vec      []float32
+	vecModel string
+}
+
+// resolveSignature maps a freshly computed signature to its learning key.
+//
+// It is the wrapper every non-rerank caller uses: it runs the whole chain and
+// discards the deferral, which is what an un-configured judge always produces.
+// See resolveSignatureN for the chain itself.
+func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
+	sig domain.SignatureResult, s domain.Situation) domain.SignatureResult {
+
+	resolved, _, _ := d.resolveSignatureN(ctx, cfg, sig, s)
+	return resolved
+}
+
+// resolveSignatureN is resolveSignature plus the LLM-as-a-judge deferral:
 //
 //  1. over-masked, semantic disabled, or index not ready → unchanged;
 //  2. the exact hash key already exists → unchanged (no embed call);
 //  3. embedder available: cosine match ≥ similarity_threshold within the
 //     (situation type, agent type) scope → remap onto the matched key;
+//     3b. with llm.reranking_command set, the threshold is a FILTER instead:
+//     every candidate at or above it is collected and either answered from
+//     the verdict cache or returned as a plan for the caller to judge
+//     off-loop. The returned signature is what step 3 WOULD have chosen, so
+//     a judge that never runs — or fails — costs nothing;
 //  4. cosine did not match — because it was skipped (floor), unavailable,
 //     errored, OR ran cleanly and found nothing above the threshold — BM25
 //     match ≥ bm25_min_score → remap;
 //  5. no match → keep the raw hash as a NEW key and persist its semantic
 //     identity (salient + vector when available) for future matching.
 //
-// Every failure degrades toward exact-hash behavior — never blocks a
-// decision, never panics (fail-safe rule).
-func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
-	sig domain.SignatureResult, s domain.Situation) domain.SignatureResult {
+// A non-nil plan means "this is provisional": the caller must run the judge and
+// finish through finishRerank, or use the returned signature as-is. Every
+// failure degrades toward exact-hash behavior — never blocks a decision, never
+// panics (fail-safe rule).
+func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
+	sig domain.SignatureResult, s domain.Situation) (domain.SignatureResult, []domain.SignatureResult, *rerankPlan) {
 
 	if sig.Signature == "" || cfg.Embedding.Disabled || !d.semanticReady.Load() {
 		// Non-empty signature with semantic off/not-ready: matching is
@@ -166,7 +211,7 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 		if sig.Signature != "" {
 			sig.Match.Method = domain.MatchExact
 		}
-		return sig
+		return sig, nil, nil
 	}
 
 	existing, err := d.opt.Store.GetSignature(ctx, sig.Raw)
@@ -174,11 +219,11 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 		// Read failed before any match ran: leave MatchNone so we don't assert
 		// an "exact" match that was never actually checked.
 		slog.Warn("semantic resolve: signature read failed; using hash key", "error", err)
-		return sig
+		return sig, nil, nil
 	}
 	if existing != nil {
 		sig.Match.Method = domain.MatchExact // known situation: cheap deterministic fast path
-		return sig
+		return sig, nil, nil
 	}
 
 	scope := match.Scope{SituationType: s.Type, AgentType: s.AgentType}
@@ -233,6 +278,13 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 			// That is the floor's documented shape ("reachable by BM25 and by
 			// exact hash"), not a leak: BM25 needs real shared terms, where a
 			// near-empty embedding matches anything.
+			//
+			// The SAME closure gates the re-ranking candidate set below. That is
+			// load-bearing rather than tidy: the judge must never be able to pick
+			// a candidate this filter would have refused — remapAllowed carries
+			// ApprovalRemapCompatible, so without it the judge could merge two
+			// approval screens that merely share a verb and hap would type one
+			// screen's answer into the other.
 			accept := func(h match.Hit) bool {
 				if !domain.EmbeddableSalient(h.Salient, cfg.Embedding.MinSalientChars) {
 					slog.Debug("vector candidate below min_salient_chars; skipped",
@@ -241,39 +293,54 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 				}
 				return remapAllowed(s, sig, h)
 			}
-			hit, ok, err := d.matcher.MatchVector(ctx, vec, scope, accept)
-			switch {
-			case err != nil:
-				// Not fatal: the BM25 pass below runs unconditionally, so a
-				// degraded latch or a text-only build where KNN is unavailable
-				// still gets a text match. vec is deliberately NOT cleared —
-				// the embedding itself succeeded, and the row minted below only
-				// carries a vector when vec is non-nil. Clearing it here would
-				// persist a vectorless row on a transient search error, leaving
-				// this signature invisible to cosine until a later daemon start
-				// re-embedded it (reembed.Reconcile).
-				slog.Warn("vector match failed; trying text match", "error", err)
-			case ok && hit.Score >= cfg.Embedding.SimilarityThreshold:
-				// Debug: a routine cache hit, emitted once per classification.
-				// At Info it was the single most common line in the log (167 of
-				// 735 in a live sample) and said only "the matcher worked".
-				slog.Debug("semantic match: reusing learned signature",
-					"signature", hit.Signature, "cosine", hit.Score, "raw", sig.Raw)
-				sig.Signature = hit.Signature
-				sig.Match.Method = domain.MatchCosine
-				sig.Match.Score = hit.Score
-				return sig
-			default:
-				// Cosine ran and found nothing usable — no candidate survived
-				// the accept filter, or the best one scored below the
-				// threshold. This used to fall straight through to minting a
-				// new key, silently and without a log line; it now retries by
-				// text below. hit is the zero value when ok is false, so
-				// best_cosine reads 0 there.
-				cosineMissed = true
-				slog.Debug("no cosine match; trying text match",
-					"best_cosine", hit.Score, "accepted", ok,
-					"threshold", cfg.Embedding.SimilarityThreshold, "raw", sig.Raw)
+			if cfg.RerankingConfigured() {
+				resolved, ranked, plan, judged, missed := d.cosineRerankPass(ctx, cfg, sig, s, scope, vec, vecModel, accept)
+				if judged {
+					return resolved, ranked, plan
+				}
+				// missed is true ONLY when the search ran cleanly and found
+				// nothing above the threshold — the ordinary cosine miss. A
+				// search ERROR leaves it false, exactly as MatchVector's error
+				// branch does below, because bm25RetryAllowed refuses a text
+				// retry for a STRUCTURED salient cosine has REFUSED: reporting a
+				// transient KNN failure as a refusal would mint a new key for
+				// every approval, choice and error screen.
+				cosineMissed = missed
+			} else {
+				hit, ok, err := d.matcher.MatchVector(ctx, vec, scope, accept)
+				switch {
+				case err != nil:
+					// Not fatal: the BM25 pass below runs unconditionally, so a
+					// degraded latch or a text-only build where KNN is unavailable
+					// still gets a text match. vec is deliberately NOT cleared —
+					// the embedding itself succeeded, and the row minted below only
+					// carries a vector when vec is non-nil. Clearing it here would
+					// persist a vectorless row on a transient search error, leaving
+					// this signature invisible to cosine until a later daemon start
+					// re-embedded it (reembed.Reconcile).
+					slog.Warn("vector match failed; trying text match", "error", err)
+				case ok && hit.Score >= cfg.Embedding.SimilarityThreshold:
+					// Debug: a routine cache hit, emitted once per classification.
+					// At Info it was the single most common line in the log (167 of
+					// 735 in a live sample) and said only "the matcher worked".
+					slog.Debug("semantic match: reusing learned signature",
+						"signature", hit.Signature, "cosine", hit.Score, "raw", sig.Raw)
+					sig.Signature = hit.Signature
+					sig.Match.Method = domain.MatchCosine
+					sig.Match.Score = hit.Score
+					return sig, nil, nil
+				default:
+					// Cosine ran and found nothing usable — no candidate survived
+					// the accept filter, or the best one scored below the
+					// threshold. This used to fall straight through to minting a
+					// new key, silently and without a log line; it now retries by
+					// text below. hit is the zero value when ok is false, so
+					// best_cosine reads 0 there.
+					cosineMissed = true
+					slog.Debug("no cosine match; trying text match",
+						"best_cosine", hit.Score, "accepted", ok,
+						"threshold", cfg.Embedding.SimilarityThreshold, "raw", sig.Raw)
+				}
 			}
 		}
 	}
@@ -308,7 +375,7 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 	if !bm25RetryAllowed(sig, cosineMissed) {
 		slog.Debug("structured salient refused by cosine; not retried by text",
 			"raw", sig.Raw, "type", s.Type)
-		return d.mintSignature(ctx, sig, s, vec, vecModel)
+		return d.mintSignature(ctx, sig, s, vec, vecModel), nil, nil
 	}
 	bmCtx, cancel := context.WithTimeout(ctx, bm25MatchTimeout)
 	defer cancel()
@@ -316,7 +383,7 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 	accept := func(h match.Hit) bool { return remapAllowed(s, sig, h) }
 	if hit, ok, err := d.matcher.MatchText(bmCtx, sig.Salient, scope, accept); err != nil {
 		slog.Warn("text match failed; using hash key", "error", err)
-		return sig
+		return sig, nil, nil
 	} else if ok && hit.Score >= bar {
 		// Debug for the same reason as the cosine hit above: routine success.
 		slog.Debug("text match: reusing learned signature",
@@ -324,10 +391,10 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 		sig.Signature = hit.Signature
 		sig.Match.Method = domain.MatchBM25
 		sig.Match.Score = hit.Score
-		return sig
+		return sig, nil, nil
 	}
 
-	return d.mintSignature(ctx, sig, s, vec, vecModel)
+	return d.mintSignature(ctx, sig, s, vec, vecModel), nil, nil
 }
 
 // mintSignature records a situation as NEW: it persists the semantic identity
@@ -395,6 +462,13 @@ func (d *Daemon) RefreshKnowledge() {
 	if d.matcher == nil {
 		return
 	}
+	// Rules learned on other machines have just arrived, so the candidate set a
+	// verdict was judged against no longer describes what the matcher would
+	// return — and a rule the refresh DELETED may be the one a verdict names.
+	// Drop them all, in flight included, rather than reason about which are
+	// still answerable: a re-rank is one subprocess, a wrong reuse is a wrong
+	// rule.
+	d.invalidateRerank()
 	gen := d.semanticGen.Add(1)
 	d.spawn(func() {
 		_ = logging.Guard("semantic-refresh", func() error {

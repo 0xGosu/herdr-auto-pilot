@@ -59,7 +59,12 @@ var claudeValueFlags = map[string]bool{
 	"--session-id":             true,
 	"--settings":               true,
 	"--system-prompt":          true,
-	"-r":                       true,
+	// --tools names the BUILT-IN tool set ("" disables all of them), where
+	// --allowedTools/--disallowedTools filter what is already available. The
+	// re-ranking preset passes it empty: that judge reads nothing and writes
+	// nothing, and it runs in the MONITORED AGENT's directory.
+	"--tools": true,
+	"-r":      true,
 }
 
 var claudeBoolFlags = map[string]bool{

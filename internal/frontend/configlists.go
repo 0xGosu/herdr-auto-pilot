@@ -271,6 +271,7 @@ func (a *App) RemoveCaptureDelay(ctx context.Context, agentType string) error {
 // reports, so what a listing shows is what an edit takes.
 var LLMEnvScopes = []string{
 	"shared", "command", "task_generate_command", "learn_from_user_command",
+	"reranking_command",
 }
 
 // llmEnvMap returns a pointer to the inline env table for a scope, so one
@@ -285,6 +286,8 @@ func llmEnvMap(llm *config.LLM, scope string) (*map[string]string, error) {
 		return &llm.GenerateTaskEnv, nil
 	case "learn_from_user_command":
 		return &llm.LearnFromUserEnv, nil
+	case "reranking_command":
+		return &llm.RerankingEnv, nil
 	}
 	return nil, fmt.Errorf("unknown env scope %q (%s)", scope, strings.Join(LLMEnvScopes, "|"))
 }

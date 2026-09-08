@@ -295,23 +295,59 @@ const matchK = 3
 // are a point-in-time snapshot: an accept that mutates the matcher (Delete/
 // Rebuild) may observe or return a now-stale signature.
 func (m *Matcher) MatchVector(ctx context.Context, vec []float32, s Scope, accept func(Hit) bool) (Hit, bool, error) {
-	cands, err := m.vectorCandidates(ctx, vec, s)
+	cands, err := m.VectorCandidates(ctx, vec, s, matchK, accept)
 	if err != nil {
 		return Hit{}, false, err
 	}
-	for _, hit := range cands { // descending similarity
-		if accept == nil || accept(hit) {
-			return hit, true, nil
-		}
+	if len(cands) == 0 {
+		return Hit{}, false, nil
 	}
-	return Hit{}, false, nil
+	return cands[0], true, nil // descending similarity: first accepted is best
 }
 
-// vectorCandidates runs the KNN search under the read lock and returns the top-K
-// matches as value copies (independent of the index), so MatchVector can apply
-// accept after releasing the lock. The lock spans the whole search but never the
-// accept callback.
-func (m *Matcher) vectorCandidates(ctx context.Context, vec []float32, s Scope) ([]Hit, error) {
+// VectorCandidates returns EVERY stored signature within scope that the accept
+// filter admits, in descending cosine similarity, considering the k nearest
+// neighbours (k <= 0 uses matchK). Thresholding is the caller's, as it is for
+// MatchVector.
+//
+// It exists for LLM-as-a-judge re-ranking, which needs the whole admitted field
+// rather than the best of it — and MatchVector's "return the first acceptable
+// candidate" shortcut is sound ONLY because this list is in descending cosine,
+// so first-acceptable is also highest-scoring and one threshold test over it is
+// correct. A re-ranker breaks that: once the SELECTION order is the judge's
+// rather than cosine's, the threshold has to be applied across every candidate
+// before the judge sees them, which is why the caller needs the list.
+//
+// k is passed to the KNN search itself, so raising it changes RECALL, not just
+// the length of the returned slice. matchK stays the cap for every non-rerank
+// lookup.
+//
+// accept carries the same contract as MatchVector's: it runs per candidate
+// OUTSIDE the matcher lock, over value-copy hits materialized under it, so it
+// may safely call back into the Matcher, and those hits are a point-in-time
+// snapshot.
+func (m *Matcher) VectorCandidates(ctx context.Context, vec []float32, s Scope, k int, accept func(Hit) bool) ([]Hit, error) {
+	if k <= 0 {
+		k = matchK
+	}
+	cands, err := m.vectorCandidates(ctx, vec, s, k)
+	if err != nil {
+		return nil, err
+	}
+	out := cands[:0:0]          // fresh backing array: never alias the search result
+	for _, hit := range cands { // descending similarity
+		if accept == nil || accept(hit) {
+			out = append(out, hit)
+		}
+	}
+	return out, nil
+}
+
+// vectorCandidates runs the KNN search under the read lock and returns the top-k
+// matches as value copies (independent of the index), so the exported wrappers
+// can apply accept after releasing the lock. The lock spans the whole search but
+// never the accept callback.
+func (m *Matcher) vectorCandidates(ctx context.Context, vec []float32, s Scope, k int) ([]Hit, error) {
 	// Hold the read lock for the WHOLE search. Rebuild/Close take the write lock
 	// to swap in a new index and Close the old one, so holding RLock across the
 	// search guarantees the index cannot be closed mid-read. Snapshotting idx and
@@ -339,7 +375,7 @@ func (m *Matcher) vectorCandidates(ctx context.Context, vec []float32, s Scope) 
 	if len(vec) != dims {
 		return nil, fmt.Errorf("query vector dims %d != index dims %d", len(vec), dims)
 	}
-	res, err := knnSearch(ctx, idx, vec, matchK, []string{"salient"}, scopeFilter(s))
+	res, err := knnSearch(ctx, idx, vec, k, []string{"salient"}, scopeFilter(s))
 	if err != nil {
 		return nil, err
 	}

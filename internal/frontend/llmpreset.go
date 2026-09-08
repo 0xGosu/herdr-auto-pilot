@@ -10,10 +10,11 @@ import (
 
 // ── Built-in LLM command recipes ────────────────────────────────────────────
 //
-// Three [llm] argv templates are OFF until an operator writes one, and each
+// Four [llm] argv templates are OFF until an operator writes one, and each
 // renders "(disabled)" on the TUI Config tab: llm.command (the consult),
-// llm.task_generate_command (idle task suggestion) and
-// llm.learn_from_user_command (write a lesson after a correction). They are
+// llm.task_generate_command (idle task suggestion),
+// llm.learn_from_user_command (write a lesson after a correction) and
+// llm.reranking_command (judge which learned rule a situation matches). They are
 // free-text argv, so CR-036 makes them TUI-read-only — the one-line prompt
 // round-trip mangles them — which used to leave a TUI operator with a
 // disabled feature and no way to turn it on, and a CLI operator retyping a
@@ -105,6 +106,27 @@ const (
 		"The lesson goes under a heading spelled exactly \"" + llmLessonSection + "\". If that heading is already in " + llmLessonFile + ", edit that section IN PLACE and never add a second one; otherwise append the heading at the end of the file.\n\n" +
 		"Touch that one section and nothing else: leave the rest of the file alone, do not run the task, do not touch the terminal, do not answer the prompt shown on screen. Add or amend ONE short, general rule, phrased as guidance for the future rather than as a note about this incident; if a rule in that section already covers it, sharpen that rule instead of adding a second one. If the correction carries no durable lesson (a one-off, or purely situational), change nothing.\n\n" +
 		"Agent: {agent_name} ({agent_type})\nCwd: {cwd}\nSituation: {situation_type}\n\nScreen:\n{pane_excerpt}\n---\nYou were about to answer: {suggestion}\nThe user corrected this to: {correction}"
+
+	// The re-ranking judge. Deliberately the SHORTEST-lived and cheapest of the
+	// four: it reads nothing, writes nothing, needs no tools or MCP server, and its only
+	// output is a JSON array. It also does NOT read AUTO.md — the lessons there
+	// are about how to ANSWER a screen, and this run is not answering one; it is
+	// deciding whether two screens are the same question.
+	//
+	// Three clauses in it are load-bearing:
+	//
+	//   - "[] is a valid and expected answer". Without it a model reliably picks
+	//     its least-bad option, which is exactly the false positive the feature
+	//     exists to veto — the judge would then only ever re-order what cosine
+	//     already accepted.
+	//   - "ONLY the JSON array, nothing else". hap does tolerate surrounding
+	//     prose (it scans for the last top-level array), but prose containing
+	//     brackets is how a reply becomes unparseable, and an unparseable reply
+	//     silently degrades to the un-judged cosine answer.
+	//   - The ids are "the numbers above, nothing else". They are ordinals into
+	//     the listing, and an id outside the offered range rejects the WHOLE
+	//     verdict — hap will not act on a partial answer it cannot trust.
+	llmRerankPrompt = "You are hap's rule-matching judge. hap answers prompts on a coding agent's screen by reusing rules it learned from earlier screens, and an embedding search has proposed the rules below. Your job is to decide which of them — if any — genuinely answers THIS situation.\n\nA rule matches only if answering the current situation with that rule's learned action would be CORRECT. Two screens that merely look alike are not a match: an approval whose target changed (a different service, path, branch, or command), a question with different options, or a different question that happens to share wording are all NON-matches, however similar the text is. Judge what the action would DO, not how the words score.\n\nReturn a JSON array, ordered by relevance score descending, of at most {top_k} entries:\n[{\"id\": <the rule's number>, \"score\": <0-1>}]\n\nOmit any rule you would score below {relevance_score_threshold}. If NO rule genuinely answers this situation, return an empty array [] — that is a valid and expected answer, and it is the whole reason you are being asked. Never pick the least-bad option to avoid returning nothing.\n\nUse ONLY the numbers shown above as ids; do not invent ids and do not name a rule twice. Output ONLY the JSON array and nothing else — no explanation, no code fence, no preamble.\n\nAgent: {agent_name} ({agent_type})\nSituation type: {situation_type}\n\nThe situation to match:\n{salient}\n\nCandidate rules:\n{candidates}"
 )
 
 // LLM config keys that have presets. Spelled as constants because each is
@@ -113,6 +135,7 @@ const (
 	LLMCommandKey              = "llm.command"
 	LLMTaskGenerateCommandKey  = "llm.task_generate_command"
 	LLMLearnFromUserCommandKey = "llm.learn_from_user_command"
+	LLMRerankingCommandKey     = "llm.reranking_command"
 )
 
 // Preset names, in picker display order.
@@ -218,11 +241,58 @@ var llmCommandPresets = map[string]map[string][]string{
 			llmLearnFromUserPrompt,
 		},
 	},
+	// The judge runs on the SMALLEST model of the four, and that is a design
+	// choice rather than thrift: it sits INSIDE the classify→decide path with a
+	// parked agent waiting on it, so latency is part of its correctness.
+	//
+	// It also needs no tools at all: its entire input is in the prompt and its
+	// entire output is a JSON array. Saying so is not enough — it runs in the
+	// MONITORED AGENT's own directory (llm.run_in_agent_cwd), so the grant has
+	// to be CLOSED rather than merely unused, and three flags do different jobs
+	// here. `--strict-mcp-config` isolates MCP servers only. `--permission-mode
+	// auto` governs how tool permissions are DECIDED, not which tools exist. It
+	// is `--tools ""` that removes Claude's built-in set outright, and without
+	// it this recipe could read files in that project.
+	//
+	// The codex recipe passes `--sandbox read-only` instead: `codex exec` with
+	// no policy at all is an untested shape here, and read-only is the tightest
+	// grant the documented recipes are known to run under. That is weaker than
+	// the claude side — it can still READ the agent's project — and it is a
+	// floor rather than a need; tightening it wants a verified codex flag.
+	LLMRerankingCommandKey: {
+		LLMPresetClaude: {
+			"claude",
+			"--no-session-persistence",
+			"--model",
+			"sonnet",
+			"--permission-mode",
+			"auto",
+			"-p",
+			llmRerankPrompt,
+			// No built-in tools and no MCP servers: the run answers from its
+			// prompt alone, in the monitored agent's directory.
+			"--tools",
+			"",
+			"--strict-mcp-config",
+		},
+		LLMPresetCodex: {
+			"codex",
+			"--model",
+			"gpt-5.6-luna",
+			"exec",
+			"--ephemeral",
+			"--skip-git-repo-check",
+			"--sandbox",
+			"read-only",
+			llmRerankPrompt,
+		},
+	},
 }
 
 // LLMPresetKeys lists every config key that offers presets, in registry
 // order, for help text and error messages.
-var LLMPresetKeys = []string{LLMCommandKey, LLMTaskGenerateCommandKey, LLMLearnFromUserCommandKey}
+var LLMPresetKeys = []string{LLMCommandKey, LLMTaskGenerateCommandKey, LLMLearnFromUserCommandKey,
+	LLMRerankingCommandKey}
 
 // LLMPreset returns the recipe installed for key by preset, copied so a
 // caller can never mutate the shared table.
@@ -256,6 +326,8 @@ func llmCommandArgv(cfg *config.Config, key string) *[]string {
 		return &cfg.LLM.GenerateTaskCommand
 	case LLMLearnFromUserCommandKey:
 		return &cfg.LLM.LearnFromUserCommand
+	case LLMRerankingCommandKey:
+		return &cfg.LLM.RerankingCommand
 	default:
 		return nil
 	}

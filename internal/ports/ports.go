@@ -268,6 +268,27 @@ type TaskGeneratorPort interface {
 	GenerateTaskConfigured() bool
 }
 
+// RerankerPort is an optional capability of the LLM adapter: a one-shot run
+// that RE-RANKS the learned rules a cosine search already admitted, so an LLM
+// judge — not a similarity number — decides which one (if any) answers the
+// situation (llm.reranking_command). Callers type-assert and degrade
+// gracefully when absent, which for this feature means "behave exactly as hap
+// did before it existed".
+//
+// Like TaskGeneratorPort and unlike Consult it stages nothing and uses no MCP
+// server: the verdict is the subprocess's stdout, parsed by
+// domain.ParseRerankVerdict. That is deliberate rather than incidental — the
+// consult path holds a one-pending-llm_requests-row-per-agent guard, and a
+// re-rank running there would starve the real consults that guard exists for.
+type RerankerPort interface {
+	// Rerank runs the configured judge CLI and returns its raw stdout, or an
+	// error on spawn failure / non-zero exit / timeout / empty output. The
+	// caller parses it; every error degrades to the un-judged cosine answer.
+	Rerank(ctx context.Context, req domain.RerankRequest) (string, error)
+	// RerankConfigured reports whether a re-ranking CLI is configured.
+	RerankConfigured() bool
+}
+
 // LearnFromUserPort is an optional capability of the LLM adapter: a one-shot
 // run that records a lesson in the agent's own project memory after the
 // operator CORRECTS an escalation (llm.learn_from_user_command). Callers

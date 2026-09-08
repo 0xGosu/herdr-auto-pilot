@@ -42,6 +42,10 @@ type fakeHerdr struct {
 	// that many lines (isolates the deep LLM-context read from the
 	// shallow classification read).
 	failReadOver int
+	// readGate holds every ReadPane call until it is closed, so a test can
+	// park the daemon INSIDE a pane read and drive a concurrent event into
+	// exactly that window.
+	readGate     chan struct{}
 	readLines    []int
 	paneInfo     domain.PaneInfo
 	failPaneInfo bool
@@ -116,6 +120,16 @@ func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
 }
 
 func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (string, error) {
+	f.mu.Lock()
+	gate := f.readGate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.panicOnRead {
@@ -383,6 +397,12 @@ func (f *fakeHerdr) ListAgents(ctx context.Context) ([]domain.AgentTransition, e
 		return nil, errors.New("induced agent-list failure")
 	}
 	return append([]domain.AgentTransition(nil), f.agents...), nil
+}
+
+func (f *fakeHerdr) setReadGate(gate chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.readGate = gate
 }
 
 func (f *fakeHerdr) setListAgentsGate(gate chan struct{}) {

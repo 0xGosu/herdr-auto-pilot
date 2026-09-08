@@ -958,6 +958,15 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	case st.Embedding != "":
 		fmt.Fprintf(out, "semantic matching:   %s\n", st.Embedding)
 	}
+	// The re-ranking judge, when one is configured. It sits between cosine and
+	// BM25, so it belongs right under the semantic-matching line — and it has to
+	// be printed at all because its failure mode is invisible: a judge that
+	// errors on every call silently degrades to the plain cosine answer.
+	if cfg, cfgErr := app.Config(); cfgErr == nil {
+		if line := frontend.RerankSummary(cfg); line != "" {
+			fmt.Fprintf(out, "rule re-ranking:     %s\n", line)
+		}
+	}
 	// A running embedder can still be soft-degraded (embed calls latched to
 	// text fallback) — the config-derived line above would otherwise hide it.
 	if h.EmbedderDegraded {

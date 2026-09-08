@@ -2346,6 +2346,12 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"llm.command_env_file":                 "/etc/hap/consult.env",
 		"llm.task_generate_command_env_file":   "/etc/hap/taskgen.env",
 		"llm.learn_from_user_command_env_file": "/etc/hap/learn.env",
+		"llm.reranking_command":                `claude -p "judge the rules"`,
+		"llm.reranking_timeout_seconds":        "20",
+		"llm.reranking_top_k":                  "5",
+		"llm.relevance_score_threshold":        "0.80",
+		"llm.reranking_max_candidates":         "8",
+		"llm.reranking_command_env_file":       "/etc/hap/rerank.env",
 		"embedding.disabled":                   "false",
 		"embedding.model_path":                 "/models/custom.gguf",
 		"embedding.similarity_threshold":       "0.90",
@@ -2502,6 +2508,7 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 		"llm.rewrite_action_fallback_template": true,
 		"llm.task_generate_command":            true,
 		"llm.learn_from_user_command":          true,
+		"llm.reranking_command":                true,
 		"embedding.model_path":                 true,
 		// A URL, a token and a label are free text too; the token is also
 		// hidden, but the declared flag is what this test pins.
@@ -2553,8 +2560,15 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"llm.command_env_file":                 true,
 		"llm.task_generate_command_env_file":   true,
 		"llm.learn_from_user_command_env_file": true,
-		"embedding.pane_salient_chars":         true,
-		"embedding.warm_timeout_ms":            true,
+		"llm.reranking_command_env_file":       true,
+		// top_k and max_candidates are prompt-shaping numbers an operator tunes
+		// once if ever; the command, its budget and the relevance bar are the
+		// three that decide whether the judge does anything, so those stay on
+		// the Config tab.
+		"llm.reranking_top_k":          true,
+		"llm.reranking_max_candidates": true,
+		"embedding.pane_salient_chars": true,
+		"embedding.warm_timeout_ms":    true,
 		// The env file holds a token, so it follows the llm.*_env_file rule:
 		// registered (a path is not a secret and `hap config set` must reach
 		// it) but off the TUI's Config tab. The two timing knobs are tuned once
