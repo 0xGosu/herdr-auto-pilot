@@ -402,6 +402,13 @@ func (d *Daemon) cachedRerankVerdict(key string) ([]domain.RerankResult, bool) {
 func (d *Daemon) storeRerankVerdict(key string, v []domain.RerankResult) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.storeRerankVerdictLocked(key, v)
+}
+
+// storeRerankVerdictLocked is storeRerankVerdict's body; the caller holds mu.
+// It exists so commitRerankVerdict can check the generation and store in one
+// critical section.
+func (d *Daemon) storeRerankVerdictLocked(key string, v []domain.RerankResult) {
 	if _, seen := d.rerankCache[key]; !seen {
 		if len(d.rerankCacheOrder) >= rerankCacheMax {
 			delete(d.rerankCache, d.rerankCacheOrder[0])
@@ -414,6 +421,17 @@ func (d *Daemon) storeRerankVerdict(key string, v []domain.RerankResult) {
 
 // invalidateRerank drops every cached verdict AND retires every verdict still
 // being computed, by bumping the generation each in-flight run carries.
+//
+// It bumps UNCONDITIONALLY — there is deliberately no "nothing to invalidate"
+// fast path, and that is a correctness requirement rather than a missed
+// optimization. A verdict in transit belongs to NEITHER map: handleRerankOutcome
+// removes the flight before its visible-pane read, which is a herdr shell-out
+// lasting long enough for a fleet-sync RefreshKnowledge to land inside it. An
+// idle check would then see an empty cache and an empty registry, skip the bump,
+// and the pre-refresh verdict would commit against a generation that never
+// moved. The per-agent cancelRerank keeps its fast path because it is per-EVENT
+// and cannot have this shape: it is keyed on one agent, and a missing entry
+// there really does mean there is nothing to cancel.
 //
 // It is called on ANY reload and on RefreshKnowledge, unconditionally — never
 // gated on a section comparison the way reloadEmbedder's port swap is on
@@ -434,27 +452,38 @@ func (d *Daemon) storeRerankVerdict(key string, v []domain.RerankResult) {
 // reload, which follows every `hap config set`. A retired one still resumes,
 // on the cosine answer hap would have given without a judge at all.
 func (d *Daemon) invalidateRerank() {
-	// Same reason as cancelRerank: every reload runs this, and on an install
-	// with no judge configured there is nothing to invalidate — so the check
-	// happens under RLock rather than behind the write lock.
-	d.mu.RLock()
-	idle := len(d.rerankCache) == 0 && len(d.rerankInFlight) == 0
-	d.mu.RUnlock()
-	if idle {
-		return
-	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.rerankCache = map[string][]domain.RerankResult{}
-	d.rerankCacheOrder = nil
+	if len(d.rerankCache) > 0 {
+		d.rerankCache = map[string][]domain.RerankResult{}
+		d.rerankCacheOrder = nil
+	}
 	d.rerankGen++
 }
 
-// rerankGeneration reports the current invalidation generation.
-func (d *Daemon) rerankGeneration() uint64 {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return d.rerankGen
+// commitRerankVerdict is the LINEARIZATION POINT this feature's invalidation
+// turns on: it checks the generation and stores the verdict under ONE hold of
+// the lock, and reports whether the caller may apply it.
+//
+// Splitting those into a generation read and a later cache write reopens the
+// hole invalidateRerank exists to close, in a form no idle-path change can
+// reach: an invalidation landing between them commits a pre-invalidation
+// verdict anyway, and caches it. Ordering them here means a concurrent
+// invalidation either precedes this call — so the generation has moved and the
+// verdict is refused — or follows it, in which case it clears the entry just
+// written. Either way nothing survives that the invalidation meant to discard.
+//
+// finishRerank deliberately runs OUTSIDE the lock (it writes to the store), on
+// a verdict that was current at this instant. That is what a linearization
+// point means: correct as of the moment it commits, not for all time.
+func (d *Daemon) commitRerankVerdict(gen uint64, key string, verdict []domain.RerankResult) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.rerankGen != gen {
+		return false
+	}
+	d.storeRerankVerdictLocked(key, verdict)
+	return true
 }
 
 // startRerank runs the judge off the select loop and resumes the decision on
@@ -661,24 +690,24 @@ func (d *Daemon) handleRerankOutcome(ctx context.Context, res rerankOutcome) {
 			slog.Debug("re-ranking: the judge printed no JSON array; this is NOT an empty verdict",
 				"agent", res.situation.AgentID)
 		}
-	case d.rerankGeneration() != res.gen:
-		// A reload or a knowledge refresh landed while the judge ran, so this
-		// verdict answers a question that no longer stands: the command, prompt
-		// or thresholds may have changed, the operator may have emptied
-		// llm.reranking_command outright, or the rule the verdict NAMES may have
-		// been deleted by the refresh. A verdict is not exempt from that
-		// invalidation just because it was already in flight — a veto especially,
-		// which mints a new key and skips BM25.
-		//
-		// It is also deliberately NOT cached: storing it would repopulate, under
-		// the new generation, exactly the answer the invalidation discarded.
+	// The generation check and the cache write are ONE critical section
+	// (commitRerankVerdict). A reload or a knowledge refresh landing anywhere
+	// before it means this verdict answers a question that no longer stands —
+	// the command, prompt or thresholds may have changed, the operator may have
+	// emptied llm.reranking_command outright, or the rule the verdict NAMES may
+	// have been deleted by the refresh. A verdict is not exempt from that just
+	// because it was already in flight; a veto especially, which mints a new key
+	// and skips BM25. Refused verdicts are not cached either: storing one would
+	// repopulate, under the new generation, exactly what the invalidation
+	// discarded.
+	//
+	// Only a verdict the judge actually PRODUCED is cached — caching a failure
+	// would make one bad run stick to this screen for the daemon's life — which
+	// is why the error case is handled before this and never reaches it.
+	case !d.commitRerankVerdict(res.gen, res.cacheKey, res.verdict):
 		slog.Info("re-ranking was invalidated while the judge ran; using the cosine match",
 			"agent", res.situation.AgentID)
 	default:
-		// Cache only a verdict the judge actually produced, under a generation
-		// still current. Caching a failure would make one bad run stick to this
-		// screen for the daemon's life.
-		d.storeRerankVerdict(res.cacheKey, res.verdict)
 		sig = d.finishRerank(ctx, res.fallback, res.original, res.situation, res.plan, res.verdict)
 	}
 	d.decideAndActResolved(ctx, res.situation, res.tr, res.agentName, d.opt.Clock.Now(), sig)

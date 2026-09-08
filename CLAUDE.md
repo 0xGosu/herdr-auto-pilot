@@ -1262,10 +1262,24 @@ whose manifest carries exactly that version).
     carries the `rerankGen` it started under and `handleRerankOutcome` degrades an older
     one to the cosine fallback. It degrades rather than CANCELS on purpose: a reload
     follows every `hap config set`, and cancelling would drop a pending decision outright
-    instead of answering it the way an unjudged daemon would. Keep
+    instead of answering it the way an unjudged daemon would.
+    **Two bounds make the counter actually work, and both were proved by mutation.**
+    `invalidateRerank` bumps UNCONDITIONALLY — no "nothing to invalidate" fast path — because
+    a verdict IN TRANSIT is in neither map: `handleRerankOutcome` removes the flight before
+    its visible-pane read, a herdr shell-out wide enough for the fleet-sync goroutine's
+    `RefreshKnowledge` to land inside, and an idle check would then see two empty maps, skip
+    the bump, and let the pre-refresh verdict commit against a generation that never moved.
+    And the generation check and the cache write are ONE critical section
+    (`commitRerankVerdict`): split, an invalidation landing between them commits and caches a
+    pre-invalidation verdict anyway, which no fast-path change reaches. `finishRerank` runs
+    outside the lock on a verdict that was current at that instant — what a linearization
+    point means. `cancelRerank` keeps its own fast path: it is per-EVENT and keyed on one
+    agent, where a missing entry really does mean nothing to cancel. Keep
     `TestAnInvalidatedVerdictIsNeitherAppliedNorCached` and its control
     `TestACurrentVerdictIsStillAppliedAndCached` (without the control the first passes on
-    an implementation that discards every verdict).
+    an implementation that discards every verdict) /
+    `TestARefreshLandingInsideTheResumeStillInvalidatesTheVerdict` (deterministic, via the
+    fake herdr's read gate) / `TestTheGenerationCheckAndTheCacheWriteAreOneCriticalSection`.
   - **The verdict cache keys on the RENDERED listing, never the candidate signatures.**
     A parked pane re-captures on every attention event, so a cache is required — but the
     listing carries each rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what

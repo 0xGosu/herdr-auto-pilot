@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -445,7 +447,7 @@ func TestAnInvalidatedVerdictIsNeitherAppliedNorCached(t *testing.T) {
 			fallback.Match.Score = 0.93
 
 			// A flight registered under the CURRENT generation...
-			gen := d.rerankGeneration()
+			gen := currentRerankGen(d)
 			_, cancel := context.WithCancel(context.Background())
 			t.Cleanup(cancel)
 			d.mu.Lock()
@@ -456,7 +458,7 @@ func TestAnInvalidatedVerdictIsNeitherAppliedNorCached(t *testing.T) {
 
 			// ...and the world moves while it runs.
 			tc.invalidate(d)
-			if d.rerankGeneration() == gen {
+			if currentRerankGen(d) == gen {
 				t.Fatal("premise: the invalidation must move the generation")
 			}
 
@@ -511,7 +513,7 @@ func TestACurrentVerdictIsStillAppliedAndCached(t *testing.T) {
 	fallback.Signature = "approval:cosine"
 	fallback.Match.Method = domain.MatchCosine
 
-	gen := d.rerankGeneration()
+	gen := currentRerankGen(d)
 	_, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	d.mu.Lock()
@@ -538,6 +540,14 @@ func TestACurrentVerdictIsStillAppliedAndCached(t *testing.T) {
 	if !hasSnapshot(t, d, "approval:judged") {
 		t.Error("a current verdict must be applied")
 	}
+}
+
+// currentRerankGen reads the invalidation generation. Tests are in-package, so
+// this stays here rather than becoming an accessor production has no use for.
+func currentRerankGen(d *Daemon) uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.rerankGen
 }
 
 // hasSnapshot reports whether the daemon recorded rule provenance for a
@@ -1187,5 +1197,144 @@ func TestARerankResumeToleratesIdleDrift(t *testing.T) {
 	h.herdr.setPane(unrelatedRun)
 	if !h.daemon.rerankSituationHeldStill(context.Background(), res) {
 		t.Error("an idle resume must match on type alone; comparing signatures drops every one of them")
+	}
+}
+
+// TestARefreshLandingInsideTheResumeStillInvalidatesTheVerdict is the
+// deterministic regression for the window a generation counter alone does not
+// close.
+//
+// handleRerankOutcome removes the flight BEFORE its visible-pane read, and that
+// read is a herdr shell-out long enough for the fleet-sync goroutine's
+// RefreshKnowledge to land inside it. In that window the verdict belongs to
+// neither the cache nor the flight registry, so an invalidation that skipped the
+// generation bump when both looked empty would leave the pre-refresh verdict
+// committing against a generation that never moved.
+//
+// The test parks the handler inside the pane read with a gate, refreshes, then
+// releases — which is the exact schedule, not an approximation of it.
+func TestARefreshLandingInsideTheResumeStillInvalidatesTheVerdict(t *testing.T) {
+	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+	d := h.daemon
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	s.AgentID, s.PaneID, s.Status = "agent-refresh-race", "agent-refresh-race", "blocked"
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}})
+	orig := domain.ComputeSignature(s)
+	fallback := orig
+	fallback.Signature = "approval:cosine"
+	fallback.Match.Method = domain.MatchCosine
+
+	gen := currentRerankGen(d)
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	d.mu.Lock()
+	d.rerankSeq++
+	token := d.rerankSeq
+	d.rerankInFlight[s.AgentID] = rerankFlight{raw: orig.Raw, token: token, gen: gen, cancel: cancel}
+	// The cache is empty and, once the handler removes the flight, so is the
+	// registry — the state an idle fast path would read as "nothing to do".
+	d.rerankCache = map[string][]domain.RerankResult{}
+	d.rerankCacheOrder = nil
+	d.mu.Unlock()
+
+	gate := make(chan struct{})
+	h.herdr.setReadGate(gate)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		d.handleRerankOutcome(context.Background(), rerankOutcome{
+			situation: s,
+			tr:        domain.AgentTransition{AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked"},
+			fallback:  fallback, original: orig, token: token, gen: gen,
+			cacheKey: "in-transit",
+			plan: &rerankPlan{
+				candidates: []domain.RerankCandidate{{ID: 1, Signature: "approval:judged", Cosine: 0.93}},
+				rendered:   "--- rule 1 ---",
+			},
+			verdict: []domain.RerankResult{{ID: 1, Score: 0.99}},
+		})
+	}()
+
+	// Wait until the handler is parked in the read with the flight already gone
+	// — that IS the window.
+	waitFor(t, 3*time.Second, func() bool {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+		_, still := d.rerankInFlight[s.AgentID]
+		return !still
+	})
+	d.RefreshKnowledge()
+	if currentRerankGen(d) == gen {
+		t.Fatal("a refresh landing on empty maps must still move the generation; " +
+			"an idle fast path here lets a pre-refresh verdict commit")
+	}
+	close(gate)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleRerankOutcome did not return")
+	}
+
+	if _, ok := d.cachedRerankVerdict("in-transit"); ok {
+		t.Error("a verdict invalidated mid-resume was cached anyway")
+	}
+	if hasSnapshot(t, d, "approval:judged") {
+		t.Error("a verdict invalidated mid-resume was applied anyway")
+	}
+	if !hasSnapshot(t, d, "approval:cosine") {
+		t.Error("the decision did not resume on the cosine fallback")
+	}
+}
+
+// TestTheGenerationCheckAndTheCacheWriteAreOneCriticalSection covers the
+// second, narrower window: an invalidation landing AFTER the generation was read
+// but BEFORE the verdict was cached. Removing only the idle fast path leaves it
+// open, which is why the two are one call rather than two.
+//
+// It hammers the pair concurrently instead of timing them, because the window a
+// split implementation opens is a few instructions wide. The invariant is
+// one-directional and cannot pass by luck: a verdict may be refused, and it may
+// be committed and then cleared, but it may never be left CACHED under a
+// generation newer than the one it was checked against. That is precisely the
+// state a check-then-act split produces and a single critical section cannot.
+//
+// Verified by mutation: a split with a scheduler yield between the check and the
+// write — the realistic shape, since anything at all would sit in that gap —
+// fails here within ~12k iterations. A split with literally nothing between them
+// may still slip through, so this is a strong signal rather than a proof; the
+// deterministic half of the invariant lives in
+// TestARefreshLandingInsideTheResumeStillInvalidatesTheVerdict.
+func TestTheGenerationCheckAndTheCacheWriteAreOneCriticalSection(t *testing.T) {
+	d, _ := rerankHarness(t, &fakeEmbedder{}, rerankCfg)
+	for i := range 20000 {
+		key := fmt.Sprintf("k%d", i)
+		gen := currentRerankGen(d)
+		var wg sync.WaitGroup
+		var committed atomic.Bool
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			committed.Store(d.commitRerankVerdict(gen, key, []domain.RerankResult{{ID: 1, Score: 1}}))
+		}()
+		go func() {
+			defer wg.Done()
+			runtime.Gosched()
+			d.invalidateRerank()
+		}()
+		wg.Wait()
+
+		_, cached := d.cachedRerankVerdict(key)
+		if cached && currentRerankGen(d) != gen {
+			t.Fatalf("iteration %d: a verdict is cached under a generation newer than the one it "+
+				"was checked against — the check and the write are not one critical section", i)
+		}
+		if cached && !committed.Load() {
+			t.Fatalf("iteration %d: a REFUSED verdict was cached", i)
+		}
 	}
 }
