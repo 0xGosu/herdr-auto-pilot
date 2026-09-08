@@ -142,6 +142,61 @@ func TestRerankOversizedOutputIsRefused(t *testing.T) {
 	}
 }
 
+// TestRerankBoundsCaptureWhileTheChildRuns: the cap is enforced DURING the run,
+// not after it.
+//
+// The judge is launched on every attention event and is the only LLM adapter
+// with a short deadline it is expected to sometimes hit, so a CLI writing
+// continuously until its timeout would otherwise hold everything it produced in
+// that window. The output here is far larger than the caps; what the test
+// asserts is that the refusal still arrives and that nothing near that volume
+// was retained.
+func TestRerankBoundsCaptureWhileTheChildRuns(t *testing.T) {
+	script := writeScript(t,
+		"yes 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' | head -c 4000000\n"+
+			"yes 'noise on stderr' | head -c 4000000 >&2\n")
+	a := &Adapter{RerankTemplate: []string{script}, RerankTimeout: 20 * time.Second}
+	out, err := a.Rerank(context.Background(), domain.RerankRequest{})
+	if err == nil || !strings.Contains(err.Error(), "oversized") {
+		t.Fatalf("a flood of output must be refused as oversized, got out=%d bytes err=%v", len(out), err)
+	}
+	// The error carries a stderr tail, and that tail must come from a BOUNDED
+	// capture: an unbounded one would have kept all 4 MB to take 500 bytes from.
+	if len(err.Error()) > 4096 {
+		t.Errorf("the refusal itself carries %d bytes; the stderr tail is not bounded", len(err.Error()))
+	}
+}
+
+// TestCapWriterKeepsTheCapAndReportsOverflow pins the writer's two contracts:
+// it never keeps more than the cap, and it never reports a short write — a
+// short count or an error would make exec tear the pipe down and surface a
+// misbehaving CLI as a broken one.
+func TestCapWriterKeepsTheCapAndReportsOverflow(t *testing.T) {
+	w := newCapWriter(10)
+	if n, err := w.Write([]byte("abcde")); n != 5 || err != nil {
+		t.Fatalf("Write under the cap = (%d, %v), want (5, nil)", n, err)
+	}
+	if w.Overflowed() {
+		t.Error("a write under the cap must not report overflow")
+	}
+	if n, err := w.Write([]byte("fghijklmno")); n != 10 || err != nil {
+		t.Fatalf("Write past the cap = (%d, %v), want the full length and no error", n, err)
+	}
+	if !w.Overflowed() {
+		t.Error("a write past the cap must report overflow")
+	}
+	if got := w.String(); got != "abcdefghij" {
+		t.Errorf("kept %q, want exactly the first 10 bytes", got)
+	}
+	// Every later write is discarded, and still reports success.
+	if n, err := w.Write([]byte("zzz")); n != 3 || err != nil {
+		t.Fatalf("Write after overflow = (%d, %v), want (3, nil)", n, err)
+	}
+	if got := w.String(); got != "abcdefghij" {
+		t.Errorf("kept %q after a post-overflow write", got)
+	}
+}
+
 // TestRerankUnconfiguredErrorsWithoutSpawning keeps "off" a hard gate in the
 // adapter too, not only at the daemon's port assertion.
 func TestRerankUnconfiguredErrorsWithoutSpawning(t *testing.T) {

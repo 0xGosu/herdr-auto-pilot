@@ -85,6 +85,7 @@ type rerankOutcome struct {
 	verdict  []domain.RerankResult
 	err      error
 	token    uint64
+	gen      uint64
 }
 
 // rerankFlight is the registry entry for the one live judge run per agent.
@@ -95,8 +96,13 @@ type rerankOutcome struct {
 // duplicate run is dropped; a different raw means the screen moved on, so the
 // old flight is cancelled and superseded.
 type rerankFlight struct {
-	raw    string
-	token  uint64
+	raw   string
+	token uint64
+	// gen is the invalidation generation the run STARTED under. A reload or a
+	// knowledge refresh bumps it, and handleRerankOutcome degrades any outcome
+	// carrying an older one — the same invalidation the verdict cache obeys,
+	// applied to the runs that were still computing when it happened.
+	gen    uint64
 	cancel context.CancelFunc
 }
 
@@ -406,28 +412,49 @@ func (d *Daemon) storeRerankVerdict(key string, v []domain.RerankResult) {
 	d.rerankCache[key] = v
 }
 
-// clearRerankCache drops every cached verdict.
+// invalidateRerank drops every cached verdict AND retires every verdict still
+// being computed, by bumping the generation each in-flight run carries.
 //
 // It is called on ANY reload and on RefreshKnowledge, unconditionally — never
 // gated on a section comparison the way reloadEmbedder's port swap is on
 // prev.Embedding != next.Embedding. Turning the judge off and on again, editing
 // its prompt, changing the threshold, or pulling rules learned on another
-// machine all change what the judge would answer, and a cache that survived any
-// of them would keep answering the old question.
-func (d *Daemon) clearRerankCache() {
+// machine all change what the judge would answer, and a verdict that survived
+// any of them would keep answering the old question.
+//
+// The two halves are one operation on purpose. Clearing only the cache leaves
+// the hole open in its most confusing form: a run started under the old regime
+// finishes seconds later, passes the per-agent token check (which is about
+// SUPERSESSION, not staleness), applies its answer, and REPOPULATES the cache
+// that was just emptied.
+//
+// In-flight runs are retired rather than CANCELLED, and that is the
+// degrade-never-block direction. A cancelled flight drops its decision
+// entirely, leaving the pane unanswered until the next attention event — for a
+// reload, which follows every `hap config set`. A retired one still resumes,
+// on the cosine answer hap would have given without a judge at all.
+func (d *Daemon) invalidateRerank() {
 	// Same reason as cancelRerank: every reload runs this, and on an install
-	// with no judge configured the cache is always empty — so the emptiness
-	// check happens under RLock rather than behind the write lock.
+	// with no judge configured there is nothing to invalidate — so the check
+	// happens under RLock rather than behind the write lock.
 	d.mu.RLock()
-	empty := len(d.rerankCache) == 0
+	idle := len(d.rerankCache) == 0 && len(d.rerankInFlight) == 0
 	d.mu.RUnlock()
-	if empty {
+	if idle {
 		return
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.rerankCache = map[string][]domain.RerankResult{}
 	d.rerankCacheOrder = nil
+	d.rerankGen++
+}
+
+// rerankGeneration reports the current invalidation generation.
+func (d *Daemon) rerankGeneration() uint64 {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.rerankGen
 }
 
 // startRerank runs the judge off the select loop and resumes the decision on
@@ -484,8 +511,9 @@ func (d *Daemon) startRerank(ctx context.Context, s domain.Situation,
 	}
 	d.rerankSeq++
 	token := d.rerankSeq
+	gen := d.rerankGen
 	rctx, cancel := context.WithCancel(ctx)
-	d.rerankInFlight[s.AgentID] = rerankFlight{raw: sig.Raw, token: token, cancel: cancel}
+	d.rerankInFlight[s.AgentID] = rerankFlight{raw: sig.Raw, token: token, gen: gen, cancel: cancel}
 	d.mu.Unlock()
 
 	req := domain.RerankRequest{
@@ -507,7 +535,7 @@ func (d *Daemon) startRerank(ctx context.Context, s domain.Situation,
 	}
 	outcome := rerankOutcome{
 		situation: s, tr: tr, agentName: agentName,
-		fallback: fallback, original: sig, plan: plan, token: token,
+		fallback: fallback, original: sig, plan: plan, token: token, gen: gen,
 		cacheKey: rerankCacheKey(sig.Raw, plan.rendered),
 	}
 	spawned := d.spawn(func() {
@@ -633,19 +661,24 @@ func (d *Daemon) handleRerankOutcome(ctx context.Context, res rerankOutcome) {
 			slog.Debug("re-ranking: the judge printed no JSON array; this is NOT an empty verdict",
 				"agent", res.situation.AgentID)
 		}
+	case d.rerankGeneration() != res.gen:
+		// A reload or a knowledge refresh landed while the judge ran, so this
+		// verdict answers a question that no longer stands: the command, prompt
+		// or thresholds may have changed, the operator may have emptied
+		// llm.reranking_command outright, or the rule the verdict NAMES may have
+		// been deleted by the refresh. A verdict is not exempt from that
+		// invalidation just because it was already in flight — a veto especially,
+		// which mints a new key and skips BM25.
+		//
+		// It is also deliberately NOT cached: storing it would repopulate, under
+		// the new generation, exactly the answer the invalidation discarded.
+		slog.Info("re-ranking was invalidated while the judge ran; using the cosine match",
+			"agent", res.situation.AgentID)
 	default:
-		// Cache only a verdict the judge actually produced. Caching a failure
-		// would make one bad run stick to this screen for the daemon's life.
+		// Cache only a verdict the judge actually produced, under a generation
+		// still current. Caching a failure would make one bad run stick to this
+		// screen for the daemon's life.
 		d.storeRerankVerdict(res.cacheKey, res.verdict)
-		// An operator who emptied llm.reranking_command while this ran turned
-		// the feature off, and a verdict is not exempt from that just because it
-		// was already in flight — a veto especially, which mints a new key and
-		// skips BM25. Same symmetry the cache already accepts on reload.
-		if cfg, _, _ := d.snapshot(); !cfg.RerankingConfigured() {
-			slog.Info("re-ranking was turned off while the judge ran; using the cosine match",
-				"agent", res.situation.AgentID)
-			break
-		}
 		sig = d.finishRerank(ctx, res.fallback, res.original, res.situation, res.plan, res.verdict)
 	}
 	d.decideAndActResolved(ctx, res.situation, res.tr, res.agentName, d.opt.Clock.Now(), sig)

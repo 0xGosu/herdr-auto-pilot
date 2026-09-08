@@ -463,10 +463,12 @@ func (d *Daemon) RefreshKnowledge() {
 		return
 	}
 	// Rules learned on other machines have just arrived, so the candidate set a
-	// cached verdict was judged against no longer describes what the matcher
-	// would return. Drop them all rather than reason about which are still
-	// answerable — a re-rank is one subprocess, a wrong reuse is a wrong rule.
-	d.clearRerankCache()
+	// verdict was judged against no longer describes what the matcher would
+	// return — and a rule the refresh DELETED may be the one a verdict names.
+	// Drop them all, in flight included, rather than reason about which are
+	// still answerable: a re-rank is one subprocess, a wrong reuse is a wrong
+	// rule.
+	d.invalidateRerank()
 	gen := d.semanticGen.Add(1)
 	d.spawn(func() {
 		_ = logging.Guard("semantic-refresh", func() error {

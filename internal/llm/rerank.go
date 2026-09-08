@@ -1,7 +1,6 @@
 package llm
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os/exec"
@@ -25,7 +24,18 @@ import (
 // task-gen 16 KB capture cap). A verdict is a short JSON array; anything huge
 // is a misbehaving CLI, and parsing megabytes of it to find a trailing array
 // would be work done on behalf of a run that has already gone wrong.
+//
+// It is enforced WHILE the child runs (capWriter), not after it exits. The
+// other adapters accumulate into an unbounded bytes.Buffer and check the size
+// at the end, which is fine for a CLI that answers and stops — but this one is
+// launched on every attention event and a judge writing continuously until its
+// 30-second timeout would hold everything it produced in that window first.
 const maxRerankOutput = 16 * 1024
+
+// maxRerankStderr bounds the diagnostic stream for the same reason. Nothing
+// ever reads more than tailOf(…, 500) of it, so keeping more than this buys
+// nothing; the cap is generous so a real stack trace still arrives intact.
+const maxRerankStderr = 64 * 1024
 
 // defaultRerankTimeout is the adapter's own safety net for a zero RerankTimeout.
 // It deliberately does NOT fall back to a.Timeout the way TaskGenTimeout does:
@@ -137,9 +147,13 @@ func (a *Adapter) RerankWithSession(ctx context.Context, req domain.RerankReques
 	// After the timeout kills the CLI, don't wait on lingering grandchildren
 	// holding the output pipes open — fail safe promptly.
 	cmd.WaitDelay = 2 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// Bounded while the child runs. Overflow is not an I/O error — see
+	// capWriter — so a noisy CLI is still reported as producing oversized
+	// output rather than as a broken pipe.
+	stdout := newCapWriter(maxRerankOutput + 1)
+	stderr := newCapWriter(maxRerankStderr)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	cmd.Env = childEnv
 	runErr := cmd.Run()
 
@@ -167,9 +181,9 @@ func (a *Adapter) RerankWithSession(ctx context.Context, req domain.RerankReques
 		return "", sessionID, fmt.Errorf("re-ranking CLI produced empty output (stderr: %s)",
 			tailOf(stderr.String(), 500))
 	}
-	if len(result) > maxRerankOutput {
-		return "", sessionID, fmt.Errorf("re-ranking CLI produced oversized output (%d bytes > %d cap)",
-			len(result), maxRerankOutput)
+	if stdout.Overflowed() || len(result) > maxRerankOutput {
+		return "", sessionID, fmt.Errorf("re-ranking CLI produced oversized output (over the %d byte cap)",
+			maxRerankOutput)
 	}
 	return result, sessionID, nil
 }

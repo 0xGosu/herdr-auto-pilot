@@ -1253,6 +1253,19 @@ whose manifest carries exactly that version).
     row's `signature` (it names the rule the judge picked) plus one Debug line; do not
     "fix" this by adding provenance to the auto path without deciding what that does for
     every existing cosine/bm25 delivery too.
+  - **An IN-FLIGHT run is invalidated by the same events the cache is** (`invalidateRerank`,
+    called from `reloadWith` and `RefreshKnowledge`). Clearing only the cache leaves the
+    hole in its most confusing form: a run started under the old command, prompt or
+    threshold finishes seconds later, passes the per-agent token check — which is about
+    SUPERSESSION, not staleness — applies its answer, and REPOPULATES the cache that was
+    just emptied. A refresh can also DELETE the very rule the verdict names. Each flight
+    carries the `rerankGen` it started under and `handleRerankOutcome` degrades an older
+    one to the cosine fallback. It degrades rather than CANCELS on purpose: a reload
+    follows every `hap config set`, and cancelling would drop a pending decision outright
+    instead of answering it the way an unjudged daemon would. Keep
+    `TestAnInvalidatedVerdictIsNeitherAppliedNorCached` and its control
+    `TestACurrentVerdictIsStillAppliedAndCached` (without the control the first passes on
+    an implementation that discards every verdict).
   - **The verdict cache keys on the RENDERED listing, never the candidate signatures.**
     A parked pane re-captures on every attention event, so a cache is required — but the
     listing carries each rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what

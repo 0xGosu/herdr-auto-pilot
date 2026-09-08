@@ -409,6 +409,149 @@ func TestRerankCacheIsClearedOnReload(t *testing.T) {
 	}
 }
 
+// TestAnInvalidatedVerdictIsNeitherAppliedNorCached is the other half of that
+// rule, and it is the half that was missing.
+//
+// Clearing only the CACHE leaves the hole in its most confusing form: a judge
+// started under the old command, prompt or threshold finishes seconds later,
+// passes the per-agent token check — which is about SUPERSESSION, not staleness
+// — applies its answer, and repopulates the cache that was just emptied. A veto
+// arriving that way is worse still: it mints a new key and skips BM25 under a
+// configuration that may no longer have a judge at all.
+func TestAnInvalidatedVerdictIsNeitherAppliedNorCached(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		invalidate func(*Daemon)
+	}{
+		{"a reload", func(d *Daemon) { _ = d.reloadWith(false) }},
+		{"a knowledge refresh", func(d *Daemon) { d.RefreshKnowledge() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+			d := h.daemon
+			s := classifierForTest().Classify("claude", "blocked", approvalPane)
+			s.AgentID, s.PaneID, s.Status = "agent-gen", "agent-gen", "blocked"
+			h.herdr.setPane(approvalPane) // the pane still stands, so only the generation decides
+			// The agent must be LIVE, or the resumed escalation is auto-dismissed
+			// as agent_not_live and the test cannot see which key it resumed on.
+			h.herdr.setAgents([]domain.AgentTransition{{
+				AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+			}})
+			orig := domain.ComputeSignature(s)
+
+			fallback := orig
+			fallback.Signature = "approval:cosine"
+			fallback.Match.Method = domain.MatchCosine
+			fallback.Match.Score = 0.93
+
+			// A flight registered under the CURRENT generation...
+			gen := d.rerankGeneration()
+			_, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			d.mu.Lock()
+			d.rerankSeq++
+			token := d.rerankSeq
+			d.rerankInFlight[s.AgentID] = rerankFlight{raw: orig.Raw, token: token, gen: gen, cancel: cancel}
+			d.mu.Unlock()
+
+			// ...and the world moves while it runs.
+			tc.invalidate(d)
+			if d.rerankGeneration() == gen {
+				t.Fatal("premise: the invalidation must move the generation")
+			}
+
+			res := rerankOutcome{
+				situation: s,
+				tr:        domain.AgentTransition{AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked"},
+				fallback:  fallback, original: orig, token: token, gen: gen,
+				cacheKey: "stale-key",
+				plan: &rerankPlan{
+					candidates: []domain.RerankCandidate{{ID: 1, Signature: "approval:judged", Cosine: 0.93}},
+					rendered:   "--- rule 1 ---",
+				},
+				verdict: []domain.RerankResult{{ID: 1, Score: 0.99}},
+			}
+			d.handleRerankOutcome(context.Background(), res)
+
+			if _, ok := d.cachedRerankVerdict("stale-key"); ok {
+				t.Error("an invalidated verdict was cached — it would repopulate exactly what the invalidation discarded")
+			}
+			// The decision still RESUMES, on the un-judged cosine answer:
+			// retiring is a degrade, not a cancellation, or every `hap config
+			// set` would drop a pending decision outright.
+			//
+			// The provenance snapshot is what proves WHICH key it resumed on:
+			// decideAndActResolved writes it synchronously, keyed on the RESOLVED
+			// signature, before any of the decision's own gates can route the
+			// audit row somewhere this assertion cannot see.
+			if !hasSnapshot(t, d, "approval:cosine") {
+				t.Error("the decision did not resume on the cosine fallback")
+			}
+			if hasSnapshot(t, d, "approval:judged") {
+				t.Error("the invalidated verdict was applied anyway")
+			}
+		})
+	}
+}
+
+// TestACurrentVerdictIsStillAppliedAndCached is the control. Without it the
+// test above passes on an implementation that discards every verdict.
+func TestACurrentVerdictIsStillAppliedAndCached(t *testing.T) {
+	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+	d := h.daemon
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	s.AgentID, s.PaneID, s.Status = "agent-gen-ok", "agent-gen-ok", "blocked"
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}})
+	orig := domain.ComputeSignature(s)
+
+	fallback := orig
+	fallback.Signature = "approval:cosine"
+	fallback.Match.Method = domain.MatchCosine
+
+	gen := d.rerankGeneration()
+	_, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	d.mu.Lock()
+	d.rerankSeq++
+	token := d.rerankSeq
+	d.rerankInFlight[s.AgentID] = rerankFlight{raw: orig.Raw, token: token, gen: gen, cancel: cancel}
+	d.mu.Unlock()
+
+	d.handleRerankOutcome(context.Background(), rerankOutcome{
+		situation: s,
+		tr:        domain.AgentTransition{AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked"},
+		fallback:  fallback, original: orig, token: token, gen: gen,
+		cacheKey: "live-key",
+		plan: &rerankPlan{
+			candidates: []domain.RerankCandidate{{ID: 1, Signature: "approval:judged", Cosine: 0.93}},
+			rendered:   "--- rule 1 ---",
+		},
+		verdict: []domain.RerankResult{{ID: 1, Score: 0.99}},
+	})
+
+	if _, ok := d.cachedRerankVerdict("live-key"); !ok {
+		t.Error("a current verdict must be cached")
+	}
+	if !hasSnapshot(t, d, "approval:judged") {
+		t.Error("a current verdict must be applied")
+	}
+}
+
+// hasSnapshot reports whether the daemon recorded rule provenance for a
+// signature — the first thing decideAndActResolved does with the RESOLVED key,
+// and so the cheapest synchronous evidence of which key a resume used.
+func hasSnapshot(t *testing.T, d *Daemon, signature string) bool {
+	t.Helper()
+	snap, err := d.opt.Store.GetSignatureSnapshot(context.Background(), signature)
+	if err != nil {
+		t.Fatalf("reading the snapshot for %s: %v", signature, err)
+	}
+	return snap != ""
+}
+
 // TestRerankCacheEvictsInsteadOfGrowing: the cache is process-lifetime state on
 // a daemon that may run for weeks over a herd whose screens keep changing.
 func TestRerankCacheEvictsInsteadOfGrowing(t *testing.T) {

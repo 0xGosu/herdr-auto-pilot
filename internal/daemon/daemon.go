@@ -309,10 +309,20 @@ type Daemon struct {
 	// rerankCache memoizes verdicts by (raw hash, rendered candidate listing):
 	// a parked pane re-captures on every attention event, so without it the
 	// judge is paid for repeatedly on one unchanged screen. rerankCacheOrder is
-	// its FIFO eviction order. Both are dropped on ANY reload and on
-	// RefreshKnowledge — see clearRerankCache.
+	// its FIFO eviction order.
+	//
+	// rerankGen is what makes an IN-FLIGHT run answerable to the same
+	// invalidation the cache obeys. A reload or a knowledge refresh changes what
+	// the judge was asked — its command, prompt and thresholds, or the rules the
+	// candidate listing described — so a run started before one and finishing
+	// after it answers a question nobody asked any more. The cache is emptied
+	// and this counter is bumped together (invalidateRerank); a flight carries
+	// the value it started under, and handleRerankOutcome degrades an outcome
+	// whose generation has moved to the un-judged cosine answer rather than
+	// applying it or repopulating the cache with it.
 	rerankInFlight   map[string]rerankFlight
 	rerankSeq        uint64
+	rerankGen        uint64
 	rerankCache      map[string][]domain.RerankResult
 	rerankCacheOrder []string
 
@@ -959,13 +969,13 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 		d.snapshotSaved = map[string]bool{}
 	}
 	d.mu.Unlock()
-	// Every cached re-ranking verdict answers a question posed under the OLD
-	// config — the judge's own prompt, its relevance threshold, how many
-	// candidates it saw — and a reload also follows signature deletion and
-	// learned-data resets. Cleared unconditionally rather than on a section
-	// comparison: turning the judge off and on again must not resurrect the
-	// answers it gave before.
-	d.clearRerankCache()
+	// Every re-ranking verdict — cached, or still being computed — answers a
+	// question posed under the OLD config: the judge's own prompt, its relevance
+	// threshold, how many candidates it saw. A reload also follows signature
+	// deletion and learned-data resets. Invalidated unconditionally rather than
+	// on a section comparison: turning the judge off and on again must not
+	// resurrect the answers it gave before.
+	d.invalidateRerank()
 	allow, errs := domain.NewNeverAutoList(!cfg.Safety.DisableNeverAutoSeedPatterns,
 		cfg.Safety.DisabledSeedPatterns, cfg.Safety.NeverAutoPatterns, neverAutoRules(cfg.Safety))
 	for _, e := range errs {
