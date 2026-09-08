@@ -1186,6 +1186,26 @@ whose manifest carries exactly that version).
   `embedding.similarity_threshold` into a FILTER: every candidate at or above it is
   listed for a one-shot CLI, which returns `[{"id": n, "score": s}]` ordered by
   relevance and hap uses the first. Five bounds are load-bearing:
+  - **The kill switch is asked for HERE, not inherited.** Every other LLM subprocess in
+    the daemon is reached only because `Decide` asked for it, and `Decide` already has
+    `killActive` from `readDecisionState` — but `startRerank` spawns BEFORE that read, so
+    an ungated judge leaves a PAUSED herd launching a subprocess per attention event per
+    parked agent, for decisions that escalate regardless. Refusing is not a degrade: the
+    caller carries on with the cosine fallback, which is what hap answered before this
+    feature existed. A read error refuses too, for the same reason auto-accept's kill
+    re-check fails closed. Keep `TestAPausedHerdNeverSpawnsTheJudge`.
+  - **The resume re-reads the pane, and its drop is SILENT** — `rerankSituationHeldStill`
+    discards the decision and logs one INFO line, leaving the pane to the next attention
+    event. That is the right direction (the alternative resumes a 30-second-old decision
+    into a live menu) but it is also the branch most able to disable the feature without
+    anyone noticing, so it is covered directly rather than through the pipeline tests,
+    which only ever exercise the pass. It carries `handleActionReviewOutcome`'s asymmetry:
+    idle matches on situation TYPE alone, because an idle signature hashes a masked
+    content head that legitimately differs between the original `--source recent` capture
+    and this `--source visible` re-read — comparing signatures there drops every idle
+    resume. The transition's status falls back to the situation's own, since an empty one
+    would mismatch on type and drop everything while every test still passed. Keep
+    `TestARerankResumeDropsAPaneThatMovedOn` / `…ToleratesIdleDrift`.
   - **A vector-search ERROR is not a cosine miss.** `cosineRerankPass` reports (judged,
     missed) separately for exactly this: `bm25RetryAllowed` refuses a text retry for any
     STRUCTURED salient cosine has REFUSED, so collapsing a transient KNN failure into

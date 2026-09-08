@@ -340,7 +340,14 @@ func (d *Daemon) rerankSituationHeldStill(ctx context.Context, res rerankOutcome
 	d.mu.RLock()
 	cls := d.classifier
 	d.mu.RUnlock()
-	current := cls.Classify(s.AgentType, res.tr.Status, pane)
+	// The transition's status is what the original classification used; fall
+	// back to the situation's own copy so an empty one can never make every
+	// resume mismatch on type and silently drop the whole feature.
+	status := res.tr.Status
+	if status == "" {
+		status = s.Status
+	}
+	current := cls.Classify(s.AgentType, status, pane)
 	if current.Type != s.Type {
 		slog.Info("situation changed during re-ranking; dropping the resume",
 			"agent", s.AgentID, "was", s.Type, "now", current.Type)
@@ -350,7 +357,7 @@ func (d *Daemon) rerankSituationHeldStill(ctx context.Context, res rerankOutcome
 		return true
 	}
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
-	current.Status = res.tr.Status
+	current.Status = status
 	fresh := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars)
 	if !domain.SignatureHeldStill(res.original, fresh, staleDeferredSendJitterPercent) {
 		slog.Info("signature changed during re-ranking; dropping the resume", "agent", s.AgentID)
@@ -437,6 +444,25 @@ func (d *Daemon) startRerank(ctx context.Context, s domain.Situation,
 
 	rp := d.rerankerPort()
 	if rp == nil {
+		return false
+	}
+	// The kill switch is read HERE, and it is the one gate this feature has to
+	// ask for itself. Every other LLM subprocess in the daemon is reached only
+	// because Decide asked for it, and Decide already has killActive from
+	// readDecisionState — but the judge spawns BEFORE that read, so on a paused
+	// herd every attention event on every parked agent would launch a
+	// subprocess for a decision that is going to escalate anyway.
+	//
+	// Refusing is not a degrade: the caller proceeds inline with the cosine
+	// fallback, which is precisely what hap answered before this feature
+	// existed, and a paused herd escalates either way. A read ERROR refuses for
+	// the same reason auto-accept's kill re-check fails closed — "we could not
+	// ask" is not "the herd is running".
+	if kill, err := d.opt.Store.LatestKillEvent(ctx); err != nil {
+		slog.Warn("re-ranking: kill switch unreadable; using the cosine match", "error", err)
+		return false
+	} else if domain.KillStateActive(kill) {
+		slog.Debug("re-ranking skipped: the herd is paused", "agent", s.AgentID)
 		return false
 	}
 	cfg, _, _ := d.snapshot()

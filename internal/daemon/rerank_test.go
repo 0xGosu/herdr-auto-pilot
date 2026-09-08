@@ -941,3 +941,108 @@ func TestAVectorSearchErrorIsNotACosineRefusal(t *testing.T) {
 			got.Match.Method, got.Signature)
 	}
 }
+
+// TestAPausedHerdNeverSpawnsTheJudge: the kill switch is the ONE safety control
+// this feature has to ask for itself.
+//
+// Every other LLM subprocess in the daemon is reached only because Decide asked
+// for it, and Decide already has killActive; the judge spawns BEFORE that read.
+// Ungated, pausing a herd would leave every parked agent launching a subprocess
+// on every attention event, for decisions that escalate regardless — which an
+// operator watching their CLI spin up would file as a bug.
+func TestAPausedHerdNeverSpawnsTheJudge(t *testing.T) {
+	sit := approvalWithOpts("run npm install in the web package")
+	sig := domain.ComputeSignature(sit)
+	emb := &fakeEmbedder{vectors: map[string][]float32{sig.Salient: {1, 0, 0, 0}}}
+	d, rr := rerankHarness(t, emb, rerankCfg)
+	ctx := context.Background()
+	cfg, _, _ := d.snapshot()
+	seedRule(t, d, sig.Salient, domain.SituationApproval, "approval:learned", []float32{1, 0, 0, 0})
+	rr.rerank = func(context.Context, domain.RerankRequest) (string, error) {
+		t.Error("the judge ran while the herd was paused")
+		return `[]`, nil
+	}
+	if _, err := d.opt.Store.InsertKillEvent(ctx, domain.KillEvent{
+		State: "active", Scope: "global", Author: "test", CreatedAt: d.opt.Clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, plan := d.resolveSignatureN(ctx, cfg, sig, sit)
+	if plan == nil {
+		t.Fatal("premise: the cosine pass must still produce a plan; only the SPAWN is gated")
+	}
+	tr := domain.AgentTransition{AgentID: sit.AgentID, PaneID: sit.PaneID, AgentType: "claude", Status: "blocked"}
+	if d.startRerank(ctx, sit, tr, "agent", sig, sig, plan) {
+		t.Fatal("startRerank took ownership on a paused herd — the caller then never decides at all")
+	}
+	// Refusing is not a degrade: the caller carries on with the cosine answer,
+	// which is exactly what hap gave before this feature existed.
+	d.mu.RLock()
+	inflight := len(d.rerankInFlight)
+	d.mu.RUnlock()
+	if inflight != 0 {
+		t.Errorf("a refused spawn left %d flight(s) registered", inflight)
+	}
+}
+
+// TestARerankResumeDropsAPaneThatMovedOn covers the gate that can discard a
+// decision outright. Its failure mode is SILENT — the decision vanishes, one
+// INFO line, and the pane sits unanswered until the next attention event — so
+// the drop branch needs its own coverage rather than riding on the two pipeline
+// tests, which only ever exercise the pass.
+func TestARerankResumeDropsAPaneThatMovedOn(t *testing.T) {
+	tests := []struct {
+		name       string
+		pane       string // what the re-read now shows ("" = make the read fail)
+		wantResume bool
+	}{
+		{name: "the same screen still stands", pane: approvalPane, wantResume: true},
+		{name: "a different question now stands", pane: rerankLivePane, wantResume: false},
+		{name: "the agent moved on entirely", pane: "all done, nothing to approve\n", wantResume: false},
+		{name: "the pane cannot be read", pane: "", wantResume: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+			s := classifierForTest().Classify("claude", "blocked", approvalPane)
+			s.AgentID, s.PaneID, s.Status = "agent-stale", "agent-stale", "blocked"
+			res := rerankOutcome{
+				situation: s,
+				tr:        domain.AgentTransition{AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked"},
+				original:  domain.ComputeSignature(s),
+			}
+			if tc.pane == "" {
+				h.herdr.mu.Lock()
+				h.herdr.failRead = true
+				h.herdr.mu.Unlock()
+			} else {
+				h.herdr.setPane(tc.pane)
+			}
+			if got := h.daemon.rerankSituationHeldStill(context.Background(), res); got != tc.wantResume {
+				t.Errorf("rerankSituationHeldStill = %v, want %v", got, tc.wantResume)
+			}
+		})
+	}
+}
+
+// TestARerankResumeToleratesIdleDrift: an idle signature hashes a masked
+// content head that legitimately differs between the original consuming
+// "--source recent" read and the "--source visible" re-read, so idle matches on
+// situation TYPE alone — the same asymmetry handleActionReviewOutcome carries.
+// Comparing signatures there would drop every idle resume, silently.
+func TestARerankResumeToleratesIdleDrift(t *testing.T) {
+	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+	original := idleSituation(learnedRun)
+	original.AgentID, original.PaneID, original.Status = "agent-idle", "agent-idle", "idle"
+	res := rerankOutcome{
+		situation: original,
+		tr:        domain.AgentTransition{AgentID: "agent-idle", PaneID: "agent-idle", AgentType: "claude", Status: "idle"},
+		original:  domain.ComputeSignature(original),
+	}
+	// A completely different idle screen: still idle, so the resume proceeds.
+	h.herdr.setPane(unrelatedRun)
+	if !h.daemon.rerankSituationHeldStill(context.Background(), res) {
+		t.Error("an idle resume must match on type alone; comparing signatures drops every one of them")
+	}
+}
