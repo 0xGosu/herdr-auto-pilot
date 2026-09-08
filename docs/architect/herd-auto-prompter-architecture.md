@@ -531,9 +531,18 @@ fallback chain (each step stamps a `match_method` recorded in the audit log):
    `similarity_threshold` (up to `llm.reranking_max_candidates`, which is also
    the vector search's *k* here) is numbered and listed for a one-shot CLI,
    which answers with a JSON array `[{"id": <n>, "score": <0-1>}]` ordered by
-   relevance. Entries below `llm.relevance_score_threshold` are dropped, the
-   rest truncated to `llm.reranking_top_k`, and the **first** is the learned
-   key (`match_method = rerank`, score = the judge's relevance).
+   relevance. Entries below `llm.relevance_score_threshold` are dropped and the
+   rest truncated to `llm.reranking_top_k` (`match_method = rerank`, score = the
+   judge's relevance for whichever entry is used).
+
+   The engine **walks** that list rather than taking its head. The judge ranks by
+   relevance and cannot see a rule's learned state, so its best match is often
+   one hap may not act on — still in shadow mode, below its confidence
+   threshold, naming an option the screen no longer offers. Each affirmed rule
+   is put to `domain.Decide` in order and the first that does not escalate is
+   acted on; if none can, the HEAD escalates, since that is the rule the
+   operator should be asked about. `top_k` is therefore the depth of the walk,
+   and must be at least 1.
 
    Three properties make it safe:
 

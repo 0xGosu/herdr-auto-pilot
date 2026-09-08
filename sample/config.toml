@@ -452,10 +452,11 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # relevance_score_threshold = 0.95 # minimum relevance score a judged rule needs
 #                                  # to be usable. Passed to the judge so it
 #                                  # drops the rest itself. Omitted: 0.95.
-# reranking_max_candidates = 10    # how many above-threshold rules the judge is
+# reranking_max_candidates = 20    # how many above-threshold rules the judge is
 #                                  # shown. Also the vector search's k on this
 #                                  # path, so it changes RECALL, not just prompt
-#                                  # size. Omitted: 10.
+#                                  # size, and it also bounds how far the engine
+#                                  # can fall back. Omitted: 20.
 
 
 

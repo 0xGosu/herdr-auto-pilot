@@ -524,9 +524,9 @@ tab-separated stdout is unaffected.
 | `llm.learn_from_user_timeout_seconds` | inherits `timeout_seconds` | timeout for one learn run |
 | `llm.reranking_command` | (disabled) | argv for the LLM-as-a-judge rule re-ranker; empty keeps the plain cosine → BM25 chain. The run answers from its prompt alone but executes in the monitored agent's directory, so the presets differ in what they grant: the claude one disables Claude's built-in tools outright (`--tools ""` plus `--strict-mcp-config`), the codex one only restricts it to `--sandbox read-only`, which can still READ that project |
 | `llm.reranking_timeout_seconds` | 30 | timeout for one judge run. Deliberately does NOT inherit `timeout_seconds` — the agent is parked and unanswered while it runs |
-| `llm.reranking_top_k` | 3 | most rules the judge may return; hap acts on the first |
+| `llm.reranking_top_k` | 3 | most rules the judge may return; must be >= 1. hap walks the list in order and acts on the first rule that yields an autonomous decision, falling back to the best match for the escalation when none does |
 | `llm.relevance_score_threshold` | 0.95 | min relevance score a judged rule needs to be usable; passed to the judge in its prompt |
-| `llm.reranking_max_candidates` | 10 | how many above-threshold rules the judge is shown (also the vector search's k on this path) |
+| `llm.reranking_max_candidates` | 20 | how many above-threshold rules the judge is shown (also the vector search's k on this path, and the ceiling on how far the engine can fall back) |
 | `llm.env_file` | (none) | `.env` shared by every llm command |
 | `llm.command_env_file` etc. | (none) | per-command `.env`, layered over the shared one (one per command) |
 | `embedding.disabled` | false | turn semantic matching off entirely |

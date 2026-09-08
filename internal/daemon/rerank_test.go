@@ -131,7 +131,7 @@ func TestRerankingOffLeavesTheChainUnchanged(t *testing.T) {
 	}
 	seedRule(t, d, sig.Salient, domain.SituationApproval, "approval:learned", []float32{1, 0, 0, 0})
 
-	got, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	got, _, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
 	if plan != nil {
 		t.Fatal("an unconfigured judge must never defer a decision")
 	}
@@ -279,7 +279,7 @@ func TestRerankNeverRunsWithoutACandidateAboveThreshold(t *testing.T) {
 		return `[]`, nil
 	}
 
-	got, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	got, _, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
 	if plan != nil {
 		t.Fatal("an empty candidate field must not defer the decision")
 	}
@@ -331,7 +331,7 @@ func TestRerankCandidatesAreAcceptFilteredBeforeTheJudge(t *testing.T) {
 		return `[{"id": 1, "score": 1}]`, nil
 	}
 
-	got, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	got, _, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
 	if plan != nil {
 		t.Fatal("no admissible candidate must not defer the decision")
 	}
@@ -362,7 +362,7 @@ func TestRerankVerdictIsCachedPerCandidateSet(t *testing.T) {
 		t.Fatalf("first resolve = %q", first.Signature)
 	}
 	// Second identical capture: answered inline from the cache, no deferral.
-	second, plan := d.resolveSignatureN(ctx, cfg, sig, sit)
+	second, _, plan := d.resolveSignatureN(ctx, cfg, sig, sit)
 	if plan != nil {
 		t.Fatal("a cached verdict must be applied inline, not deferred")
 	}
@@ -389,7 +389,7 @@ func TestRerankVerdictIsCachedPerCandidateSet(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, plan := d.resolveSignatureN(ctx, cfg, sig, sit); plan == nil {
+	if _, _, plan := d.resolveSignatureN(ctx, cfg, sig, sit); plan == nil {
 		t.Fatal("a rule whose learned action changed must be judged again, not served from cache")
 	}
 }
@@ -652,7 +652,7 @@ func TestRerankDoesNotStallTheSelectLoop(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+		_, _, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
 		if plan == nil {
 			t.Error("a configured judge with candidates must hand back a plan")
 		}
@@ -721,7 +721,7 @@ func resolveThroughJudge(t *testing.T, d *Daemon, cfg config.Config,
 	sig domain.SignatureResult, sit domain.Situation) domain.SignatureResult {
 	t.Helper()
 	ctx := context.Background()
-	fallback, plan := d.resolveSignatureN(ctx, cfg, sig, sit)
+	fallback, _, plan := d.resolveSignatureN(ctx, cfg, sig, sit)
 	if plan == nil {
 		return fallback
 	}
@@ -742,7 +742,7 @@ func resolveThroughJudge(t *testing.T, d *Daemon, cfg config.Config,
 		return fallback
 	}
 	d.storeRerankVerdict(rerankCacheKey(sig.Raw, plan.rendered), verdict)
-	return d.finishRerank(ctx, fallback, sig, sit, plan, verdict)
+	return d.finishRerank(ctx, fallback, sig, sit, plan, verdict)[0]
 }
 
 // newHarnessRerank installs an embedder, a real match index and a judge on the
@@ -968,7 +968,7 @@ func TestADuplicateTransitionDoesNotStartASecondJudge(t *testing.T) {
 		return `[]`, nil
 	}
 
-	_, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	_, _, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
 	if plan == nil {
 		t.Fatal("premise: the first pass must hand back a plan")
 	}
@@ -1019,7 +1019,7 @@ func TestANewSituationSupersedesTheJudgeInFlight(t *testing.T) {
 		return `[]`, nil
 	}
 
-	_, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	_, _, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
 	if plan == nil {
 		t.Fatal("premise: the first pass must hand back a plan")
 	}
@@ -1084,7 +1084,7 @@ func TestAVectorSearchErrorIsNotACosineRefusal(t *testing.T) {
 		return `[]`, nil
 	}
 
-	got, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
+	got, _, plan := d.resolveSignatureN(context.Background(), cfg, sig, sit)
 	if plan != nil {
 		t.Fatal("a failed search must not defer anything")
 	}
@@ -1121,7 +1121,7 @@ func TestAPausedHerdNeverSpawnsTheJudge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, plan := d.resolveSignatureN(ctx, cfg, sig, sit)
+	_, _, plan := d.resolveSignatureN(ctx, cfg, sig, sit)
 	if plan == nil {
 		t.Fatal("premise: the cosine pass must still produce a plan; only the SPAWN is gated")
 	}
@@ -1336,5 +1336,236 @@ func TestTheGenerationCheckAndTheCacheWriteAreOneCriticalSection(t *testing.T) {
 		if cached && !committed.Load() {
 			t.Fatalf("iteration %d: a REFUSED verdict was cached", i)
 		}
+	}
+}
+
+// seedGraduatedRule makes a signature autonomous with a consistent history, so
+// domain.Decide will send its action rather than escalate.
+func seedGraduatedRule(t *testing.T, d *Daemon, signature, action string, typ domain.SituationType) {
+	t.Helper()
+	ctx := context.Background()
+	for i := range 8 {
+		if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+			Signature: signature, SituationType: typ, AgentType: "claude",
+			ChosenAction: action, Source: domain.SourceOperator,
+			CreatedAt: d.opt.Clock.Now().Add(-time.Duration(8-i) * time.Minute),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := d.opt.Store.UpsertSignature(ctx, domain.SignatureState{
+		Signature: signature, SituationType: typ, AgentType: "claude",
+		Mode: domain.ModeAutonomous, ConsecutiveConfirmations: 8,
+		CachedConfidence: 1.0, UpdatedAt: d.opt.Clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// seedShadowRule leaves a signature UNGRADUATED: it exists and has an action,
+// but domain.Decide will escalate rather than act on it.
+func seedShadowRule(t *testing.T, d *Daemon, signature, action string, typ domain.SituationType) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
+		Signature: signature, SituationType: typ, AgentType: "claude",
+		ChosenAction: action, Source: domain.SourceOperator, CreatedAt: d.opt.Clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.opt.Store.UpsertSignature(ctx, domain.SignatureState{
+		Signature: signature, SituationType: typ, AgentType: "claude",
+		Mode: domain.ModeShadow, UpdatedAt: d.opt.Clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTheEngineFallsBackToALowerRankedRule is the point of walking the judge's
+// answer instead of taking its head.
+//
+// The judge ranks by RELEVANCE — how well a rule answers this screen — and
+// cannot see a rule's learned state at all. Its best match is routinely one hap
+// may not act on: still in shadow mode, below its confidence threshold, or
+// naming an option this screen no longer offers. Taking only the head turns
+// every such case into an escalation even when the judge also affirmed a rule
+// that IS ready, which is the whole cost this walk removes.
+func TestTheEngineFallsBackToALowerRankedRule(t *testing.T) {
+	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+	d := h.daemon
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	s.AgentID, s.PaneID, s.Status = "agent-fallback", "agent-fallback", "blocked"
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}})
+	orig := domain.ComputeSignature(s)
+
+	// #1 by relevance is not actionable; #2 is graduated and answers "1".
+	seedShadowRule(t, d, "approval:shadow", "1", domain.SituationApproval)
+	seedGraduatedRule(t, d, "approval:ready", "1", domain.SituationApproval)
+
+	rank := func(sig string, score float64) domain.SignatureResult {
+		out := orig
+		out.Signature = sig
+		out.Match.Method = domain.MatchRerank
+		out.Match.Score = score
+		return out
+	}
+	ranked := []domain.SignatureResult{rank("approval:shadow", 0.99), rank("approval:ready", 0.96)}
+
+	d.decideAndActResolved(context.Background(), s, domain.AgentTransition{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}, "agent", d.opt.Clock.Now(), ranked[0], ranked)
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "1" {
+		t.Errorf("sent %q, want the lower-ranked rule's learned answer", got)
+	}
+	audits, err := d.opt.Store.AuditLog(context.Background(), 5)
+	if err != nil || len(audits) == 0 {
+		t.Fatalf("audit log: %v %v", audits, err)
+	}
+	if audits[0].Signature != "approval:ready" {
+		t.Errorf("audit filed under %q, want the rule that actually acted", audits[0].Signature)
+	}
+	if !strings.Contains(audits[0].Rationale, "fell back") {
+		t.Errorf("the rationale must say the answer came from below the best match: %q", audits[0].Rationale)
+	}
+	// Provenance is recorded for the rule that ACTED, not for every candidate
+	// the walk looked at.
+	if hasSnapshot(t, d, "approval:shadow") {
+		t.Error("a candidate the walk skipped was given rule provenance")
+	}
+}
+
+// TestTheBestMatchIsWhatEscalatesWhenNothingCanAct: the fallback is for finding
+// a rule that can ACT, never for choosing which rule to ask the operator about.
+// When the whole list refuses, the human sees the judge's best match.
+func TestTheBestMatchIsWhatEscalatesWhenNothingCanAct(t *testing.T) {
+	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+	d := h.daemon
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	s.AgentID, s.PaneID, s.Status = "agent-none-act", "agent-none-act", "blocked"
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}})
+	orig := domain.ComputeSignature(s)
+	seedShadowRule(t, d, "approval:best", "1", domain.SituationApproval)
+	seedShadowRule(t, d, "approval:second", "2", domain.SituationApproval)
+
+	rank := func(sig string, score float64) domain.SignatureResult {
+		out := orig
+		out.Signature = sig
+		out.Match.Method = domain.MatchRerank
+		out.Match.Score = score
+		return out
+	}
+	ranked := []domain.SignatureResult{rank("approval:best", 0.99), rank("approval:second", 0.95)}
+
+	d.decideAndActResolved(context.Background(), s, domain.AgentTransition{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}, "agent", d.opt.Clock.Now(), ranked[0], ranked)
+
+	waitFor(t, 3*time.Second, func() bool {
+		a, err := d.opt.Store.AuditLog(context.Background(), 5)
+		return err == nil && len(a) > 0
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Fatalf("nothing was actionable, so nothing may be sent; got %v", got)
+	}
+	audits, _ := d.opt.Store.AuditLog(context.Background(), 5)
+	if audits[0].Status != "escalated" {
+		t.Errorf("status = %q, want escalated", audits[0].Status)
+	}
+	if audits[0].Signature != "approval:best" {
+		t.Errorf("escalated under %q, want the judge's BEST match — that is the rule "+
+			"the operator should be asked about", audits[0].Signature)
+	}
+}
+
+// TestASingleRankedRuleBehavesExactlyAsBefore is the guard that the walk is
+// invisible to every situation that is not re-ranked: one candidate, or none,
+// must take the same path and cost no extra store read.
+func TestASingleRankedRuleBehavesExactlyAsBefore(t *testing.T) {
+	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+	d := h.daemon
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	s.AgentID, s.PaneID, s.Status = "agent-single", "agent-single", "blocked"
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}})
+	sig := domain.ComputeSignature(s)
+	seedGraduatedRule(t, d, sig.Signature, "1", domain.SituationApproval)
+
+	// nil ranked — the shape every non-rerank caller passes.
+	d.decideAndActResolved(context.Background(), s, domain.AgentTransition{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}, "agent", d.opt.Clock.Now(), sig, nil)
+
+	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	audits, _ := d.opt.Store.AuditLog(context.Background(), 5)
+	if len(audits) == 0 || audits[0].Signature != sig.Signature {
+		t.Fatalf("a single-rule decision changed shape: %v", audits)
+	}
+	if strings.Contains(audits[0].Rationale, "fell back") {
+		t.Errorf("a decision with no alternatives must not claim a fallback: %q", audits[0].Rationale)
+	}
+}
+
+// TestTheWalkNeverOutrunsASafetyVeto: every gate that does not depend on the
+// SIGNATURE — the kill switch here, and equally the never-auto match, the
+// suspected-irreversible heuristic and the rate guard — is fixed for the whole
+// walk. A decision they refuse is refused for every candidate, so the walk can
+// only ever land back on the head.
+//
+// Without this, "try the next rule until one sends" reads like a loop that
+// could shop for a candidate past a safety refusal, which is exactly the thing
+// it must not be.
+func TestTheWalkNeverOutrunsASafetyVeto(t *testing.T) {
+	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
+	d := h.daemon
+	ctx := context.Background()
+	s := classifierForTest().Classify("claude", "blocked", approvalPane)
+	s.AgentID, s.PaneID, s.Status = "agent-killed", "agent-killed", "blocked"
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}})
+	orig := domain.ComputeSignature(s)
+	// BOTH rules are graduated and would act — only the kill switch stops them.
+	seedGraduatedRule(t, d, "approval:one", "1", domain.SituationApproval)
+	seedGraduatedRule(t, d, "approval:two", "1", domain.SituationApproval)
+	if _, err := d.opt.Store.InsertKillEvent(ctx, domain.KillEvent{
+		State: "active", Scope: "global", Author: "test", CreatedAt: d.opt.Clock.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rank := func(sig string, score float64) domain.SignatureResult {
+		out := orig
+		out.Signature = sig
+		out.Match.Method = domain.MatchRerank
+		out.Match.Score = score
+		return out
+	}
+	ranked := []domain.SignatureResult{rank("approval:one", 0.99), rank("approval:two", 0.97)}
+
+	d.decideAndActResolved(ctx, s, domain.AgentTransition{
+		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
+	}, "agent", d.opt.Clock.Now(), ranked[0], ranked)
+
+	waitFor(t, 3*time.Second, func() bool {
+		a, err := d.opt.Store.AuditLog(ctx, 5)
+		return err == nil && len(a) > 0
+	})
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Fatalf("the herd is paused; the walk sent %v anyway", got)
+	}
+	audits, _ := d.opt.Store.AuditLog(ctx, 5)
+	if audits[0].Signature != "approval:one" {
+		t.Errorf("escalated under %q, want the head", audits[0].Signature)
 	}
 }

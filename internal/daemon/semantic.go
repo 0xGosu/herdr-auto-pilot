@@ -177,7 +177,7 @@ type rerankPlan struct {
 func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 	sig domain.SignatureResult, s domain.Situation) domain.SignatureResult {
 
-	resolved, _ := d.resolveSignatureN(ctx, cfg, sig, s)
+	resolved, _, _ := d.resolveSignatureN(ctx, cfg, sig, s)
 	return resolved
 }
 
@@ -203,7 +203,7 @@ func (d *Daemon) resolveSignature(ctx context.Context, cfg config.Config,
 // failure degrades toward exact-hash behavior — never blocks a decision, never
 // panics (fail-safe rule).
 func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
-	sig domain.SignatureResult, s domain.Situation) (domain.SignatureResult, *rerankPlan) {
+	sig domain.SignatureResult, s domain.Situation) (domain.SignatureResult, []domain.SignatureResult, *rerankPlan) {
 
 	if sig.Signature == "" || cfg.Embedding.Disabled || !d.semanticReady.Load() {
 		// Non-empty signature with semantic off/not-ready: matching is
@@ -211,7 +211,7 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 		if sig.Signature != "" {
 			sig.Match.Method = domain.MatchExact
 		}
-		return sig, nil
+		return sig, nil, nil
 	}
 
 	existing, err := d.opt.Store.GetSignature(ctx, sig.Raw)
@@ -219,11 +219,11 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 		// Read failed before any match ran: leave MatchNone so we don't assert
 		// an "exact" match that was never actually checked.
 		slog.Warn("semantic resolve: signature read failed; using hash key", "error", err)
-		return sig, nil
+		return sig, nil, nil
 	}
 	if existing != nil {
 		sig.Match.Method = domain.MatchExact // known situation: cheap deterministic fast path
-		return sig, nil
+		return sig, nil, nil
 	}
 
 	scope := match.Scope{SituationType: s.Type, AgentType: s.AgentType}
@@ -294,9 +294,9 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 				return remapAllowed(s, sig, h)
 			}
 			if cfg.RerankingConfigured() {
-				resolved, plan, judged, missed := d.cosineRerankPass(ctx, cfg, sig, s, scope, vec, vecModel, accept)
+				resolved, ranked, plan, judged, missed := d.cosineRerankPass(ctx, cfg, sig, s, scope, vec, vecModel, accept)
 				if judged {
-					return resolved, plan
+					return resolved, ranked, plan
 				}
 				// missed is true ONLY when the search ran cleanly and found
 				// nothing above the threshold — the ordinary cosine miss. A
@@ -328,7 +328,7 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 					sig.Signature = hit.Signature
 					sig.Match.Method = domain.MatchCosine
 					sig.Match.Score = hit.Score
-					return sig, nil
+					return sig, nil, nil
 				default:
 					// Cosine ran and found nothing usable — no candidate survived
 					// the accept filter, or the best one scored below the
@@ -375,7 +375,7 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 	if !bm25RetryAllowed(sig, cosineMissed) {
 		slog.Debug("structured salient refused by cosine; not retried by text",
 			"raw", sig.Raw, "type", s.Type)
-		return d.mintSignature(ctx, sig, s, vec, vecModel), nil
+		return d.mintSignature(ctx, sig, s, vec, vecModel), nil, nil
 	}
 	bmCtx, cancel := context.WithTimeout(ctx, bm25MatchTimeout)
 	defer cancel()
@@ -383,7 +383,7 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 	accept := func(h match.Hit) bool { return remapAllowed(s, sig, h) }
 	if hit, ok, err := d.matcher.MatchText(bmCtx, sig.Salient, scope, accept); err != nil {
 		slog.Warn("text match failed; using hash key", "error", err)
-		return sig, nil
+		return sig, nil, nil
 	} else if ok && hit.Score >= bar {
 		// Debug for the same reason as the cosine hit above: routine success.
 		slog.Debug("text match: reusing learned signature",
@@ -391,10 +391,10 @@ func (d *Daemon) resolveSignatureN(ctx context.Context, cfg config.Config,
 		sig.Signature = hit.Signature
 		sig.Match.Method = domain.MatchBM25
 		sig.Match.Score = hit.Score
-		return sig, nil
+		return sig, nil, nil
 	}
 
-	return d.mintSignature(ctx, sig, s, vec, vecModel), nil
+	return d.mintSignature(ctx, sig, s, vec, vecModel), nil, nil
 }
 
 // mintSignature records a situation as NEW: it persists the semantic identity

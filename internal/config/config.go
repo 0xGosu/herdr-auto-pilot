@@ -454,8 +454,14 @@ type LLM struct {
 	// classify→decide path: the agent is parked and its screen unanswered for
 	// the whole run, where a consult only starts once hap has already given up.
 	RerankingTimeoutSeconds int `toml:"reranking_timeout_seconds,omitempty"`
-	// RerankingTopK caps how many rules the judge may return; zero or negative
-	// uses DefaultRerankTopK. Only the first is acted on.
+	// RerankingTopK caps how many rules the judge may return. It must be at
+	// least 1; `hap config set` refuses less, and RerankTopK floors an omitted
+	// or hand-edited value at DefaultRerankTopK.
+	//
+	// hap does not simply take the first entry: it walks the judge's answer in
+	// order and acts on the first rule whose learned state yields an autonomous
+	// decision, falling back to the best match for the escalation when none
+	// does. So this is the depth of that walk, not just a prompt cap.
 	RerankingTopK int `toml:"reranking_top_k,omitempty"`
 	// RelevanceScoreThreshold is the minimum relevance score a judged rule must
 	// carry to be usable. It is passed to the judge in its own prompt so the
@@ -2384,10 +2390,12 @@ const DefaultRerankTopK = 3
 const DefaultRelevanceScoreThreshold = 0.95
 
 // DefaultRerankMaxCandidates bounds how many above-threshold rules are listed
-// for the judge. Larger than match.matchK (3, the cap on every non-rerank
+// for the judge. Far larger than match.matchK (3, the cap on every non-rerank
 // lookup) because the judge's whole value is seeing the field it chooses from:
-// a correct rule permanently shadowed at rank 4 is invisible to it.
-const DefaultRerankMaxCandidates = 10
+// a correct rule permanently shadowed at rank 4 is invisible to it, and the
+// engine now walks DOWN the judge's answer looking for one it can act on, so a
+// shallow field also costs it the fallbacks.
+const DefaultRerankMaxCandidates = 20
 
 // RerankingTimeout returns the re-ranking timeout: reranking_timeout_seconds,
 // or — when zero/omitted — DefaultRerankingTimeoutSeconds. Unlike the other two
@@ -2404,9 +2412,15 @@ func (c Config) RerankingTimeout() time.Duration {
 // disagree about whether the feature is on.
 func (c Config) RerankingConfigured() bool { return len(c.LLM.RerankingCommand) > 0 }
 
-// RerankTopK returns the judge's answer cap, defaulted.
+// RerankTopK returns the judge's answer cap, floored at 1.
+//
+// `hap config set` already refuses anything below 1, so this covers the two
+// routes that bypass it: an omitted key (which decodes to 0) and a hand-edited
+// file. It can never return less than 1 — the engine walks this many rules
+// looking for one it can act on, and a zero would make the whole feature inert
+// while looking configured.
 func (c Config) RerankTopK() int {
-	if c.LLM.RerankingTopK <= 0 {
+	if c.LLM.RerankingTopK < 1 {
 		return DefaultRerankTopK
 	}
 	return c.LLM.RerankingTopK

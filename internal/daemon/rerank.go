@@ -134,11 +134,12 @@ func (d *Daemon) rerankerPort() ports.RerankerPort {
 //     KNN failure reported as a refusal would therefore mint a new key for
 //     exactly the approval/choice/error screens this feature exists to match.
 //
-// The two bools are (judged, missed), in that order.
+// The returns are (best, ranked, plan, judged, missed): ranked is the judge's
+// full ordered answer when one was applied from cache, and best is its head.
 func (d *Daemon) cosineRerankPass(ctx context.Context, cfg config.Config,
 	sig domain.SignatureResult, s domain.Situation, scope match.Scope,
 	vec []float32, vecModel string, accept func(match.Hit) bool,
-) (domain.SignatureResult, *rerankPlan, bool, bool) {
+) (domain.SignatureResult, []domain.SignatureResult, *rerankPlan, bool, bool) {
 
 	hits, err := d.matcher.VectorCandidates(ctx, vec, scope, cfg.RerankMaxCandidates(), accept)
 	if err != nil {
@@ -146,7 +147,7 @@ func (d *Daemon) cosineRerankPass(ctx context.Context, cfg config.Config,
 		// below, vec is deliberately not cleared — and cosine did NOT refuse
 		// this situation, so missed stays false.
 		slog.Warn("vector match failed; trying text match", "error", err)
-		return sig, nil, false, false
+		return sig, nil, nil, false, false
 	}
 	cands := make([]domain.RerankCandidate, 0, len(hits))
 	for _, h := range hits { // descending cosine
@@ -163,7 +164,7 @@ func (d *Daemon) cosineRerankPass(ctx context.Context, cfg config.Config,
 	if len(cands) == 0 {
 		slog.Debug("no cosine candidate above the threshold; judge not consulted",
 			"threshold", cfg.Embedding.SimilarityThreshold, "raw", sig.Raw)
-		return sig, nil, false, true
+		return sig, nil, nil, false, true
 	}
 	d.describeRules(ctx, cfg, cands)
 
@@ -187,9 +188,10 @@ func (d *Daemon) cosineRerankPass(ctx context.Context, cfg config.Config,
 	if v, ok := d.cachedRerankVerdict(rerankCacheKey(sig.Raw, built.rendered)); ok {
 		slog.Debug("re-ranking verdict served from cache", "raw", sig.Raw,
 			"candidates", len(cands), "kept", len(v))
-		return d.finishRerank(ctx, fallback, sig, s, built, v), nil, true, false
+		ranked := d.finishRerank(ctx, fallback, sig, s, built, v)
+		return ranked[0], ranked, nil, true, false
 	}
-	return fallback, built, true, false
+	return fallback, nil, built, true, false
 }
 
 // describeRules fills in what reusing each candidate would MEAN — its learned
@@ -275,19 +277,30 @@ func (d *Daemon) rerankHistories(ctx context.Context, sigs []string) map[string]
 // the judge is shown the same score the decision core will compute.
 const rerankHistoryLimit = 50
 
-// finishRerank applies a verdict to the provisional signature.
+// finishRerank applies a verdict, returning the judge's answer as a RANKED list
+// of learning keys, best first.
 //
-//   - a rule was chosen → remap onto it, MatchRerank, the judge's own relevance
-//     score (not the cosine, which is logged beside it);
-//   - the verdict was EMPTY → mint the raw hash as a new key, MatchRerankVeto,
-//     and do NOT run BM25 (see this file's header);
+//   - rules were chosen → one entry per verdict entry, in the judge's order,
+//     each MatchRerank carrying its OWN relevance score (not the cosine, which
+//     is logged beside it);
+//   - the verdict was EMPTY → a single minted key on the raw hash,
+//     MatchRerankVeto, and BM25 is NOT run (see this file's header);
 //   - anything else → the fallback verbatim, unchanged from today's behavior.
+//
+// The list is ranked rather than collapsed because the engine walks DOWN it: a
+// rule the judge ranked first may be in shadow mode, below its confidence
+// threshold, or naming an option this screen no longer offers, and none of that
+// is visible from here — only domain.Decide knows. decideAndActResolved tries
+// each in turn and acts on the first that yields an autonomous decision. Every
+// entry is a real learned rule the judge affirmed, so acting on the second is
+// not a weaker answer than acting on the first; it is the same answer to the
+// question "which of these applies", asked of a rule that can actually apply.
 //
 // It is called from both entry points — the cached path on the select loop and
 // the deferred path in handleRerankOutcome — so a gate added here is added to
 // both.
 func (d *Daemon) finishRerank(ctx context.Context, fallback, sig domain.SignatureResult,
-	s domain.Situation, plan *rerankPlan, verdict []domain.RerankResult) domain.SignatureResult {
+	s domain.Situation, plan *rerankPlan, verdict []domain.RerankResult) []domain.SignatureResult {
 
 	if len(verdict) == 0 {
 		// INFO, not Debug: a veto looks EXACTLY like "nothing matched" from
@@ -299,26 +312,37 @@ func (d *Daemon) finishRerank(ctx context.Context, fallback, sig domain.Signatur
 			"best_cosine", plan.candidates[0].Cosine, "type", s.Type)
 		minted := d.mintSignature(ctx, sig, s, plan.vec, plan.vecModel)
 		minted.Match.Method = domain.MatchRerankVeto
-		return minted
+		return []domain.SignatureResult{minted}
 	}
-	top := verdict[0]
-	// The id was already range-checked by ParseRerankVerdict against the count
-	// this plan produced; re-check rather than index on trust, because the two
-	// are separated by a goroutine and an outcome channel.
-	if top.ID < 1 || top.ID > len(plan.candidates) {
-		slog.Warn("re-ranking: verdict named a rule that was not offered; using the cosine match",
-			"id", top.ID, "candidates", len(plan.candidates), "raw", sig.Raw)
-		return fallback
+
+	ranked := make([]domain.SignatureResult, 0, len(verdict))
+	for _, v := range verdict {
+		// The ids were already range-checked by ParseRerankVerdict against the
+		// count this plan produced; re-check rather than index on trust,
+		// because the two are separated by a goroutine and an outcome channel.
+		if v.ID < 1 || v.ID > len(plan.candidates) {
+			slog.Warn("re-ranking: verdict named a rule that was not offered; skipping it",
+				"id", v.ID, "candidates", len(plan.candidates), "raw", sig.Raw)
+			continue
+		}
+		chosen := plan.candidates[v.ID-1]
+		out := sig
+		out.Signature = chosen.Signature
+		out.Match.Method = domain.MatchRerank
+		out.Match.Score = v.Score
+		ranked = append(ranked, out)
 	}
-	chosen := plan.candidates[top.ID-1]
-	slog.Debug("re-ranking: the judge chose a learned rule",
-		"signature", chosen.Signature, "relevance", top.Score,
-		"cosine", chosen.Cosine, "rank_by_cosine", top.ID, "raw", sig.Raw)
-	out := sig
-	out.Signature = chosen.Signature
-	out.Match.Method = domain.MatchRerank
-	out.Match.Score = top.Score
-	return out
+	if len(ranked) == 0 {
+		// Every entry named a rule outside the offered range: the verdict is
+		// about some other listing, so there is nothing to walk.
+		slog.Warn("re-ranking: no verdict entry named an offered rule; using the cosine match",
+			"raw", sig.Raw)
+		return []domain.SignatureResult{fallback}
+	}
+	slog.Debug("re-ranking: the judge ranked learned rules",
+		"best", ranked[0].Signature, "relevance", ranked[0].Match.Score,
+		"alternatives", len(ranked)-1, "raw", sig.Raw)
+	return ranked
 }
 
 // rerankSituationHeldStill re-reads the pane and reports whether the situation
@@ -677,6 +701,7 @@ func (d *Daemon) handleRerankOutcome(ctx context.Context, res rerankOutcome) {
 	}
 
 	sig := res.fallback
+	var ranked []domain.SignatureResult
 	switch {
 	case res.err != nil:
 		// INFO, not Warn-and-forget: this is the operator's only signal that a
@@ -708,9 +733,10 @@ func (d *Daemon) handleRerankOutcome(ctx context.Context, res rerankOutcome) {
 		slog.Info("re-ranking was invalidated while the judge ran; using the cosine match",
 			"agent", res.situation.AgentID)
 	default:
-		sig = d.finishRerank(ctx, res.fallback, res.original, res.situation, res.plan, res.verdict)
+		ranked = d.finishRerank(ctx, res.fallback, res.original, res.situation, res.plan, res.verdict)
+		sig = ranked[0]
 	}
-	d.decideAndActResolved(ctx, res.situation, res.tr, res.agentName, d.opt.Clock.Now(), sig)
+	d.decideAndActResolved(ctx, res.situation, res.tr, res.agentName, d.opt.Clock.Now(), sig, ranked)
 }
 
 // agentCwd reports the monitored agent's working directory for the judge run,

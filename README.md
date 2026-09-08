@@ -429,8 +429,13 @@ screens that only *look* alike, and it has no way to say "these two are 0.93
 apart but they are not the same question". Point `llm.reranking_command` at a
 CLI and `similarity_threshold` stops being the **decision** and becomes a
 **filter** — every rule at or above it is listed for a judge, which answers with
-the ones that genuinely match, ordered by its own relevance score. hap uses the
-first.
+the ones that genuinely match, ordered by its own relevance score. hap then
+**walks** that list: the judge ranks by relevance and cannot see whether a rule
+has actually graduated, so its best match is often one hap may not act on yet —
+still in shadow mode, below its confidence threshold, or naming an option the
+screen no longer offers. Each rule it affirmed is tried in order and the first
+that resolves autonomously is used; if none can, the best match is what you are
+asked about.
 
 An **empty answer means no rule matches**, and that is the point: it is how the
 judge overrides a false positive the embedding produced. A vetoed situation
@@ -448,9 +453,10 @@ hap config set llm.reranking_command --preset claude   # or: codex
 [llm]
 reranking_timeout_seconds = 30    # own budget, NOT inherited from timeout_seconds:
                                   # the agent is parked and unanswered while it runs
-reranking_top_k = 3               # most rules the judge may return; hap acts on the first
+reranking_top_k = 3               # most rules the judge may return, and how far hap
+                                  # walks looking for one it can act on. At least 1
 relevance_score_threshold = 0.95  # minimum relevance a judged rule needs to be usable
-reranking_max_candidates = 10     # how many above-threshold rules the judge is shown
+reranking_max_candidates = 20     # how many above-threshold rules the judge is shown
                                   # (also the vector search's k here, so it changes recall)
 ```
 

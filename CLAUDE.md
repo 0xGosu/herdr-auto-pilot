@@ -1185,7 +1185,23 @@ whose manifest carries exactly that version).
   never run on the select loop** — `llm.reranking_command` (off by default) turns
   `embedding.similarity_threshold` into a FILTER: every candidate at or above it is
   listed for a one-shot CLI, which returns `[{"id": n, "score": s}]` ordered by
-  relevance and hap uses the first. Five bounds are load-bearing:
+  relevance and hap WALKS it. Six bounds are load-bearing:
+  - **The judge ranks by RELEVANCE and cannot see a rule's learned STATE, so the head is
+    not always actionable.** Its best match is routinely one hap may not act on — shadow
+    mode, below its confidence threshold, an option the screen no longer offers — and only
+    `domain.Decide` knows. `walkRankedDecision` therefore tries each affirmed rule in order
+    and takes the first whose decision is not an escalation; when none is, the HEAD
+    escalates, because that is the rule the operator should be asked about. This cannot
+    loosen a safety control by construction: every gate that does not depend on the
+    SIGNATURE — kill switch, never-auto, suspected-irreversible, rate guard — is fixed in
+    the shared `DecideInput` and vetoes every candidate or none, so the walk lands back on
+    the head. Only the learning-derived refusals vary, which is exactly what it is for.
+    `llm.reranking_top_k` is the DEPTH of that walk, not just a prompt cap, which is why
+    `hap config set` refuses anything below 1 (0 is not "use the default" here) and
+    `RerankTopK` floors an omitted or hand-edited value. Rule provenance is written after
+    the walk, for the rule that ACTED, not for every candidate it looked at. Keep
+    `TestTheEngineFallsBackToALowerRankedRule` / `TestTheBestMatchIsWhatEscalatesWhenNothingCanAct` /
+    `TestASingleRankedRuleBehavesExactlyAsBefore` / `TestTheWalkNeverOutrunsASafetyVeto`.
   - **The kill switch is asked for HERE, not inherited.** Every other LLM subprocess in
     the daemon is reached only because `Decide` asked for it, and `Decide` already has
     `killActive` from `readDecisionState` — but `startRerank` spawns BEFORE that read, so

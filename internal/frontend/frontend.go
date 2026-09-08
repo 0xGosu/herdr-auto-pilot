@@ -3103,9 +3103,15 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			cfg.LLM.RerankingTimeoutSeconds = v
 			return nil
 		case "llm.reranking_top_k":
+			// At least 1, and 0 is refused rather than read as "use the
+			// default" the way the timeout keys read it. The engine walks this
+			// many rules looking for one it can act on, so a zero would leave
+			// the judge with nothing to return and the walk with nothing to
+			// consider — a silently inert feature. Omitting the key is how an
+			// operator asks for the default; setting it is how they choose.
 			v, err := strconv.Atoi(value)
-			if err != nil || v < 0 {
-				return fmt.Errorf("llm.reranking_top_k must be a non-negative integer (0 = %d default), got %q",
+			if err != nil || v < 1 {
+				return fmt.Errorf("llm.reranking_top_k must be at least 1 (omit the key for the default of %d), got %q",
 					config.DefaultRerankTopK, value)
 			}
 			cfg.LLM.RerankingTopK = v

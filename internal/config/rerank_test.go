@@ -152,3 +152,46 @@ func TestRerankingEnvIsItsOwnScope(t *testing.T) {
 		t.Error("reranking_command is missing from EnvSummaries — `hap config env list` would not show it")
 	}
 }
+
+// TestRerankTopKIsNeverBelowOne pins the floor from both directions.
+//
+// The walk over the judge's answer is `top_k` deep, so a zero would leave the
+// judge with nothing to return and the engine with nothing to consider — a
+// feature that reads as configured and does nothing. `hap config set` refuses
+// anything below 1 (see the SetField case); this covers the two routes that
+// bypass it, an omitted key and a hand-edited file.
+func TestRerankTopKIsNeverBelowOne(t *testing.T) {
+	for _, v := range []int{0, -1, -99} {
+		var cfg config.Config
+		cfg.LLM.RerankingTopK = v
+		if got := cfg.RerankTopK(); got < 1 {
+			t.Errorf("RerankTopK() with %d = %d, want at least 1", v, got)
+		}
+		if got := cfg.RerankTopK(); got != config.DefaultRerankTopK {
+			t.Errorf("RerankTopK() with %d = %d, want the %d default", v, got, config.DefaultRerankTopK)
+		}
+	}
+	if config.DefaultRerankTopK < 1 {
+		t.Fatalf("the default itself is %d", config.DefaultRerankTopK)
+	}
+	var cfg config.Config
+	cfg.LLM.RerankingTopK = 1
+	if got := cfg.RerankTopK(); got != 1 {
+		t.Errorf("an explicit 1 must be honoured, got %d", got)
+	}
+}
+
+// TestRerankMaxCandidatesLeavesRoomToFallBack: the candidate cap is also the
+// ceiling on how far the walk can go, so it must comfortably exceed top_k —
+// and match.matchK (3), the cap on every non-rerank lookup, since a rule
+// shadowed below that is invisible to the judge entirely.
+func TestRerankMaxCandidatesLeavesRoomToFallBack(t *testing.T) {
+	if config.DefaultRerankMaxCandidates <= config.DefaultRerankTopK {
+		t.Errorf("max_candidates %d must exceed top_k %d, or the judge has nothing to rank",
+			config.DefaultRerankMaxCandidates, config.DefaultRerankTopK)
+	}
+	if config.DefaultRerankMaxCandidates <= 3 {
+		t.Errorf("max_candidates %d must exceed the non-rerank matchK of 3",
+			config.DefaultRerankMaxCandidates)
+	}
+}

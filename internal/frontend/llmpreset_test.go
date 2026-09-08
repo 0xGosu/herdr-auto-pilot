@@ -286,3 +286,27 @@ func TestTheJudgePresetGrantsNoTools(t *testing.T) {
 		t.Error("the codex judge preset must not take the bypass flag; it reads and writes nothing")
 	}
 }
+
+// TestSetRerankTopKRefusesBelowOne: 0 is refused here rather than read as "use
+// the default" the way the timeout keys read it, because the engine walks this
+// many rules looking for one it can act on. Omitting the key is how an operator
+// asks for the default; setting it is how they choose.
+func TestSetRerankTopKRefusesBelowOne(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	for _, bad := range []string{"0", "-1", "abc"} {
+		if _, err := app.SetField(ctx, "llm.reranking_top_k", bad); err == nil {
+			t.Errorf("SetField accepted llm.reranking_top_k=%q, want a refusal", bad)
+		}
+	}
+	if _, err := app.SetField(ctx, "llm.reranking_top_k", "1"); err != nil {
+		t.Errorf("SetField refused the minimum valid value: %v", err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.RerankTopK() != 1 {
+		t.Errorf("RerankTopK() = %d after setting 1", cfg.RerankTopK())
+	}
+}

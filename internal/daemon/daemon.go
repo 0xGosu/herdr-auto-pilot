@@ -2305,11 +2305,109 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	// decideAndActResolved with the judged key. The returned sig is what the
 	// ordinary cosine pass would have chosen, so a judge that cannot be
 	// started costs nothing — startRerank reporting false means "carry on".
-	resolved, plan := d.resolveSignatureN(ctx, cfg, sig, situation)
+	resolved, ranked, plan := d.resolveSignatureN(ctx, cfg, sig, situation)
 	if plan != nil && d.startRerank(ctx, situation, tr, agentName, resolved, sig, plan) {
 		return
 	}
-	d.decideAndActResolved(ctx, situation, tr, agentName, now, resolved)
+	d.decideAndActResolved(ctx, situation, tr, agentName, now, resolved, ranked)
+}
+
+// walkRankedDecision tries the judge's ranked rules in order and returns the
+// first (signature, decision) pair that resolves without escalating, or the
+// head's pair when none does.
+//
+// head/headDecision are already computed by the caller, so a list of one — every
+// non-rerank situation — costs nothing and takes no extra store read.
+//
+// The DecideInput is passed by pointer and its Signature/State/History are
+// rewritten per candidate. Everything else in it is per-SITUATION or per-AGENT
+// and identical across candidates, which is precisely why the walk cannot loosen
+// a safety control: the kill switch, the never-auto match, the suspected-
+// irreversible heuristic and the rate guard veto every candidate or none.
+//
+// A state read that FAILS drops that candidate rather than failing the walk —
+// the head's escalation is still available, and turning a transient store error
+// into a lost decision would be worse than trying one fewer alternative.
+func (d *Daemon) walkRankedDecision(ctx context.Context, s domain.Situation,
+	head domain.SignatureResult, headDecision domain.Decision,
+	ranked []domain.SignatureResult, in *domain.DecideInput,
+) (domain.SignatureResult, domain.Decision) {
+
+	if headDecision.Action != domain.ActionEscalate || len(ranked) < 2 {
+		return head, headDecision
+	}
+	for i, alt := range ranked {
+		if i == 0 || alt.Signature == head.Signature {
+			continue // the head is what headDecision already answers
+		}
+		state, history, rate, retries, killActive, err := d.readDecisionState(ctx, alt, s)
+		if err != nil {
+			slog.Warn("re-ranking fallback: state read failed; skipping this alternative",
+				"signature", alt.Signature, "error", err)
+			continue
+		}
+		in.Signature, in.State, in.History = alt, state, history
+		in.Rate, in.RetryCount, in.KillActive = rate, retries, killActive
+		dec := domain.Decide(*in)
+		if dec.Action == domain.ActionEscalate {
+			slog.Debug("re-ranking fallback: alternative also escalates",
+				"signature", alt.Signature, "rank", i+1, "reason", dec.Reason)
+			continue
+		}
+		// INFO: the operator's only signal that the answer came from a rule
+		// the judge ranked BELOW its best match, which is worth being able to
+		// see when auditing why a screen was answered the way it was.
+		slog.Info("re-ranking fallback: the best match could not act; using a lower-ranked rule",
+			"agent", s.AgentID, "signature", alt.Signature, "rank", i+1,
+			"relevance", alt.Match.Score, "best", head.Signature,
+			"best_refused", headDecision.Reason)
+		dec.Rationale = fmt.Sprintf("%s; re-ranking fell back to the judge's #%d of %d (best match %s could not act: %s)",
+			dec.Rationale, i+1, len(ranked), shortSignature(head.Signature), headDecision.Reason)
+		return alt, dec
+	}
+	// Nothing below the head could act either, so the head escalates: it is the
+	// judge's best match and the rule the operator should be asked about.
+	return head, headDecision
+}
+
+// shortSignature trims a signature to its type prefix and a few hex digits, for
+// a log line or a rationale that must stay readable.
+func shortSignature(sig string) string {
+	if i := strings.IndexByte(sig, ':'); i >= 0 && len(sig) > i+9 {
+		return sig[:i+9]
+	}
+	return sig
+}
+
+// saveSignatureProvenance records the pane snapshot a learning key was FIRST
+// seen with (insert-or-ignore; an in-memory cache skips the no-op write on
+// repeat sightings), so the Rules views can show what situation a learned
+// action answers. Best-effort — never blocks the decision.
+func (d *Daemon) saveSignatureProvenance(ctx context.Context, s domain.Situation,
+	sig domain.SignatureResult, now time.Time) {
+
+	if sig.Signature == "" {
+		return
+	}
+	d.mu.Lock()
+	saved := d.snapshotSaved[sig.Signature]
+	d.mu.Unlock()
+	if saved {
+		return
+	}
+	// Deliberately NOT truncateExcerpt: a signature snapshot is provenance for
+	// `hap signatures show` (which prints it unpaged), not the Guard 3
+	// comparison input, and signature_snapshots has no retention path at all —
+	// one row per learned signature, forever. The aggregate budget is for the
+	// column auto-accept reads.
+	if err := d.opt.Store.SaveSignatureSnapshot(ctx, sig.Signature,
+		truncateTailRunes(s.Content, snapshotMaxRunes), now); err != nil {
+		slog.Warn("signature snapshot write failed", "error", err)
+		return
+	}
+	d.mu.Lock()
+	d.snapshotSaved[sig.Signature] = true
+	d.mu.Unlock()
 }
 
 // decideAndActResolved is decideAndAct once the learning key is FINAL: rule
@@ -2320,34 +2418,14 @@ func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 // everything below is keyed on the RESOLVED signature (the provenance snapshot
 // first of all), so the split falls exactly where the deferral does.
 func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situation,
-	tr domain.AgentTransition, agentName string, now time.Time, sig domain.SignatureResult) {
+	tr domain.AgentTransition, agentName string, now time.Time, sig domain.SignatureResult,
+	ranked []domain.SignatureResult) {
 
 	cfg, allow, _ := d.snapshot()
 
-	// Rule provenance: keep the pane snapshot the signature was FIRST seen
-	// with (insert-or-ignore; an in-memory cache skips the no-op write on
-	// repeat sightings), so the Rules views can show what situation a
-	// learned action answers. Best-effort — never blocks the decision.
-	d.mu.Lock()
-	saved := d.snapshotSaved[sig.Signature]
-	d.mu.Unlock()
-	if sig.Signature != "" && !saved {
-		if err := d.opt.Store.SaveSignatureSnapshot(ctx, sig.Signature,
-			// Deliberately NOT truncateExcerpt: a signature snapshot is
-			// provenance for `hap signatures show` (which prints it unpaged),
-			// not the Guard 3 comparison input, and signature_snapshots has no
-			// retention path at all — one row per learned signature, forever.
-			// The aggregate budget is for the column auto-accept reads.
-			truncateTailRunes(situation.Content, snapshotMaxRunes), now); err != nil {
-			slog.Warn("signature snapshot write failed", "error", err)
-		} else {
-			d.mu.Lock()
-			d.snapshotSaved[sig.Signature] = true
-			d.mu.Unlock()
-		}
-	}
-
-	// Assemble decision inputs (all reads).
+	// Assemble decision inputs (all reads). ranked carries the judge's ordered
+	// answer when one applied; the walk below re-reads state per candidate, so
+	// this first read is the head's.
 	state, history, rate, retries, killActive, readErr := d.readDecisionState(ctx, sig, situation)
 	if readErr != nil {
 		slog.Error("state read failed; escalating", "error", readErr)
@@ -2427,6 +2505,35 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 	}
 
 	decision := domain.Decide(in)
+
+	// The judge's answer is a RANKED list, and hap walks it. The rule it put
+	// first may be in shadow mode, below its confidence threshold, or naming an
+	// option this screen no longer offers — none of which the judge can see,
+	// because only domain.Decide knows a rule's learned state. So an escalating
+	// head is not the end of the answer: the next rule the judge affirmed gets
+	// the same question, and the first one that resolves autonomously wins.
+	//
+	// This can never loosen a safety control. Every gate that does not depend on
+	// the SIGNATURE — the kill switch, the never-auto match, the suspected-
+	// irreversible heuristic, the rate guard — is already fixed in `in` and
+	// identical for every candidate, so a decision they veto is vetoed for all
+	// of them and the walk lands back on the head. Only the learning-derived
+	// refusals vary, which is exactly what the fallback is for.
+	//
+	// If nothing resolves, the HEAD is what escalates: it is the judge's best
+	// match, and it is the rule the operator should be shown and asked about.
+	sig, decision = d.walkRankedDecision(ctx, situation, sig, decision, ranked, &in)
+
+	// Rule provenance: keep the pane snapshot the signature was FIRST seen
+	// with (insert-or-ignore; an in-memory cache skips the no-op write on
+	// repeat sightings), so the Rules views can show what situation a
+	// learned action answers. Best-effort — never blocks the decision.
+	//
+	// It runs AFTER the walk so only the rule actually used gets a snapshot;
+	// writing one per candidate would record provenance for rules this
+	// situation never acted on.
+	d.saveSignatureProvenance(ctx, situation, sig, now)
+
 	if disabled {
 		if decision.Action == domain.ActionEscalate {
 			d.escalate(ctx, situation, sig, decision, tr, now)
