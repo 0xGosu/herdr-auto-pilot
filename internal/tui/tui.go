@@ -147,6 +147,11 @@ type actionResultMsg struct {
 	// keypress stashed awaiting its own completion. Zero for the untagged
 	// majority; see doTagged.
 	token actionToken
+	// sent names the escalation rows this action claimed, so its own result
+	// releases exactly those. Clearing the whole set instead would let the
+	// first of two concurrent batches un-dim the second's rows, which is the
+	// double-send the dimming exists to prevent.
+	sent []int64
 	// taskLists carries the authoritative renumbered checklist a task
 	// mutation returned, keyed by canonical source path. Applying it
 	// directly updates the Tasks tab the moment the write lands, instead
@@ -172,6 +177,23 @@ type openSendPromptMsg struct {
 // prompt directly.
 type openAddPromptMsg struct {
 	id int64
+	// sent is the claim confirmAuditID took, released here: this is the second
+	// way that command can END, and a claim leaked on it would leave the row
+	// dimmed and unanswerable until something else resolved it.
+	sent []int64
+}
+
+// beginSendingMsg claims escalation rows for an action a PROMPT dispatched,
+// and then runs it.
+//
+// It exists for the same reason openSendPromptMsg does — a prompt's onSubmit
+// returns a tea.Cmd and cannot mutate the model directly — and the claim has to
+// be taken HERE rather than at the keypress that opened the prompt: `c` opens
+// an editor the operator can still abandon with esc, and a row dimmed at the
+// keypress would stay dimmed with nothing in flight.
+type beginSendingMsg struct {
+	ids []int64
+	run tea.Cmd
 }
 
 // openTaskSourceFieldMsg re-opens a prompt for the VALUE of the task-source
@@ -851,6 +873,23 @@ type Model struct {
 	// filtering with no explicit teardown. nil = never run / not applicable.
 	sigSemantic *semanticSigSearch
 	marked      map[int64]bool // Escalations tab multi-select (audit ids), space toggles
+	// sending holds the audit ids whose action has been DISPATCHED and whose
+	// result has not arrived. Set at dispatch, released by that same action's
+	// result, and pruned on refresh.
+	//
+	// It exists because answering another machine's escalation is not a local
+	// write: the request is filed in agent_actions for the owning node and this
+	// process then waits for that daemon's verdict — up to
+	// frontend.DefaultRemoteActionTimeout (45s), two sync intervals plus slack.
+	// For that whole window the row looked untouched, so there was nothing to
+	// tell "it is on its way" from "the key did not register", and a second
+	// press queued the work twice. Same reasoning as actionResultMsg.taskLists,
+	// which exists because a round trip "takes long enough that the old
+	// checkbox invites a second press".
+	//
+	// Not conditional on the row's node: a local action clears in milliseconds,
+	// and branching on the node would only add a case to get wrong.
+	sending map[int64]bool
 	// taskMarks is the Tasks tab multi-select, keyed by taskMarkKey
 	// (group index + item number). Space toggles; d/x consume the set.
 	taskMarks map[string]bool
@@ -2046,6 +2085,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Same for claims: a result normally releases one, but not every row's
+		// fate is ours to observe — another machine's operator, or that node's
+		// own daemon, can resolve the escalation while our request is in
+		// flight, and then the row just leaves the queue.
+		m.pruneSending()
 		// Same for task marks: an item deleted (or renumbered away by an
 		// external edit) must not leave a mark pointing at nothing.
 		if len(m.taskMarks) > 0 {
@@ -2085,6 +2129,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return "automation resumed", nil
 		})
 	case actionResultMsg:
+		// Release before anything else can return early: every branch below is
+		// a way this result ENDS, and a claim leaked on one of them leaves the
+		// row dimmed and unanswerable until it resolves elsewhere.
+		m.releaseSending(msg.sent)
 		m.applyTaskLists(msg.taskLists)
 		if msg.pauseAction && (msg.err != nil || (msg.pauseNoChange && m.lastPaused)) {
 			// The pause request failed, or was a no-op on a pause this TUI
@@ -2144,7 +2192,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case openSendPromptMsg:
 		return m.openSendPrompt(msg.id, msg.action)
 	case openAddPromptMsg:
+		// The second way a confirm+send ends: the agent went busy, and the
+		// operator is about to be asked whether to queue the tasks instead.
+		m.releaseSending(msg.sent)
 		return m.openAddPrompt(msg.id)
+	case beginSendingMsg:
+		m.message = m.beginSending(msg.ids)
+		return m, msg.run
 	case openTaskSourceFieldMsg:
 		return m.openTaskSourceFieldPrompt(msg)
 	case tickMsg:
@@ -3078,8 +3132,16 @@ func (m Model) confirmSelected() (tea.Model, tea.Cmd) {
 // chains to an "add to the task list instead?" prompt (openAddPromptMsg) rather
 // than surfacing the error. Any other failure surfaces as-is.
 func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
+	ids := []int64{id}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
 	app, ctx, wg := m.app, m.ctx, m.inflight
 	m.beginAction()
+	// After beginAction, which clears the message area: the claim's notice is
+	// the immediate feedback, and beginAction would wipe it.
+	m.message = m.beginSending(ids)
 	if wg != nil {
 		wg.Add(1)
 	}
@@ -3089,12 +3151,12 @@ func (m Model) confirmAuditID(id int64) (tea.Model, tea.Cmd) {
 		}
 		err := app.Confirm(ctx, id, true)
 		if err == nil {
-			return actionResultMsg{message: fmt.Sprintf("confirmed #%d and sent", id)}
+			return actionResultMsg{message: fmt.Sprintf("confirmed #%d and sent", id), sent: ids}
 		}
 		if errors.Is(err, frontend.ErrSuggestionStaleAgentBusy) {
-			return openAddPromptMsg{id: id}
+			return openAddPromptMsg{id: id, sent: ids}
 		}
-		return actionResultMsg{err: err}
+		return actionResultMsg{err: err, sent: ids}
 	}
 }
 
@@ -3134,10 +3196,15 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 	if len(ids) == 0 {
 		return m, nil
 	}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
 	app, ctx, wg := m.app, m.ctx, m.inflight
 	desc := describeEscalations(ids)
 	m.beginAction()
 	m.marked = nil
+	m.message = m.beginSending(ids)
 	if wg != nil {
 		wg.Add(1)
 	}
@@ -3169,7 +3236,7 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 			confirmed++
 		}
 		if firstErr != nil {
-			return actionResultMsg{err: fmt.Errorf("confirmed %d, skipped %s: %w",
+			return actionResultMsg{sent: ids, err: fmt.Errorf("confirmed %d, skipped %s: %w",
 				confirmed, strings.Join(skipped, " "), firstErr)}
 		}
 		if firstNotice != nil {
@@ -3185,9 +3252,9 @@ func (m Model) confirmWithoutSend() (tea.Model, tea.Cmd) {
 				count = fmt.Sprintf("confirmed %d, skipped %s",
 					confirmed, strings.Join(skipped, " "))
 			}
-			return actionResultMsg{err: firstNotice, message: count}
+			return actionResultMsg{err: firstNotice, message: count, sent: ids}
 		}
-		return actionResultMsg{message: fmt.Sprintf(
+		return actionResultMsg{sent: ids, message: fmt.Sprintf(
 			"confirmed %s — learned, nothing sent (the agent is not answered)", desc)}
 	}
 }
@@ -3224,9 +3291,33 @@ func (m *Model) openNoticeDetail(notice *frontend.NoTaskSourceNotice) {
 // detail overlay's y, acting on the record it snapshotted rather than the live
 // cursor (and never on the list's marks, which the overlay does not show).
 func (m Model) confirmIDWithoutSend(id int64) (tea.Model, tea.Cmd) {
+	// Claimed here rather than at the caller, the way confirmAuditID is: the
+	// overlay's y is the list's y in another surface, and a guard that lived in
+	// the key handler would have to be repeated at each door to the same action
+	// — which is how this one came to be the door with no guard on it.
+	ids := []int64{id}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
+	app, ctx, wg := m.app, m.ctx, m.inflight
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("confirmed #%d — learned, nothing sent (the agent is not answered)", id),
-		func(ctx context.Context) error { return m.app.Confirm(ctx, id, false) })
+	// Written out rather than routed through m.do, which builds its own result
+	// and so cannot carry the claim back.
+	m.message = m.beginSending(ids)
+	if wg != nil {
+		wg.Add(1)
+	}
+	return m, func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		if err := app.Confirm(ctx, id, false); err != nil {
+			return actionResultMsg{err: err, sent: ids}
+		}
+		return actionResultMsg{sent: ids, message: fmt.Sprintf(
+			"confirmed #%d — learned, nothing sent (the agent is not answered)", id)}
+	}
 }
 
 // openAddPrompt asks whether to queue a stale generated-task suggestion onto the
@@ -3278,6 +3369,11 @@ func (m Model) correctSelected() (tea.Model, tea.Cmd) {
 // historical record (e.g. correcting a past auto decision) the correction is
 // recorded only, never sent.
 func (m Model) correctByID(id int64, live bool) (tea.Model, tea.Cmd) {
+	ids := []int64{id}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
 	app, ctx := m.app, m.ctx
 	m.beginAction()
 	m.openPrompt(&prompt{
@@ -3285,15 +3381,17 @@ func (m Model) correctByID(id int64, live bool) (tea.Model, tea.Cmd) {
 		onSubmit: func(input string) tea.Cmd {
 			if live {
 				// Defer recording to the send prompt so exactly one correction
-				// is written with the chosen send flag.
+				// is written with the chosen send flag — and, with it, the
+				// claim: nothing is dispatched on this branch.
 				return func() tea.Msg { return openSendPromptMsg{id: id, action: input} }
 			}
-			return func() tea.Msg {
+			run := func() tea.Msg {
 				if err := app.Resolve(ctx, id, input, false); err != nil {
-					return actionResultMsg{err: err}
+					return actionResultMsg{err: err, sent: ids}
 				}
-				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d", id)}
+				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d", id), sent: ids}
 			}
+			return func() tea.Msg { return beginSendingMsg{ids: ids, run: run} }
 		},
 	})
 	return m, nil
@@ -3311,15 +3409,17 @@ func (m Model) openSendPrompt(id int64, action string) (tea.Model, tea.Cmd) {
 		input: "n",
 		onSubmit: func(input string) tea.Cmd {
 			send := strings.HasPrefix(strings.ToLower(strings.TrimSpace(input)), "y")
-			return func() tea.Msg {
+			ids := []int64{id}
+			run := func() tea.Msg {
 				if err := app.Resolve(ctx, id, action, send); err != nil {
-					return actionResultMsg{err: err}
+					return actionResultMsg{err: err, sent: ids}
 				}
 				if send {
-					return actionResultMsg{message: fmt.Sprintf("correction recorded and sent for #%d", id)}
+					return actionResultMsg{message: fmt.Sprintf("correction recorded and sent for #%d", id), sent: ids}
 				}
-				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d (not sent)", id)}
+				return actionResultMsg{message: fmt.Sprintf("correction recorded for #%d (not sent)", id), sent: ids}
 			}
+			return func() tea.Msg { return beginSendingMsg{ids: ids, run: run} }
 		},
 	})
 	return m, nil
@@ -3328,18 +3428,58 @@ func (m Model) openSendPrompt(id int64, action string) (tea.Model, tea.Cmd) {
 // dismissByID dismisses one escalation by id — used by the detail overlay.
 // The list uses deleteEscalations for its marked/cursor batch semantics.
 func (m Model) dismissByID(id int64) (tea.Model, tea.Cmd) {
+	// The overlay's x, and the same reasoning as confirmIDWithoutSend above:
+	// deleteEscalations guards the list's x, so leaving this door open means a
+	// row already in flight can still be dismissed out from under its own
+	// answer.
+	ids := []int64{id}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
+	app, ctx, wg := m.app, m.ctx, m.inflight
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("dismissed #%d", id), func(ctx context.Context) error {
-		return m.app.Dismiss(ctx, id)
-	})
+	m.message = m.beginSending(ids)
+	if wg != nil {
+		wg.Add(1)
+	}
+	return m, func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		if err := app.Dismiss(ctx, id); err != nil {
+			return actionResultMsg{err: err, sent: ids}
+		}
+		return actionResultMsg{message: fmt.Sprintf("dismissed #%d", id), sent: ids}
+	}
 }
 
 // retryByID re-invokes the LLM on one escalation by id (list and detail).
 func (m Model) retryByID(id int64) (tea.Model, tea.Cmd) {
+	ids := []int64{id}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
+	app, ctx, wg := m.app, m.ctx, m.inflight
 	m.beginAction()
-	return m, m.do(fmt.Sprintf("retry LLM queued for #%d", id), func(ctx context.Context) error {
-		return m.app.RetryLLM(ctx, id)
-	})
+	// Written out rather than routed through m.do, which builds its own result
+	// and so cannot carry the claim back. A retry files an llm_retries row
+	// under the escalation's OWN node, so on a remote row it waits the same way
+	// a confirm does.
+	m.message = m.beginSending(ids)
+	if wg != nil {
+		wg.Add(1)
+	}
+	return m, func() tea.Msg {
+		if wg != nil {
+			defer wg.Done()
+		}
+		if err := app.RetryLLM(ctx, id); err != nil {
+			return actionResultMsg{err: err, sent: ids}
+		}
+		return actionResultMsg{message: fmt.Sprintf("retry LLM queued for #%d", id), sent: ids}
+	}
 }
 
 // retrySelected re-invokes the LLM on the escalation under the cursor, with a
@@ -3416,6 +3556,111 @@ func (m Model) targetEscalationIDs() []int64 {
 	return ids
 }
 
+// beginSending claims rows for an action about to be dispatched, and returns
+// the notice naming what is happening and where it is going.
+//
+// Copy-on-write: a Bubble Tea Model is passed by value and copied constantly,
+// so mutating the map in place would reach every other copy holding it —
+// including one an earlier frame rendered from.
+func (m *Model) beginSending(ids []int64) string {
+	next := make(map[int64]bool, len(m.sending)+len(ids))
+	for id := range m.sending {
+		next[id] = true
+	}
+	for _, id := range ids {
+		next[id] = true
+	}
+	m.sending = next
+	return m.sendingNotice(ids)
+}
+
+// releaseSending drops the claims an action's own result carries.
+func (m *Model) releaseSending(ids []int64) {
+	if len(ids) == 0 || len(m.sending) == 0 {
+		return
+	}
+	next := make(map[int64]bool, len(m.sending))
+	for id := range m.sending {
+		next[id] = true
+	}
+	for _, id := range ids {
+		delete(next, id)
+	}
+	m.sending = next
+}
+
+// pruneSending drops claims for rows that are no longer pending.
+//
+// The result normally releases a claim, but not every row's fate is this
+// process's to observe: another machine's operator — or that node's own daemon
+// — can resolve the escalation while this request is in flight, and then the
+// row simply leaves the queue. Without this the id would sit in the map for the
+// life of the TUI. Called on every refresh, where the queue is re-read anyway.
+//
+// A FAILED refresh carries no escalations at all, and "we could not read the
+// queue" is not "the row left it": pruning there would drop every live claim,
+// un-dim the rows and let a second press queue the same answer again — exactly
+// what the claim exists to prevent.
+func (m *Model) pruneSending() {
+	if len(m.sending) == 0 || m.data.err != nil {
+		return
+	}
+	next := make(map[int64]bool, len(m.sending))
+	for _, e := range m.data.escalations {
+		if m.sending[e.ID] {
+			next[e.ID] = true
+		}
+	}
+	m.sending = next
+}
+
+// sendingBlocked reports the refusal for ids already in flight, or "" when the
+// action may proceed.
+//
+// It answers on the ids the action would actually act on, never on the marks:
+// confirmWithoutSend clears m.marked at dispatch, so a second press falls back
+// to the cursor row — and a guard that looked at marks would wave it through.
+func (m Model) sendingBlocked(ids []int64) string {
+	var busy []int64
+	for _, id := range ids {
+		if m.sending[id] {
+			busy = append(busy, id)
+		}
+	}
+	if len(busy) == 0 {
+		return ""
+	}
+	if len(busy) == len(ids) {
+		return describeEscalations(busy) + " is already being answered — waiting for the result"
+	}
+	return describeEscalations(busy) + " is already being answered — clear the marks and retry the rest"
+}
+
+// sendingNotice is the banner a dispatch shows immediately. It names the NODE
+// for another machine's row, because that is what explains the wait: the
+// request travels on this node's next push and that node's next pull.
+func (m Model) sendingNotice(ids []int64) string {
+	nodes := map[string]bool{}
+	for _, e := range m.data.escalations {
+		for _, id := range ids {
+			if e.ID == id && !m.isSelfNode(e.NodeID) {
+				nodes[m.data.status.NodeLabel(e.NodeID)] = true
+			}
+		}
+	}
+	switch len(nodes) {
+	case 0:
+		return "answering " + describeEscalations(ids) + "…"
+	case 1:
+		for label := range nodes {
+			return fmt.Sprintf("answering %s on node %s — queued for its daemon…",
+				describeEscalations(ids), label)
+		}
+	}
+	return fmt.Sprintf("answering %s across %d nodes — queued for their daemons…",
+		describeEscalations(ids), len(nodes))
+}
+
 // describeEscalations names the action targets compactly: "escalation #41"
 // or "3 escalations (#41 #40 #39)", eliding a long id list.
 func describeEscalations(ids []int64) string {
@@ -3441,9 +3686,14 @@ func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
 	if len(ids) == 0 {
 		return m, nil
 	}
+	if busy := m.sendingBlocked(ids); busy != "" {
+		m.message = busy
+		return m, nil
+	}
 	app, ctx := m.app, m.ctx
 	desc := describeEscalations(ids)
 	m.beginAction()
+	m.message = m.beginSending(ids)
 	return m, func() tea.Msg {
 		// Skip-and-continue: a failed id usually means the row was
 		// resolved/confirmed concurrently; the rest still delete.
@@ -3461,10 +3711,10 @@ func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
 			deleted++
 		}
 		if firstErr != nil {
-			return actionResultMsg{err: fmt.Errorf("deleted %d, skipped %s: %w",
+			return actionResultMsg{sent: ids, err: fmt.Errorf("deleted %d, skipped %s: %w",
 				deleted, strings.Join(skipped, " "), firstErr)}
 		}
-		return actionResultMsg{message: fmt.Sprintf(
+		return actionResultMsg{sent: ids, message: fmt.Sprintf(
 			"deleted %s; audit rows kept as dismissed", desc)}
 	}
 }
@@ -7029,7 +7279,7 @@ func (m Model) helpLine() string {
 				seed = "  b: disable builtin rule"
 			}
 		}
-		return "enter: confirm+send  y: confirm only (marked)  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule" + seed + "  space: mark  x: delete  X: prune old  v: details  /: search  " + common
+		return "enter: confirm+send  y: confirm only (marked)  c: correct (+send?)  l: retry LLM  f: focus in herdr  t: see rule" + seed + "  space: mark  x: delete  X: prune old  v: details  /: search  (» = answer in flight)  " + common
 	case tabAudit:
 		return "c: correct decision  v: details  t: see rule  /: search  " + common
 	case tabSignatures:
@@ -7392,10 +7642,7 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		// name@node for another machine's row: pane ids repeat across
 		// machines, so a local name lookup would mislabel it.
 		agent := m.data.status.RecordAgent(e)
-		mark := " "
-		if m.marked[e.ID] {
-			mark = "✓"
-		}
+		mark := escalationMark(m.marked[e.ID], m.sending[e.ID])
 		rWidth, sWidth := m.budget(escPrefix, e.Suggestion != "")
 		line := fmt.Sprintf(escRowFmt,
 			mark, shortAuditID(e.ID), humanizeWhen(e.CreatedAt, m.renderNow()), e.SituationType,
@@ -7405,12 +7652,53 @@ func (m Model) renderEscalations(b *strings.Builder) {
 		if e.Suggestion != "" {
 			line += "  → " + oneLine(e.Suggestion, sWidth)
 		}
-		if i == m.cursors[m.tab] {
-			line = m.styles().selected.Render(line)
+		if st, ok := escalationRowStyle(m.styles(), m.sending[e.ID], i == m.cursors[m.tab]); ok {
+			line = st.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
 	m.renderMoreRows(b, len(esc)-end)
+}
+
+// escalationMark is the leftmost column: what this row is, in one cell.
+//
+// Sending outranks marked, and not only because a dispatch clears the marks —
+// a row whose answer is already travelling is no longer a selection the next
+// key would act on, and saying so is the point.
+//
+// It is a GLYPH rather than colour alone because colour is the half that
+// disappears: lipgloss emits nothing without a TTY, so on a plain pipe — and in
+// every test — the style is invisible and this cell is the only thing left
+// saying the row is in flight. Single-width on purpose; the column is %-1s, and
+// a double-width rune (⏳, →) shifts every column after it.
+func escalationMark(marked, sending bool) string {
+	switch {
+	case sending:
+		return "»"
+	case marked:
+		return "✓"
+	}
+	return " "
+}
+
+// escalationRowStyle picks the style for one Escalations row, or reports false
+// to leave it plain.
+//
+// A pure function for the same reason auditRowStyle is one: lipgloss drops
+// colour entirely with no TTY, so asserting on the rendered escape sequence
+// passes vacuously — the CHOICE has to be assertable on its own.
+//
+// Selected wins over sending, or the cursor vanishes the moment you answer the
+// row you are looking at. The glyph still marks it, which is why losing the dim
+// here costs nothing.
+func escalationRowStyle(st styles, sending, selected bool) (lipgloss.Style, bool) {
+	switch {
+	case selected:
+		return st.selected, true
+	case sending:
+		return st.pending, true
+	}
+	return lipgloss.Style{}, false
 }
 
 // auditRowStyle picks the style for one Audit row, or reports false to leave it

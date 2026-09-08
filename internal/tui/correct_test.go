@@ -245,7 +245,21 @@ func runPromptSubmit(t *testing.T, m Model, input string) (Model, tea.Msg) {
 	if cmd == nil {
 		return m, nil
 	}
-	return m, cmd()
+	msg := cmd()
+	// An action dispatched from inside a prompt claims its rows first — a
+	// prompt's onSubmit returns a tea.Cmd and cannot mutate the model — and
+	// carries the real command as the claim's payload. Following that hop is
+	// exactly what the Bubble Tea runtime does, and it is what keeps every
+	// assertion below pointed at what the ACTION did rather than at the claim.
+	if bs, ok := msg.(beginSendingMsg); ok {
+		upd, _ := m.Update(bs)
+		m = upd.(Model)
+		if bs.run == nil {
+			return m, nil
+		}
+		msg = bs.run()
+	}
+	return m, msg
 }
 
 // TestCorrectLiveOpensSendPromptAndRecords: correcting a live escalation opens
