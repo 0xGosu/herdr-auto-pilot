@@ -3472,11 +3472,17 @@ func (m Model) deleteEscalations() (tea.Model, tea.Cmd) {
 // pruneEscalationsPrompt asks for an age in minutes (pre-filled with the
 // default, editable) and dismisses every pending escalation older than that.
 // Enter confirms, esc cancels.
+//
+// The prompt and the result NAME the scope when the store is shared, because
+// the prune spans every node the way this tab's list does: on a six-machine
+// fleet one keypress can go from retiring a dozen rows to retiring hundreds,
+// and a label that said only "prune escalations" would not have shown that.
+// On a single-node install pruneScope is empty and both lines read as before.
 func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
-	app, ctx := m.app, m.ctx
+	app, ctx, scope := m.app, m.ctx, m.pruneScope()
 	m.beginAction()
 	m.openPrompt(&prompt{
-		label: "prune escalations older than N minutes — enter confirms, esc cancels",
+		label: "prune escalations" + scope + " older than N minutes — enter confirms, esc cancels",
 		input: strconv.Itoa(frontend.DefaultPruneMinutes),
 		onSubmit: func(input string) tea.Cmd {
 			return func() tea.Msg {
@@ -3489,11 +3495,24 @@ func (m Model) pruneEscalationsPrompt() (tea.Model, tea.Cmd) {
 					return actionResultMsg{err: err}
 				}
 				return actionResultMsg{message: fmt.Sprintf(
-					"pruned %d escalation(s) older than %d minute(s); audit rows kept as dismissed", n, minutes)}
+					"pruned %d escalation(s)%s older than %d minute(s); audit rows kept as dismissed",
+					n, scope, minutes)}
 			}
 		},
 	})
 	return m, nil
+}
+
+// pruneScope renders " across N nodes" when several machines share this store,
+// and "" when they do not. Status.Nodes is empty under the local engine, and
+// holds one row for a shared store nobody else has joined yet — neither is a
+// fleet, and saying "across 1 node" to an operator who has never heard of the
+// feature would be noise.
+func (m Model) pruneScope() string {
+	if n := len(m.data.status.Nodes); n > 1 {
+		return fmt.Sprintf(" across %d nodes", n)
+	}
+	return ""
 }
 
 // --- Tasks tab CRUD (mirrors `hap task` add/edit/done/undone/delete) ---
@@ -3818,6 +3837,20 @@ func (m Model) taskSourceRemovable(g frontend.TaskGroup) (string, bool) {
 // often hand-written docs hap did not create and could not restore, and
 // re-adding the source brings the list back untouched.
 func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
+	// Another machine's header. A task source is a [[task_sources]] entry in
+	// THAT node's config.toml, and config never enters the shared database, so
+	// there is nothing here to remove — but silence read as a broken key.
+	g, ok := m.fleetTaskGroup(group)
+	if ok {
+		m.message = fmt.Sprintf("this list belongs to node %s — a task source lives in that machine's "+
+			"config.toml, which never enters the shared database; remove it there with "+
+			"`hap config task-source remove`", g.NodeLabel)
+		return m, nil
+	}
+	if g.Err != "" {
+		m.message = g.Err
+		return m, nil
+	}
 	if group < 0 || group >= len(m.data.tasks) {
 		return m, nil
 	}
@@ -3918,6 +3951,8 @@ func (m Model) confirmDeleteTaskTargets(targets []taskTarget, clearsMarks bool) 
 // no source to consult at all.
 func (m Model) taskSourceLabel(r *taskRow) string {
 	if r.group >= len(m.data.tasks) {
+		// Another node's list, or a source that has gone: neither has a
+		// selector here to name it by, so the address is the label.
 		return truncatePathKeepBase(displayTaskAddress(r.path), taskPathDisplayWidth)
 	}
 	src := m.data.tasks[r.group].Source
@@ -4015,9 +4050,23 @@ func (m Model) focusSelectedTaskAgent() (tea.Model, tea.Cmd) {
 	return m.focusTaskGroupAgent(r.group)
 }
 
-// focusTaskGroupAgent focuses the first live agent whose selectors match the
-// given task source (config index) — shared by the list and detail `f`.
+// focusTaskGroupAgent focuses the live agent this task source feeds — shared by
+// the list and detail `f`.
+//
+// MonitoredAgents is THIS node's herd, so a fleet row can never match it: every
+// one of another machine's lists used to answer "no live agent matches this
+// task source", which is not what happened — the row names its node and the
+// agent that node keeps the list for, and the Agents tab's own `f` has reached
+// a remote pane since remoteagent.go landed.
 func (m Model) focusTaskGroupAgent(group int) (tea.Model, tea.Cmd) {
+	g, ok := m.fleetTaskGroup(group)
+	if ok {
+		return m.focusFleetTaskAgent(g)
+	}
+	if g.Err != "" {
+		m.message = g.Err
+		return m, nil
+	}
 	for _, a := range m.data.status.MonitoredAgents {
 		for _, idx := range m.agentTaskSourceMatches(m.localRow(a)) {
 			if idx == group {
@@ -4027,6 +4076,63 @@ func (m Model) focusTaskGroupAgent(group int) (tea.Model, tea.Cmd) {
 	}
 	m.message = "no live agent matches this task source"
 	return m, nil
+}
+
+// focusFleetTaskAgent focuses the agent another node keeps a list for.
+//
+// The list row carries the agent's NAME in that node's namespace, never a pane
+// id — pane ids repeat on every machine — so the roster is what turns it into
+// something focusable. An unnamed list is refused with the same sentence
+// sendRemoteTaskRow uses, since it is the same missing fact.
+func (m Model) focusFleetTaskAgent(g frontend.TaskGroup) (tea.Model, tea.Cmd) {
+	if g.Source.Agent == "" {
+		m.message = fmt.Sprintf("node %s does not say which agent this list belongs to", g.NodeLabel)
+		return m, nil
+	}
+	for _, r := range m.data.status.RemoteAgents {
+		if r.NodeID == g.NodeID && r.Name == g.Source.Agent {
+			return m.focusAgentOn(g.NodeID, r.AgentID)
+		}
+	}
+	m.message = fmt.Sprintf("no live agent %s on node %s — it may have exited",
+		g.Source.Agent, g.NodeLabel)
+	return m, nil
+}
+
+// fleetTaskGroup returns the OTHER node's list a row's group index addresses,
+// and whether the index names one at all.
+//
+// Fleet rows are laid out past every configured source (fleetTaskRows takes
+// len(m.data.tasks) as its base), so this boundary is the one thing that tells
+// another machine's list from this one's — and it was open-coded at every call
+// site, each having to get the arithmetic right on its own. A site that reads
+// only `>= len(m.data.tasks)` cannot tell a remote list from a source that has
+// gone, which is how a bare guard came to refuse a row that was on screen; a
+// site with no guard at all would index past the slice.
+// The ok is false for the SYNTHETIC error group FleetTaskGroups returns when
+// the store cannot be read (fleettasks.go: "a store that cannot be read is not
+// a fleet with no lists"). It renders, because silence would be worse — but it
+// describes no list at all: no node, no locator, no agent. An action that took
+// it for another machine's would name an empty node and send the operator to a
+// machine that does not exist. Its Err comes back either way, so a caller can
+// say what is actually wrong instead.
+func (m Model) fleetTaskGroup(group int) (frontend.TaskGroup, bool) {
+	k := group - len(m.data.tasks)
+	if k < 0 || k >= len(m.data.fleetTasks) {
+		return frontend.TaskGroup{}, false
+	}
+	g := m.data.fleetTasks[k]
+	return g, g.NodeID != ""
+}
+
+// taskGroupAt returns the group a row addresses, local or fleet — for the
+// actions that work the same either way, because they act on the LIST (through
+// a locator the store resolves per node) rather than on the source's config.
+func (m Model) taskGroupAt(group int) (frontend.TaskGroup, bool) {
+	if group >= 0 && group < len(m.data.tasks) {
+		return m.data.tasks[group], true
+	}
+	return m.fleetTaskGroup(group)
 }
 
 // taskGroupAgent resolves the first live agent whose selectors match the
@@ -4080,7 +4186,13 @@ func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
 		m.message = "K/J reorders checklist items — move the cursor onto a task"
 		return m, nil
 	}
-	if r.group >= len(m.data.tasks) {
+	// Local or fleet: a reorder rewrites the LIST, and MoveTask addresses it by
+	// locator — which the store resolves to the owning node's task_lists row.
+	// Nothing below this point reads the source's config, so refusing a fleet
+	// row here left an advertised key dead on every remote list, and said
+	// "no longer loaded" about one that was on screen.
+	g, ok := m.taskGroupAt(r.group)
+	if !ok {
 		m.message = "this task source is no longer loaded — refreshing"
 		return m, nil
 	}
@@ -4098,7 +4210,7 @@ func (m Model) moveSelectedTask(delta int) (tea.Model, tea.Cmd) {
 	// first sub-task, and asking to swap those two is re-parenting, which
 	// MoveTask refuses. Stepping by position would make K/J fail on exactly the
 	// nested lists a subtree-carrying move exists for.
-	items := m.data.tasks[r.group].Items
+	items := g.Items
 	to := domain.SiblingPosition(items, r.item, delta)
 	// Refuse at the ends rather than clamping: a clamp would rewrite the file
 	// with identical content and report success, so holding the key at the top
@@ -4179,8 +4291,11 @@ func (m Model) sendTaskRow(r taskRow) (tea.Model, tea.Cmd) {
 	// is not in this herd, so nothing here can resolve a pane or a template for
 	// it — but the list row carries the agent's name in that node's namespace,
 	// which is the only identity the request needs.
-	if k := r.group - len(m.data.tasks); k >= 0 && k < len(m.data.fleetTasks) {
-		return m.sendRemoteTaskRow(r, m.data.fleetTasks[k])
+	if g, ok := m.fleetTaskGroup(r.group); ok {
+		return m.sendRemoteTaskRow(r, g)
+	} else if g.Err != "" {
+		m.message = g.Err
+		return m, nil
 	}
 	agent := m.taskGroupAgent(r.group)
 	if agent == nil {
@@ -4281,8 +4396,7 @@ func (m Model) taskDetailLines(r taskRow, width int) []string {
 		src := m.data.tasks[r.group].Source
 		lines = m.detailField(lines, w, "Agent selector", orDash(src.Agent))
 		lines = m.detailField(lines, w, "Workspace", orDash(src.Workspace))
-	} else if k := r.group - len(m.data.tasks); k >= 0 && k < len(m.data.fleetTasks) {
-		g := m.data.fleetTasks[k]
+	} else if g, ok := m.fleetTaskGroup(r.group); ok {
 		lines = m.detailField(lines, w, "Node", g.NodeLabel)
 		lines = m.detailField(lines, w, "Agent", orDash(g.Source.Agent))
 	}

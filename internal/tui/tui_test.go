@@ -1862,6 +1862,25 @@ func TestAuditTabDeleteRefused(t *testing.T) {
 	}
 }
 
+// TestEscalationPruneNamesItsFleetScope: the prune spans every node the way
+// this tab's list does, so on a shared store one keypress can go from retiring
+// a dozen rows to retiring hundreds. The prompt and the result say so.
+func TestEscalationPruneNamesItsFleetScope(t *testing.T) {
+	m, _, _, _, _ := escalationsModel(t)
+	m.data.status.Nodes = []domain.NodeInfo{{ID: "aaaaaaaaaaaaaaaa"}, {ID: "bbbbbbbbbbbbbbbb"}}
+
+	m = press(t, m, "X")
+	if m.prompt == nil || !strings.Contains(m.prompt.label, "across 2 nodes") {
+		t.Fatalf("fleet prune prompt = %+v, want the scope named", m.prompt)
+	}
+	upd, cmd := m.Update(pressKeyMsg("enter"))
+	m = upd.(Model)
+	msg, ok := cmd().(actionResultMsg)
+	if !ok || msg.err != nil || !strings.Contains(msg.message, "across 2 nodes") {
+		t.Fatalf("result = %+v, want the scope named there too", msg)
+	}
+}
+
 func TestEscalationPrunePromptFlow(t *testing.T) {
 	m, _, st, oldID, freshID := escalationsModel(t)
 	ctx := context.Background()
@@ -1870,6 +1889,10 @@ func TestEscalationPrunePromptFlow(t *testing.T) {
 	m = press(t, m, "X")
 	if m.prompt == nil || m.prompt.input != "360" {
 		t.Fatalf("X should open the prune prompt pre-filled with 360, got %+v", m.prompt)
+	}
+	// On a single-node install the label says nothing about scope.
+	if strings.Contains(m.prompt.label, "across") {
+		t.Errorf("single-node prune prompt = %q, want no fleet scope", m.prompt.label)
 	}
 	// Enter with the default prunes only the 7h-old escalation.
 	upd, cmd := m.Update(pressKeyMsg("enter"))

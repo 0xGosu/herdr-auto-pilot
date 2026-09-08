@@ -1222,23 +1222,53 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 
 // escalationsPrune dismisses pending escalations older than the given age
 // in minutes (default 360). Audit rows are kept; nothing is sent or learned.
+//
+// Without --node it prunes EVERY node, matching the queue `hap escalations`
+// prints. --node scopes it to one machine.
 func escalationsPrune(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	minutes := frontend.DefaultPruneMinutes
-	if len(args) > 1 {
-		return fmt.Errorf("usage: escalations prune [minutes] (see: hap help escalations)")
-	}
-	if len(args) == 1 {
-		v, err := strconv.Atoi(args[0])
-		if err != nil || v <= 0 {
-			return fmt.Errorf("invalid age %q — whole minutes, e.g. escalations prune 120", args[0])
-		}
-		minutes = v
-	}
-	n, err := app.PruneEscalations(ctx, time.Duration(minutes)*time.Minute)
+	// Whether --node was SPELLED, which splitNodeFlag cannot answer on its own:
+	// it collapses `--node <this machine>` to an empty node id, the same value
+	// it returns when the flag is absent. For rename and friends those two are
+	// the same request; here they are opposites — one prunes this node, the
+	// other prunes the fleet.
+	scoped := slices.ContainsFunc(args, func(arg string) bool {
+		return arg == "--node" || strings.HasPrefix(arg, "--node=")
+	})
+	// splitNodeFlag, not nodeFlag: this verb takes a positional [minutes], and
+	// nodeFlag refuses any leftover argument.
+	rest, nodeID, label, err := splitNodeFlag(ctx, app, args)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "pruned %d escalation(s) older than %d minute(s); audit rows kept as dismissed\n", n, minutes)
+	minutes := frontend.DefaultPruneMinutes
+	if len(rest) > 1 {
+		return fmt.Errorf("usage: escalations prune [minutes] [--node <label|id>] (see: hap help escalations)")
+	}
+	if len(rest) == 1 {
+		v, err := strconv.Atoi(rest[0])
+		if err != nil || v <= 0 {
+			return fmt.Errorf("invalid age %q — whole minutes, e.g. escalations prune 120", rest[0])
+		}
+		minutes = v
+	}
+	var n int64
+	scope := ""
+	if scoped {
+		if label == "" {
+			label = " on this node"
+		}
+		scope = label
+		n, err = app.PruneEscalationsOn(ctx, time.Duration(minutes)*time.Minute, nodeID)
+	} else {
+		if nodes, e := app.Store.ListNodes(ctx); e == nil && len(nodes) > 1 {
+			scope = fmt.Sprintf(" across %d nodes", len(nodes))
+		}
+		n, err = app.PruneEscalations(ctx, time.Duration(minutes)*time.Minute)
+	}
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "pruned %d escalation(s)%s older than %d minute(s); audit rows kept as dismissed\n", n, scope, minutes)
 	PrintNextSteps(out, []Hint{
 		{Cmd: "hap escalations", Why: "what is still pending"},
 		{Cmd: "hap audit --limit 20", Why: "the pruned rows are kept here as dismissed"},

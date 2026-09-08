@@ -2037,6 +2037,57 @@ func TestPruneEscalations(t *testing.T) {
 	if _, err := app.PruneEscalations(ctx, 0); err == nil {
 		t.Error("a non-positive prune age must be rejected")
 	}
+	if _, err := app.PruneEscalationsOn(ctx, 0, ""); err == nil {
+		t.Error("a non-positive prune age must be rejected on the scoped path too")
+	}
+}
+
+// TestPruneEscalationsAcrossNodes pins the scope of each prune from the App
+// seam: the plain one retires another machine's aged rows (the Escalations
+// surfaces are a fleet list, so it must), and the scoped one leaves them alone.
+func TestPruneEscalationsAcrossNodes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.db")
+	self, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { self.Close() })
+	// The same file as another machine sees it.
+	other, err := store.OpenAs(path, "bbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	app := &frontend.App{Store: self, ConfigPath: filepath.Join(dir, "config.toml"), Author: "operator"}
+
+	ctx := context.Background()
+	aged := time.Now().Add(-7 * time.Hour)
+	seed := func(st *store.Store) int64 {
+		t.Helper()
+		id, err := st.AppendAudit(ctx, domain.AuditRecord{SituationType: domain.SituationApproval,
+			Trigger: "old", Action: "escalated", Status: "escalated", CreatedAt: aged})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	mine, theirs := seed(self), seed(other)
+
+	if n, err := app.PruneEscalationsOn(ctx, 6*time.Hour, ""); err != nil || n != 1 {
+		t.Fatalf("PruneEscalationsOn(self) = %d, %v; want 1, nil", n, err)
+	}
+	if rec, _ := self.GetAudit(ctx, theirs); rec == nil || rec.Status != "escalated" {
+		t.Errorf("a scoped prune dismissed another node's escalation: %+v", rec)
+	}
+	if n, err := app.PruneEscalations(ctx, 6*time.Hour); err != nil || n != 1 {
+		t.Fatalf("PruneEscalations = %d, %v; want 1 (the other node's row), nil", n, err)
+	}
+	for _, id := range []int64{mine, theirs} {
+		if rec, _ := self.GetAudit(ctx, id); rec == nil || rec.Status != "dismissed" {
+			t.Errorf("audit #%d after the fleet prune: %+v, want dismissed", id, rec)
+		}
+	}
 }
 
 func TestResolveUnknownAuditFails(t *testing.T) {

@@ -423,14 +423,20 @@ func buildCommands() {
 			Summary: "list what is waiting for an answer; prune old ones",
 			Usage: []string{
 				"hap escalations",
-				"hap escalations prune [minutes]",
+				"hap escalations prune [minutes] [--node <label|id>]",
 				"hap escalations retry <audit-id>",
+			},
+			Flags: []FlagDoc{
+				{Name: "--node <label|id>", Desc: "prune only one machine's escalations (prune only; see `hap status` for the nodes sharing this store)"},
 			},
 			Details: "Each row is: #id, time, situation type, reason, agent, LLM confidence,\n" +
 				"the suggested answer, and the learned rule it matched (if any).\n" +
 				"Answer a row with `confirm` (accept the suggestion), `resolve` (supply the right\n" +
 				"answer), or `dismiss` (drop it). `prune` dismisses everything older than N minutes\n" +
 				"(default 360); audit rows are kept and nothing is sent or learned.\n" +
+				"Under a shared database (`[database] engine = \"turso\"`) the list spans every\n" +
+				"machine, and so does `prune` — it retires exactly what you are looking at.\n" +
+				"Pass `--node` to prune one machine instead.\n" +
 				"`retry` re-invokes the operator LLM on an escalation whose consult failed or\n" +
 				"timed out (and re-runs a failed learn-from-correction). It queues the request:\n" +
 				"the running daemon re-consults against the agent's LIVE pane, so the answer\n" +
@@ -442,7 +448,8 @@ func buildCommands() {
 			},
 			Examples: []string{
 				"hap escalations", "hap confirm 42 --send",
-				"hap escalations prune 120", "hap escalations retry 42",
+				"hap escalations prune 120", "hap escalations prune 120 --node laptop",
+				"hap escalations retry 42",
 			},
 			SelfHints: true,
 			Handler:   escalations,
@@ -1453,7 +1460,16 @@ func splitNodeFlag(ctx context.Context, app *frontend.App, args []string) (rest 
 			ref = args[i+1]
 			i++
 		case strings.HasPrefix(args[i], "--node="):
+			// An EMPTY value is the same operator mistake the bare `--node`
+			// makes, and it must get the same answer. Falling through with
+			// ref == "" reads as "the flag was absent", which is a silent
+			// no-op for the verbs that then run locally — and, for a verb
+			// whose unflagged form is WIDER than its flagged one (the fleet
+			// prune), silently the broader action.
 			ref = strings.TrimPrefix(args[i], "--node=")
+			if ref == "" {
+				return nil, "", "", fmt.Errorf("--node requires a node (label or id)")
+			}
 		default:
 			rest = append(rest, args[i])
 		}

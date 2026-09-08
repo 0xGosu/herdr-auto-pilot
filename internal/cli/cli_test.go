@@ -844,9 +844,80 @@ func TestEscalationsPruneCLI(t *testing.T) {
 		t.Errorf("2h-old escalation must fall to the 60-minute cutoff, got %q", rec.Status)
 	}
 
-	for _, args := range [][]string{{"prune", "0"}, {"prune", "-5"}, {"prune", "abc"}, {"prune", "60", "extra"}, {"bogus"}} {
+	for _, args := range [][]string{{"prune", "0"}, {"prune", "-5"}, {"prune", "abc"}, {"prune", "60", "extra"},
+		{"prune", "--node"}, {"prune", "--node="}, {"prune", "--node", "nosuchnode"}, {"bogus"}} {
 		if _, err := run(t, app, "escalations", args...); err == nil {
 			t.Errorf("escalations %v must fail", args)
+		}
+	}
+}
+
+// TestEscalationsPruneNodeFlag pins the two scopes the verb offers. The
+// positional [minutes] is what rules nodeFlag out — it refuses any leftover
+// argument — so this also proves the verb still reads the age after
+// splitNodeFlag has lifted the flag out from in front of it.
+func TestEscalationsPruneNodeFlag(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "t.db")
+	self, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { self.Close() })
+	other, err := store.OpenAs(path, "bbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	app := &frontend.App{Store: self, ConfigPath: filepath.Join(dir, "config.toml"),
+		Author: "operator", StateDir: dir}
+
+	ctx := context.Background()
+	now := time.Now()
+	// Both machines announce themselves the way a running daemon does — the
+	// nodes table is what --node resolves against and what the fleet count
+	// reads.
+	for _, st := range []*store.Store{self, other} {
+		if err := st.UpsertNode(ctx, domain.NodeInfo{ID: st.NodeID(), Label: "node-" + st.NodeID()[:4],
+			StartedAt: now, LastSeen: now}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	aged := now.Add(-7 * time.Hour)
+	seed := func(st *store.Store) int64 {
+		t.Helper()
+		id, err := st.AppendAudit(ctx, domain.AuditRecord{SituationType: domain.SituationApproval,
+			Trigger: "old", Action: "escalated", Status: "escalated", CreatedAt: aged})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	mine, theirs := seed(self), seed(other)
+
+	// --node names THIS machine: only its own row goes.
+	out, err := run(t, app, "escalations", "prune", "--node", self.NodeID(), "60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "pruned 1 escalation(s) on this node older than 60 minute(s)") {
+		t.Errorf("scoped prune output:\n%s", out)
+	}
+	if rec, _ := self.GetAudit(ctx, theirs); rec.Status != "escalated" {
+		t.Errorf("--node <self> dismissed another node's escalation: %q", rec.Status)
+	}
+
+	// No flag: the fleet, which is what `hap escalations` lists.
+	out, err = run(t, app, "escalations", "prune", "60")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "pruned 1 escalation(s) across 2 nodes older than 60 minute(s)") {
+		t.Errorf("fleet prune output:\n%s", out)
+	}
+	for _, id := range []int64{mine, theirs} {
+		if rec, _ := self.GetAudit(ctx, id); rec.Status != "dismissed" {
+			t.Errorf("audit #%d after the fleet prune = %q, want dismissed", id, rec.Status)
 		}
 	}
 }

@@ -63,6 +63,7 @@ var nodeScopeExemptions = map[string]string{
 	"GetAudit#1":                     "by id, returns node_id",
 	"CountPendingEscalations#1":      "fleet read: the unified pending count",
 	"PendingEscalations#1":           "fleet read: the unified queue, node_id per row",
+	"DismissEscalationsBefore#1":     "fleet write: the operator prunes the unified queue they are looking at",
 	"MarkLLMRetryProcessed#1":        "by id",
 	"RetireEscalationForRetry#1":     "by id",
 	"GetLLMRequest#1":                "by request_id",
@@ -360,8 +361,12 @@ func TestOperationalReadsNeverSeeAnotherNodesRows(t *testing.T) {
 	if rs, _ := a.OpenTaskReservations(ctx); len(rs) != 1 || rs[0].Restamps != 0 || !rs[0].ConfirmedAt.IsZero() {
 		t.Errorf("B's restart or a B pane going working touched A's hand-out: %+v", rs)
 	}
-	if n, _ := b.DismissEscalationsBefore(ctx, now.Add(time.Hour)); n != 0 {
-		t.Errorf("B's prune dismissed A's escalations: %d", n)
+	// The FLEET prune (DismissEscalationsBefore) deliberately spans nodes, so it
+	// is proved in TestFleetPruneDismissesEveryNodesAgedEscalations instead — it
+	// would dismiss the row every assertion below still needs. What belongs here
+	// is its node-scoped sibling, which is the one an operator points at B.
+	if n, _ := b.DismissEscalationsBeforeOn(ctx, now.Add(time.Hour), b.NodeID()); n != 0 {
+		t.Errorf("B's own-node prune dismissed A's escalations: %d", n)
 	}
 	if a2, _ := a.GetAudit(ctx, claimedID); a2.Status != domain.AuditStatusAutoAccepting {
 		t.Errorf("A's claim was disturbed: %q", a2.Status)
@@ -615,4 +620,81 @@ func indexExists(t *testing.T, db *sql.DB, name string) bool {
 		t.Fatal(err)
 	}
 	return n == 1
+}
+
+// TestFleetPruneDismissesEveryNodesAgedEscalations pins the one node-scoped
+// write that had to become fleet-wide: the operator's prune.
+//
+// The Escalations surfaces are a FLEET read — PendingEscalations has no node
+// filter and every row renders as name@node — so a prune that only touched
+// s.self retired a fraction of the list the operator was looking at and
+// reported the count as though it had retired all of it.
+//
+// The three assertions discriminate as a set. Without the `On` case the fleet
+// prune could be a prune of everything with no scoping left at all; without the
+// auto_accepting row a widened prune could reach a row another machine is
+// mid-claim on, which is the one hazard the status guard exists for.
+func TestFleetPruneDismissesEveryNodesAgedEscalations(t *testing.T) {
+	a, path := openTestStore(t)
+	b := openSecondNode(t, path, "bbbbbbbbbbbbbbbb")
+	ctx := context.Background()
+	now := time.Now()
+	old := now.Add(-2 * time.Hour)
+
+	seed := func(s *Store, status string, at time.Time) int64 {
+		t.Helper()
+		id, err := s.AppendAudit(ctx, domain.AuditRecord{AgentID: "1", AgentType: "claude",
+			Signature: "sig", Trigger: "t", SituationType: domain.SituationApproval,
+			Action: domain.AuditActionEscalated, Status: status, CreatedAt: at})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	agedA := seed(a, "escalated", old)
+	agedB := seed(b, "escalated", old)
+	freshB := seed(b, "escalated", now)
+	// Mid-claim on B. It is older than the cutoff, so only the status guard
+	// keeps the prune off it.
+	claimedB := seed(b, domain.AuditStatusAutoAccepting, old)
+
+	statusOf := func(id int64) string {
+		t.Helper()
+		rec, err := a.GetAudit(ctx, id)
+		if err != nil || rec == nil {
+			t.Fatalf("GetAudit(%d): %v", id, err)
+		}
+		return rec.Status
+	}
+
+	// A's own-node prune leaves B's rows alone.
+	n, err := a.DismissEscalationsBeforeOn(ctx, now.Add(-time.Hour), a.NodeID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("DismissEscalationsBeforeOn(A) = %d, want 1 (only A's aged row)", n)
+	}
+	if got := statusOf(agedB); got != "escalated" {
+		t.Errorf("B's aged row after A's scoped prune = %q, want escalated", got)
+	}
+
+	// The fleet prune, run from A, retires B's aged row too.
+	n, err = a.DismissEscalationsBefore(ctx, now.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("fleet prune = %d, want 1 (B's aged row; A's was already dismissed)", n)
+	}
+	for id, want := range map[int64]string{
+		agedA:    "dismissed",
+		agedB:    "dismissed",
+		freshB:   "escalated",
+		claimedB: domain.AuditStatusAutoAccepting,
+	} {
+		if got := statusOf(id); got != want {
+			t.Errorf("audit #%d = %q, want %q", id, got, want)
+		}
+	}
 }

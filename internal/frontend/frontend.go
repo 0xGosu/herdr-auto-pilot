@@ -2225,13 +2225,34 @@ func (a *App) HasPendingLLMConsultOn(ctx context.Context, nodeID, agentID string
 const DefaultPruneMinutes = 360
 
 // PruneEscalations dismisses every pending escalation older than the given
-// age, returning how many were dismissed. Like Dismiss, the audit rows are
-// kept and nothing is sent or learned.
+// age, on EVERY node, returning how many were dismissed. Like Dismiss, the
+// audit rows are kept and nothing is sent or learned.
+//
+// The scope matches the list it prunes: Escalations is a fleet read, so a
+// node-scoped prune retired a fraction of what the operator was looking at and
+// reported the count as though it had retired all of it. PruneEscalationsOn
+// prunes one machine.
+//
+// The reload nudge only reaches THIS node's daemon; another machine's picks the
+// dismissals up on its next pull, the same latency PauseNode already accepts.
 func (a *App) PruneEscalations(ctx context.Context, olderThan time.Duration) (int64, error) {
 	if olderThan <= 0 {
 		return 0, fmt.Errorf("prune age must be positive, got %s", olderThan)
 	}
 	n, err := a.Store.DismissEscalationsBefore(ctx, time.Now().Add(-olderThan))
+	if err != nil {
+		return 0, err
+	}
+	a.nudge(ctx, control.KindReload) // best-effort, as above
+	return n, nil
+}
+
+// PruneEscalationsOn is PruneEscalations scoped to one node (empty = this one).
+func (a *App) PruneEscalationsOn(ctx context.Context, olderThan time.Duration, nodeID string) (int64, error) {
+	if olderThan <= 0 {
+		return 0, fmt.Errorf("prune age must be positive, got %s", olderThan)
+	}
+	n, err := a.Store.DismissEscalationsBeforeOn(ctx, time.Now().Add(-olderThan), orSelf(a, nodeID))
 	if err != nil {
 		return 0, err
 	}
@@ -4726,6 +4747,14 @@ func (a *App) GetTask(agent, path string, index int) (domain.ChecklistItem, erro
 // that is not a managed task source is left uncapped. Matched by absolute path
 // so it applies to both agent- and path-addressed adds of a registered source.
 // A config read error also yields 0 (fail-open: never block an add on it).
+//
+// ANOTHER NODE's list is a third uncapped case, and it is a limit rather than a
+// bug: a `db://<node>/<name>` list the TUI's Tasks tab shows is registered as a
+// [[task_sources]] entry in THAT machine's config.toml, and config never enters
+// the shared database — so its max_tasks is not readable from here and
+// domain.StoredTaskList carries no copy of it. Adding to a remote list from the
+// unified view is therefore uncapped; the owning node's own surfaces still
+// enforce its cap, and so does its daemon's generation gate.
 func (a *App) taskSourceLimit(agent, locator string) int {
 	cfg, err := a.Config()
 	if err != nil {
