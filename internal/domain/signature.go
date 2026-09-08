@@ -131,6 +131,19 @@ const (
 	// skipped or failed, AND equally a search that ran cleanly but found
 	// nothing above similarity_threshold.
 	MatchBM25 MatchMethod = "bm25"
+	// MatchRerank: an LLM judge (llm.reranking_command) picked this rule out of
+	// the candidates cosine admitted at or above similarity_threshold. Score is
+	// the judge's own relevance score, not the cosine.
+	MatchRerank MatchMethod = "rerank"
+	// MatchRerankVeto: the judge was shown candidates and answered with an
+	// EMPTY list — none of them genuinely answers this situation — so the raw
+	// hash was minted as a new key. It is a fresh signature exactly like
+	// MatchNone (nothing downstream branches on the method; it is audit and
+	// display only), recorded distinctly so `hap audit` can say the embedding
+	// DID find candidates and the judge refused them. Without it the row is
+	// indistinguishable from "nothing matched", which is how a silent veto
+	// would look like the feature simply not working.
+	MatchRerankVeto MatchMethod = "rerank_veto"
 )
 
 // MatchDetail records how a signature was resolved, for operator-facing
@@ -139,8 +152,9 @@ const (
 type MatchDetail struct {
 	// Method is the path that resolved the learning key.
 	Method MatchMethod
-	// Score is the cosine similarity (MatchCosine) or normalized BM25 score in
-	// (0,1] (MatchBM25); 0 for exact/none.
+	// Score is the cosine similarity (MatchCosine), the normalized BM25 score in
+	// (0,1] (MatchBM25), or the LLM judge's relevance score (MatchRerank);
+	// 0 for exact/none/rerank_veto.
 	Score float64
 	// EmbedError is the embedding failure message for THIS event, when the
 	// embed call errored (including the degraded latch); "" when embedding

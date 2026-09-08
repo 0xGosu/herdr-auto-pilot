@@ -12,12 +12,13 @@ import (
 )
 
 // presetKeys is every key that offers presets, paired with the accessor a
-// test uses to read the argv back off a loaded config. Adding a fourth preset
+// test uses to read the argv back off a loaded config. Adding another preset
 // key without extending this map fails TestEveryPresetKeyIsCovered.
 var presetKeys = map[string]func(config.Config) []string{
 	frontend.LLMCommandKey:              func(c config.Config) []string { return c.LLM.Command },
 	frontend.LLMTaskGenerateCommandKey:  func(c config.Config) []string { return c.LLM.GenerateTaskCommand },
 	frontend.LLMLearnFromUserCommandKey: func(c config.Config) []string { return c.LLM.LearnFromUserCommand },
+	frontend.LLMRerankingCommandKey:     func(c config.Config) []string { return c.LLM.RerankingCommand },
 }
 
 // TestLLMPresetSurvivesATOMLRoundTrip is the discriminating test for the whole

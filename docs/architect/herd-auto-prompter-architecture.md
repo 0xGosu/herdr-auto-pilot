@@ -525,6 +525,43 @@ fallback chain (each step stamps a `match_method` recorded in the audit log):
    over them would disable cosine paraphrase matching for approvals, choices and
    errors; they are distilled identities already guarded by
    `ApprovalRemapCompatible` and `StructuredSalient`.
+3b. **LLM-as-a-judge re-ranking** *(opt-in, `llm.reranking_command`)* — with a
+   judge configured, step 3's threshold is a **filter** rather than the
+   decision. Every candidate the accept filter admits at cosine ≥
+   `similarity_threshold` (up to `llm.reranking_max_candidates`, which is also
+   the vector search's *k* here) is numbered and listed for a one-shot CLI,
+   which answers with a JSON array `[{"id": <n>, "score": <0-1>}]` ordered by
+   relevance. Entries below `llm.relevance_score_threshold` are dropped, the
+   rest truncated to `llm.reranking_top_k`, and the **first** is the learned
+   key (`match_method = rerank`, score = the judge's relevance).
+
+   Three properties make it safe:
+
+   - **The candidate set is accept-filtered BEFORE the judge sees it.** The
+     `min_salient_chars` veto and `ApprovalRemapCompatible` (issue #155) both
+     run first, so the judge can never pick a candidate the ordinary pass
+     would have refused — those gates are not delegated to a model.
+   - **An EMPTY verdict is terminal and skips step 4.** It mints a new key
+     (`match_method = rerank_veto`). This is the whole feature: the judge
+     exists to override a false positive the embedding produced, and step 4
+     runs "equally when the vector search ran cleanly but found nothing above
+     `similarity_threshold`" — so a veto that fell through would be re-admitted
+     by BM25 and change nothing, while looking like it worked.
+   - **A judge FAILURE is not a veto.** Missing binary, timeout, non-zero exit,
+     prose with no array, a duplicate or out-of-range id: all degrade to the
+     answer step 3 would have given. Only a literal, well-formed `[]` vetoes.
+
+   The run is a subprocess with a 30-second budget, and `resolveSignature` runs
+   on the daemon select loop, so it CANNOT run there. The cosine pass returns a
+   plan, `decideAndAct` suspends, and the decision resumes in
+   `daemon.handleRerankOutcome` — one flight per agent, keyed on `sig.Raw`
+   (there is no learning key yet), cancelled when the agent goes back to work
+   or a human interacts. Verdicts are memoized per (raw hash, rendered
+   candidate listing) so a parked pane re-capturing every attention event costs
+   one run, not one per event; the listing carries each rule's learned action,
+   mode and confidence, so a corrected rule is judged again rather than served
+   an answer about what it used to do.
+
 4. **BM25 text fallback** — whenever step 3 did not remap: no embedding was
    available (skipped by the floor, embedder degraded, errored, or a `!vectors`
    build), **and equally when the vector search ran cleanly but found nothing

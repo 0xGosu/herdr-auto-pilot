@@ -419,6 +419,50 @@ type LLM struct {
 	// a saved config names the behavior it is running under.
 	RunInAgentCwd *bool `toml:"run_in_agent_cwd,omitempty"`
 
+	// ── LLM-as-a-judge re-ranking ─────────────────────────────────────────
+	// RerankingCommand is the argv template for the one-shot CLI run that
+	// RE-RANKS the learned rules a cosine search already admitted. Empty (the
+	// default) leaves signature matching exactly as it was.
+	//
+	// When it is set, embedding.similarity_threshold stops being the DECISION
+	// and becomes a FILTER: every candidate at or above it is listed for the
+	// judge, which answers with a JSON array
+	// [{"id": <1-based rule number>, "score": <0-1>}] ordered by relevance, and
+	// hap uses the first. An EMPTY array means no rule matches — and that is
+	// TERMINAL: the situation mints a NEW signature and the BM25 text fallback
+	// is skipped, because otherwise BM25 would re-admit exactly the rule the
+	// judge just refused and the veto would do nothing at all.
+	//
+	// Anything that is not a well-formed array — a missing binary, a timeout, a
+	// non-zero exit, prose with no array, an id naming a rule that was not
+	// offered — degrades to the answer hap would have given WITHOUT the judge
+	// (the best cosine candidate). Only a literal [] is the veto. The run reads
+	// and writes nothing and needs no MCP server; its answer is read from stdout.
+	//
+	// Placeholders: {self}, {agent_name}, {agent_type}, {cwd}, {situation_type},
+	// {salient}, {candidates}, {pane_excerpt}, {top_k},
+	// {relevance_score_threshold}, {session_id}.
+	RerankingCommand []string `toml:"reranking_command,omitempty"`
+	// RerankingTimeoutSeconds bounds one judge run; zero or omitted uses
+	// DefaultRerankingTimeoutSeconds. It is a SEPARATE default from
+	// timeout_seconds — not an inherit — because this run sits INSIDE the
+	// classify→decide path: the agent is parked and its screen unanswered for
+	// the whole run, where a consult only starts once hap has already given up.
+	RerankingTimeoutSeconds int `toml:"reranking_timeout_seconds,omitempty"`
+	// RerankingTopK caps how many rules the judge may return; zero or negative
+	// uses DefaultRerankTopK. Only the first is acted on.
+	RerankingTopK int `toml:"reranking_top_k,omitempty"`
+	// RelevanceScoreThreshold is the minimum relevance score a judged rule must
+	// carry to be usable. It is passed to the judge in its own prompt so the
+	// model drops the rest itself, and re-applied on the answer. Outside (0,1]
+	// uses DefaultRelevanceScoreThreshold.
+	RelevanceScoreThreshold float64 `toml:"relevance_score_threshold,omitempty"`
+	// RerankingMaxCandidates bounds how many above-threshold rules are listed
+	// for the judge; zero or negative uses DefaultRerankMaxCandidates.
+	// It is also the k of the vector search on this path, so it changes RECALL,
+	// not just prompt size.
+	RerankingMaxCandidates int `toml:"reranking_max_candidates,omitempty"`
+
 	// ── Per-command environment ──────────────────────────────────────
 	// Each of the five command templates can carry its own environment, so
 	// one CLI can run against a different provider/model/key than another.
@@ -445,6 +489,8 @@ type LLM struct {
 	GenerateTaskEnvFile string `toml:"task_generate_command_env_file,omitempty"`
 	// LearnFromUserEnvFile is the `.env` file for LearnFromUserCommand only.
 	LearnFromUserEnvFile string `toml:"learn_from_user_command_env_file,omitempty"`
+	// RerankingEnvFile is the `.env` file for RerankingCommand only.
+	RerankingEnvFile string `toml:"reranking_command_env_file,omitempty"`
 
 	// Env is the shared inline environment applied to every command.
 	// Map fields are declared last: the TOML encoder emits sub-tables after
@@ -457,6 +503,8 @@ type LLM struct {
 	GenerateTaskEnv map[string]string `toml:"task_generate_command_env,omitempty"`
 	// LearnFromUserEnv is the inline environment for LearnFromUserCommand only.
 	LearnFromUserEnv map[string]string `toml:"learn_from_user_command_env,omitempty"`
+	// RerankingEnv is the inline environment for RerankingCommand only.
+	RerankingEnv map[string]string `toml:"reranking_command_env,omitempty"`
 }
 
 // Embedding configures semantic signature matching: situations are matched
@@ -2266,6 +2314,7 @@ func (l LLM) EnvSummaries() []LLMEnvSummary {
 		{"command", l.CommandEnv, l.CommandEnvFile},
 		{"task_generate_command", l.GenerateTaskEnv, l.GenerateTaskEnvFile},
 		{"learn_from_user_command", l.LearnFromUserEnv, l.LearnFromUserEnvFile},
+		{"reranking_command", l.RerankingEnv, l.RerankingEnvFile},
 	}
 	var out []LLMEnvSummary
 	for _, s := range scopes {
@@ -2307,6 +2356,77 @@ func (c Config) GenerateTaskTimeout() time.Duration {
 		return c.LLMTimeout()
 	}
 	return time.Duration(c.LLM.GenerateTaskTimeoutSeconds) * time.Second
+}
+
+// DefaultRerankingTimeoutSeconds bounds one LLM-as-a-judge re-ranking run.
+//
+// It is a SEPARATE default from timeout_seconds, deliberately shorter, because
+// the two runs sit at different places in the pipeline. A consult happens after
+// hap has already decided it cannot answer; the judge happens BEFORE the
+// decision, with the agent parked and its screen unanswered for the whole run.
+// A budget as long as the consult's would silently add that delay to every
+// attention event whenever the judge CLI is slow or wedged.
+const DefaultRerankingTimeoutSeconds = 30
+
+// DefaultRerankTopK bounds how many rules the judge may return. Only the first
+// is ever acted on; the rest ride along for the operator-facing log.
+const DefaultRerankTopK = 3
+
+// DefaultRelevanceScoreThreshold is the minimum relevance score a judged rule
+// must carry to be usable. Deliberately high: the judge is a SECOND opinion
+// over candidates cosine already called near-identical, so anything it is not
+// almost certain about is better escalated than typed into a pane.
+const DefaultRelevanceScoreThreshold = 0.95
+
+// DefaultRerankMaxCandidates bounds how many above-threshold rules are listed
+// for the judge. Larger than match.matchK (3, the cap on every non-rerank
+// lookup) because the judge's whole value is seeing the field it chooses from:
+// a correct rule permanently shadowed at rank 4 is invisible to it.
+const DefaultRerankMaxCandidates = 10
+
+// RerankingTimeout returns the re-ranking timeout: reranking_timeout_seconds,
+// or — when zero/omitted — DefaultRerankingTimeoutSeconds. Unlike the other two
+// command timeouts this deliberately does NOT inherit timeout_seconds.
+func (c Config) RerankingTimeout() time.Duration {
+	if c.LLM.RerankingTimeoutSeconds <= 0 {
+		return DefaultRerankingTimeoutSeconds * time.Second
+	}
+	return time.Duration(c.LLM.RerankingTimeoutSeconds) * time.Second
+}
+
+// RerankingConfigured reports whether an LLM judge is configured for signature
+// re-ranking. One predicate, so config, the daemon and the front ends can never
+// disagree about whether the feature is on.
+func (c Config) RerankingConfigured() bool { return len(c.LLM.RerankingCommand) > 0 }
+
+// RerankTopK returns the judge's answer cap, defaulted.
+func (c Config) RerankTopK() int {
+	if c.LLM.RerankingTopK <= 0 {
+		return DefaultRerankTopK
+	}
+	return c.LLM.RerankingTopK
+}
+
+// RelevanceScoreThreshold returns the judge's minimum usable relevance score,
+// defaulted. A value outside (0,1] is a misconfiguration that would make the
+// judge either useless (>1 refuses every rule) or unbounded (<=0 accepts every
+// rule it names), so it falls back to the default rather than being clamped
+// silently at the call site.
+func (c Config) RelevanceScoreThreshold() float64 {
+	v := c.LLM.RelevanceScoreThreshold
+	if v <= 0 || v > 1 {
+		return DefaultRelevanceScoreThreshold
+	}
+	return v
+}
+
+// RerankMaxCandidates returns how many above-threshold rules the judge is
+// shown, defaulted.
+func (c Config) RerankMaxCandidates() int {
+	if c.LLM.RerankingMaxCandidates <= 0 {
+		return DefaultRerankMaxCandidates
+	}
+	return c.LLM.RerankingMaxCandidates
 }
 
 // LearnFromUserTimeout returns the learn-from-correction timeout:

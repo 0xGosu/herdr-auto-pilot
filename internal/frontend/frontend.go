@@ -2407,6 +2407,11 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.task_generate_timeout_seconds", TUIEditable: true},
 	{Key: "llm.learn_from_user_command"}, // argv template (lesson after an operator correction)
 	{Key: "llm.learn_from_user_timeout_seconds", TUIEditable: true},
+	{Key: "llm.reranking_command"}, // argv template (LLM-as-a-judge rule re-ranking)
+	{Key: "llm.reranking_timeout_seconds", TUIEditable: true},
+	{Key: "llm.reranking_top_k", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.relevance_score_threshold", TUIEditable: true},
+	{Key: "llm.reranking_max_candidates", TUIEditable: true, TUIHidden: true},
 	// Only the `.env` PATHS are registered. The inline `[llm.*_env]` tables
 	// hold API keys, and every key in this registry is rendered by
 	// `config fields`, so they stay config.toml-only; `hap config`
@@ -2415,6 +2420,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "llm.command_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.task_generate_command_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "llm.learn_from_user_command_env_file", TUIEditable: true, TUIHidden: true},
+	{Key: "llm.reranking_command_env_file", TUIEditable: true, TUIHidden: true},
 	{Key: "embedding.disabled", TUIEditable: true},
 	{Key: "embedding.model_path"}, // path
 	{Key: "embedding.similarity_threshold", TUIEditable: true},
@@ -2727,6 +2733,35 @@ func FieldValue(cfg config.Config, key string) string {
 		return envFileValue(cfg.LLM.GenerateTaskEnvFile)
 	case "llm.learn_from_user_command_env_file":
 		return envFileValue(cfg.LLM.LearnFromUserEnvFile)
+	case "llm.reranking_command":
+		if len(cfg.LLM.RerankingCommand) == 0 {
+			return "(disabled)"
+		}
+		return JoinCommand(cfg.LLM.RerankingCommand)
+	case "llm.reranking_timeout_seconds":
+		// Deliberately NOT "(inherits timeout_seconds)" like the other two: a
+		// judge run holds up an unanswered agent, so it has its own default.
+		if cfg.LLM.RerankingTimeoutSeconds <= 0 {
+			return fmt.Sprintf("%d (default)", config.DefaultRerankingTimeoutSeconds)
+		}
+		return strconv.Itoa(cfg.LLM.RerankingTimeoutSeconds)
+	case "llm.reranking_top_k":
+		if cfg.LLM.RerankingTopK <= 0 {
+			return fmt.Sprintf("%d (default)", config.DefaultRerankTopK)
+		}
+		return strconv.Itoa(cfg.LLM.RerankingTopK)
+	case "llm.relevance_score_threshold":
+		if cfg.LLM.RelevanceScoreThreshold <= 0 || cfg.LLM.RelevanceScoreThreshold > 1 {
+			return fmt.Sprintf("%.2f (default)", config.DefaultRelevanceScoreThreshold)
+		}
+		return fmt.Sprintf("%.2f", cfg.LLM.RelevanceScoreThreshold)
+	case "llm.reranking_max_candidates":
+		if cfg.LLM.RerankingMaxCandidates <= 0 {
+			return fmt.Sprintf("%d (default)", config.DefaultRerankMaxCandidates)
+		}
+		return strconv.Itoa(cfg.LLM.RerankingMaxCandidates)
+	case "llm.reranking_command_env_file":
+		return envFileValue(cfg.LLM.RerankingEnvFile)
 	case "embedding.disabled":
 		return strconv.FormatBool(cfg.Embedding.Disabled)
 	case "embedding.model_path":
@@ -3048,6 +3083,53 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			}
 			cfg.LLM.LearnFromUserTimeoutSeconds = v
 			return nil
+		case "llm.reranking_command":
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("llm.reranking_command: %w", err)
+			}
+			// Empty disables LLM-as-a-judge re-ranking, which restores the
+			// plain cosine → BM25 chain exactly.
+			cfg.LLM.RerankingCommand = argv
+			return nil
+		case "llm.reranking_timeout_seconds":
+			// 0 uses DefaultRerankingTimeoutSeconds — NOT timeout_seconds; see
+			// config.RerankingTimeout. Reject negatives.
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("llm.reranking_timeout_seconds must be a non-negative integer (0 = %ds default), got %q",
+					config.DefaultRerankingTimeoutSeconds, value)
+			}
+			cfg.LLM.RerankingTimeoutSeconds = v
+			return nil
+		case "llm.reranking_top_k":
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("llm.reranking_top_k must be a non-negative integer (0 = %d default), got %q",
+					config.DefaultRerankTopK, value)
+			}
+			cfg.LLM.RerankingTopK = v
+			return nil
+		case "llm.relevance_score_threshold":
+			// 0 restores the default; anything outside (0,1] is refused rather
+			// than clamped. A threshold above 1 refuses every rule the judge
+			// could name and a negative one accepts every rule it names, so
+			// both are silent ways to turn the feature into something else.
+			v, err := strconv.ParseFloat(value, 64)
+			if err != nil || v < 0 || v > 1 {
+				return fmt.Errorf("llm.relevance_score_threshold must be between 0 and 1 (0 = %.2f default), got %q",
+					config.DefaultRelevanceScoreThreshold, value)
+			}
+			cfg.LLM.RelevanceScoreThreshold = v
+			return nil
+		case "llm.reranking_max_candidates":
+			v, err := strconv.Atoi(value)
+			if err != nil || v < 0 {
+				return fmt.Errorf("llm.reranking_max_candidates must be a non-negative integer (0 = %d default), got %q",
+					config.DefaultRerankMaxCandidates, value)
+			}
+			cfg.LLM.RerankingMaxCandidates = v
+			return nil
 		case "embedding.disabled":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
@@ -3073,6 +3155,9 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			return nil
 		case "llm.learn_from_user_command_env_file":
 			cfg.LLM.LearnFromUserEnvFile = strings.TrimSpace(value)
+			return nil
+		case "llm.reranking_command_env_file":
+			cfg.LLM.RerankingEnvFile = strings.TrimSpace(value)
 			return nil
 		case "embedding.similarity_threshold":
 			return setFloat(&cfg.Embedding.SimilarityThreshold)
@@ -5185,9 +5270,29 @@ func MatchSummary(rec domain.AuditRecord) string {
 		return fmt.Sprintf("matched by `bm25_min_score` (bm25 %.2f, text fallback)", rec.MatchScore)
 	case domain.MatchExact:
 		return "exact content hash"
+	case domain.MatchRerank:
+		return fmt.Sprintf("chosen by the `reranking_command` judge (relevance %.2f, over the rules `similarity_threshold` admitted)", rec.MatchScore)
+	case domain.MatchRerankVeto:
+		// A veto looks identical to "nothing matched" everywhere else, so this
+		// line is the only place an operator learns that the embedding DID find
+		// candidates and the judge refused every one of them.
+		return "new rule — the `reranking_command` judge refused every rule `similarity_threshold` admitted"
 	default:
 		return ""
 	}
+}
+
+// RerankSummary describes the configured LLM-as-a-judge re-ranker for
+// `hap status`, or "" when none is configured. It names the numbers that
+// decide the feature's behavior, because all four are silent otherwise: a
+// judge failing every call degrades to the plain cosine answer, which is
+// indistinguishable from the feature being off.
+func RerankSummary(cfg config.Config) string {
+	if !cfg.RerankingConfigured() {
+		return ""
+	}
+	return fmt.Sprintf("judge configured — top_k %d, relevance >= %.2f, up to %d candidates, %s budget",
+		cfg.RerankTopK(), cfg.RelevanceScoreThreshold(), cfg.RerankMaxCandidates(), cfg.RerankingTimeout())
 }
 
 // IndexSignatures keys signature rows by signature for O(1) rule lookups

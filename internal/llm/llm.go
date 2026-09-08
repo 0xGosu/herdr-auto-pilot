@@ -59,6 +59,17 @@ type Adapter struct {
 	LearnTimeout time.Duration
 	// LearnEnv is the environment for LearnTemplate, layered over BaseEnv.
 	LearnEnv EnvSpec
+
+	// RerankTemplate is the argv template for the LLM-as-a-judge re-ranking run
+	// (llm.reranking_command). Empty = the feature is off and signature matching
+	// behaves exactly as it did before it existed.
+	RerankTemplate []string
+	// RerankTimeout bounds one re-ranking run. Unlike the other two it does NOT
+	// fall back to Timeout (see defaultRerankTimeout): this run holds up an
+	// unanswered agent, where a consult only starts after hap has given up.
+	RerankTimeout time.Duration
+	// RerankEnv is the environment for RerankTemplate, layered over BaseEnv.
+	RerankEnv EnvSpec
 	// RunInAgentCwd runs the consult and task-generation CLIs in the monitored
 	// agent's OWN working directory when the request names a live one, so the
 	// CLI picks up that project's instructions (CLAUDE.md / AGENTS.md), its

@@ -121,9 +121,9 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # equivalent is commented out. Enable ONE `command` (comment the Claude
 # keys and uncomment the Codex ones to switch).
 #
-# You do not have to copy any of this by hand. The three commands that ship
-# DISABLED — `command`, `task_generate_command` and `learn_from_user_command`
-# — carry the recipes below as built-in PRESETS: run
+# You do not have to copy any of this by hand. The four commands that ship
+# DISABLED — `command`, `task_generate_command`, `learn_from_user_command` and
+# `reranking_command` — carry the recipes below as built-in PRESETS: run
 #   hap config set llm.command --preset claude      (or: --preset codex)
 # or press `e` on a "(disabled)" row in the TUI's Config tab and pick a CLI.
 # A preset only ever bootstraps a command nobody has configured; once one is
@@ -392,6 +392,63 @@ task_generate_timeout_seconds = 300   # recommended; omitted: inherits timeout_s
 # ]
 
 # learn_from_user_timeout_seconds = 300   # omitted: inherits timeout_seconds
+
+# ── LLM-as-a-judge rule re-ranking (OFF by default) ──────────────────
+# When `reranking_command` is set, `embedding.similarity_threshold` stops being
+# the DECISION and becomes a FILTER. Every learned rule the vector search admits
+# at or above it is listed for a second, cheap model, which answers with the
+# rules that GENUINELY match — ordered by its own relevance score. hap uses the
+# first one.
+#
+# An EMPTY answer means "no rule matches", and that is the whole point: it is
+# how the judge overrides a false positive the embedding produced. A vetoed
+# situation mints a NEW rule and does NOT fall through to the BM25 text
+# fallback, which would otherwise re-admit the very rule the judge refused.
+#
+# Anything that is not a well-formed JSON array — a missing binary, a timeout,
+# a non-zero exit, prose with no array, an id naming a rule that was not offered
+# — degrades to the answer hap would have given WITHOUT the judge (the best
+# cosine match). Only a literal `[]` is the veto, so a broken judge can never
+# cost you a rule you already taught it.
+#
+# The run reads nothing, writes nothing and needs no MCP server; its answer is
+# read from stdout. It DOES sit inside the classify->decide path, with the agent
+# parked while it runs — which is why it has its own short budget and why both
+# recipes name a small, fast model.
+#
+# Placeholders: {self}, {agent_name}, {agent_type}, {cwd}, {situation_type},
+# {salient} (the situation's masked identity), {candidates} (the numbered rule
+# listing), {pane_excerpt}, {top_k}, {relevance_score_threshold}, {session_id}.
+# {salient}, {candidates} and {pane_excerpt} are argv-only.
+#
+# Bootstrap it without typing any of this:
+#   hap config set llm.reranking_command --preset claude    (or: --preset codex)
+# reranking_command = [
+#   "claude", "--no-session-persistence", "--model", "sonnet", "--permission-mode", "auto", "-p",
+#   "You are hap's rule-matching judge. hap answers prompts on a coding agent's screen by reusing rules it learned from earlier screens, and an embedding search has proposed the rules below. Your job is to decide which of them — if any — genuinely answers THIS situation.\n\nA rule matches only if answering the current situation with that rule's learned action would be CORRECT. Two screens that merely look alike are not a match: an approval whose target changed (a different service, path, branch, or command), a question with different options, or a different question that happens to share wording are all NON-matches, however similar the text is. Judge what the action would DO, not how the words score.\n\nReturn a JSON array, ordered by relevance score descending, of at most {top_k} entries:\n[{\"id\": <the rule's number>, \"score\": <0-1>}]\n\nOmit any rule you would score below {relevance_score_threshold}. If NO rule genuinely answers this situation, return an empty array [] — that is a valid and expected answer, and it is the whole reason you are being asked. Never pick the least-bad option to avoid returning nothing.\n\nUse ONLY the numbers shown above as ids; do not invent ids and do not name a rule twice. Output ONLY the JSON array and nothing else — no explanation, no code fence, no preamble.\n\nAgent: {agent_name} ({agent_type})\nSituation type: {situation_type}\n\nThe situation to match:\n{salient}\n\nCandidate rules:\n{candidates}",
+#   "--strict-mcp-config",
+# ]
+
+# ── Rule re-ranking — OpenAI Codex (commented; swap in to use codex) ──
+# reranking_command = [
+#   "codex", "--model", "gpt-5.6-luna", "exec", "--ephemeral", "--skip-git-repo-check",
+#   "--sandbox", "read-only",
+#   "You are hap's rule-matching judge. hap answers prompts on a coding agent's screen by reusing rules it learned from earlier screens, and an embedding search has proposed the rules below. Your job is to decide which of them — if any — genuinely answers THIS situation.\n\nA rule matches only if answering the current situation with that rule's learned action would be CORRECT. Two screens that merely look alike are not a match: an approval whose target changed (a different service, path, branch, or command), a question with different options, or a different question that happens to share wording are all NON-matches, however similar the text is. Judge what the action would DO, not how the words score.\n\nReturn a JSON array, ordered by relevance score descending, of at most {top_k} entries:\n[{\"id\": <the rule's number>, \"score\": <0-1>}]\n\nOmit any rule you would score below {relevance_score_threshold}. If NO rule genuinely answers this situation, return an empty array [] — that is a valid and expected answer, and it is the whole reason you are being asked. Never pick the least-bad option to avoid returning nothing.\n\nUse ONLY the numbers shown above as ids; do not invent ids and do not name a rule twice. Output ONLY the JSON array and nothing else — no explanation, no code fence, no preamble.\n\nAgent: {agent_name} ({agent_type})\nSituation type: {situation_type}\n\nThe situation to match:\n{salient}\n\nCandidate rules:\n{candidates}",
+# ]
+
+# reranking_timeout_seconds = 30   # omitted: 30s. Deliberately NOT inherited
+#                                  # from timeout_seconds — an agent is parked
+#                                  # and unanswered for the whole run.
+# reranking_top_k = 3              # most rules the judge may return; hap acts
+#                                  # on the first. Omitted: 3.
+# relevance_score_threshold = 0.95 # minimum relevance score a judged rule needs
+#                                  # to be usable. Passed to the judge so it
+#                                  # drops the rest itself. Omitted: 0.95.
+# reranking_max_candidates = 10    # how many above-threshold rules the judge is
+#                                  # shown. Also the vector search's k on this
+#                                  # path, so it changes RECALL, not just prompt
+#                                  # size. Omitted: 10.
+
 
 
 # ── Semantic rule matching (vector embeddings) ──────────────────────

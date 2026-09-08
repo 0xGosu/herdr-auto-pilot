@@ -1181,6 +1181,68 @@ whose manifest carries exactly that version).
     `…NeverDeletesTheNewestKillEvent` / `…KeepsAnUnconfirmedReservation` /
     `…KeepsACorrectionItsActionStillReferences` / `…FloorsAnAggressiveCutoff` /
     `TestZeroRowRetentionStillSparesLiveWork` / `TestRowRetentionOffKeepsEveryFinishedRow`.
+- **An LLM judge may only ever NARROW what cosine already admitted, and it may
+  never run on the select loop** — `llm.reranking_command` (off by default) turns
+  `embedding.similarity_threshold` into a FILTER: every candidate at or above it is
+  listed for a one-shot CLI, which returns `[{"id": n, "score": s}]` ordered by
+  relevance and hap uses the first. Five bounds are load-bearing:
+  - **The candidate set is accept-filtered BEFORE the judge sees it.** The same
+    closure `resolveSignatureN`'s cosine pass uses — the `min_salient_chars` veto plus
+    `remapAllowed`/`ApprovalRemapCompatible` — gates `matcher.VectorCandidates`, so the
+    judge can never pick a candidate the ordinary pass would have refused. Those gates
+    exist because similarity alone bridges two different approval screens that share a
+    verb (#155); delegating them to a model puts the wrong answer into a pane.
+  - **An EMPTY verdict is TERMINAL and skips BM25.** Step 4 of the chain runs "equally
+    when the vector search ran cleanly but found nothing above similarity_threshold", so
+    a veto that fell through is re-admitted by text and the feature is a no-op that looks
+    like it works. `finishRerank` mints instead (`MatchRerankVeto`).
+  - **A judge FAILURE is not a veto.** Missing binary, timeout, non-zero exit, prose with
+    no array, a duplicate or out-of-range id all degrade to the answer step 3 would have
+    given (`fallback`, computed BEFORE the run so no error path reconstructs it). Only a
+    literal, well-formed `[]` vetoes — `domain.ErrNoRerankVerdict` is the sentinel that
+    keeps the two apart, and `lastJSONArray` only accepts a region that already
+    unmarshals as `[{id, score}]`, so prose brackets are never an answer.
+  - **It CANNOT run inline.** `resolveSignature` is called from `decideAndAct` on the
+    daemon select loop, which serves every agent — the reason the embed call has
+    `embed_timeout_ms` and the BM25 pass has `bm25MatchTimeout`. So the cosine pass
+    returns a `rerankPlan`, `decideAndAct` suspends, and `handleRerankOutcome` re-enters
+    `decideAndActResolved`. One flight per agent keyed on `sig.Raw` (there is no learning
+    key yet — resolving it is what the run is for), superseded on a different raw and
+    cancelled wherever a pending capture is (`working`, human interaction, pane recycle);
+    a token check drops a stale verdict. `rerankOutcome` carries `fallback` AND
+    `original` because they are not interchangeable: a veto mints from the ORIGINAL, and
+    minting from the fallback persists the raw hash while returning the candidate the
+    judge just refused.
+  - **Only an ESCALATION row carries `match_method`** (`daemon.escalate`, the sole writer),
+    which predates this feature — so `MatchRerankVeto` is visible in `hap audit` while
+    `MatchRerank` on a delivered row is not. The chosen-rule case is covered by the audit
+    row's `signature` (it names the rule the judge picked) plus one Debug line; do not
+    "fix" this by adding provenance to the auto path without deciding what that does for
+    every existing cosine/bm25 delivery too.
+  - **The verdict cache keys on the RENDERED listing, never the candidate signatures.**
+    A parked pane re-captures on every attention event, so a cache is required — but the
+    listing carries each rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what
+    makes the judge say "yes, reuse this", and all of those move under an UNCHANGED
+    signature set every time a decision is recorded. Keying on the set alone serves a
+    rule's pre-correction verdict until the set itself happens to change. Cleared on ANY
+    reload and on `RefreshKnowledge`, unconditionally — never gated on a section compare
+    the way `reloadEmbedder`'s port swap is, or turning the judge off and on again
+    resurrects the answers it gave before.
+
+  `match.VectorCandidates` exists for this and re-expresses `MatchVector` rather than
+  duplicating it: `MatchVector`'s "return the first accepted candidate" is sound only
+  because the list is in descending cosine, so first-acceptable is also highest-scoring
+  and one threshold test over the returned hit is correct — a re-ranker breaks that, so
+  the threshold moves to a caller that sees every candidate. Keep
+  `TestRerankingOffLeavesTheChainUnchanged` (if any pre-existing semantic test needs its
+  expectations edited, the gating is wrong) /
+  `TestRerankEmptyVerdictMintsANewSignatureAndSkipsBM25` /
+  `TestRerankJudgeFailureDegradesToCosine` / `TestRerankCandidatesAreAcceptFilteredBeforeTheJudge` /
+  `TestRerankDoesNotStallTheSelectLoop` / `TestRerankVerdictIsCachedPerCandidateSet` /
+  `TestRerankNeverRunsWithoutACandidateAboveThreshold` / `TestRerankJudgesASingleCandidate`,
+  and in `internal/domain` the `ParseRerankVerdict` table (whose two decisive rows are
+  "empty array" and "prose with no array" — the same output to a careless reader, opposite
+  outcomes here).
 - **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
   shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
   results back through a channel (see `consultLLM` / `llmResults`).

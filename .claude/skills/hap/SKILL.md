@@ -107,6 +107,16 @@ normalized BM25 text matching takes over whenever the vector search does not
 match (the embedder being down, *and* a search that ran but found nothing above
 `similarity_threshold`), then exact hash.
 
+**LLM-as-a-judge re-ranking** (opt-in, `llm.reranking_command`) — with a judge
+configured, `similarity_threshold` becomes a FILTER rather than the decision:
+every rule at or above it is listed for a second model, which returns the ones
+that genuinely match ordered by relevance, and hap uses the first. An EMPTY
+answer means no match — the situation mints a new rule and BM25 is skipped, so
+the judge can override a false positive the embedding produced. Any failure
+(missing binary, timeout, non-zero exit, prose with no JSON array, an unknown
+id) degrades to the un-judged cosine answer. An escalation raised by a veto
+reads `rerank_veto` in `hap audit`.
+
 **@noop** — the sentinel action meaning "no reply is needed". Recorded and
 learned like any other decision; nothing is sent to the pane.
 
@@ -512,6 +522,11 @@ tab-separated stdout is unaffected.
 | `llm.task_generate_timeout_seconds` | inherits `timeout_seconds` | timeout for one generation run |
 | `llm.learn_from_user_command` | (disabled) | argv run when you CORRECT an escalation, to record the lesson in `AUTO.md` in the agent's project |
 | `llm.learn_from_user_timeout_seconds` | inherits `timeout_seconds` | timeout for one learn run |
+| `llm.reranking_command` | (disabled) | argv for the LLM-as-a-judge rule re-ranker; empty keeps the plain cosine → BM25 chain |
+| `llm.reranking_timeout_seconds` | 30 | timeout for one judge run. Deliberately does NOT inherit `timeout_seconds` — the agent is parked and unanswered while it runs |
+| `llm.reranking_top_k` | 3 | most rules the judge may return; hap acts on the first |
+| `llm.relevance_score_threshold` | 0.95 | min relevance score a judged rule needs to be usable; passed to the judge in its prompt |
+| `llm.reranking_max_candidates` | 10 | how many above-threshold rules the judge is shown (also the vector search's k on this path) |
 | `llm.env_file` | (none) | `.env` shared by every llm command |
 | `llm.command_env_file` etc. | (none) | per-command `.env`, layered over the shared one (one per command) |
 | `embedding.disabled` | false | turn semantic matching off entirely |

@@ -422,6 +422,43 @@ Changing `pane_salient_chars` re-keys idle/unclassified rules once, so they
 re-learn; structured rules are unaffected. The failure count that latches the
 BM25 fallback is a fixed internal constant, not a setting.
 
+### LLM-as-a-judge re-ranking (off by default)
+
+Cosine similarity is one number, and it is wrong in both directions: it merges
+screens that only *look* alike, and it has no way to say "these two are 0.93
+apart but they are not the same question". Point `llm.reranking_command` at a
+CLI and `similarity_threshold` stops being the **decision** and becomes a
+**filter** — every rule at or above it is listed for a judge, which answers with
+the ones that genuinely match, ordered by its own relevance score. hap uses the
+first.
+
+An **empty answer means no rule matches**, and that is the point: it is how the
+judge overrides a false positive the embedding produced. A vetoed situation
+mints a new rule and skips the BM25 fallback (which would otherwise re-admit the
+rule the judge just refused). Everything else — a missing binary, a timeout, a
+non-zero exit, prose with no JSON array, an id naming a rule that was not
+offered — falls back to the answer hap would have given without the judge, so a
+broken judge never costs you a rule you already taught it.
+
+```sh
+hap config set llm.reranking_command --preset claude   # or: codex
+```
+
+```toml
+[llm]
+reranking_timeout_seconds = 30    # own budget, NOT inherited from timeout_seconds:
+                                  # the agent is parked and unanswered while it runs
+reranking_top_k = 3               # most rules the judge may return; hap acts on the first
+relevance_score_threshold = 0.95  # minimum relevance a judged rule needs to be usable
+reranking_max_candidates = 10     # how many above-threshold rules the judge is shown
+                                  # (also the vector search's k here, so it changes recall)
+```
+
+The judge runs off the daemon's main loop, so a slow one delays that one agent's
+answer and nothing else. `hap status` shows the settings in force, and an
+escalation the judge caused by refusing every candidate reads `rerank_veto` in
+`hap audit` — otherwise it would look identical to nothing having matched.
+
 ## Task sources
 
 A task source points agents at a checklist file so idle agents get the next
@@ -962,13 +999,14 @@ already have installed. The model receives context and submits its suggestion
 through hap's own MCP server (`hap mcp` — tools `get_context` and
 `submit_decision`); its stdout is captured for audit only.
 
-The three `[llm]` command fields ship disabled, and their argv is far too long
+The four `[llm]` command fields ship disabled, and their argv is far too long
 to retype. **Use a preset:**
 
 ```sh
 hap config set llm.command --preset claude                # or: codex
 hap config set llm.task_generate_command --preset claude
 hap config set llm.learn_from_user_command --preset claude
+hap config set llm.reranking_command --preset claude      # see "Semantic rule matching"
 ```
 
 A preset only ever bootstraps a field **nobody has configured** — once one is
@@ -1112,7 +1150,7 @@ ANTHROPIC_MODEL = "haiku"                     # cheaper for task ideas
 ```
 
 The inline tables are editable from the CLI, per scope (`shared`, `command`,
-`task_generate_command`, `learn_from_user_command`):
+`task_generate_command`, `learn_from_user_command`, `reranking_command`):
 
 ```sh
 hap config env list                                          # names only, never values

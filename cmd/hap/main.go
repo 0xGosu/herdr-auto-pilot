@@ -492,6 +492,8 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 			TaskGenTimeout:  cfg.GenerateTaskTimeout(),
 			LearnTemplate:   cfg.LLM.LearnFromUserCommand,
 			LearnTimeout:    cfg.LearnFromUserTimeout(),
+			RerankTemplate:  cfg.LLM.RerankingCommand,
+			RerankTimeout:   cfg.RerankingTimeout(),
 			RunInAgentCwd:   cfg.RunLLMInAgentCwd(),
 			// The `.env` files are never read here: the adapter reads them
 			// when it spawns a CLI, so editing a file applies to the next
@@ -501,6 +503,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 			CommandEnv: llm.EnvSpec{Vars: cfg.LLM.CommandEnv, File: cfg.LLM.CommandEnvFile},
 			TaskGenEnv: llm.EnvSpec{Vars: cfg.LLM.GenerateTaskEnv, File: cfg.LLM.GenerateTaskEnvFile},
 			LearnEnv:   llm.EnvSpec{Vars: cfg.LLM.LearnFromUserEnv, File: cfg.LLM.LearnFromUserEnvFile},
+			RerankEnv:  llm.EnvSpec{Vars: cfg.LLM.RerankingEnv, File: cfg.LLM.RerankingEnvFile},
 		}
 	}
 

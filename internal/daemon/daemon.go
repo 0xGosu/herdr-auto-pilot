@@ -234,6 +234,7 @@ type Daemon struct {
 	nudges                chan control.Kind
 	llmResults            chan llmOutcome
 	actionReviewResults   chan actionReviewOutcome
+	rerankResults         chan rerankOutcome
 	taskListReviewResults chan taskListReviewOutcome
 	taskGenResults        chan taskGenOutcome
 	sweepResults          chan sweepOutcome
@@ -298,6 +299,22 @@ type Daemon struct {
 	// handler's token check also drops the other kind's outcome.
 	preDeliveryReviewInFlight map[string]preDeliveryReviewFlight
 	preDeliveryReviewSeq      uint64
+
+	// rerankInFlight tracks the one live LLM-as-a-judge re-ranking run per
+	// agent; the token lets handleRerankOutcome drop a superseded or cancelled
+	// verdict. Guarded by mu alongside rerankSeq. Keyed on the agent, and the
+	// entry holds sig.Raw rather than sig.Signature — resolving the signature
+	// is what the run is FOR, so there is no learning key yet.
+	//
+	// rerankCache memoizes verdicts by (raw hash, rendered candidate listing):
+	// a parked pane re-captures on every attention event, so without it the
+	// judge is paid for repeatedly on one unchanged screen. rerankCacheOrder is
+	// its FIFO eviction order. Both are dropped on ANY reload and on
+	// RefreshKnowledge — see clearRerankCache.
+	rerankInFlight   map[string]rerankFlight
+	rerankSeq        uint64
+	rerankCache      map[string][]domain.RerankResult
+	rerankCacheOrder []string
 
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
@@ -669,6 +686,7 @@ func New(opt Options) (*Daemon, error) {
 		nudges:                    make(chan control.Kind, 16),
 		llmResults:                make(chan llmOutcome, 16),
 		actionReviewResults:       make(chan actionReviewOutcome, 16),
+		rerankResults:             make(chan rerankOutcome, 16),
 		taskListReviewResults:     make(chan taskListReviewOutcome, 16),
 		taskGenResults:            make(chan taskGenOutcome, 16),
 		sweepResults:              make(chan sweepOutcome, 16),
@@ -681,6 +699,8 @@ func New(opt Options) (*Daemon, error) {
 		lastAutoSend:              map[string]time.Time{},
 		lastAutoNoop:              map[string]time.Time{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
+		rerankInFlight:            map[string]rerankFlight{},
+		rerankCache:               map[string][]domain.RerankResult{},
 		sweepInFlight:             map[string]bool{},
 		sessionRenamePushes:       map[string]int{},
 		sessionSyncNoted:          map[string]string{},
@@ -939,6 +959,13 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 		d.snapshotSaved = map[string]bool{}
 	}
 	d.mu.Unlock()
+	// Every cached re-ranking verdict answers a question posed under the OLD
+	// config — the judge's own prompt, its relevance threshold, how many
+	// candidates it saw — and a reload also follows signature deletion and
+	// learned-data resets. Cleared unconditionally rather than on a section
+	// comparison: turning the judge off and on again must not resurrect the
+	// answers it gave before.
+	d.clearRerankCache()
 	allow, errs := domain.NewNeverAutoList(!cfg.Safety.DisableNeverAutoSeedPatterns,
 		cfg.Safety.DisabledSeedPatterns, cfg.Safety.NeverAutoPatterns, neverAutoRules(cfg.Safety))
 	for _, e := range errs {
@@ -1531,6 +1558,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.handleLearnOutcome(ctx, res)
 				return nil
 			})
+		case res := <-d.rerankResults:
+			logging.Guard("rerank-result", func() error {
+				d.handleRerankOutcome(ctx, res)
+				return nil
+			})
 		}
 	}
 }
@@ -1646,6 +1678,9 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// staleness re-read) would stamp audit/rate side effects for a
 		// pane that already moved on.
 		d.cancelPreDeliveryReviewExcept(ctx, tr.AgentID, "")
+		// Same for an in-flight signature re-rank: its verdict would resume a
+		// decision about a screen that has already moved on.
+		d.cancelRerank(tr.AgentID)
 		// Genuine progress ends the pane's parked episode: re-arm the
 		// subscribe-time reconcile so a fresh block/idle/done is surfaced (#49).
 		// The agent is working again, so it is no longer idle and no longer
@@ -1875,6 +1910,7 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	// capture or review for the dead agent must not fire against the new one.
 	d.cancelCapture(a.PaneID)
 	d.cancelPreDeliveryReviewExcept(ctx, a.AgentID, "")
+	d.cancelRerank(a.AgentID)
 
 	d.mu.Lock()
 	delete(d.episodeHandled, a.PaneID)
@@ -2241,13 +2277,38 @@ const maxReviewOutput = 16 * 1024
 func (d *Daemon) decideAndAct(ctx context.Context, situation domain.Situation,
 	tr domain.AgentTransition, agentName string, now time.Time) {
 
-	cfg, allow, _ := d.snapshot()
+	cfg, _, _ := d.snapshot()
 
 	sig := domain.ComputeSignatureN(situation, cfg.Embedding.PaneSalientChars)
 	// Semantic resolution may remap the key onto an existing learned
 	// signature (embedding / BM25 match on the masked salient content);
 	// sig.Raw always keeps the literal content hash.
-	sig = d.resolveSignature(ctx, cfg, sig, situation)
+	//
+	// With llm.reranking_command set it may also come back PROVISIONAL: a
+	// non-nil plan means an LLM judge has to choose among the candidates
+	// cosine admitted, and that is a subprocess this loop cannot wait on. The
+	// decision then resumes in handleRerankOutcome, which re-enters
+	// decideAndActResolved with the judged key. The returned sig is what the
+	// ordinary cosine pass would have chosen, so a judge that cannot be
+	// started costs nothing — startRerank reporting false means "carry on".
+	resolved, plan := d.resolveSignatureN(ctx, cfg, sig, situation)
+	if plan != nil && d.startRerank(ctx, situation, tr, agentName, resolved, sig, plan) {
+		return
+	}
+	d.decideAndActResolved(ctx, situation, tr, agentName, now, resolved)
+}
+
+// decideAndActResolved is decideAndAct once the learning key is FINAL: rule
+// provenance, state reads, safety inputs, the pure decision core, and dispatch.
+//
+// It is a separate entry point because an LLM-as-a-judge re-rank suspends the
+// pipeline between the two halves — everything above needs only the situation,
+// everything below is keyed on the RESOLVED signature (the provenance snapshot
+// first of all), so the split falls exactly where the deferral does.
+func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situation,
+	tr domain.AgentTransition, agentName string, now time.Time, sig domain.SignatureResult) {
+
+	cfg, allow, _ := d.snapshot()
 
 	// Rule provenance: keep the pane snapshot the signature was FIRST seen
 	// with (insert-or-ignore; an in-memory cache skips the no-op write on
@@ -5307,8 +5368,10 @@ func (d *Daemon) expireStaleLLMWork(ctx context.Context) {
 }
 
 func (d *Daemon) registerHumanInteraction(ctx context.Context, agentID string) {
-	// The human owns the pane now: a pending reviewed send is moot.
+	// The human owns the pane now: a pending reviewed send is moot, and so is
+	// a signature re-rank for the screen they just answered.
 	d.cancelPreDeliveryReviewExcept(ctx, agentID, "")
+	d.cancelRerank(agentID)
 	rate, err := d.opt.Store.GetAgentRate(ctx, agentID)
 	if err != nil {
 		return
