@@ -60,8 +60,21 @@ relevance_score_threshold = 0.9
 // rerankHarness is semanticHarness plus a judge. It returns the daemon and the
 // fake so a test can drive the verdict and inspect what was asked.
 func rerankHarness(t *testing.T, emb *fakeEmbedder, cfgTOML string) (*Daemon, *fakeReranker) {
+	d, _, rr := rerankHarnessWithHerdr(t, emb, cfgTOML)
+	return d, rr
+}
+
+// rerankHarnessWithHerdr is rerankHarness plus the fake herdr.
+//
+// It deliberately does NOT run the daemon's loop — New() only — which is what
+// makes the ranked-walk tests deterministic. Those call decideAndActResolved
+// directly, and a running loop's startup reconcile drives the SAME pane
+// concurrently: its escalation lands first and escalate()'s duplicate-pending
+// guard then suppresses the one under test, so the row never appears.
+func rerankHarnessWithHerdr(t *testing.T, emb *fakeEmbedder, cfgTOML string) (*Daemon, *fakeHerdr, *fakeReranker) {
 	t.Helper()
 	rr := &fakeReranker{fakeLLM: &fakeLLM{configured: true}}
+	fh := &fakeHerdr{}
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 	if cfgTOML != "" {
@@ -78,9 +91,9 @@ func rerankHarness(t *testing.T, emb *fakeEmbedder, cfgTOML string) (*Daemon, *f
 		ConfigPath:        cfgPath,
 		ControlSocketPath: filepath.Join(testutil.SocketDir(t), "c.sock"),
 		Store:             raw,
-		Herdr:             &fakeHerdr{},
+		Herdr:             fh,
 		Events:            &fakeEvents{ch: make(chan domain.AgentTransition, 4)},
-		Notify:            &fakeHerdr{},
+		Notify:            fh,
 		Embedder:          emb,
 		LLM:               rr,
 		MatchIndexDir:     filepath.Join(dir, "match-index"),
@@ -94,7 +107,7 @@ func rerankHarness(t *testing.T, emb *fakeEmbedder, cfgTOML string) (*Daemon, *f
 		}
 	})
 	waitFor(t, 5*time.Second, func() bool { return d.semanticReady.Load() })
-	return d, rr
+	return d, fh, rr
 }
 
 // twoApprovals seeds two learned approval rules whose vectors both sit above
@@ -1391,14 +1404,10 @@ func seedShadowRule(t *testing.T, d *Daemon, signature, action string, typ domai
 // every such case into an escalation even when the judge also affirmed a rule
 // that IS ready, which is the whole cost this walk removes.
 func TestTheEngineFallsBackToALowerRankedRule(t *testing.T) {
-	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
-	d := h.daemon
+	d, herdr, _ := rerankHarnessWithHerdr(t, &fakeEmbedder{}, rerankCfg)
 	s := classifierForTest().Classify("claude", "blocked", approvalPane)
 	s.AgentID, s.PaneID, s.Status = "agent-fallback", "agent-fallback", "blocked"
-	h.herdr.setPane(approvalPane)
-	h.herdr.setAgents([]domain.AgentTransition{{
-		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
-	}})
+	herdr.setPane(approvalPane)
 	orig := domain.ComputeSignature(s)
 
 	// #1 by relevance is not actionable; #2 is graduated and answers "1".
@@ -1418,19 +1427,16 @@ func TestTheEngineFallsBackToALowerRankedRule(t *testing.T) {
 		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
 	}, "agent", d.opt.Clock.Now(), ranked[0], ranked)
 
-	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	if got := h.herdr.sentInputs()[0]; got != "1" {
+	waitFor(t, 10*time.Second, func() bool { return len(herdr.sentInputs()) == 1 })
+	if got := herdr.sentInputs()[0]; got != "1" {
 		t.Errorf("sent %q, want the lower-ranked rule's learned answer", got)
 	}
-	audits, err := d.opt.Store.AuditLog(context.Background(), 5)
-	if err != nil || len(audits) == 0 {
-		t.Fatalf("audit log: %v %v", audits, err)
+	row := waitForAudit(t, d, "approval:ready")
+	if !strings.Contains(row.Rationale, "fell back") {
+		t.Errorf("the rationale must say the answer came from below the best match: %q", row.Rationale)
 	}
-	if audits[0].Signature != "approval:ready" {
-		t.Errorf("audit filed under %q, want the rule that actually acted", audits[0].Signature)
-	}
-	if !strings.Contains(audits[0].Rationale, "fell back") {
-		t.Errorf("the rationale must say the answer came from below the best match: %q", audits[0].Rationale)
+	if rerankAuditFor(t, d, "approval:shadow") != nil {
+		t.Error("the skipped candidate was filed an audit row of its own")
 	}
 	// Provenance is recorded for the rule that ACTED, not for every candidate
 	// the walk looked at.
@@ -1443,12 +1449,11 @@ func TestTheEngineFallsBackToALowerRankedRule(t *testing.T) {
 // a rule that can ACT, never for choosing which rule to ask the operator about.
 // When the whole list refuses, the human sees the judge's best match.
 func TestTheBestMatchIsWhatEscalatesWhenNothingCanAct(t *testing.T) {
-	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
-	d := h.daemon
+	d, herdr, _ := rerankHarnessWithHerdr(t, &fakeEmbedder{}, rerankCfg)
 	s := classifierForTest().Classify("claude", "blocked", approvalPane)
 	s.AgentID, s.PaneID, s.Status = "agent-none-act", "agent-none-act", "blocked"
-	h.herdr.setPane(approvalPane)
-	h.herdr.setAgents([]domain.AgentTransition{{
+	herdr.setPane(approvalPane)
+	herdr.setAgents([]domain.AgentTransition{{
 		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
 	}})
 	orig := domain.ComputeSignature(s)
@@ -1468,20 +1473,20 @@ func TestTheBestMatchIsWhatEscalatesWhenNothingCanAct(t *testing.T) {
 		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
 	}, "agent", d.opt.Clock.Now(), ranked[0], ranked)
 
-	waitFor(t, 3*time.Second, func() bool {
-		a, err := d.opt.Store.AuditLog(context.Background(), 5)
-		return err == nil && len(a) > 0
-	})
-	if got := h.herdr.sentInputs(); len(got) != 0 {
+	// The roster is live because an escalation for an agent herdr no longer
+	// reports is auto-dismissed rather than raised. Rows are still looked up by
+	// SIGNATURE rather than by position: the assertion is about which rule was
+	// filed under, and naming it says so.
+	row := waitForAudit(t, d, "approval:best")
+	if got := herdr.sentInputs(); len(got) != 0 {
 		t.Fatalf("nothing was actionable, so nothing may be sent; got %v", got)
 	}
-	audits, _ := d.opt.Store.AuditLog(context.Background(), 5)
-	if audits[0].Status != "escalated" {
-		t.Errorf("status = %q, want escalated", audits[0].Status)
+	if row.Status != "escalated" {
+		t.Errorf("status = %q, want escalated", row.Status)
 	}
-	if audits[0].Signature != "approval:best" {
-		t.Errorf("escalated under %q, want the judge's BEST match — that is the rule "+
-			"the operator should be asked about", audits[0].Signature)
+	if rerankAuditFor(t, d, "approval:second") != nil {
+		t.Error("a lower-ranked rule was escalated under; the operator must be asked " +
+			"about the judge's BEST match")
 	}
 }
 
@@ -1489,14 +1494,10 @@ func TestTheBestMatchIsWhatEscalatesWhenNothingCanAct(t *testing.T) {
 // invisible to every situation that is not re-ranked: one candidate, or none,
 // must take the same path and cost no extra store read.
 func TestASingleRankedRuleBehavesExactlyAsBefore(t *testing.T) {
-	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
-	d := h.daemon
+	d, herdr, _ := rerankHarnessWithHerdr(t, &fakeEmbedder{}, rerankCfg)
 	s := classifierForTest().Classify("claude", "blocked", approvalPane)
 	s.AgentID, s.PaneID, s.Status = "agent-single", "agent-single", "blocked"
-	h.herdr.setPane(approvalPane)
-	h.herdr.setAgents([]domain.AgentTransition{{
-		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
-	}})
+	herdr.setPane(approvalPane)
 	sig := domain.ComputeSignature(s)
 	seedGraduatedRule(t, d, sig.Signature, "1", domain.SituationApproval)
 
@@ -1505,13 +1506,10 @@ func TestASingleRankedRuleBehavesExactlyAsBefore(t *testing.T) {
 		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
 	}, "agent", d.opt.Clock.Now(), sig, nil)
 
-	waitFor(t, 3*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
-	audits, _ := d.opt.Store.AuditLog(context.Background(), 5)
-	if len(audits) == 0 || audits[0].Signature != sig.Signature {
-		t.Fatalf("a single-rule decision changed shape: %v", audits)
-	}
-	if strings.Contains(audits[0].Rationale, "fell back") {
-		t.Errorf("a decision with no alternatives must not claim a fallback: %q", audits[0].Rationale)
+	waitFor(t, 10*time.Second, func() bool { return len(herdr.sentInputs()) == 1 })
+	row := waitForAudit(t, d, sig.Signature)
+	if strings.Contains(row.Rationale, "fell back") {
+		t.Errorf("a decision with no alternatives must not claim a fallback: %q", row.Rationale)
 	}
 }
 
@@ -1525,13 +1523,12 @@ func TestASingleRankedRuleBehavesExactlyAsBefore(t *testing.T) {
 // could shop for a candidate past a safety refusal, which is exactly the thing
 // it must not be.
 func TestTheWalkNeverOutrunsASafetyVeto(t *testing.T) {
-	h, _ := newHarnessRerank(t, rerankCfg, &fakeEmbedder{}, nil)
-	d := h.daemon
+	d, herdr, _ := rerankHarnessWithHerdr(t, &fakeEmbedder{}, rerankCfg)
 	ctx := context.Background()
 	s := classifierForTest().Classify("claude", "blocked", approvalPane)
 	s.AgentID, s.PaneID, s.Status = "agent-killed", "agent-killed", "blocked"
-	h.herdr.setPane(approvalPane)
-	h.herdr.setAgents([]domain.AgentTransition{{
+	herdr.setPane(approvalPane)
+	herdr.setAgents([]domain.AgentTransition{{
 		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
 	}})
 	orig := domain.ComputeSignature(s)
@@ -1557,15 +1554,38 @@ func TestTheWalkNeverOutrunsASafetyVeto(t *testing.T) {
 		AgentID: s.AgentID, PaneID: s.PaneID, AgentType: "claude", Status: "blocked",
 	}, "agent", d.opt.Clock.Now(), ranked[0], ranked)
 
-	waitFor(t, 3*time.Second, func() bool {
-		a, err := d.opt.Store.AuditLog(ctx, 5)
-		return err == nil && len(a) > 0
-	})
-	if got := h.herdr.sentInputs(); len(got) != 0 {
+	waitForAudit(t, d, "approval:one")
+	if got := herdr.sentInputs(); len(got) != 0 {
 		t.Fatalf("the herd is paused; the walk sent %v anyway", got)
 	}
-	audits, _ := d.opt.Store.AuditLog(ctx, 5)
-	if audits[0].Signature != "approval:one" {
-		t.Errorf("escalated under %q, want the head", audits[0].Signature)
+	if rerankAuditFor(t, d, "approval:two") != nil {
+		t.Error("the walk moved past a safety veto onto a lower-ranked rule")
 	}
+}
+
+// rerankAuditFor returns the newest audit row filed under a signature, or nil.
+// (autosendidle_test.go already has an auditFor keyed on agent and status.)
+//
+// The walk tests index by SIGNATURE rather than by position because the harness
+// daemon's own reconcile may file a row for the same pane concurrently — under
+// the situation's own computed key, not one of the ranked candidates.
+func rerankAuditFor(t *testing.T, d *Daemon, signature string) *domain.AuditRecord {
+	t.Helper()
+	rows, err := d.opt.Store.AuditLog(context.Background(), 50)
+	if err != nil {
+		t.Fatalf("audit log: %v", err)
+	}
+	for i := range rows {
+		if rows[i].Signature == signature {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+// waitForAudit blocks until a row is filed under a signature and returns it.
+func waitForAudit(t *testing.T, d *Daemon, signature string) *domain.AuditRecord {
+	t.Helper()
+	waitFor(t, 10*time.Second, func() bool { return rerankAuditFor(t, d, signature) != nil })
+	return rerankAuditFor(t, d, signature)
 }
