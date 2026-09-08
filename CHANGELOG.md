@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.4
+
+- Fixed the embedding model's identity: it is now a digest of the model file, not the file's name. Two different models both installed as `model.gguf` used to report the same id, so a stored vector computed by one was kept and compared against the other — silently mixing vector spaces. The same model at a different path or under a different name now also reports the SAME id, which is what stops nodes sharing one database from re-embedding each other's rules forever.
+- Changed: after upgrading, the first daemon start re-embeds every stored rule once (they carry the old file-name id, and nothing recorded what those vectors were really computed with). `hap status` shows the drift until that pass finishes.
+
 ## 0.9.3
 
 - Added `llm.reranking_command`: an optional LLM judge that re-ranks the learned rules an embedding search found. With it set, `embedding.similarity_threshold` becomes a filter rather than the decision — every rule at or above it is shown to the judge, which answers with the ones that genuinely match, and hap uses the first. An empty answer means no rule matches, so the situation is learned as new instead of inheriting a rule that only looked similar; the BM25 text fallback is skipped there, since it would otherwise re-admit the rule the judge just refused. Off by default, and a judge that fails, times out or answers unparseably falls back to the match hap would have made without it, so a broken judge never costs you a rule you already taught it.
