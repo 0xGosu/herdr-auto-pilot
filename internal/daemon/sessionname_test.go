@@ -112,6 +112,9 @@ func parkedAndSettled(t *testing.T, h *harness, trs ...domain.AgentTransition) {
 func TestSessionSyncRenamesTheAgentToItsClaudeSessionName(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
 	ctx := context.Background()
+	// The CONTROL for the three refusal cases below: same agent, same pane,
+	// quiescent and settled, so adoption goes through.
+	settleAgents(t, h, claudeTr("pA", "idle"))
 	generated := agentNameNow(t, h, "pA")
 	h.herdr.mu.Lock()
 	h.herdr.pane = claudeComposerPane("My Feature: Work #2", "")
@@ -283,6 +286,7 @@ func TestSessionSyncTreatsACaptureWithNoComposerAsUnknown(t *testing.T) {
 func TestSessionSyncSkipsAnUnstorableSessionName(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
 	ctx := context.Background()
+	settleAgents(t, h, claudeTr("pA", "idle"))
 	generated := agentNameNow(t, h, "pA")
 
 	got := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
@@ -528,6 +532,7 @@ func TestSessionSyncCollisionIsIdempotentAcrossCaptures(t *testing.T) {
 // real transition, the real delayed capture, the real classification read.
 func TestSessionSyncRunsOnTheRealAttentionPath(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
+	settleAgents(t, h, claudeTr("pA", "idle"))
 	h.herdr.setPane(claudeComposerPane("add-sweep-command-grid", ""))
 
 	h.push("pA", "idle")
@@ -563,6 +568,7 @@ func TestSessionSyncOnTheAttentionPathIsOffByDefault(t *testing.T) {
 func TestSessionSyncReportsAStandingReasonOnce(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
 	ctx := context.Background()
+	settleAgents(t, h, claudeTr("pA", "idle"))
 	generated := agentNameNow(t, h, "pA")
 	pane := claudeComposerPane("日本語", "")
 
@@ -592,6 +598,7 @@ func TestSessionSyncReportsAStandingReasonOnce(t *testing.T) {
 func TestSessionSyncClearsItsNoteOnceAligned(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
 	ctx := context.Background()
+	settleAgents(t, h, claudeTr("pA", "idle"))
 	generated := agentNameNow(t, h, "pA")
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
@@ -677,6 +684,7 @@ func TestFlippingSessionSyncOnAdoptsANamedSession(t *testing.T) {
 	h := newHarnessWrapped(t, "",
 		liveClaudeHerd(claudeComposerPane("My Feature: Work #2", ""), claudeTr("pA", "idle")))
 	agentNameNow(t, h, "pA")
+	settleAgents(t, h, claudeTr("pA", "idle"))
 
 	h.writeConfig(t, sessionSyncOn)
 	reloadNow(t, h)
@@ -1333,5 +1341,67 @@ func TestAnAlignedPairNeverArmsARetry(t *testing.T) {
 		if st, ok := deferralFor(t, h, "pA"); ok {
 			t.Fatalf("status %q: an already-identical pair has nothing to retry, got %+v", status, st)
 		}
+	}
+}
+
+// The settle window gates ADOPTION too, not only the keystroke. Adoption types
+// nothing, so this buys no safety — it buys that hap's name and the composer's
+// are never knowingly left disagreeing: adopting on the spot while the push
+// waits out the window would leave the pair merely DERIVED from one another for
+// a minute or two, which is the character-identical contract the feature holds.
+func TestSessionSyncRefusesToAdoptAJustParkedAgent(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setAgents([]domain.AgentTransition{claudeTr("pA", "idle")})
+	h.daemon.mu.Lock()
+	h.daemon.idleSince["pA"] = idleMark{paneID: "pA", terminalID: "term_pA", at: time.Now()}
+	h.daemon.mu.Unlock()
+
+	got := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
+		claudeComposerPane("add-sweep-command-grid", ""))
+
+	if got != generated {
+		t.Fatalf("sync returned %q; a just-parked agent must not be adopted yet", got)
+	}
+	if stored := agentNameNow(t, h, "pA"); stored != generated {
+		t.Fatalf("the agent was adopted to %q before its session settled", stored)
+	}
+	if st, ok := deferralFor(t, h, "pA"); !ok || st.reason != sessionSyncUnsettled {
+		t.Fatalf("expected a %q deferral, got %+v (armed=%v)", sessionSyncUnsettled, st, ok)
+	}
+}
+
+// startSessionRename carries its OWN settle check, and this is the only case
+// that can prove it: the shared gate in applyClaudeSession now answers the same
+// question first, so every path-driven test passes with this layer deleted.
+// It is kept rather than deleted because it guards a KEYSTROKE — a future caller
+// reaching startSessionRename without going through applyClaudeSession would
+// otherwise type into a session the operator opened seconds ago.
+func TestStartSessionRenameRefusesAJustParkedAgentOnItsOwn(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+	h.herdr.setAgents([]domain.AgentTransition{claudeTr("pA", "idle")})
+	h.daemon.mu.Lock()
+	h.daemon.idleSince["pA"] = idleMark{paneID: "pA", terminalID: "term_pA", at: time.Now()}
+	h.daemon.mu.Unlock()
+
+	h.daemon.startSessionRename(ctx, claudeTr("pA", "idle"), generated)
+
+	if !noSendWithin(t, h, 400*time.Millisecond) {
+		t.Fatalf("the delivery gate must refuse a just-parked agent on its own, got %v",
+			h.herdr.sentInputs())
+	}
+
+	// The control, through the same entry point: once settled, it sends.
+	settleAgents(t, h, claudeTr("pA", "idle"))
+	h.daemon.startSessionRename(ctx, claudeTr("pA", "idle"), generated)
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatalf("a settled agent must still be renamed, got %v", h.herdr.sentInputs())
 	}
 }

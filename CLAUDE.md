@@ -310,13 +310,29 @@ whose manifest carries exactly that version).
     is deliberate: status before the pane read (it is cheaper and skips the read), and the composer
     proof LAST, because "the operator started typing" changes on one keypress while status changes
     at a turn boundary.
-  - **A just-parked agent is not a quiet one** (`sessionRenameSettle`, `sessionRenameSettled`). The
-    complaint this feature earned is a rename typed into a session the operator opened seconds ago:
-    the composer is empty because they have not typed the FIRST character yet, so both checks pass
-    and the push races their first keypress. No re-read closes a sub-second race; waiting does. The
-    evidence is `d.idleSince`, already maintained by the sweep and cleared on `working` and on a
-    pane recycle, so it costs one map read — and an ABSENT or foreign mark is UNSETTLED, never
-    settled, which is exactly the state a brand-new agent is in until the first sweep sees it.
+  - **A just-parked agent is not a quiet one** (`sessionRenameSettle`, `sessionRenameSettled`,
+    reached through `sessionSyncReady`). The complaint this feature earned is a rename typed into a
+    session the operator opened seconds ago: the composer is empty because they have not typed the
+    FIRST character yet, so both quiescence checks pass and the push races their first keypress. No
+    re-read closes a sub-second race; waiting does. The evidence is `d.idleSince`, already
+    maintained by the sweep and cleared on `working` and on a pane recycle, so it costs one map read
+    — and an ABSENT or foreign mark is UNSETTLED, never settled, which is exactly the state a
+    brand-new agent is in until the first sweep sees it.
+    - **It gates ADOPTION too**, though adoption types nothing and so buys no safety from it. What
+      it buys is that hap's name and the composer's are never knowingly left disagreeing: adopting
+      on the spot while the push waits out the window leaves the pair merely DERIVED from one
+      another for a minute or two, which is the CHARACTER-IDENTICAL contract this whole feature
+      exists to hold. The accepted cost is named: an escalation raised inside that window calls the
+      agent by its generated name. The already-aligned fast path runs ABOVE the gate, so a settled
+      pair still costs nothing at any status.
+    - **`startSessionRename` keeps its own copy**, which `applyClaudeSession` now makes redundant on
+      every live path — kept because it guards a KEYSTROKE, and only
+      `TestStartSessionRenameRefusesAJustParkedAgentOnItsOwn` (which calls it directly) can prove it.
+    - **The constant is not the knob it looks like.** `d.idleSince` is written only by the 60s
+      sweep and a deferral's first backoff step is also 60s, so the effective wait is ~1–2 minutes
+      whatever `sessionRenameSettle` says, and it applies every time an agent goes quiet rather than
+      only on a fresh session. Lowering the constant changes almost nothing; setting it to 0 removes
+      the gate. Renames are not time-critical, which is what makes that trade acceptable.
   - **A refusal DEFERS; it never burns a push.** `maxSessionRenamePushes` bounds KEYSTROKES typed
     at a pane that never takes the rename; `maxSessionSyncDeferrals` bounds READS spent on a pane
     that is never ready. Conflating them is destructive rather than merely wrong: every refusal used
@@ -347,6 +363,8 @@ whose manifest carries exactly that version).
   - Keep `TestSessionSyncRefusesToAdoptWhileTheOperatorIsTyping` / `…ANonParkedAgent` /
     `TestSessionSyncAcceptsADoneAgent` (which pins the idle+done decision) /
     `TestSessionRenameRefusesAnAgentThatJustParked` / `…WithNoParkedMark` /
+    `TestSessionSyncRefusesToAdoptAJustParkedAgent` /
+    `TestStartSessionRenameRefusesAJustParkedAgentOnItsOwn` /
     `…ThatWentBackToWorkAfterTheCapture` (the only case that moves the agent AFTER the capture,
     so it is the only one the live re-read is needed for) / `…ARecycledPane` /
     `TestSessionRenameProceedsWhenTheTerminalIDIsUnknown` (the control, and not optional) /

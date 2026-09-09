@@ -152,7 +152,7 @@ func (d *Daemon) applyClaudeSession(ctx context.Context, tr domain.AgentTransiti
 	// bypassed by adding a third caller. The same two questions are asked again
 	// against LIVE state immediately before the keystroke; this one only decides
 	// whether to look, and arms the sweep to look again when the answer is no.
-	if ok, reason := sessionSyncQuiescent(tr.Status, sess); !ok {
+	if ok, reason := d.sessionSyncReady(tr, sess, d.opt.Clock.Now()); !ok {
 		d.deferSessionSync(tr.AgentID, reason)
 		return agentName
 	}
@@ -680,9 +680,30 @@ func sessionRenameParked(status string) bool {
 	return false
 }
 
-// sessionSyncQuiescent answers whether this agent may be synced at all right
-// now, and names the reason when it may not. Both clauses are asked twice: here
-// at the top of applyClaudeSession, over the capture, and again inside
+// sessionSyncReady is the whole beginning gate: quiescent AND settled.
+//
+// The settle clause is here, over BOTH directions, rather than only in front of
+// the keystroke. Adoption types nothing, so gating it buys no safety — what it
+// buys is that hap's name and the name in the composer are never knowingly left
+// to disagree: adopting on the spot while the push waits out the settle window
+// would leave the pair merely DERIVED from one another for a minute or two,
+// which is the CHARACTER-IDENTICAL contract this feature exists to hold. The
+// cost is named and accepted: an escalation raised inside that window calls the
+// agent by its generated name. The already-aligned fast path runs ABOVE this,
+// so a settled pair still costs nothing at any status.
+func (d *Daemon) sessionSyncReady(tr domain.AgentTransition, sess domain.ClaudeSession,
+	now time.Time) (bool, string) {
+	if ok, reason := sessionSyncQuiescent(tr.Status, sess); !ok {
+		return false, reason
+	}
+	if !d.sessionRenameSettled(tr, now) {
+		return false, sessionSyncUnsettled
+	}
+	return true, ""
+}
+
+// sessionSyncQuiescent answers the two questions that are asked TWICE: here at
+// the top of applyClaudeSession, over the capture, and again inside
 // pushSessionRename against LIVE state immediately before the keystroke.
 func sessionSyncQuiescent(status string, sess domain.ClaudeSession) (bool, string) {
 	if !sessionRenameParked(status) {
