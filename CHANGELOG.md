@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.5
+
+- Added `hap task <agent|--path|--node …> drop-list`, which deletes a whole checklist kept in the hap database — the list-level counterpart to `remove <n>`, which only ever deleted one task. It asks before acting (`--yes` to script it), works on another machine's list when the store is shared, and refuses a list kept in a file or a gist, which are yours to remove rather than hap's
+- Added `X` on the TUI Tasks tab: the same removal from a list header, with a confirmation naming how many tasks go with it. It reaches a fleet list too, which is the only way to clear a dead list belonging to a node you are not sitting at
+- Added an automatic reclaim of `sqlite`-provider checklists nothing can reach any more: on the daemon's existing daily retention pass, a list on this machine that no task source names, that no live agent owns, and that has not been written for the retention window is deleted. Until now a `task_lists` row was immortal — removing its source or retiring its agent left it in the database forever, syncing with every other change
+- The reclaim rides `[logging] row_retention_days` (default 30 days, negative to switch it off) with its own 7-day floor, so setting that key to 0 or 1 to clear bookkeeping rows aggressively never reaps a checklist written this week. It skips the whole pass rather than guessing whenever it cannot tell which agents are live, so a daemon that has just started, or one whose herdr is down, deletes nothing
+
 ## 0.9.4
 
 - Fixed the embedding model's identity: it is now a digest of the model file, not the file's name. Two different models both installed as `model.gguf` used to report the same id, so a stored vector computed by one was kept and compared against the other — silently mixing vector spaces. The same model at a different path or under a different name now also reports the SAME id, which is what stops nodes sharing one database from re-embedding each other's rules forever.
