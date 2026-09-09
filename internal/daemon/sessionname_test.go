@@ -940,20 +940,38 @@ func TestSessionRenameRefusesAnAgentThatWentBackToWorkAfterTheCapture(t *testing
 
 // herdr recycles pane ids, so a changed terminal behind this pane id is a
 // DIFFERENT agent and the send would land on a stranger.
+//
+// Driven through pushSessionRename directly: the shared gate's own settle check
+// refuses a transition whose terminal disagrees with the parked mark, so the
+// capture path never reaches the tenancy compare and cannot prove it. The mark
+// and the listing both describe the NEW tenant — what the sweep would really
+// have recorded — while tr is the old one's.
 func TestSessionRenameRefusesARecycledPane(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
 	ctx := context.Background()
 	generated := agentNameNow(t, h, "pA")
-	h.herdr.setPane(claudeComposerPane("", ""))
-	settleAgents(t, h, claudeTr("pA", "idle"))
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
 	recycled := claudeTr("pA", "idle")
 	recycled.TerminalID = "term_somebody_else"
 	h.herdr.setAgents([]domain.AgentTransition{recycled})
+	settleAgents(t, h, recycled)
 
-	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
-
-	if !noSendWithin(t, h, 400*time.Millisecond) {
-		t.Fatalf("a recycled pane must not be typed into, got %v", h.herdr.sentInputs())
+	tr := claudeTr("pA", "idle") // the previous tenant
+	typed, err := h.daemon.pushSessionRename(ctx, tr, generated, sessionRenameKey(tr, generated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typed {
+		t.Fatal("a recycled pane must not be typed into")
+	}
+	if !noSendWithin(t, h, 200*time.Millisecond) {
+		t.Fatalf("nothing may reach a stranger's pane, got %v", h.herdr.sentInputs())
+	}
+	if st, ok := deferralFor(t, h, "pA"); !ok || st.reason != sessionSyncRecycled {
+		t.Fatalf("expected a %q deferral, got %+v (armed=%v)", sessionSyncRecycled, st, ok)
 	}
 }
 
@@ -1372,13 +1390,13 @@ func TestSessionSyncRefusesToAdoptAJustParkedAgent(t *testing.T) {
 	}
 }
 
-// startSessionRename carries its OWN settle check, and this is the only case
-// that can prove it: the shared gate in applyClaudeSession now answers the same
-// question first, so every path-driven test passes with this layer deleted.
-// It is kept rather than deleted because it guards a KEYSTROKE — a future caller
-// reaching startSessionRename without going through applyClaudeSession would
-// otherwise type into a session the operator opened seconds ago.
-func TestStartSessionRenameRefusesAJustParkedAgentOnItsOwn(t *testing.T) {
+// --- Review #426: the two races CharlieHelps reproduced ---
+
+// The pre-spawn settle check answers about the parked spell that was current
+// when the capture was taken. The agent can go working and park AGAIN in the
+// gap this goroutine spends on herdr — a NEW spell, and exactly the state the
+// settle window exists for — so "parked" at the live check is not enough.
+func TestSessionRenameRefusesAParkedSpellThatRestartedAfterTheCapture(t *testing.T) {
 	h := newHarness(t, sessionSyncOn)
 	ctx := context.Background()
 	generated := agentNameNow(t, h, "pA")
@@ -1387,21 +1405,107 @@ func TestStartSessionRenameRefusesAJustParkedAgentOnItsOwn(t *testing.T) {
 	h.herdr.onSend = renameOnSend
 	h.herdr.mu.Unlock()
 	h.herdr.setAgents([]domain.AgentTransition{claudeTr("pA", "idle")})
+	// The agent went working and parked again: handleTransition deleted the
+	// mark and the next sweep re-set it to NOW.
 	h.daemon.mu.Lock()
 	h.daemon.idleSince["pA"] = idleMark{paneID: "pA", terminalID: "term_pA", at: time.Now()}
 	h.daemon.mu.Unlock()
 
-	h.daemon.startSessionRename(ctx, claudeTr("pA", "idle"), generated)
+	tr := claudeTr("pA", "idle")
+	typed, err := h.daemon.pushSessionRename(ctx, tr, generated, sessionRenameKey(tr, generated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typed {
+		t.Fatal("a restarted parked spell must not be typed into")
+	}
+	if !noSendWithin(t, h, 200*time.Millisecond) {
+		t.Fatalf("nothing may reach the pane, got %v", h.herdr.sentInputs())
+	}
+	if st, ok := deferralFor(t, h, "pA"); !ok || st.reason != sessionSyncUnsettled {
+		t.Fatalf("expected a %q deferral, got %+v (armed=%v)", sessionSyncUnsettled, st, ok)
+	}
+}
 
-	if !noSendWithin(t, h, 400*time.Millisecond) {
-		t.Fatalf("the delivery gate must refuse a just-parked agent on its own, got %v",
-			h.herdr.sentInputs())
+// The control: the same entry point, same listing, but the parked spell HAS
+// settled. Without it the case above passes on a build that refuses everything.
+func TestSessionRenamePushProceedsOnASettledParkedSpell(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
+
+	tr := claudeTr("pA", "idle")
+	typed, err := h.daemon.pushSessionRename(ctx, tr, generated, sessionRenameKey(tr, generated))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !typed {
+		t.Fatalf("a settled parked spell must still be renamed, got %v", h.herdr.sentInputs())
+	}
+}
+
+// A false→true flip landing while a deferred RETRY owns the shared latch used
+// to be dropped, and nothing else ever re-runs the one-shot live-herd sync —
+// the retry pass only visits agents that already carry a deferral, so an agent
+// with none stayed unsynced until the operator toggled the key again.
+func TestAFlipArrivingDuringAnotherPassIsNotLost(t *testing.T) {
+	h := newHarnessWrapped(t, sessionSyncOn,
+		liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	generated := agentNameNow(t, h, "pA")
+	settleAgents(t, h, claudeTr("pA", "idle"))
+
+	// A pass is in flight.
+	h.daemon.mu.Lock()
+	h.daemon.sessionSyncPassRunning = true
+	h.daemon.mu.Unlock()
+
+	h.daemon.startClaudeSessionNameSync()
+
+	if !noSendWithin(t, h, 200*time.Millisecond) {
+		t.Fatalf("a latched pass must not walk the herd, got %v", h.herdr.sentInputs())
+	}
+	h.daemon.mu.Lock()
+	pending := h.daemon.sessionSyncFlipPending
+	h.daemon.mu.Unlock()
+	if !pending {
+		t.Fatal("the flip must be recorded, not dropped")
 	}
 
-	// The control, through the same entry point: once settled, it sends.
-	settleAgents(t, h, claudeTr("pA", "idle"))
-	h.daemon.startSessionRename(ctx, claudeTr("pA", "idle"), generated)
+	// The in-flight pass finishes.
+	h.daemon.releaseSessionSyncPass()
+
 	if !waitForSend(t, h, "/rename "+generated) {
-		t.Fatalf("a settled agent must still be renamed, got %v", h.herdr.sentInputs())
+		t.Fatalf("the coalesced flip must run once the latch is free, got %v",
+			h.herdr.sentInputs())
+	}
+	h.daemon.mu.Lock()
+	stillPending := h.daemon.sessionSyncFlipPending
+	h.daemon.mu.Unlock()
+	if stillPending {
+		t.Fatal("the pending flip must be consumed, or every release re-walks the herd")
+	}
+}
+
+// The control: releasing the latch with nothing recorded must NOT walk the herd.
+// Without it the test above passes on a build that re-runs the pass on every
+// release, which would turn each retry tick into a full live-herd sync.
+func TestReleasingTheLatchWithNoFlipRunsNoPass(t *testing.T) {
+	h := newHarnessWrapped(t, sessionSyncOn,
+		liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
+	agentNameNow(t, h, "pA")
+	settleAgents(t, h, claudeTr("pA", "idle"))
+
+	h.daemon.mu.Lock()
+	h.daemon.sessionSyncPassRunning = true
+	h.daemon.mu.Unlock()
+	h.daemon.releaseSessionSyncPass()
+
+	if !noSendWithin(t, h, 300*time.Millisecond) {
+		t.Fatalf("a plain release must not re-walk the herd, got %v", h.herdr.sentInputs())
 	}
 }

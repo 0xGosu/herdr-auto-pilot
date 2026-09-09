@@ -249,6 +249,11 @@ func (d *Daemon) applyClaudeSession(ctx context.Context, tr domain.AgentTransiti
 func (d *Daemon) startClaudeSessionNameSync() {
 	d.mu.Lock()
 	if d.sessionSyncPassRunning {
+		// Another pass — most often a deferred RETRY — owns the latch. Record
+		// the enable rather than dropping it: nothing else re-runs the one-shot
+		// live-herd sync, so a flip lost here is lost until the operator turns
+		// the key off and on again. releaseSessionSyncPass picks it up.
+		d.sessionSyncFlipPending = true
 		d.mu.Unlock()
 		return
 	}
@@ -260,19 +265,13 @@ func (d *Daemon) startClaudeSessionNameSync() {
 	// goroutine.
 	ctx := d.shutdownCtx
 	if !d.spawn(func() {
-		defer func() {
-			d.mu.Lock()
-			d.sessionSyncPassRunning = false
-			d.mu.Unlock()
-		}()
+		defer d.releaseSessionSyncPass()
 		logging.Guard("session-name-sync-pass", func() error {
 			d.syncClaudeSessionNamesNow(ctx)
 			return nil
 		})
 	}) {
-		d.mu.Lock()
-		d.sessionSyncPassRunning = false
-		d.mu.Unlock()
+		d.releaseSessionSyncPass()
 	}
 }
 
@@ -385,21 +384,13 @@ func (d *Daemon) startSessionRename(ctx context.Context, tr domain.AgentTransiti
 		d.clearSessionSyncDefer(tr.AgentID)
 		return
 	}
-	// The SETTLE window, and it is the only gate that addresses the complaint
-	// this change was asked for. An agent that has just parked is most often one
-	// the operator has this second finished starting — the composer is empty
-	// because they have not typed the first character YET, so both quiescence
-	// checks pass and the rename races their first keypress. No amount of
-	// re-reading closes a sub-second race; waiting does. d.idleSince already
-	// records when the pane's current parked spell began, refreshed from the
-	// sweep's own listing and cleared on a working transition and on a pane
-	// recycle, so this costs one map read. An ABSENT mark is unsettled, never
-	// settled: unobserved is never evidence, and it is exactly the state a
-	// brand-new agent is in until the first sweep sees it.
-	if !d.sessionRenameSettled(tr, d.opt.Clock.Now()) {
-		d.deferSessionSync(tr.AgentID, sessionSyncUnsettled)
-		return
-	}
+	// No settle check here on purpose. It was a third copy, and it is now dead
+	// weight rather than defence in depth: the shared gate in applyClaudeSession
+	// asks it over the capture before this is ever reached, and pushSessionRename
+	// re-asks it against the LIVE parked spell, which is strictly stronger — a
+	// copy over the stale tr could only ever agree with the gate that already
+	// ran. An unprovable duplicate is worse than none: it makes the mutation
+	// that deletes the real check pass.
 	key := sessionRenameKey(tr, want)
 	d.mu.Lock()
 	spent := d.sessionRenamePushes[key]
@@ -488,6 +479,19 @@ func (d *Daemon) pushSessionRename(ctx context.Context, tr domain.AgentTransitio
 		slog.Debug("session rename deferred: the agent is no longer parked",
 			"agent", tr.AgentID, "status", live.Status)
 		d.deferSessionSync(tr.AgentID, sessionSyncBusy(live.Status))
+		return false, nil
+	}
+	// "Parked" is not the same question as "parked LONG ENOUGH", and only the
+	// second one is what the settle window guards. The agent may have gone
+	// working and parked AGAIN in the gap this goroutine spends on herdr — a
+	// NEW parked spell, which is precisely the "the operator just started
+	// something" state the window exists for, and the pre-spawn check answered
+	// about the spell before it. The mark is deleted on the working transition
+	// and re-set by the next sweep, so an absent one is UNSETTLED here too.
+	if !d.sessionRenameSettled(live, d.opt.Clock.Now()) {
+		slog.Debug("session rename deferred: the agent's parked spell has not settled",
+			"agent", tr.AgentID)
+		d.deferSessionSync(tr.AgentID, sessionSyncUnsettled)
 		return false, nil
 	}
 	if live.PaneID != tr.PaneID || recycledSince(tr, live) {
@@ -860,19 +864,36 @@ func (d *Daemon) startSessionSyncRetryPass(agents, actionable []domain.AgentTran
 	// tracked goroutine.
 	ctx := d.shutdownCtx
 	if !d.spawn(func() {
-		defer func() {
-			d.mu.Lock()
-			d.sessionSyncPassRunning = false
-			d.mu.Unlock()
-		}()
+		defer d.releaseSessionSyncPass()
 		logging.Guard("session-name-retry-pass", func() error {
 			d.sessionSyncRetryPass(ctx, agents, actionable, d.opt.Clock.Now())
 			return nil
 		})
 	}) {
-		d.mu.Lock()
-		d.sessionSyncPassRunning = false
-		d.mu.Unlock()
+		d.releaseSessionSyncPass()
+	}
+}
+
+// releaseSessionSyncPass drops the shared pass latch and honours a flip that
+// arrived while it was held.
+//
+// The latch is shared with the retry pass, so without this a false→true flip
+// landing while a retry pass is walking the herd is DROPPED — and nothing else
+// ever re-runs the one-shot live-herd sync, which is the entire reason that pass
+// exists. The retry pass cannot stand in for it either: it only visits agents
+// that already carry a deferral. Coalescing to one pending re-run keeps the
+// invariant the latch is for (never two passes walking the herd at once) while
+// making the enable event impossible to lose; the re-run is sequential, and a
+// second walk is harmless because the at-send screen refuses an already-aligned
+// pair and the push ceiling bounds the rest.
+func (d *Daemon) releaseSessionSyncPass() {
+	d.mu.Lock()
+	d.sessionSyncPassRunning = false
+	pending := d.sessionSyncFlipPending
+	d.sessionSyncFlipPending = false
+	d.mu.Unlock()
+	if pending {
+		d.startClaudeSessionNameSync()
 	}
 }
 

@@ -325,9 +325,17 @@ whose manifest carries exactly that version).
       exists to hold. The accepted cost is named: an escalation raised inside that window calls the
       agent by its generated name. The already-aligned fast path runs ABOVE the gate, so a settled
       pair still costs nothing at any status.
-    - **`startSessionRename` keeps its own copy**, which `applyClaudeSession` now makes redundant on
-      every live path — kept because it guards a KEYSTROKE, and only
-      `TestStartSessionRenameRefusesAJustParkedAgentOnItsOwn` (which calls it directly) can prove it.
+    - **It is asked in exactly TWO places, and a third copy is a hazard rather than defence in
+      depth.** `startSessionRename` deliberately carries none: the shared gate already answered over
+      the capture, and `pushSessionRename` re-asks against the LIVE parked spell, which is strictly
+      stronger. A copy over the stale `tr` could only ever agree with the gate that just ran — and
+      it made the mutation deleting the REAL check pass, which is how a duplicate turns into a
+      silent hole.
+    - **The live re-check asks "parked LONG ENOUGH", not just "parked".** An agent can go working
+      and park AGAIN in the gap the goroutine spends on herdr — a NEW spell, exactly the state the
+      window exists for, and one the pre-spawn check knew nothing about. The mark is deleted on the
+      working transition and re-set by the next sweep, so an absent one is UNSETTLED here too.
+      Caught in review (#426).
     - **The constant is not the knob it looks like.** `d.idleSince` is written only by the 60s
       sweep and a deferral's first backoff step is also 60s, so the effective wait is ~1–2 minutes
       whatever `sessionRenameSettle` says, and it applies every time an agent goes quiet rather than
@@ -347,8 +355,11 @@ whose manifest carries exactly that version).
     1-minute ticker, at 1→2→4→8→15 minutes. `nextAt` is load-bearing: the ticker has no phase
     relationship to when a deferral was armed, so without it "about a minute" is 0–60s. The pass is
     SPAWNED (the sweep arm is the loop that serves every agent) and shares `sessionSyncPassRunning`
-    with the flip pass so two passes never walk the herd typing at once — safe because no deferral
-    is ever armed while the key is off, so a false→true flip cannot find one in flight. It is handed
+    with the flip pass so two passes never walk the herd typing at once. Sharing it means a
+    false→true flip can arrive while a retry pass holds the latch, and that flip MUST be coalesced
+    (`sessionSyncFlipPending`, honoured by `releaseSessionSyncPass`) rather than dropped: nothing
+    else re-runs the one-shot live-herd sync, and the retry pass cannot stand in for it because it
+    only visits agents that already carry a deferral. Caught in review (#426). It is handed
     BOTH slices: the whole listing is what the map is PRUNED against (an agent withheld from `rest`
     has not vanished), while only `rest` may be touched. A not-parked agent is answered from that
     listing with no shell-out at all.
@@ -364,7 +375,9 @@ whose manifest carries exactly that version).
     `TestSessionSyncAcceptsADoneAgent` (which pins the idle+done decision) /
     `TestSessionRenameRefusesAnAgentThatJustParked` / `…WithNoParkedMark` /
     `TestSessionSyncRefusesToAdoptAJustParkedAgent` /
-    `TestStartSessionRenameRefusesAJustParkedAgentOnItsOwn` /
+    `TestSessionRenameRefusesAParkedSpellThatRestartedAfterTheCapture` /
+    `TestSessionRenamePushProceedsOnASettledParkedSpell` (its control) /
+    `TestAFlipArrivingDuringAnotherPassIsNotLost` / `TestReleasingTheLatchWithNoFlipRunsNoPass` /
     `…ThatWentBackToWorkAfterTheCapture` (the only case that moves the agent AFTER the capture,
     so it is the only one the live re-read is needed for) / `…ARecycledPane` /
     `TestSessionRenameProceedsWhenTheTerminalIDIsUnknown` (the control, and not optional) /

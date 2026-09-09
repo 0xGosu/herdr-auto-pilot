@@ -357,6 +357,13 @@ type Daemon struct {
 	// by the pass's own defer, including when it returns early.
 	sessionSyncPassRunning bool
 
+	// sessionSyncFlipPending records a false→true flip of
+	// [agents] sync_claude_session_name that arrived while sessionSyncPassRunning
+	// was held by another pass (guarded by mu). Without it the enable event is
+	// dropped and nothing re-runs the one-shot live-herd sync — see
+	// releaseSessionSyncPass.
+	sessionSyncFlipPending bool
+
 	// rosterPassRunning latches the goroutine a roster publish spawns for its
 	// shell-out half (guarded by mu). While a TUI is registered the roster
 	// ticks every rosterTickInterval, and one pass can outlive that — a slow
