@@ -175,23 +175,29 @@ type Options struct {
 	// FleetWrites is signalled by the store after a committed write; the sync
 	// loop debounces a push on it. nil means no push-on-write.
 	FleetWrites <-chan struct{}
-	// RestartSelf hands the herd to a FRESH daemon process running the same
-	// binary (a detached `daemon --ensure` spawn in prod), used when the fleet
-	// sync engine has wedged in a way only a new process clears — the observed
-	// case is macOS's Security framework failing every TLS handshake until the
-	// daemon is restarted, which leaves this node silently isolated from the
-	// shared database.
+	// RestartSelf ORDERS a fresh daemon process running the same binary, used
+	// when the fleet sync engine has wedged in a way only a new process clears
+	// — the observed case is macOS's Security framework failing every TLS
+	// handshake until the daemon is restarted, which leaves this node silently
+	// isolated from the shared database.
 	//
-	// It is a SEPARATE seam from HandOff even though prod wires both to the
-	// same spawn: HandOff is about a binary that no longer exists and takes
-	// the successor's path, this is about a process that no longer works and
-	// takes a reason for the log. Nil disables the recovery entirely, which is
-	// what every front end and every test that has not opted in gets, so
-	// nothing spawns a daemon by accident.
+	// In prod it is a detached `daemon --restart`, and the flag is the whole
+	// reason this is a SEPARATE seam from HandOff rather than a second caller
+	// of it. HandOff spawns `--ensure` because its successor is a DIFFERENT
+	// binary; `--ensure` here would bow out, since EnsureFresh returns doing
+	// nothing when the running holder already matches the version and path it
+	// would start. Nil disables the recovery entirely — what every front end
+	// and every test that has not opted in gets — so nothing spawns a daemon
+	// by accident.
 	//
-	// Like HandOff it is called at most once successfully — after that this
-	// daemon exits — but a failed attempt is retried on a later heartbeat, so
-	// it must be safe to call more than once.
+	// It follows that this seam does NOT end the daemon, and that is where it
+	// parts company with HandOff: the command it spawns is what stops this
+	// process, so Run keeps going until that signal arrives (exiting early
+	// would only widen the window in which the herd has no monitor, since
+	// `--restart` waits for the lock to release before starting). The caller
+	// latches instead — see checkFleetSyncWedged — and a failed attempt is
+	// retried on a later heartbeat, so this must be safe to call more than
+	// once.
 	RestartSelf func(reason string) error
 }
 
