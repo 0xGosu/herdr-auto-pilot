@@ -121,6 +121,14 @@ func openTurso(ctx context.Context, paths config.Paths, cfg config.Config, nodeI
 			}
 		},
 	}
+	// The retry loop's own outage record. This wait is UNBOUNDED — a wrong URL
+	// or a rejected token loops here forever — and the daemon holds the lock
+	// throughout, so `hap status` reads "running" for a process that has not
+	// begun monitoring anything. Recording when the waiting started, and how
+	// many attempts it has cost, is what lets the front ends tell a cold start
+	// from an install that will never come up (frontend.DaemonHealth).
+	var firstFailure time.Time
+	attempts := 0
 	for {
 		tdb, err := turso.Open(ctx, opts)
 		if err == nil {
@@ -130,11 +138,17 @@ func openTurso(ctx context.Context, paths config.Paths, cfg config.Config, nodeI
 			return nil, err
 		}
 		now := time.Now()
-		slog.Warn("turso: bootstrap from the remote failed; retrying", "error", err, "in", cfg.Database.SyncInterval())
+		if firstFailure.IsZero() {
+			firstFailure = now
+		}
+		attempts++
+		slog.Warn("turso: bootstrap from the remote failed; retrying", "error", err,
+			"in", cfg.Database.SyncInterval(), "waiting_for", now.Sub(firstFailure).Round(time.Second))
 		_ = daemonhealth.Write(paths.StateDir, daemonhealth.Health{
 			PID: os.Getpid(), Version: buildinfo.Version, StartedAt: startedAt, HeartbeatAt: now,
 			FleetSync: &daemonhealth.FleetSyncHealth{Engine: "turso", Bootstrapped: false,
-				LastError: err.Error(), LastErrorAt: now},
+				LastError: err.Error(), LastErrorAt: now,
+				FirstFailureAt: firstFailure, ConsecutiveFailures: attempts},
 		})
 		select {
 		case <-ctx.Done():

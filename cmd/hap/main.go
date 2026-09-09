@@ -626,11 +626,56 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 			}
 			return spawnDaemon(paths, exePath, "daemon", "--ensure")
 		},
+		// Wired only under the turso engine, because that is the only place a
+		// wedged sync engine can isolate this node — and leaving it nil under
+		// sqlite means an install that never opted in can never self-restart.
+		RestartSelf: restartSelfHook(paths, fleet != nil,
+			func(exePath string, args ...string) error { return spawnDaemon(paths, exePath, args...) }),
 	})
 	if err != nil {
 		return err
 	}
 	return d.Run(ctx)
+}
+
+// restartSelfHook builds the daemon's automatic sync-recovery seam, or nil
+// when there is no shared database to be isolated from.
+//
+// It spawns `hap daemon --restart` — NOT the `--ensure` the upgrade handoff
+// uses, and the difference is the whole reason this is a separate seam.
+// `--ensure` is EnsureFresh, which returns doing nothing when the running
+// holder is already the version and binary it would start (daemonlock's
+// `current()` check). That is exactly this case: we are restarting as the SAME
+// binary. So an `--ensure` successor would bow out, we would step aside behind
+// it, and the herd would be left with no daemon at all — the one outcome worse
+// than the isolation being repaired. `--restart` is `force`, which stops the
+// holder, waits for the lock to release, starts a fresh daemon, and confirms a
+// heartbeat before reporting.
+//
+// It follows that this daemon does NOT exit on its own: the command it spawns
+// is what stops it, exactly as when an operator types the same words. The
+// caller therefore latches instead of handing over — see checkFleetSyncWedged.
+//
+// The crash-loop breaker is consulted first for the reason the HandOff hook
+// consults it: a latched breaker would refuse the start AFTER cmd.Start() had
+// already returned nil, and the failure would be invisible here.
+// spawn is injected so a test can drive the real hook — the breaker gate and
+// the argv both — without forking a daemon.
+func restartSelfHook(paths config.Paths, turso bool, spawn func(exePath string, args ...string) error) func(string) error {
+	if !turso {
+		return nil
+	}
+	return func(reason string) error {
+		if blocked, why := spawnBlocked(paths); blocked {
+			return fmt.Errorf("crash-loop breaker would suppress the replacement daemon: %s", why)
+		}
+		self, err := selfpath.Resolve()
+		if err != nil {
+			return fmt.Errorf("resolve the hap binary to restart as: %w", err)
+		}
+		slog.Warn("restarting the daemon to clear a wedged fleet sync engine", "reason", reason, "binary", self)
+		return spawn(self, "daemon", "--restart")
+	}
 }
 
 // ensureDaemon starts a detached daemon if none is running (used by the

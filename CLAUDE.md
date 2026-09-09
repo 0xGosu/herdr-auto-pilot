@@ -1073,6 +1073,78 @@ whose manifest carries exactly that version).
     domain cannot import daemon), `TestNodeRowIsWrittenLessOftenThanTheHealthFile` (collapsing
     the two constants back restores the cost silently) and
     `TestNodeRowIsNotRewrittenOnEveryHealthBeat`.
+- **A wedged sync engine is REPAIRED once and SAID always, and the two halves have
+  opposite defaults** — under the turso engine a failing `Push`/`Pull` used to be
+  `logging.Guard` + `slog.Warn` + `return nil`, visible only in `hap status`'s fleet-sync
+  line. The daemon kept running, the herd looked quiet, and every fleet read this node
+  served was silently half a fleet short. Verified live 2026-09-09 (macOS, hap 0.9.4): the
+  sync engine's TLS handshake failed every tick with `tls: failed to verify certificate:
+  SecPolicyCreateSSL error: 0` — crypto/x509's darwin verifier reporting that
+  `SecPolicyCreateSSL` returned NULL, a Security-framework allocation failure that says
+  nothing about the certificate — with `last pull never, last push never`, while the TUI
+  showed six escalations and named them all local. One `hap daemon --restart` fixed it.
+  - **The counter spans BOTH directions and the anchor is the last SUCCESS.** A node that
+    pulls fine and cannot push is just as isolated, so `consecutiveFailures` is incremented
+    in `fleetPush` and `fleetPull` alike and reset by `noteSuccess` in either. Isolation is
+    measured from `max(LastPullAt, LastPushAt)` and falls back to `FirstFailureAt`, which
+    is the ONLY anchor a daemon that has never synced has — and "never synced" is the exact
+    shape the incident was reported in. `daemonhealth.FleetSyncIsolatedAfter` is a CLOCK,
+    not a boolean on `LastError`: a banner that fires on one failed tick is a banner nobody
+    reads by Friday, so a fresh failure is `DaemonWarn` and only five minutes without a
+    success is `DaemonError` — which it earns for the reason `BinaryReplaced` does, the
+    daemon being perfectly alive while everything it reports is incomplete. The banner
+    leads with the CONSEQUENCE ("this machine is NOT exchanging rows with the other
+    nodes"), never the TLS text, which is a detail line.
+  - **The automatic restart is gated on the fault being PROCESS-LOCAL, and unknown means
+    NO** (`domain.SyncFailureProcessLocal`, remote shapes checked FIRST so a TLS error
+    nested inside a dial timeout reads as the timeout). Restarting on a remote that is
+    merely down — a token revoked, wifi off, Turso out — buys nothing and costs the herd
+    its in-flight captures and consults every cooldown, forever; declining costs one node
+    that says so loudly and is fixed by hand. Both bounds must clear
+    (`fleetRecoveryMinFailures` AND `fleetRecoveryMinOutage`): a count alone fires on a
+    fast interval, an elapsed time alone on one old failure.
+  - **It spawns `--restart`, NOT the `--ensure` the upgrade handoff uses, and this is the
+    trap.** `EnsureFresh` returns doing NOTHING when the running holder already matches the
+    version and path it would start (`daemonlock.current`) — which is precisely a restart
+    as the SAME binary. An `--ensure` successor would bow out, and a daemon that then
+    stepped aside would leave the herd with no monitor at all. So `checkFleetSyncWedged`
+    latches `fleetRecoveryOrdered` and keeps running rather than taking `handedOff`: the
+    command it spawned is what stops this process, and `--restart` waits for the lock to
+    release before starting, so exiting early would only widen the unmonitored gap.
+  - **The latch is released by EVIDENCE, not by time.** `fleetrecovery.go`'s marker file is
+    written BEFORE the spawn (the successor may read it first) and deleted by the first
+    successful pull or push; a daemon that adopts a fresh one refuses to order another. An
+    unwritable marker REFUSES the restart, because without it an unfixable fault becomes a
+    restart loop that abandons in-flight work every cooldown — strictly worse than the
+    isolation. A failed spawn clears the marker, or a later restart's successor is latched
+    by a recovery that never happened. `fleetRecoveryCooldown` is only the ceiling on how
+    long a marker latches when nothing ever succeeds.
+  - **An unbootstrapped node is a THIRD state, not a degraded one.** `openTurso` retries the
+    first bootstrap forever and `daemonlock.Acquire` runs BEFORE it (`cmd/hap/main.go`), so a
+    wrong URL or a rejected token leaves `hap status` reporting a running daemon that has not
+    begun monitoring anything — worse than isolation, which at least still answers for its own
+    herd. It gets its own banner and its own remedy (the URL and the token), gated on the same
+    clock so a cold start stays a warning; `openTurso` records `FirstFailureAt` for that clock,
+    since nothing else on that path has one. Keep `TestAStuckBootstrapIsNamedSeparately` /
+    `TestAColdBootstrapIsOnlyAWarning`.
+  - `internal/fdprobe` records the descriptor budget at each failure — instrumentation, not
+    a control, because fd exhaustion was the leading explanation and was never MEASURED.
+    `OpenKnown` is separate from `Open` because macOS has no `/proc/self/fd` and rendering
+    its zero as "0 open" would report the opposite of what happened; `Exhausted` is a real
+    syscall and is the only field that is proof.
+
+  Keep `TestAWedgedSyncEngineRestartsTheDaemon` / `TestARemoteOutageNeverRestartsTheDaemon`
+  (the control — without it, code that restarts on ANY isolation passes the file) /
+  `TestAnOutageMustClearBOTHBounds` / `TestADaemonBornFromARecoveryDoesNotOrderAnother` /
+  `TestARecoveryMarkerPastItsCooldownDoesNotLatch` / `TestASuccessfulSyncReleasesTheRecoveryLatch` /
+  `TestAFailedRecoverySpawnLeavesNoMarker` / `TestAnUnwritableMarkerRefusesTheRestart` /
+  `TestARecoveryIsNotRetriedEveryHeartbeat` / `TestFailuresCountBothDirections` /
+  `TestSyncRecoveryOrdersARestartNotAnEnsure` / `TestSyncRecoveryRefusesWhileTheCrashLoopBreakerHasGivenUp`,
+  in `internal/daemonhealth` `TestIsolationIsMeasuredFromTheLastSuccess` /
+  `TestANodeThatHasNeverSyncedIsStillMeasurable` / `TestAFreshFailureIsNotYetIsolation` /
+  `TestDiagLinesCarryTheDescriptorEvidence`, and in `internal/frontend`
+  `TestAnIsolatedNodeIsADaemonError` / `TestAFreshSyncFailureIsOnlyAWarning` (a pair; either
+  alone passes on code that answers one way for everything).
 - **Retention has TWO windows, and the exemptions are the safety control** —
   `PruneAuditExcerpts` blanks one COLUMN (`[logging] audit_excerpt_retention_days`);
   `PruneAgedRows` deletes finished bookkeeping ROWS (`[logging] row_retention_days`, default 30).

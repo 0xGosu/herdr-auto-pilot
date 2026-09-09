@@ -74,6 +74,37 @@ type DaemonHealth struct {
 	// FleetSyncLine describes the shared database's sync state under the
 	// turso engine ("" under the local engine).
 	FleetSyncLine string
+	// FleetSyncBootstrapping: the daemon is still waiting for Turso Cloud to
+	// hand over the initial database and has not started monitoring anything.
+	// It is a DIFFERENT state from a degraded sync and needs its own words:
+	// this node has no database at all, rather than one that has fallen out of
+	// step. The wait is unbounded — a wrong URL or a rejected token loops
+	// forever — while the daemon holds the lock throughout, so `hap status`
+	// says "running" for a process doing nothing. Past the isolation window it
+	// is reported as the stuck install it almost certainly is.
+	FleetSyncBootstrapping bool
+	// FleetSyncDegraded: the last sync operation failed, at any age. This is
+	// the WARNING level and nothing more — a single failed tick is weather,
+	// and a banner that fires on one is a banner nobody reads by Friday.
+	FleetSyncDegraded bool
+	// FleetSyncIsolated: no successful pull OR push for longer than
+	// daemonhealth.FleetSyncIsolatedAfter. This is the one that matters, and
+	// it ranks with the hard failures: the daemon is running perfectly and
+	// every read it serves is a LIE OF OMISSION — the fleet's escalations and
+	// agents are not visible here, and this machine's are not reaching them.
+	// It looks exactly like a quiet herd, which is why it needs saying out
+	// loud rather than leaving to a status line an operator has to think to
+	// run.
+	FleetSyncIsolated bool
+	// FleetSyncFor is how long the current outage has run.
+	FleetSyncFor time.Duration
+	// FleetSyncError is the last sync error, for the detail lines. The banner
+	// deliberately does NOT carry it: what an operator must act on is that
+	// this machine is cut off, not that a TLS handshake failed.
+	FleetSyncError string
+	// FleetSyncDiagLines is the evidence behind it — the descriptor budget at
+	// the last failure, and whether an automatic recovery has been spent.
+	FleetSyncDiagLines []string
 	// Reason explains a gave-up / auto-disabled latch.
 	Reason string
 	// StderrLog is the captured daemon stderr path (for hung/crashed post-mortem).
@@ -112,6 +143,14 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 			h.EmbedderDiagLines = rec.EmbedderDiagLines()
 			h.BinaryReplaced = rec.BinaryReplaced
 			h.FleetSyncLine = rec.FleetSync.Line(now)
+			h.FleetSyncDegraded = rec.FleetSync.Degraded()
+			h.FleetSyncBootstrapping = rec.FleetSync != nil && !rec.FleetSync.Bootstrapped
+			h.FleetSyncIsolated = rec.FleetSync.Isolated(now)
+			h.FleetSyncFor = rec.FleetSync.IsolatedFor(now)
+			h.FleetSyncDiagLines = rec.FleetSync.DiagLines(now)
+			if rec.FleetSync != nil {
+				h.FleetSyncError = rec.FleetSync.LastError
+			}
 		}
 	}
 	if g, ok := crashguard.Read(a.StateDir); ok {
@@ -150,9 +189,19 @@ func (h DaemonHealth) Severity() DaemonSeverity {
 	// daemon still works (it is merely old), whereas one whose binary is gone
 	// cannot spawn the MCP server or the embed worker at all — every consult
 	// comes back empty, which is indistinguishable from broken automation.
-	case h.Hung || h.GaveUp || h.CrashLooping || h.BinaryReplaced:
+	// FleetSyncIsolated ranks with the hard failures for the same reason
+	// BinaryReplaced does: the daemon is alive and beating, and every fleet
+	// read it serves is silently incomplete. A herd that looks quiet because
+	// the other machines' escalations cannot reach this screen is worse than
+	// one that looks broken.
+	// A bootstrap that has outlasted the isolation window is an install that is
+	// not coming up on its own: the retry is unbounded, the daemon holds the
+	// lock while it waits, and NOTHING is being monitored — worse than an
+	// isolated node, which at least still answers for its own herd.
+	case h.Hung || h.GaveUp || h.CrashLooping || h.BinaryReplaced || h.FleetSyncIsolated ||
+		(h.FleetSyncBootstrapping && h.FleetSyncFor >= daemonhealth.FleetSyncIsolatedAfter):
 		return DaemonError
-	case h.EmbeddingAutoDisabled || h.EmbedderDegraded || (h.Running && h.VersionStale):
+	case h.EmbeddingAutoDisabled || h.EmbedderDegraded || h.FleetSyncDegraded || (h.Running && h.VersionStale):
 		return DaemonWarn
 	default:
 		return DaemonOK
@@ -172,10 +221,27 @@ func (h DaemonHealth) Banner() string {
 		return fmt.Sprintf("⚠ DAEMON NOT RESPONDING — no heartbeat for %s; see %s", formatAge(h.HeartbeatAge), h.StderrLog)
 	case h.BinaryReplaced:
 		return "⚠ DAEMON BINARY REMOVED (upgraded underneath it) — LLM consults cannot run; run: hap daemon --ensure"
+	// Ranked above the isolation cases: a node with no database yet is not
+	// monitoring at all, and the remedy is different (the URL and the token,
+	// not the sync engine). Named separately from the "still starting" case
+	// below so a cold start does not read as a broken install.
+	case h.FleetSyncBootstrapping && h.FleetSyncFor >= daemonhealth.FleetSyncIsolatedAfter:
+		return fmt.Sprintf("⚠ DAEMON NOT MONITORING — still waiting %s for the shared database to bootstrap; "+
+			"nothing is being watched. Check database.turso_database_url and the auth token", formatAge(h.FleetSyncFor))
+	// Leads with the CONSEQUENCE, not the fault: an operator needs to know
+	// that what this screen shows is only half the fleet. The error text is a
+	// detail line (FleetSyncDiagLines / the status line), not this.
+	case h.FleetSyncIsolated:
+		return fmt.Sprintf("⚠ FLEET SYNC ISOLATED for %s — this machine is NOT exchanging rows with the other nodes; "+
+			"their escalations and agents are not shown here and this node's are not reaching them", formatAge(h.FleetSyncFor))
 	case h.EmbeddingAutoDisabled:
 		return "⚠ semantic matching AUTO-DISABLED by crash-loop breaker — " + h.Reason
 	case h.EmbedderDegraded:
 		return "⚠ embedder degraded — running on BM25 text fallback"
+	case h.FleetSyncBootstrapping:
+		return "⚠ waiting for the shared database to bootstrap — this node is not monitoring yet"
+	case h.FleetSyncDegraded:
+		return "⚠ fleet sync failing — this machine may fall out of step with the other nodes"
 	case h.Running && h.VersionStale:
 		return "⚠ daemon is STALE (older binary) — run: hap daemon --ensure"
 	default:

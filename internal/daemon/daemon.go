@@ -175,6 +175,30 @@ type Options struct {
 	// FleetWrites is signalled by the store after a committed write; the sync
 	// loop debounces a push on it. nil means no push-on-write.
 	FleetWrites <-chan struct{}
+	// RestartSelf ORDERS a fresh daemon process running the same binary, used
+	// when the fleet sync engine has wedged in a way only a new process clears
+	// — the observed case is macOS's Security framework failing every TLS
+	// handshake until the daemon is restarted, which leaves this node silently
+	// isolated from the shared database.
+	//
+	// In prod it is a detached `daemon --restart`, and the flag is the whole
+	// reason this is a SEPARATE seam from HandOff rather than a second caller
+	// of it. HandOff spawns `--ensure` because its successor is a DIFFERENT
+	// binary; `--ensure` here would bow out, since EnsureFresh returns doing
+	// nothing when the running holder already matches the version and path it
+	// would start. Nil disables the recovery entirely — what every front end
+	// and every test that has not opted in gets — so nothing spawns a daemon
+	// by accident.
+	//
+	// It follows that this seam does NOT end the daemon, and that is where it
+	// parts company with HandOff: the command it spawns is what stops this
+	// process, so Run keeps going until that signal arrives (exiting early
+	// would only widen the window in which the herd has no monitor, since
+	// `--restart` waits for the lock to release before starting). The caller
+	// latches instead — see checkFleetSyncWedged — and a failed attempt is
+	// retried on a later heartbeat, so this must be safe to call more than
+	// once.
+	RestartSelf func(reason string) error
 }
 
 // Daemon is the monitor/decide/act loop.
@@ -194,6 +218,23 @@ type Daemon struct {
 	binaryReplaced atomic.Bool
 	handedOff      atomic.Bool
 	lastHandoff    atomic.Int64
+
+	// lastFleetRecovery (unix nanos) paces retries after a recovery restart
+	// whose SPAWN failed, and fleetRecoveryDeclined latches the one-line
+	// explanation for an isolated node whose fault a restart cannot fix — so
+	// it is said once per outage rather than on every heartbeat. handedOff is
+	// shared with the binary-replacement handover, which is what stops the two
+	// from ever both spawning a successor. See checkFleetSyncWedged.
+	lastFleetRecovery     atomic.Int64
+	fleetRecoveryDeclined atomic.Bool
+	// fleetRecoveryOrdered latches once a restart has been ORDERED. It is a
+	// separate latch from handedOff because the two mean different things: a
+	// handoff is this process stepping aside for a successor it started,
+	// whereas the sync recovery spawns `hap daemon --restart`, which STOPS
+	// this process on its way to starting one — so this daemon keeps the herd
+	// until the signal lands, and must only avoid ordering a second restart in
+	// the beats between.
+	fleetRecoveryOrdered atomic.Bool
 
 	mu         sync.RWMutex
 	cfg        config.Config
@@ -1276,6 +1317,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	if self, err := d.opt.ResolveSelf(); err == nil {
 		d.exePath = self
 	}
+	// Before the first health beat can publish a state this contradicts: a
+	// daemon started BY a sync recovery must not order another one.
+	d.adoptFleetRecoveryMarker()
 	d.writeHealth(startedAt)
 	// Through the throttle rather than around it: the first call always writes,
 	// and going this way ARMS the interval so the next health beat does not
@@ -1424,6 +1468,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if d.checkOwnBinary() {
 				return nil
 			}
+			// Same beat, deliberately AFTER the binary check: a daemon whose
+			// binary is gone should hand over to the NEW build rather than
+			// restart itself as the old one, and checkFleetSyncWedged stands
+			// down on handedOff for exactly that.
+			//
+			// No `return` here, unlike the check above: this one ORDERS a
+			// `hap daemon --restart`, which stops this process itself. Until
+			// that signal arrives this daemon is still the herd's only
+			// monitor, and exiting early would only widen the gap.
+			d.checkFleetSyncWedged()
 			d.writeHealth(startedAt)
 			d.maybeUpsertNode(startedAt, d.opt.Clock.Now())
 			// Bound the captured stderr log for a daemon that never restarts.
