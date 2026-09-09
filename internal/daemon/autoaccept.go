@@ -1254,11 +1254,12 @@ func autoAcceptParked(status string) bool {
 
 // liveAgentFor re-reads one agent's CURRENT transition from herdr. ok is false
 // when the listing fails or the agent is no longer in it — both of which mean
-// "do not deliver", never "retire the escalation".
+// "do not act", never "retire the escalation". Caller-neutral: the session-name
+// sync uses it as its at-send status check too.
 func (d *Daemon) liveAgentFor(ctx context.Context, agentID string) (domain.AgentTransition, bool) {
 	agents, err := d.opt.Herdr.ListAgents(ctx)
 	if err != nil {
-		slog.Debug("full self-prompting: agent listing failed; leaving the escalation pending",
+		slog.Debug("agent listing failed; leaving the pending work alone",
 			"agent", agentID, "error", err)
 		return domain.AgentTransition{}, false
 	}

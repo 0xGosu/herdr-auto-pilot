@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
@@ -21,6 +22,49 @@ import (
 // enough to ride out a pane that was repainting; a fourth would not be
 // evidence of anything new.
 const maxSessionRenamePushes = 3
+
+const (
+	// sessionSyncRetryBase and maxSessionSyncRetryWait pace the sweep's retry of
+	// a refused sync: 1, 2, 4, 8 minutes … capped. The first step is the sweep
+	// interval itself, so an agent that becomes ready is never actually delayed
+	// beyond one tick.
+	sessionSyncRetryBase    = time.Minute
+	maxSessionSyncRetryWait = 15 * time.Minute
+
+	// maxSessionSyncDeferrals bounds how many times the sweep will spend a pane
+	// read waiting for one agent to become ready. It is a different budget from
+	// maxSessionRenamePushes and the distinction is load-bearing: that one
+	// bounds KEYSTROKES typed at a pane that never takes the rename, this one
+	// bounds READS spent on a pane that is never ready. Conflating them is what
+	// makes an operator's three drafts permanently disable their rename.
+	maxSessionSyncDeferrals = 6
+
+	// sessionRenameSettle is how long an agent must have been continuously
+	// parked before its session may be renamed. See startSessionRename.
+	sessionRenameSettle = 30 * time.Second
+)
+
+// The reasons a sync is deferred, spelled once so the log line, the map entry
+// and the tests cannot drift.
+const (
+	sessionSyncNoComposer  = "no-composer"
+	sessionSyncDrafting    = "drafting"
+	sessionSyncUnsettled   = "just-parked"
+	sessionSyncPaneBusy    = "pane-busy"
+	sessionSyncAgentGone   = "agent-gone"
+	sessionSyncRecycled    = "recycled-pane"
+	sessionSyncReadFailed  = "pane-read-failed"
+	sessionSyncNameFailed  = "agent-name-failed"
+	sessionSyncAdoptFailed = "adopt-failed"
+)
+
+func sessionSyncBusy(status string) string {
+	s := strings.ToLower(strings.TrimSpace(status))
+	if s == "" {
+		s = "unreported"
+	}
+	return "busy:" + s
+}
 
 // syncClaudeSessionName aligns a claude agent's hap short name with the
 // CONVERSATION name its session carries, in whichever direction has one:
@@ -49,7 +93,15 @@ func (d *Daemon) syncClaudeSessionName(ctx context.Context, tr domain.AgentTrans
 	}
 	sess, ok := domain.ClaudeSessionFromPane(pane)
 	if !ok {
-		return agentName // no composer in this capture: UNKNOWN, never "unnamed"
+		// UNKNOWN, never "unnamed" — and the NORMAL state for a quiescent pane,
+		// since d.opt.Herdr.ReadPane is a `--source recent` CONSUMING delta that
+		// frequently returns no footer. It is also the state a freshly started
+		// session sits in, so this branch must arm the retry rather than trust
+		// "the next capture asks again": a settled pane may never produce
+		// another attention event, and the sweep's non-consuming re-read is the
+		// only thing that can see the composer at all.
+		d.deferSessionSync(tr.AgentID, sessionSyncNoComposer)
+		return agentName
 	}
 	return d.applyClaudeSession(ctx, tr, namer, agentName, sess)
 }
@@ -83,6 +135,27 @@ func (d *Daemon) claudeSessionNamer(agentType string) (ports.AgentNamerPort, boo
 // added to either is added to both.
 func (d *Daemon) applyClaudeSession(ctx context.Context, tr domain.AgentTransition,
 	namer ports.AgentNamerPort, agentName string, sess domain.ClaudeSession) string {
+	// Already byte-identical: the goal state, and the answer at ANY status.
+	// Asked ahead of the quiescence gate on purpose — otherwise every settled
+	// agent in a herd that happens to be working arms a deferral and buys a
+	// pane read a minute later to discover there was never anything to do, and
+	// the map never empties. Safe because NormalizeAgentName is a FIXED POINT,
+	// so an equal pair makes AdoptAgentName a no-op by construction.
+	if sess.Named && sess.Name == agentName {
+		d.clearSessionSyncDefer(tr.AgentID)
+		d.clearSessionSyncNote(tr.AgentID)
+		return agentName
+	}
+	// The quiescence gate, and it covers BOTH directions deliberately. Path 1
+	// types nothing, so gating it costs only a later adoption — but this is the
+	// one seam both entry points share, and a gate that lives here cannot be
+	// bypassed by adding a third caller. The same two questions are asked again
+	// against LIVE state immediately before the keystroke; this one only decides
+	// whether to look, and arms the sweep to look again when the answer is no.
+	if ok, reason := sessionSyncQuiescent(tr.Status, sess); !ok {
+		d.deferSessionSync(tr.AgentID, reason)
+		return agentName
+	}
 	if sess.Named {
 		base, ok := domain.NormalizeAgentName(sess.Name)
 		if !ok {
@@ -93,6 +166,10 @@ func (d *Daemon) applyClaudeSession(ctx context.Context, tr domain.AgentTransiti
 				slog.Info("claude session name is not storable as an agent name; leaving the agent named as it is",
 					"agent", tr.AgentID, "session_name", sess.Name, "hap_name", agentName)
 			})
+			// A standing fact about the name, not a moment that will pass: a
+			// retry reads the same unusable name and spends a pane read to say
+			// so again. The next capture still re-examines it for free.
+			d.clearSessionSyncDefer(tr.AgentID)
 			return agentName
 		}
 		assigned, err := namer.AdoptAgentName(ctx, tr.AgentID, base)
@@ -104,6 +181,9 @@ func (d *Daemon) applyClaudeSession(ctx context.Context, tr domain.AgentTransiti
 				slog.Warn("adopting the claude session name failed", "agent", tr.AgentID,
 					"session_name", sess.Name, "error", err)
 			}
+			// Transient by nature — ErrUnknownAgent is the name row racing
+			// EnsureAgentName — so the sweep asks again.
+			d.deferSessionSync(tr.AgentID, sessionSyncAdoptFailed)
 			return agentName
 		}
 		if assigned != agentName {
@@ -113,6 +193,7 @@ func (d *Daemon) applyClaudeSession(ctx context.Context, tr domain.AgentTransiti
 		if assigned == sess.Name {
 			// Byte-identical already: the goal state, and the only one that
 			// needs no keystroke.
+			d.clearSessionSyncDefer(tr.AgentID)
 			d.clearSessionSyncNote(tr.AgentID)
 			return assigned
 		}
@@ -246,8 +327,9 @@ func (d *Daemon) syncClaudeSessionNamesNow(ctx context.Context) {
 		}
 		if !ok {
 			// No composer on screen: UNKNOWN, never "unnamed". The agent is
-			// left alone and its next capture asks again.
+			// left alone, and the sweep is asked to look again.
 			slog.Debug("session-name sync: no composer on screen", "agent", a.AgentID)
+			d.deferSessionSync(a.AgentID, sessionSyncNoComposer)
 			continue
 		}
 		// After the composer is in hand, never before: EnsureAgentName is a
@@ -294,12 +376,28 @@ func (d *Daemon) syncClaudeSessionNamesNow(ctx context.Context) {
 //     evidence a keystroke landed, which is the same reason SetAgentMode is an
 //     open loop.
 func (d *Daemon) startSessionRename(ctx context.Context, tr domain.AgentTransition, want string) {
-	switch strings.ToLower(strings.TrimSpace(tr.Status)) {
-	case "idle", "done":
-	default:
+	if !sessionRenameParked(tr.Status) {
+		d.deferSessionSync(tr.AgentID, sessionSyncBusy(tr.Status))
 		return
 	}
 	if !domain.ValidAgentName(want) {
+		// A standing fact about the name, not a moment that will pass.
+		d.clearSessionSyncDefer(tr.AgentID)
+		return
+	}
+	// The SETTLE window, and it is the only gate that addresses the complaint
+	// this change was asked for. An agent that has just parked is most often one
+	// the operator has this second finished starting — the composer is empty
+	// because they have not typed the first character YET, so both quiescence
+	// checks pass and the rename races their first keypress. No amount of
+	// re-reading closes a sub-second race; waiting does. d.idleSince already
+	// records when the pane's current parked spell began, refreshed from the
+	// sweep's own listing and cleared on a working transition and on a pane
+	// recycle, so this costs one map read. An ABSENT mark is unsettled, never
+	// settled: unobserved is never evidence, and it is exactly the state a
+	// brand-new agent is in until the first sweep sees it.
+	if !d.sessionRenameSettled(tr, d.opt.Clock.Now()) {
+		d.deferSessionSync(tr.AgentID, sessionSyncUnsettled)
 		return
 	}
 	key := sessionRenameKey(tr, want)
@@ -307,6 +405,9 @@ func (d *Daemon) startSessionRename(ctx context.Context, tr domain.AgentTransiti
 	spent := d.sessionRenamePushes[key]
 	if spent >= maxSessionRenamePushes {
 		d.mu.Unlock()
+		// Nothing will ever be typed for this key again, so the sweep must stop
+		// spending a pane read on it every interval.
+		d.clearSessionSyncDefer(tr.AgentID)
 		return
 	}
 	d.sessionRenamePushes[key] = spent + 1
@@ -315,9 +416,12 @@ func (d *Daemon) startSessionRename(ctx context.Context, tr domain.AgentTransiti
 	if !d.acquirePane(tr.AgentID) {
 		// Another pane interaction owns this agent. Give the attempt back:
 		// nothing was typed, so it must not count against the ceiling.
-		d.mu.Lock()
-		d.sessionRenamePushes[key] = spent
-		d.mu.Unlock()
+		d.releaseSessionRenamePush(key)
+		// And arm the retry, or the rename is simply DROPPED until the next
+		// attention event — which a settled pane may never produce. The retry
+		// pass runs after autoSendIdleTasks, whose hand-out owns the same pane,
+		// so this collision is a real one rather than a theoretical one.
+		d.deferSessionSync(tr.AgentID, sessionSyncPaneBusy)
 		return
 	}
 	// spawn, never a bare `go` — the daemon awaits its tracked goroutines in
@@ -326,69 +430,129 @@ func (d *Daemon) startSessionRename(ctx context.Context, tr domain.AgentTransiti
 	// touching a closing store after the daemon reported itself down.
 	if !d.spawn(func() {
 		defer d.releasePane(tr.AgentID)
+		typed := false
 		if err := logging.Guard("session-rename", func() error {
-			return d.pushSessionRename(ctx, tr, want, key)
+			var err error
+			typed, err = d.pushSessionRename(ctx, tr, want, key)
+			return err
 		}); err != nil {
 			slog.Warn("session rename failed", "agent", tr.AgentID, "want", want, "error", err)
+		}
+		if !typed {
+			// Nothing reached the pane, so nothing may count against a ceiling
+			// whose entire job is to bound KEYSTROKES — the same refund the
+			// acquirePane refusal takes, for the same reason. Without it the
+			// deferral this change adds is worse than useless: three refusals a
+			// minute apart would permanently disable the rename for this
+			// (agent, terminal, name), and an operator who was mid-draft is
+			// precisely who collects three of them.
+			d.releaseSessionRenamePush(key)
 		}
 	}) {
 		// Shutdown latched between the claim and the spawn: fn never runs, so
 		// its defers never run either. Release both reservations by hand.
 		d.releasePane(tr.AgentID)
-		d.mu.Lock()
-		d.sessionRenamePushes[key] = spent
-		d.mu.Unlock()
+		d.releaseSessionRenamePush(key)
 	}
 }
 
+// pushSessionRename reports whether anything actually reached the pane. Only a
+// true return may count against maxSessionRenamePushes; every refusal below is
+// a moment that will pass and arms the sweep to look again instead.
 func (d *Daemon) pushSessionRename(ctx context.Context, tr domain.AgentTransition,
-	want, key string) error {
+	want, key string) (bool, error) {
 	if !d.sessionRenameAllowed(ctx, tr.AgentID) {
-		return nil
+		return false, nil
 	}
 	command := domain.ClaudeRenameCommand(want)
 	if d.neverAutoMatch(tr.AgentType, command) {
 		slog.Info("session rename refused by a never-auto pattern", "agent", tr.AgentID, "want", want)
-		return nil
+		// Permanent by nature: the same text screens the same way every sweep.
+		d.clearSessionSyncDefer(tr.AgentID)
+		return false, nil
 	}
 
-	// The at-send screen. `--source visible` on purpose: ReadPane's recent
+	// The at-send STATUS, re-read LIVE. tr.Status is the capture's — seconds old
+	// on the attention path, a whole pass old on the flip and retry passes —
+	// which is long enough for the operator to have started a turn, and claude
+	// QUEUES input while it works rather than refusing it. Status is reachable
+	// only through ListAgents (pane get carries none), so this is one shell-out,
+	// bounded by maxSessionRenamePushes. It fails CLOSED: "we could not ask" is
+	// not "it is idle".
+	live, ok := d.liveAgentFor(ctx, tr.AgentID)
+	if !ok {
+		d.deferSessionSync(tr.AgentID, sessionSyncAgentGone)
+		return false, nil
+	}
+	if !sessionRenameParked(live.Status) {
+		slog.Debug("session rename deferred: the agent is no longer parked",
+			"agent", tr.AgentID, "status", live.Status)
+		d.deferSessionSync(tr.AgentID, sessionSyncBusy(live.Status))
+		return false, nil
+	}
+	if live.PaneID != tr.PaneID || recycledSince(tr, live) {
+		// herdr recycles pane ids, so a changed terminal behind this pane id is
+		// a DIFFERENT agent and the send would land on a stranger. Both ids
+		// unknown fails OPEN, matching sameTenant and rosterRowUnchanged:
+		// event-socket transitions carry no terminal id at all, and the capture
+		// path is event-socket driven, so a strict compare would refuse every
+		// production rename.
+		slog.Debug("session rename refused: the pane is no longer this agent's",
+			"agent", tr.AgentID, "pane", tr.PaneID, "live_pane", live.PaneID)
+		d.deferSessionSync(tr.AgentID, sessionSyncRecycled)
+		return false, nil
+	}
+
+	// The at-send screen, and the LAST look before the keystroke on purpose:
+	// "the operator started typing" changes on a single keypress, while status
+	// changes at a turn boundary. `--source visible` because ReadPane's recent
 	// delta is consumed by the classification read, so it would routinely show
 	// no composer here and every push would refuse.
 	sess, ok, err := d.readClaudeSession(ctx, tr.PaneID)
 	if err != nil {
-		return err
+		d.deferSessionSync(tr.AgentID, sessionSyncReadFailed)
+		return false, err
 	}
 	if !ok {
-		return nil // no composer standing now: refuse, and let a later capture retry
+		// No composer standing now: refuse, and ask the sweep to look again.
+		d.deferSessionSync(tr.AgentID, sessionSyncNoComposer)
+		return false, nil
 	}
 	if sess.Named && sess.Name == want {
 		d.clearSessionRenamePushes(key)
-		return nil // already aligned — someone got there first
+		d.clearSessionSyncDefer(tr.AgentID)
+		return false, nil // already aligned — someone got there first
 	}
 	if !sess.ComposerEmpty {
 		// An operator is mid-draft. Typing here would append the command to
 		// their text and submit it.
 		slog.Debug("session rename deferred: the composer holds a draft", "agent", tr.AgentID)
-		return nil
+		d.deferSessionSync(tr.AgentID, sessionSyncDrafting)
+		return false, nil
 	}
 
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, tr.PaneID, tr.AgentType, command); err != nil {
-		return err
+		// The keystrokes may already have landed; never refund on this path.
+		return true, err
 	}
 
 	after, ok, err := d.readClaudeSession(ctx, tr.PaneID)
 	if err != nil {
-		return err
+		return true, err
 	}
 	if !ok || !after.Named || after.Name != want {
 		slog.Warn("session rename did not land", "agent", tr.AgentID, "want", want,
 			"composer_seen", ok, "session_name", after.Name)
-		return nil
+		// Deliberately arms NO deferral. The keystrokes DID go in, so this is
+		// the standing condition maxSessionRenamePushes exists to bound; a
+		// retry armed here would quietly turn that ceiling into "three pushes
+		// per interval, forever", against its own doc comment.
+		return true, nil
 	}
 	d.clearSessionRenamePushes(key)
+	d.clearSessionSyncDefer(tr.AgentID)
 	slog.Info("claude session renamed to match its agent", "agent", tr.AgentID, "name", want)
-	return nil
+	return true, nil
 }
 
 // readClaudeSession reads the pane's CURRENT screen and parses its composer.
@@ -493,4 +657,267 @@ func (d *Daemon) forgetSessionRenamePushesLocked(agentID string) {
 		}
 	}
 	delete(d.sessionSyncNoted, agentID)
+	delete(d.sessionSyncDeferred, agentID)
+}
+
+// --- quiescence: the two questions this feature asks before it types ---------
+
+// sessionRenameParked is the ONE status predicate for the session-name sync.
+//
+// Same set as autoSendParked, and defined separately for the same reason every
+// other parked predicate in this package is: they answer different questions and
+// a shared one would make narrowing any of them a change to all. "blocked" is
+// excluded even though autoAcceptParked admits it — a blocked claude is standing
+// on a modal where Enter is REBOUND and an unmatched reply commits option 1.
+// "done" is kept because it is herdr's other PARKED status, not a busy one; the
+// operator hazard this feature guards against is identical under both.
+// An empty or unreported status fails closed, exactly as autoSendParked does.
+func sessionRenameParked(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "idle", "done":
+		return true
+	}
+	return false
+}
+
+// sessionSyncQuiescent answers whether this agent may be synced at all right
+// now, and names the reason when it may not. Both clauses are asked twice: here
+// at the top of applyClaudeSession, over the capture, and again inside
+// pushSessionRename against LIVE state immediately before the keystroke.
+func sessionSyncQuiescent(status string, sess domain.ClaudeSession) (bool, string) {
+	if !sessionRenameParked(status) {
+		return false, sessionSyncBusy(status)
+	}
+	if !sess.ComposerEmpty {
+		return false, sessionSyncDrafting
+	}
+	return true, ""
+}
+
+// recycledSince reports that the pane behind this agent id is a DIFFERENT
+// terminal than the one the transition was captured from. Unknown on either
+// side is not evidence: event-socket transitions carry no terminal id.
+func recycledSince(tr, live domain.AgentTransition) bool {
+	return tr.TerminalID != "" && live.TerminalID != "" && tr.TerminalID != live.TerminalID
+}
+
+// sessionRenameSettled reports that this agent's CURRENT parked spell has lasted
+// at least sessionRenameSettle. An absent or foreign mark is unsettled.
+func (d *Daemon) sessionRenameSettled(tr domain.AgentTransition, now time.Time) bool {
+	d.mu.RLock()
+	mark, ok := d.idleSince[tr.AgentID]
+	d.mu.RUnlock()
+	if !ok || mark.paneID != tr.PaneID {
+		return false
+	}
+	if mark.terminalID != "" && tr.TerminalID != "" && mark.terminalID != tr.TerminalID {
+		return false
+	}
+	return !now.Before(mark.at.Add(sessionRenameSettle))
+}
+
+// --- the deferral: a refusal is a moment that will pass ----------------------
+
+// sessionSyncDefer is one agent's "look again later": how many consecutive
+// refusals it has collected, the earliest time the sweep may re-examine it, and
+// the reason it last gave.
+type sessionSyncDefer struct {
+	attempts int
+	nextAt   time.Time
+	reason   string
+}
+
+// sessionSyncRetryDelay is the wait after n consecutive refusals: 1, 2, 4, 8
+// minutes … capped at maxSessionSyncRetryWait. Its own constants rather than
+// autoSendIdleAfter/maxPollRedriveBackoff: the values agree today, the reasons
+// do not, and one of them moving must not move the other.
+func sessionSyncRetryDelay(n int) time.Duration {
+	d := sessionSyncRetryBase
+	for i := 1; i < n && d < maxSessionSyncRetryWait; i++ {
+		d *= 2
+	}
+	return min(d, maxSessionSyncRetryWait)
+}
+
+// deferSessionSync arms (or re-arms, one backoff step wider) the sweep's retry
+// for this agent, and gives up once the patience budget is spent.
+//
+// Giving up is bounded patience, not abandonment: the agent's next attention
+// event re-examines it for free, and a working transition restores the whole
+// budget. What it buys is that a pane which is never going to be ready stops
+// costing a `--source visible` read every interval, forever.
+func (d *Daemon) deferSessionSync(agentID, reason string) {
+	now := d.opt.Clock.Now()
+	d.mu.Lock()
+	st := d.sessionSyncDeferred[agentID]
+	st.attempts++
+	st.reason = reason
+	st.nextAt = now.Add(sessionSyncRetryDelay(st.attempts))
+	giveUp := st.attempts > maxSessionSyncDeferrals
+	if giveUp {
+		delete(d.sessionSyncDeferred, agentID)
+	} else {
+		d.sessionSyncDeferred[agentID] = st
+	}
+	d.mu.Unlock()
+	if giveUp {
+		d.noteSessionSyncOnce(agentID, "gave-up:"+reason, func() {
+			slog.Info("session-name sync stopped waiting for a quiet moment; the agent's next attention event asks again",
+				"agent", agentID, "reason", reason)
+		})
+		return
+	}
+	slog.Debug("session-name sync deferred", "agent", agentID,
+		"reason", reason, "attempt", st.attempts, "next_at", st.nextAt)
+}
+
+func (d *Daemon) clearSessionSyncDefer(agentID string) {
+	d.mu.Lock()
+	delete(d.sessionSyncDeferred, agentID)
+	d.mu.Unlock()
+}
+
+// releaseSessionRenamePush gives one push attempt back. It DECREMENTS rather
+// than restoring a remembered value: another entry point may have claimed the
+// same key in between, and writing back a snapshot would silently hand that
+// claim its budget too.
+func (d *Daemon) releaseSessionRenamePush(key string) {
+	d.mu.Lock()
+	if n := d.sessionRenamePushes[key]; n > 0 {
+		if n--; n == 0 {
+			delete(d.sessionRenamePushes, key)
+		} else {
+			d.sessionRenamePushes[key] = n
+		}
+	}
+	d.mu.Unlock()
+}
+
+// --- the retry pass ----------------------------------------------------------
+
+// startSessionSyncRetryPass re-examines the agents whose sync was refused,
+// OFF the select loop.
+//
+// agents is the sweep's whole listing and is what the map is PRUNED against;
+// actionable is the subset the sweep is willing to touch this tick (an agent
+// that just took an auto-accepted reply has input in flight herdr has not
+// reported acted on yet). Pruning against the smaller set would read a withheld
+// agent as vanished and drop a deferral that is still owed.
+//
+// Spawned, never inline: the sweep arm is the loop that serves every agent and
+// this pass shells out once per due agent — the same reason
+// startClaudeSessionNameSync exists. It shares sessionSyncPassRunning with the
+// flip pass rather than taking a latch of its own, so two passes can never walk
+// the herd typing at once. That costs nothing in practice: while the key is off
+// no deferral is ever armed (the map is dropped below), so a false→true flip
+// cannot find a retry pass in flight.
+func (d *Daemon) startSessionSyncRetryPass(agents, actionable []domain.AgentTransition) {
+	d.mu.RLock()
+	deferred := len(d.sessionSyncDeferred)
+	d.mu.RUnlock()
+	if deferred == 0 {
+		return // the common case, and it costs one map length
+	}
+	cfg, _, _ := d.snapshot()
+	if !cfg.Agents.SyncClaudeSessionName {
+		d.mu.Lock()
+		clear(d.sessionSyncDeferred)
+		d.mu.Unlock()
+		return
+	}
+
+	d.mu.Lock()
+	if d.sessionSyncPassRunning {
+		d.mu.Unlock()
+		return
+	}
+	d.sessionSyncPassRunning = true
+	d.mu.Unlock()
+
+	// Rooted at shutdownCtx: the sweep's ctx is Run's, but the pass outlives the
+	// arm that started it and must be cancelled by teardown like every other
+	// tracked goroutine.
+	ctx := d.shutdownCtx
+	if !d.spawn(func() {
+		defer func() {
+			d.mu.Lock()
+			d.sessionSyncPassRunning = false
+			d.mu.Unlock()
+		}()
+		logging.Guard("session-name-retry-pass", func() error {
+			d.sessionSyncRetryPass(ctx, agents, actionable, d.opt.Clock.Now())
+			return nil
+		})
+	}) {
+		d.mu.Lock()
+		d.sessionSyncPassRunning = false
+		d.mu.Unlock()
+	}
+}
+
+// sessionSyncRetryPass drives one round of deferred agents. Every gate stays
+// where it is: it re-enters applyClaudeSession, which re-asks the quiescence
+// questions and either clears the deferral or re-arms it one step wider.
+func (d *Daemon) sessionSyncRetryPass(ctx context.Context, agents, actionable []domain.AgentTransition,
+	now time.Time) {
+	live := make(map[string]domain.AgentTransition, len(agents))
+	for _, a := range agents {
+		live[a.AgentID] = a
+	}
+	d.mu.Lock()
+	for id := range d.sessionSyncDeferred {
+		if _, ok := live[id]; !ok {
+			// Gone from the listing: nothing left to sync.
+			delete(d.sessionSyncDeferred, id)
+		}
+	}
+	d.mu.Unlock()
+
+	for _, a := range actionable {
+		if ctx.Err() != nil {
+			return
+		}
+		d.mu.RLock()
+		st, armed := d.sessionSyncDeferred[a.AgentID]
+		d.mu.RUnlock()
+		if !armed || now.Before(st.nextAt) {
+			continue
+		}
+		namer, ok := d.claudeSessionNamer(a.AgentType)
+		if !ok {
+			d.clearSessionSyncDefer(a.AgentID)
+			continue
+		}
+		// FREE: the sweep's listing already carries LIVE status, so an agent
+		// that went back to work costs no shell-out at all.
+		if !sessionRenameParked(a.Status) {
+			d.deferSessionSync(a.AgentID, sessionSyncBusy(a.Status))
+			continue
+		}
+		// `--source visible`, never ReadPane's consuming delta: a recent read
+		// here would swallow the delta a pending classification capture is
+		// about to take. It is also the only read that can see a composer on a
+		// quiescent pane, which is the whole reason this pass exists.
+		sess, ok, err := d.readClaudeSession(ctx, a.PaneID)
+		if err != nil {
+			slog.Debug("session-name retry: pane read failed", "agent", a.AgentID, "error", err)
+			d.deferSessionSync(a.AgentID, sessionSyncReadFailed)
+			continue
+		}
+		if !ok {
+			d.deferSessionSync(a.AgentID, sessionSyncNoComposer)
+			continue
+		}
+		// After the composer is in hand, never before — EnsureAgentName is a
+		// store WRITE, and on a pane showing no composer there is nothing the
+		// row could be used for on this pass.
+		name, err := d.opt.Store.EnsureAgentName(ctx, a.AgentID)
+		if err != nil {
+			slog.Warn("session-name retry: agent name generation failed",
+				"agent", a.AgentID, "error", err)
+			d.deferSessionSync(a.AgentID, sessionSyncNameFailed)
+			continue
+		}
+		d.applyClaudeSession(ctx, a, namer, name, sess)
+	}
 }

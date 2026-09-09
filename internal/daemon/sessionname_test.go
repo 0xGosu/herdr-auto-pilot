@@ -77,6 +77,36 @@ func agentNameNow(t *testing.T, h *harness, agentID string) string {
 	return name
 }
 
+// settleAgents backdates each agent's parked-since mark past sessionRenameSettle.
+//
+// A push test needs it because a rename is refused for an agent that has only
+// just parked — the operator is most likely still typing at one — and d.idleSince
+// is refreshed by the sweep, which no unit test waits a minute for.
+func settleAgents(t *testing.T, h *harness, trs ...domain.AgentTransition) {
+	t.Helper()
+	at := time.Now().Add(-2 * sessionRenameSettle)
+	h.daemon.mu.Lock()
+	defer h.daemon.mu.Unlock()
+	for _, tr := range trs {
+		h.daemon.idleSince[tr.AgentID] = idleMark{
+			paneID: tr.PaneID, terminalID: tr.TerminalID, at: at,
+		}
+	}
+}
+
+// parkedAndSettled makes a herd look the way one that has been sitting quietly
+// does: present in herdr's LISTING (the at-send status re-check reads it there,
+// never from the capture — "we could not ask" is not "it is idle"), and parked
+// for longer than sessionRenameSettle.
+//
+// Almost every push case needs it, which is the point: both gates fail closed,
+// so a test that forgets it passes for the wrong reason.
+func parkedAndSettled(t *testing.T, h *harness, trs ...domain.AgentTransition) {
+	t.Helper()
+	h.herdr.setAgents(trs)
+	settleAgents(t, h, trs...)
+}
+
 // --- Path 1: the session is named, hap adopts it ---
 
 func TestSessionSyncRenamesTheAgentToItsClaudeSessionName(t *testing.T) {
@@ -111,6 +141,7 @@ func TestSessionSyncPushesTheFoldedNameBackToTheSession(t *testing.T) {
 	h.herdr.pane = claudeComposerPane("My Feature: Work #2", "")
 	h.herdr.onSend = renameOnSend
 	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
 		claudeComposerPane("My Feature: Work #2", ""))
@@ -170,6 +201,7 @@ func TestSessionSyncConvergesAfterOnePush(t *testing.T) {
 	h.herdr.pane = claudeComposerPane("My Feature: Work #2", "")
 	h.herdr.onSend = renameOnSend
 	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	name := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
 		claudeComposerPane("My Feature: Work #2", ""))
@@ -282,6 +314,7 @@ func TestSessionSyncPushesTheAgentNameToAnUnnamedSession(t *testing.T) {
 	h.herdr.pane = claudeComposerPane("", "")
 	h.herdr.onSend = renameOnSend
 	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
 
@@ -305,6 +338,7 @@ func TestSessionSyncPushIsASingleLine(t *testing.T) {
 	h.herdr.pane = claudeComposerPane("", "")
 	h.herdr.onSend = renameOnSend
 	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
 	if !waitForSend(t, h, "/rename") {
@@ -324,6 +358,7 @@ func TestSessionSyncPushRefusesADraftedComposer(t *testing.T) {
 	ctx := context.Background()
 	generated := agentNameNow(t, h, "pA")
 	h.herdr.setPane(claudeComposerPane("", " half a thought"))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
 
@@ -340,6 +375,9 @@ func TestSessionSyncPushRefusesAWorkingAgent(t *testing.T) {
 	ctx := context.Background()
 	generated := agentNameNow(t, h, "pA")
 	h.herdr.setPane(claudeComposerPane("", ""))
+	// The LISTING says idle and the pane is settled, so the only thing left to
+	// refuse this is the transition's own status — which is what this pins.
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "working"), generated, claudeComposerPane("", ""))
 
@@ -356,6 +394,7 @@ func TestSessionSyncPushRefusesADisabledAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.herdr.setPane(claudeComposerPane("", ""))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
 
@@ -375,6 +414,7 @@ func TestSessionSyncPushRefusesWhileTheKillSwitchIsActive(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.herdr.setPane(claudeComposerPane("", ""))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
 
@@ -391,13 +431,17 @@ func TestSessionSyncPushStopsAtItsCeiling(t *testing.T) {
 	generated := agentNameNow(t, h, "pA")
 	// The pane never repaints: every push "fails" its verify re-read.
 	h.herdr.setPane(claudeComposerPane("", ""))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
 
 	for i := 0; i < maxSessionRenamePushes+4; i++ {
 		h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
 			claudeComposerPane("", ""))
 		time.Sleep(60 * time.Millisecond)
 	}
-	if got := len(h.herdr.sentInputs()); got > maxSessionRenamePushes {
+	// EXACTLY the ceiling, not merely "no more than". Every gate in this path
+	// fails closed, so an inequality passes on a build where nothing is ever
+	// typed — which is how a ceiling test stops testing the ceiling.
+	if got := len(h.herdr.sentInputs()); got != maxSessionRenamePushes {
 		t.Fatalf("sent %d rename attempts, ceiling is %d", got, maxSessionRenamePushes)
 	}
 }
@@ -420,6 +464,7 @@ func TestSessionSyncPushesTheSuffixedNameBackOnCollision(t *testing.T) {
 	h.herdr.pane = claudeComposerPane("shared-feature", "")
 	h.herdr.onSend = renameOnSend
 	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pB", "idle"))
 
 	got := h.daemon.syncClaudeSessionName(ctx, claudeTr("pB", "idle"), generatedB,
 		claudeComposerPane("shared-feature", ""))
@@ -450,6 +495,7 @@ func TestSessionSyncCollisionIsIdempotentAcrossCaptures(t *testing.T) {
 	h.herdr.pane = claudeComposerPane("shared-feature", "")
 	h.herdr.onSend = renameOnSend
 	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pB", "idle"))
 
 	// First capture: collide, take the suffix, push it back.
 	h.daemon.syncClaudeSessionName(ctx, claudeTr("pB", "idle"), generatedB,
@@ -615,6 +661,7 @@ func reloadNow(t *testing.T, h *harness) {
 func TestFlippingSessionSyncOnRenamesTheLiveHerdWithoutACapture(t *testing.T) {
 	h := newHarnessWrapped(t, "", liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
 	generated := agentNameNow(t, h, "pA")
+	settleAgents(t, h, claudeTr("pA", "idle"))
 
 	h.writeConfig(t, sessionSyncOn)
 	reloadNow(t, h)
@@ -719,6 +766,7 @@ func TestSessionSyncPassDoesNotRunTwiceAtOnce(t *testing.T) {
 func TestSessionSyncPassReleasesItsLatch(t *testing.T) {
 	h := newHarnessWrapped(t, "", liveClaudeHerd(claudeComposerPane("", ""), claudeTr("pA", "idle")))
 	generated := agentNameNow(t, h, "pA")
+	settleAgents(t, h, claudeTr("pA", "idle"))
 
 	h.writeConfig(t, sessionSyncOn)
 	reloadNow(t, h)
@@ -731,4 +779,559 @@ func TestSessionSyncPassReleasesItsLatch(t *testing.T) {
 		defer h.daemon.mu.Unlock()
 		return !h.daemon.sessionSyncPassRunning
 	})
+}
+
+// --- The quiescence gate: parked, untouched composer, and settled ---
+
+func deferralFor(t *testing.T, h *harness, agentID string) (sessionSyncDefer, bool) {
+	t.Helper()
+	h.daemon.mu.Lock()
+	defer h.daemon.mu.Unlock()
+	st, ok := h.daemon.sessionSyncDeferred[agentID]
+	return st, ok
+}
+
+// The gate covers PATH 1 as well, and only this proves it: adoption types
+// nothing, so every send-based assertion in this file passes with the gate
+// deleted from the adopt branch. Its control is
+// TestSessionSyncRenamesTheAgentToItsClaudeSessionName, which adopts the same
+// name from the same pane with an untouched composer.
+func TestSessionSyncRefusesToAdoptWhileTheOperatorIsTyping(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
+
+	got := h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
+		claudeComposerPane("add-sweep-command-grid", " half a thought"))
+
+	if got != generated {
+		t.Fatalf("sync returned %q; a drafting operator must not be renamed around", got)
+	}
+	if stored := agentNameNow(t, h, "pA"); stored != generated {
+		t.Fatalf("the agent was adopted to %q while its operator was typing", stored)
+	}
+	st, ok := deferralFor(t, h, "pA")
+	if !ok || st.reason != sessionSyncDrafting {
+		t.Fatalf("expected a %q deferral, got %+v (armed=%v)", sessionSyncDrafting, st, ok)
+	}
+}
+
+func TestSessionSyncRefusesToAdoptANonParkedAgent(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
+
+	for _, status := range []string{"working", "blocked", "detected", ""} {
+		h.daemon.mu.Lock()
+		delete(h.daemon.sessionSyncDeferred, "pA")
+		h.daemon.mu.Unlock()
+
+		h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", status), generated,
+			claudeComposerPane("add-sweep-command-grid", ""))
+
+		if stored := agentNameNow(t, h, "pA"); stored != generated {
+			t.Fatalf("status %q adopted the session name (agent is now %q)", status, stored)
+		}
+		if _, ok := deferralFor(t, h, "pA"); !ok {
+			t.Fatalf("status %q must arm a retry", status)
+		}
+	}
+}
+
+// "done" is herdr's OTHER parked status, not a busy one. Narrowing the gate to
+// "idle" alone would silently switch the feature off for every agent herdr
+// happens to report that way, which is a partial disabling rather than a safety
+// win — the operator hazard is identical under both.
+func TestSessionSyncAcceptsADoneAgent(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+	parkedAndSettled(t, h, claudeTr("pA", "done"))
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "done"), generated, claudeComposerPane("", ""))
+
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatalf("a done agent is parked and must still be synced, got %v", h.herdr.sentInputs())
+	}
+}
+
+// An agent that parked SECONDS ago is most often one the operator has just
+// finished starting: the composer is empty because they have not typed the
+// first character YET, so both quiescence checks pass and the rename races
+// their first keypress. Waiting is the only thing that closes that race.
+func TestSessionRenameRefusesAnAgentThatJustParked(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setPane(claudeComposerPane("", ""))
+	// Listed and parked, but its parked spell began just now.
+	h.herdr.setAgents([]domain.AgentTransition{claudeTr("pA", "idle")})
+	h.daemon.mu.Lock()
+	h.daemon.idleSince["pA"] = idleMark{paneID: "pA", terminalID: "term_pA", at: time.Now()}
+	h.daemon.mu.Unlock()
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+
+	if !noSendWithin(t, h, 400*time.Millisecond) {
+		t.Fatalf("a session the operator just opened must be left alone, got %v", h.herdr.sentInputs())
+	}
+	st, ok := deferralFor(t, h, "pA")
+	if !ok || st.reason != sessionSyncUnsettled {
+		t.Fatalf("expected a %q deferral, got %+v (armed=%v)", sessionSyncUnsettled, st, ok)
+	}
+}
+
+// An agent hap has never seen park is UNSETTLED, never settled: unobserved is
+// never evidence, and it is exactly the state a brand-new agent is in.
+func TestSessionRenameRefusesAnAgentWithNoParkedMark(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setPane(claudeComposerPane("", ""))
+	h.herdr.setAgents([]domain.AgentTransition{claudeTr("pA", "idle")})
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+
+	if !noSendWithin(t, h, 400*time.Millisecond) {
+		t.Fatalf("an agent with no parked-since mark must not be typed into, got %v",
+			h.herdr.sentInputs())
+	}
+}
+
+// --- The at-send re-check: LIVE status, not the capture's ---
+
+// The capture's status is seconds old on the attention path and a whole pass
+// old on the flip and retry passes. Only this case moves the agent AFTER the
+// capture, which is what the live re-read exists for; every other refusal test
+// in this file has tr.Status already wrong and passes without it.
+func TestSessionRenameRefusesAnAgentThatWentBackToWorkAfterTheCapture(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setPane(claudeComposerPane("", ""))
+	settleAgents(t, h, claudeTr("pA", "idle"))
+	// The capture said idle; herdr says otherwise NOW.
+	h.herdr.setAgents([]domain.AgentTransition{claudeTr("pA", "working")})
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+
+	if !noSendWithin(t, h, 400*time.Millisecond) {
+		t.Fatalf("an agent that resumed must not be typed into, got %v", h.herdr.sentInputs())
+	}
+	st, ok := deferralFor(t, h, "pA")
+	if !ok || st.reason != sessionSyncBusy("working") {
+		t.Fatalf("expected a busy deferral, got %+v (armed=%v)", st, ok)
+	}
+}
+
+// herdr recycles pane ids, so a changed terminal behind this pane id is a
+// DIFFERENT agent and the send would land on a stranger.
+func TestSessionRenameRefusesARecycledPane(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setPane(claudeComposerPane("", ""))
+	settleAgents(t, h, claudeTr("pA", "idle"))
+	recycled := claudeTr("pA", "idle")
+	recycled.TerminalID = "term_somebody_else"
+	h.herdr.setAgents([]domain.AgentTransition{recycled})
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+
+	if !noSendWithin(t, h, 400*time.Millisecond) {
+		t.Fatalf("a recycled pane must not be typed into, got %v", h.herdr.sentInputs())
+	}
+}
+
+// The CONTROL for the recycle check, and it is not optional:
+// domain.AgentTransition.TerminalID is populated only by `agent list`
+// transitions, so an over-strict compare would refuse every event-socket-driven
+// rename in production while the test above still passed.
+func TestSessionRenameProceedsWhenTheTerminalIDIsUnknown(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+	settleAgents(t, h, claudeTr("pA", "idle"))
+	unknown := claudeTr("pA", "idle")
+	unknown.TerminalID = ""
+	h.herdr.setAgents([]domain.AgentTransition{unknown})
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatalf("an unknown terminal id must not refuse the rename, got %v", h.herdr.sentInputs())
+	}
+}
+
+// Fails CLOSED: "we could not ask" is not "it is idle".
+func TestSessionRenameRefusesWhenTheListingIsUnavailable(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setPane(claudeComposerPane("", ""))
+	settleAgents(t, h, claudeTr("pA", "idle"))
+	h.herdr.setFailListAgents(true)
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+
+	if !noSendWithin(t, h, 400*time.Millisecond) {
+		t.Fatalf("an unreadable listing must not license a send, got %v", h.herdr.sentInputs())
+	}
+	if st, ok := deferralFor(t, h, "pA"); !ok || st.reason != sessionSyncAgentGone {
+		t.Fatalf("expected a %q deferral, got %+v (armed=%v)", sessionSyncAgentGone, st, ok)
+	}
+}
+
+// --- The ceiling and the deferral are DIFFERENT budgets ---
+
+// The load-bearing one. maxSessionRenamePushes bounds KEYSTROKES; a refusal
+// types nothing, so it must cost nothing. Without the refund, an operator who
+// is mid-draft three times running permanently disables their own rename —
+// exactly the person this change is for.
+func TestADeferralNeverBurnsAPushAttempt(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	// The capture is clean, so the beginning gate passes and the push really
+	// runs; the live pane holds a draft, so the at-send gate refuses it.
+	h.herdr.setPane(claudeComposerPane("", " half a thought"))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
+
+	for i := 0; i < maxSessionRenamePushes+2; i++ {
+		h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
+			claudeComposerPane("", ""))
+		time.Sleep(60 * time.Millisecond)
+	}
+	if !noSendWithin(t, h, 200*time.Millisecond) {
+		t.Fatalf("nothing may be typed at a drafted composer, got %v", h.herdr.sentInputs())
+	}
+
+	// The operator submits and walks away. The rename must still be possible.
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatalf("refusals burned the push budget; the rename can no longer land (%v)",
+			h.herdr.sentInputs())
+	}
+}
+
+// The mirror of the above, and it is what stops the refund from quietly
+// widening the ceiling: a send that HAPPENED but did not verify is the standing
+// condition maxSessionRenamePushes exists to bound, so it must arm nothing.
+func TestAFailedVerifyArmsNoDeferral(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	// No onSend: the pane never repaints, so the verify re-read fails.
+	h.herdr.setPane(claudeComposerPane("", ""))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatal("the push should have been typed")
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		h.daemon.mu.Lock()
+		defer h.daemon.mu.Unlock()
+		return h.daemon.sessionRenamePushes[sessionRenameKey(claudeTr("pA", "idle"), generated)] == 1
+	})
+	if st, ok := deferralFor(t, h, "pA"); ok {
+		t.Fatalf("a send that happened must arm no retry, got %+v", st)
+	}
+}
+
+// --- The retry pass ---
+
+func TestSessionSyncRetryDelayBacksOffAndCaps(t *testing.T) {
+	want := []time.Duration{
+		sessionSyncRetryBase, 2 * sessionSyncRetryBase, 4 * sessionSyncRetryBase,
+		8 * sessionSyncRetryBase, maxSessionSyncRetryWait, maxSessionSyncRetryWait,
+	}
+	for i, w := range want {
+		if got := sessionSyncRetryDelay(i + 1); got != w {
+			t.Fatalf("attempt %d: got %v, want %v", i+1, got, w)
+		}
+	}
+}
+
+// A refusal is a moment that will pass, so the sweep looks again — rather than
+// waiting for an attention event a settled pane may never produce.
+func TestADeferredSessionSyncIsRetriedOnTheSweep(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setPane(claudeComposerPane("", " half a thought"))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+	waitFor(t, 2*time.Second, func() bool {
+		st, ok := deferralFor(t, h, "pA")
+		return ok && st.reason == sessionSyncDrafting
+	})
+
+	// The operator submitted; the composer is clean again.
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	h.herdr.mu.Unlock()
+
+	agents := []domain.AgentTransition{claudeTr("pA", "idle")}
+	h.daemon.sessionSyncRetryPass(ctx, agents, agents, time.Now().Add(2*sessionSyncRetryBase))
+
+	if !waitForSend(t, h, "/rename "+generated) {
+		t.Fatalf("the sweep must retry a deferred sync, got %v", h.herdr.sentInputs())
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		_, ok := deferralFor(t, h, "pA")
+		return !ok
+	})
+}
+
+// The control: without it "about a minute later" is fiction, because the sweep
+// ticker has no phase relationship to when the deferral was armed.
+func TestADeferredSessionSyncWaitsOutItsInterval(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+	h.herdr.setPane(claudeComposerPane("", " half a thought"))
+	parkedAndSettled(t, h, claudeTr("pA", "idle"))
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated, claudeComposerPane("", ""))
+	waitFor(t, 2*time.Second, func() bool {
+		_, ok := deferralFor(t, h, "pA")
+		return ok
+	})
+
+	h.herdr.mu.Lock()
+	h.herdr.pane = claudeComposerPane("", "")
+	h.herdr.onSend = renameOnSend
+	reads := len(h.herdr.readLines)
+	h.herdr.mu.Unlock()
+
+	agents := []domain.AgentTransition{claudeTr("pA", "idle")}
+	h.daemon.sessionSyncRetryPass(ctx, agents, agents, time.Now())
+
+	if !noSendWithin(t, h, 300*time.Millisecond) {
+		t.Fatalf("a deferral must be waited out, got %v", h.herdr.sentInputs())
+	}
+	if got := len(h.herdr.readLineCalls()); got != reads {
+		t.Fatalf("a deferral that is not due cost %d pane reads; it must cost none", got-reads)
+	}
+}
+
+// A working agent is answered from the sweep's OWN listing: no shell-out at all.
+func TestTheRetryPassSkipsAWorkingAgentWithoutAPaneRead(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	agentNameNow(t, h, "pA")
+	h.daemon.deferSessionSync("pA", sessionSyncNoComposer)
+	reads := len(h.herdr.readLineCalls())
+
+	agents := []domain.AgentTransition{claudeTr("pA", "working")}
+	h.daemon.sessionSyncRetryPass(ctx, agents, agents, time.Now().Add(2*sessionSyncRetryBase))
+
+	if got := len(h.herdr.readLineCalls()); got != reads {
+		t.Fatalf("a working agent cost %d pane reads; the listing already answered it", got-reads)
+	}
+	if st, ok := deferralFor(t, h, "pA"); !ok || st.reason != sessionSyncBusy("working") {
+		t.Fatalf("expected a busy deferral, got %+v (armed=%v)", st, ok)
+	}
+}
+
+// The map is pruned against the WHOLE listing and acted on over the subset the
+// sweep is willing to touch. Pruning against the smaller one reads a withheld
+// agent — one that just took an auto-accepted reply — as vanished, and drops a
+// deferral that is still owed.
+func TestTheRetryPassNeverPrunesAWithheldAgent(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	agentNameNow(t, h, "pA")
+	h.daemon.deferSessionSync("pA", sessionSyncNoComposer)
+
+	agents := []domain.AgentTransition{claudeTr("pA", "idle")}
+	h.daemon.sessionSyncRetryPass(ctx, agents, nil, time.Now().Add(2*sessionSyncRetryBase))
+	if _, ok := deferralFor(t, h, "pA"); !ok {
+		t.Fatal("an agent withheld from this tick has not vanished; its deferral must survive")
+	}
+
+	// Genuinely gone from the listing: now it may go.
+	h.daemon.sessionSyncRetryPass(ctx, nil, nil, time.Now().Add(2*sessionSyncRetryBase))
+	if _, ok := deferralFor(t, h, "pA"); ok {
+		t.Fatal("an agent that left the herd must not keep a deferral")
+	}
+}
+
+// Bounded patience, not abandonment: the agent's next attention event asks
+// again for free, and a working transition restores the whole budget. What it
+// buys is that a pane which will never be ready stops costing a read forever.
+func TestASessionSyncDeferralGivesUpAtItsCeiling(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	agentNameNow(t, h, "pA")
+	for i := 0; i < maxSessionSyncDeferrals; i++ {
+		h.daemon.deferSessionSync("pA", sessionSyncNoComposer)
+		if _, ok := deferralFor(t, h, "pA"); !ok {
+			t.Fatalf("gave up after %d refusals, budget is %d", i+1, maxSessionSyncDeferrals)
+		}
+	}
+	h.daemon.deferSessionSync("pA", sessionSyncNoComposer)
+	if st, ok := deferralFor(t, h, "pA"); ok {
+		t.Fatalf("the patience budget must be spent, got %+v", st)
+	}
+}
+
+func TestAWorkingTransitionRestoresTheRetryBudget(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	agentNameNow(t, h, "pA")
+	h.daemon.deferSessionSync("pA", sessionSyncDrafting)
+
+	h.push("pA", "working")
+
+	waitFor(t, 3*time.Second, func() bool {
+		_, ok := deferralFor(t, h, "pA")
+		return !ok
+	})
+}
+
+func TestARecycledPaneClearsItsSessionSyncDeferral(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	agentNameNow(t, h, "pA")
+	h.daemon.deferSessionSync("pA", sessionSyncDrafting)
+
+	recycled := claudeTr("pA", "idle")
+	recycled.TerminalID = "term_somebody_else"
+	h.daemon.resetRecycledPaneState(context.Background(), recycled)
+
+	if st, ok := deferralFor(t, h, "pA"); ok {
+		t.Fatalf("a recycled pane must not inherit its predecessor's deferral, got %+v", st)
+	}
+}
+
+// The no-composer capture is the state the operator's own scenario sits in — a
+// `--source recent` delta routinely shows no footer — so it must arm the retry
+// rather than trust "the next capture asks again".
+func TestACaptureWithNoComposerArmsARetry(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	generated := agentNameNow(t, h, "pA")
+
+	h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", "idle"), generated,
+		"⏺ nothing new in this delta.\n")
+
+	st, ok := deferralFor(t, h, "pA")
+	if !ok || st.reason != sessionSyncNoComposer {
+		t.Fatalf("expected a %q deferral, got %+v (armed=%v)", sessionSyncNoComposer, st, ok)
+	}
+}
+
+// The bound that makes arming on a no-composer capture affordable: the retry's
+// `--source visible` read is authoritative, so an already-aligned agent clears
+// its own deferral and a settled herd costs nothing from then on.
+func TestASettledHerdStopsCostingPaneReads(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, "pA"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.raw.AdoptAgentName(ctx, "pA", "already-aligned"); err != nil {
+		t.Fatal(err)
+	}
+	h.herdr.setPane(claudeComposerPane("already-aligned", ""))
+	h.daemon.deferSessionSync("pA", sessionSyncNoComposer)
+
+	agents := []domain.AgentTransition{claudeTr("pA", "idle")}
+	due := time.Now().Add(2 * sessionSyncRetryBase)
+	h.daemon.sessionSyncRetryPass(ctx, agents, agents, due)
+	if st, ok := deferralFor(t, h, "pA"); ok {
+		t.Fatalf("an aligned agent must clear its own deferral, got %+v", st)
+	}
+
+	reads := len(h.herdr.readLineCalls())
+	h.daemon.sessionSyncRetryPass(ctx, agents, agents, due)
+	if got := len(h.herdr.readLineCalls()); got != reads {
+		t.Fatalf("a settled herd cost %d pane reads on the second pass; it must cost none",
+			got-reads)
+	}
+}
+
+// Turning the key off drops the whole map, so an install that never opts in
+// never pays for the pass at all.
+func TestTheRetryPassIsInertWithTheFeatureOff(t *testing.T) {
+	h := newHarness(t, "")
+	agentNameNow(t, h, "pA")
+	h.daemon.deferSessionSync("pA", sessionSyncNoComposer)
+
+	h.daemon.startSessionSyncRetryPass(
+		[]domain.AgentTransition{claudeTr("pA", "idle")},
+		[]domain.AgentTransition{claudeTr("pA", "idle")})
+
+	if st, ok := deferralFor(t, h, "pA"); ok {
+		t.Fatalf("the deferral map must be dropped while the key is off, got %+v", st)
+	}
+	if !noSendWithin(t, h, 200*time.Millisecond) {
+		t.Fatalf("nothing may be typed with the feature off, got %v", h.herdr.sentInputs())
+	}
+}
+
+// The pass is SPAWNED: the sweep arm is the select loop that serves every
+// agent, and this pass shells out once per due agent.
+func TestTheRetryPassDoesNotStallTheSweepArm(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	agentNameNow(t, h, "pA")
+	h.daemon.deferSessionSync("pA", sessionSyncNoComposer)
+	h.daemon.mu.Lock()
+	h.daemon.sessionSyncDeferred["pA"] = sessionSyncDefer{attempts: 1, nextAt: time.Now().Add(-time.Minute)}
+	h.daemon.mu.Unlock()
+
+	gate := make(chan struct{})
+	h.herdr.setReadGate(gate)
+	defer close(gate)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.daemon.startSessionSyncRetryPass(
+			[]domain.AgentTransition{claudeTr("pA", "idle")},
+			[]domain.AgentTransition{claudeTr("pA", "idle")})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("startSessionSyncRetryPass blocked on the pane read; it must spawn")
+	}
+}
+
+// The fast path is what keeps the deferral map EMPTY on a working herd: without
+// it, every settled agent that happens to be mid-turn arms a retry and buys a
+// pane read a minute later to discover there was never anything to do.
+func TestAnAlignedPairNeverArmsARetry(t *testing.T) {
+	h := newHarness(t, sessionSyncOn)
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, "pA"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.raw.AdoptAgentName(ctx, "pA", "already-aligned"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, status := range []string{"idle", "working", "blocked"} {
+		h.daemon.syncClaudeSessionName(ctx, claudeTr("pA", status), "already-aligned",
+			claudeComposerPane("already-aligned", ""))
+		if st, ok := deferralFor(t, h, "pA"); ok {
+			t.Fatalf("status %q: an already-identical pair has nothing to retry, got %+v", status, st)
+		}
+	}
 }
