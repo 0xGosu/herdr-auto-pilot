@@ -230,3 +230,64 @@ func TestAwaitDaemonHealthOnlyBelievesTheSuccessor(t *testing.T) {
 		}
 	})
 }
+
+// TestSyncRecoveryOrdersARESTARTNotAnEnsure pins the one choice this seam
+// cannot get wrong. The upgrade handoff spawns `--ensure` because its successor
+// is a DIFFERENT binary; a sync recovery restarts as the SAME one, and
+// EnsureFresh returns doing nothing when the running holder already matches the
+// version and path it would start (daemonlock's own
+// TestRestartReplacesAHolderEnsureFreshWouldKeep is that behaviour pinned from
+// the other side). So an `--ensure` here would start nothing at all, and the
+// isolation it was meant to repair would simply continue — with the operator
+// told, in the log, that a replacement had been started.
+func TestSyncRecoveryOrdersARestartNotAnEnsure(t *testing.T) {
+	paths := config.Paths{StateDir: t.TempDir(), ConfigDir: t.TempDir()}
+	var got []string
+	hook := restartSelfHook(paths, true, func(_ string, args ...string) error {
+		got = args
+		return nil
+	})
+	if hook == nil {
+		t.Fatal("no recovery seam was built under the turso engine")
+	}
+	if err := hook("fleet sync wedged: SecPolicyCreateSSL error: 0"); err != nil {
+		t.Fatalf("hook: %v", err)
+	}
+	if len(got) != 2 || got[0] != "daemon" || got[1] != "--restart" {
+		t.Fatalf("spawned %q, want [daemon --restart]", got)
+	}
+}
+
+// TestSyncRecoverySeamIsAbsentWithoutASharedDatabase: under the local engine
+// there is no fleet to be isolated from, so the daemon is handed no way to
+// restart itself at all.
+func TestSyncRecoverySeamIsAbsentWithoutASharedDatabase(t *testing.T) {
+	paths := config.Paths{StateDir: t.TempDir(), ConfigDir: t.TempDir()}
+	if restartSelfHook(paths, false, func(string, ...string) error {
+		t.Fatal("spawned a daemon under the local engine")
+		return nil
+	}) != nil {
+		t.Fatal("a recovery seam was built under the local engine")
+	}
+}
+
+// TestSyncRecoveryRefusesWhileTheCrashLoopBreakerHasGivenUp: a latched breaker
+// refuses the start AFTER the fork has already returned nil, so the daemon
+// would read a spawn that succeeded. Refusing here keeps this daemon up —
+// isolated is bad, unmonitored is worse.
+func TestSyncRecoveryRefusesWhileTheCrashLoopBreakerHasGivenUp(t *testing.T) {
+	paths := config.Paths{StateDir: t.TempDir(), ConfigDir: t.TempDir()}
+	if err := crashguard.Write(paths.StateDir, crashguard.State{
+		GaveUp: true, Reason: "native abort in the embedder",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	hook := restartSelfHook(paths, true, func(string, ...string) error {
+		t.Fatal("spawned a daemon the crash-loop breaker would suppress")
+		return nil
+	})
+	err := hook("fleet sync wedged: too many open files")
+	if err == nil || !strings.Contains(err.Error(), "crash-loop breaker") {
+		t.Fatalf("error = %v, want a crash-loop breaker refusal", err)
+	}
+}

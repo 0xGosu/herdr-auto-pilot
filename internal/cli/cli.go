@@ -976,6 +976,18 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	if h.FleetSyncLine != "" {
 		fmt.Fprintf(out, "fleet sync:          %s\n", h.FleetSyncLine)
 	}
+	// What an isolated node means, not just that a handshake failed: every
+	// fleet read on this machine is silently incomplete while it lasts, and
+	// nothing else on this page says so.
+	if h.FleetSyncIsolated {
+		fmt.Fprintf(out, "  fleet sync ISOLATED — the other nodes' escalations and agents are not visible here,\n"+
+			"                       and this node's are not reaching them\n")
+	}
+	// The evidence: the descriptor budget as it stood at the failure, and
+	// whether an automatic restart has already been spent on it.
+	for _, line := range h.FleetSyncDiagLines {
+		fmt.Fprintf(out, "  fleet sync %s\n", line)
+	}
 	// The evidence behind the state: which budgets are in force, how many calls
 	// hit them, and the last error. Printed even when NOT degraded, so a run of
 	// timeouts is visible before the latch trips (the diag lines are empty

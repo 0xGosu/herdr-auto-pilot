@@ -75,6 +75,19 @@ type Health struct {
 	FleetSync *FleetSyncHealth `json:"fleet_sync,omitempty"`
 }
 
+// FleetSyncIsolatedAfter is how long a node may go without a SUCCESSFUL pull
+// or push before its degradation stops being weather and starts being
+// isolation — the point at which the TUI raises it from a warning to an error.
+//
+// A single failed tick is not it. Under the default 15s pull interval this is
+// twenty of them, which no transient reaches, and it is the same order as the
+// window the automatic recovery waits out: an operator who sees the error
+// banner is seeing a state the daemon has already tried to fix itself.
+//
+// It is deliberately a CLOCK, not a boolean on LastError. A banner that fires
+// on the first blip is a banner nobody reads by the end of the week.
+const FleetSyncIsolatedAfter = 5 * time.Minute
+
 // FleetSyncHealth is the heartbeat's copy of the fleet sync loop's state.
 type FleetSyncHealth struct {
 	Engine string `json:"engine"`
@@ -87,6 +100,90 @@ type FleetSyncHealth struct {
 	Revision     string    `json:"revision,omitempty"`
 	LastError    string    `json:"last_error,omitempty"`
 	LastErrorAt  time.Time `json:"last_error_at,omitempty"`
+	// ConsecutiveFailures counts sync operations that have failed in a row
+	// across BOTH directions, reset by any success. A node that pulls fine
+	// and cannot push is just as isolated as one that can do neither, so a
+	// counter that tracked only pulls would never see it.
+	ConsecutiveFailures int `json:"consecutive_failures,omitempty"`
+	// FirstFailureAt anchors the CURRENT outage — the first failure since the
+	// last success, or since start when there has never been one. It is what
+	// makes "degraded for 12m" answerable on a daemon that has never synced,
+	// where LastPullAt and LastPushAt are both zero.
+	FirstFailureAt time.Time `json:"first_failure_at,omitempty"`
+	// FDSoft, FDHard, FDOpen and FDExhausted are the descriptor budget as it
+	// stood at the LAST FAILURE — instrumentation, carried so the next
+	// occurrence is a one-command diagnosis rather than another round of
+	// guessing (see internal/fdprobe). FDOpenKnown separates "none open"
+	// from "this platform cannot count them"; FDExhausted is the only one
+	// that is proof, and it is available everywhere.
+	FDSoft      uint64 `json:"fd_soft,omitempty"`
+	FDHard      uint64 `json:"fd_hard,omitempty"`
+	FDOpen      int    `json:"fd_open,omitempty"`
+	FDOpenKnown bool   `json:"fd_open_known,omitempty"`
+	FDExhausted bool   `json:"fd_exhausted,omitempty"`
+	// RecoveredAt records when this daemon last handed the herd to a fresh
+	// process to clear a wedged sync engine, and RecoveryLatched that it may
+	// not do so again until it has seen one success. Both are display-only
+	// here; the authority is the marker file the daemon keeps.
+	RecoveredAt     time.Time `json:"recovered_at,omitempty"`
+	RecoveryLatched bool      `json:"recovery_latched,omitempty"`
+}
+
+// Degraded reports that the last sync operation failed, at any age.
+func (f *FleetSyncHealth) Degraded() bool {
+	return f != nil && (!f.Bootstrapped || f.LastError != "")
+}
+
+// LastProgressAt is the most recent SUCCESSFUL sync in either direction, zero
+// when there has never been one.
+func (f *FleetSyncHealth) LastProgressAt() time.Time {
+	if f == nil {
+		return time.Time{}
+	}
+	if f.LastPushAt.After(f.LastPullAt) {
+		return f.LastPushAt
+	}
+	return f.LastPullAt
+}
+
+// IsolatedFor is how long this node has gone without a successful sync while
+// failing, or 0 when it is not degraded at all. It measures from the last
+// success, falling back to the outage's own start when there has never been
+// one — which is the ONLY anchor a daemon that has never synced has.
+func (f *FleetSyncHealth) IsolatedFor(now time.Time) time.Duration {
+	if !f.Degraded() {
+		return 0
+	}
+	since := f.LastProgressAt()
+	if since.IsZero() {
+		since = f.FirstFailureAt
+	}
+	if since.IsZero() {
+		return 0
+	}
+	if d := now.Sub(since); d > 0 {
+		return d
+	}
+	return 0
+}
+
+// Isolated reports that the degradation has lasted long enough to mean this
+// machine's escalations are not reaching the fleet and the fleet's are not
+// reaching it.
+//
+// It REQUIRES Bootstrapped, and that is not a detail: isolation means this node
+// was part of a fleet and has been cut off, whereas an unbootstrapped one never
+// joined — it has no database at all. Both are Degraded and both accumulate an
+// IsolatedFor (the bootstrap retry is unbounded and records its own
+// FirstFailureAt), so without this clause a node stuck on a rejected token
+// reads as isolated and every reader that asks only this question tells the
+// operator their peers' escalations are not reaching them — pointing at the
+// sync engine when the answer is the URL and the token. `hap status` did
+// exactly that, because it asks with a bare `if` rather than an ordered switch.
+// The bootstrap case carries its own escalation in frontend.DaemonHealth, so
+// nothing is lost by narrowing this.
+func (f *FleetSyncHealth) Isolated(now time.Time) bool {
+	return f != nil && f.Bootstrapped && f.IsolatedFor(now) >= FleetSyncIsolatedAfter
 }
 
 // Line renders the state as the one line `hap status` prints.
@@ -104,11 +201,44 @@ func (f *FleetSyncHealth) Line(now time.Time) string {
 		return fmt.Sprintf("%s — BOOTSTRAP PENDING: %s", f.Engine, f.LastError)
 	}
 	if f.LastError != "" {
-		return fmt.Sprintf("%s — DEGRADED: %s (last pull %s, last push %s, %d unpushed)",
-			f.Engine, f.LastError, ago(f.LastPullAt), ago(f.LastPushAt), f.PendingOps)
+		state := "DEGRADED"
+		if f.Isolated(now) {
+			state = "ISOLATED"
+		}
+		return fmt.Sprintf("%s — %s for %s (%d consecutive failures): %s (last pull %s, last push %s, %d unpushed)",
+			f.Engine, state, f.IsolatedFor(now).Round(time.Second), f.ConsecutiveFailures, f.LastError,
+			ago(f.LastPullAt), ago(f.LastPushAt), f.PendingOps)
 	}
 	return fmt.Sprintf("%s — ok (last pull %s, last push %s, %d unpushed)",
 		f.Engine, ago(f.LastPullAt), ago(f.LastPushAt), f.PendingOps)
+}
+
+// DiagLines is the evidence behind a degraded sync, as indented detail lines:
+// the descriptor budget at the last failure, and whether an automatic recovery
+// has already been spent. Empty when the sync is healthy — there is nothing to
+// explain.
+func (f *FleetSyncHealth) DiagLines(now time.Time) []string {
+	if !f.Degraded() {
+		return nil
+	}
+	var out []string
+	if f.FDExhausted {
+		out = append(out, fmt.Sprintf("file descriptors: EXHAUSTED at the last failure (limit %d soft / %d hard) — raise it with `ulimit -n` before starting the daemon", f.FDSoft, f.FDHard))
+	} else if f.FDSoft > 0 {
+		open := "unavailable on this platform"
+		if f.FDOpenKnown {
+			open = fmt.Sprintf("%d open", f.FDOpen)
+		}
+		out = append(out, fmt.Sprintf("file descriptors: %s, limit %d soft / %d hard (not exhausted)", open, f.FDSoft, f.FDHard))
+	}
+	switch {
+	case f.RecoveryLatched && !f.RecoveredAt.IsZero():
+		out = append(out, fmt.Sprintf("automatic recovery: already restarted %s ago and it did not help — this needs a human",
+			now.Sub(f.RecoveredAt).Round(time.Second)))
+	case f.RecoveryLatched:
+		out = append(out, "automatic recovery: spent (this daemon was started by one and has not synced since)")
+	}
+	return out
 }
 
 // EmbedderDiag is the heartbeat's copy of embedder.Diagnostics. It lives here

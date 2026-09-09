@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/fdprobe"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
@@ -59,6 +61,22 @@ type fleetSyncState struct {
 	pendingOps  int64
 	revision    string
 	pulls       int
+	// consecutiveFailures counts failed operations in a row across BOTH
+	// directions — a node that pulls and cannot push is just as isolated as
+	// one that can do neither — and firstFailureAt anchors the current
+	// outage. Both are reset by any success.
+	consecutiveFailures int
+	firstFailureAt      time.Time
+	// fd is the descriptor budget as it stood at the last failure. It is
+	// instrumentation, not a control: nothing branches on it, and it exists
+	// so the next occurrence names its own cause (see internal/fdprobe).
+	fd fdprobe.Probe
+	// recoveryLatched is set when this daemon was itself started by an
+	// automatic recovery and has not synced since, and recoveredAt is when
+	// that restart was ordered. Cleared by the first success, which is the
+	// only evidence the restart worked.
+	recoveryLatched bool
+	recoveredAt     time.Time
 }
 
 func (s *fleetSyncState) fail(now time.Time, err error) {
@@ -66,13 +84,30 @@ func (s *fleetSyncState) fail(now time.Time, err error) {
 	defer s.mu.Unlock()
 	s.lastError = err.Error()
 	s.lastErrorAt = now
+	s.consecutiveFailures++
+	if s.firstFailureAt.IsZero() {
+		s.firstFailureAt = now
+	}
+	// Taken here rather than at read time: `hap status` runs minutes later,
+	// in another process, and the budget it would sample is not the one that
+	// failed. One os.Open of /dev/null and, on Linux, one directory read.
+	s.fd = fdprobe.Read()
 }
 
-func (s *fleetSyncState) clearError() {
+// noteSuccess records that a sync operation completed, which ends any outage
+// in progress. It reports whether an outage was actually ended, so the caller
+// releases the recovery latch — a file removal — once rather than on every
+// tick of a healthy node.
+func (s *fleetSyncState) noteSuccess() (endedOutage bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	endedOutage = s.lastError != "" || s.consecutiveFailures > 0 || s.recoveryLatched
 	s.lastError = ""
 	s.lastErrorAt = time.Time{}
+	s.consecutiveFailures = 0
+	s.firstFailureAt = time.Time{}
+	s.recoveryLatched = false
+	return endedOutage
 }
 
 // fleetHealth renders the state for the heartbeat, or nil under the local
@@ -85,15 +120,51 @@ func (d *Daemon) fleetHealth() *daemonhealth.FleetSyncHealth {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return &daemonhealth.FleetSyncHealth{
-		Engine:       "turso",
-		Bootstrapped: true,
-		LastPullAt:   s.lastPull,
-		LastPushAt:   s.lastPush,
-		PendingOps:   s.pendingOps,
-		Revision:     s.revision,
-		LastError:    s.lastError,
-		LastErrorAt:  s.lastErrorAt,
+		Engine:              "turso",
+		Bootstrapped:        true,
+		LastPullAt:          s.lastPull,
+		LastPushAt:          s.lastPush,
+		PendingOps:          s.pendingOps,
+		Revision:            s.revision,
+		LastError:           s.lastError,
+		LastErrorAt:         s.lastErrorAt,
+		ConsecutiveFailures: s.consecutiveFailures,
+		FirstFailureAt:      s.firstFailureAt,
+		FDSoft:              s.fd.Soft,
+		FDHard:              s.fd.Hard,
+		FDOpen:              s.fd.Open,
+		FDOpenKnown:         s.fd.OpenKnown,
+		FDExhausted:         s.fd.Exhausted,
+		RecoveredAt:         s.recoveredAt,
+		RecoveryLatched:     s.recoveryLatched,
 	}
+}
+
+// adoptFleetRecoveryMarker latches this daemon out of ordering a recovery of
+// its own when a predecessor already spent one. Called once, at Run.
+func (d *Daemon) adoptFleetRecoveryMarker() {
+	if d.opt.FleetSync == nil || d.opt.StateDir == "" {
+		return
+	}
+	m, ok := readFleetRecoveryMarker(d.opt.StateDir)
+	if !ok {
+		return
+	}
+	if d.opt.Clock.Now().Sub(m.RestartedAt) >= fleetRecoveryCooldown {
+		// Old enough that this failure and that one need not share a cause.
+		// Allow one more attempt, and drop the marker so it cannot latch a
+		// later daemon over something an hour stale.
+		clearFleetRecoveryMarker(d.opt.StateDir)
+		return
+	}
+	d.fleet.mu.Lock()
+	d.fleet.recoveryLatched = true
+	d.fleet.recoveredAt = m.RestartedAt
+	d.fleet.mu.Unlock()
+	slog.Warn("fleet sync: this daemon was started by an automatic sync recovery; "+
+		"it will not order another until a pull or push succeeds",
+		"restarted_at", m.RestartedAt, "recovering_from", m.Error,
+		"consecutive_failures", m.ConsecutiveFailures, "isolated_for", m.IsolatedFor)
 }
 
 // runFleetSync is the loop. It returns when ctx is done.
@@ -186,7 +257,7 @@ func (d *Daemon) fleetPush(sync ports.FleetSyncPort) {
 		d.fleet.mu.Lock()
 		d.fleet.lastPush = now
 		d.fleet.mu.Unlock()
-		d.fleet.clearError()
+		d.noteFleetSuccess()
 		d.fleetRefreshStats(sync)
 		return nil
 	})
@@ -206,7 +277,7 @@ func (d *Daemon) fleetPull(sync ports.FleetSyncPort) {
 		d.fleet.pulls++
 		pulls := d.fleet.pulls
 		d.fleet.mu.Unlock()
-		d.fleet.clearError()
+		d.noteFleetSuccess()
 		if changed {
 			// Rows from other nodes: wake the drains and refresh the index.
 			if d.syncEvents != nil {
@@ -225,6 +296,152 @@ func (d *Daemon) fleetPull(sync ports.FleetSyncPort) {
 		}
 		return nil
 	})
+}
+
+// noteFleetSuccess ends any outage in progress and, when there was one,
+// releases the recovery latch on disk. The file removal is conditional on the
+// outage actually ending so a healthy node does not stat-and-unlink every
+// fifteen seconds for the life of the process.
+func (d *Daemon) noteFleetSuccess() {
+	if !d.fleet.noteSuccess() {
+		return
+	}
+	// Re-arm the "a restart cannot fix this" explanation for the NEXT outage:
+	// it is once per outage, and this is where an outage ends.
+	d.fleetRecoveryDeclined.Store(false)
+	clearFleetRecoveryMarker(d.opt.StateDir)
+	slog.Info("fleet sync: recovered; this node is exchanging rows with the fleet again")
+}
+
+// fleetRecoveryMinFailures and fleetRecoveryMinOutage are the two bounds that
+// keep an automatic restart away from ordinary network weather. BOTH must be
+// met: a count alone fires on a fast interval, and an elapsed time alone fires
+// on a single failure that happened to be old.
+const (
+	fleetRecoveryMinFailures = 5
+	fleetRecoveryMinOutage   = 5 * time.Minute
+)
+
+// fleetRecoveryRetryInterval throttles a restart whose SPAWN failed, so a fork
+// that keeps being refused cannot storm. Mirrors handoffRetryInterval, and for
+// the same reason.
+const fleetRecoveryRetryInterval = 5 * time.Minute
+
+// checkFleetSyncWedged decides whether this node's sync engine has failed in a
+// way only a fresh process clears, and if so ORDERS a restart — it does not
+// perform one. RestartSelf spawns `hap daemon --restart`, which stops THIS
+// process on its way to starting a successor, so unlike checkOwnBinary's
+// handover there is nothing to step aside for and Run must keep going until
+// the signal arrives. Stepping aside here would be actively wrong: `--restart`
+// waits for the lock to release before starting, so a daemon that exited early
+// would just widen the window in which the herd has no monitor at all.
+//
+// It is checked on the heartbeat, where it costs one mutex and a string scan,
+// and reports whether it ordered one (for the tests; the caller ignores it).
+//
+// Six gates, and each closes something the others do not:
+//
+//   - a seam (RestartSelf) and a sync engine at all — nil in every front end
+//     and every test that does not opt in, so nothing spawns by accident;
+//   - not already handed off to a REPLACEMENT BINARY, because that successor
+//     is a newer build and outranks a restart as the same one;
+//   - not already ordered: the latch is what makes this once per process, so
+//     the ten seconds between here and the signal cannot spawn a second one;
+//   - the outage is real: fleetRecoveryMinFailures consecutive failures AND
+//     fleetRecoveryMinOutage without a success in either direction;
+//   - the fault is PROCESS-LOCAL (domain.SyncFailureProcessLocal), which is
+//     what keeps a restart away from a remote that is merely down — restarting
+//     on those buys nothing and costs the herd its in-flight work every
+//     cooldown, forever;
+//   - the recovery latch is free: a daemon born from a recovery does not order
+//     another until one has succeeded (see fleetrecovery.go).
+func (d *Daemon) checkFleetSyncWedged() bool {
+	if d.opt.FleetSync == nil || d.opt.RestartSelf == nil ||
+		d.handedOff.Load() || d.fleetRecoveryOrdered.Load() {
+		return false
+	}
+	now := d.opt.Clock.Now()
+	d.fleet.mu.Lock()
+	lastErr, failures, latched := d.fleet.lastError, d.fleet.consecutiveFailures, d.fleet.recoveryLatched
+	since := d.fleet.lastPull
+	if d.fleet.lastPush.After(since) {
+		since = d.fleet.lastPush
+	}
+	if since.IsZero() {
+		since = d.fleet.firstFailureAt
+	}
+	d.fleet.mu.Unlock()
+
+	if lastErr == "" || failures < fleetRecoveryMinFailures || since.IsZero() {
+		return false
+	}
+	outage := now.Sub(since)
+	if outage < fleetRecoveryMinOutage {
+		return false
+	}
+	if !domain.SyncFailureProcessLocal(lastErr) {
+		// Said once per outage, not per beat: notePending's doctrine. The
+		// operator still gets the banner; this explains why nothing is being
+		// done about it automatically.
+		if d.fleetRecoveryDeclined.CompareAndSwap(false, true) {
+			slog.Warn("fleet sync: isolated, but the failure does not look like one a restart clears; "+
+				"leaving it to the operator",
+				"error", lastErr, "consecutive_failures", failures, "isolated_for", outage)
+		}
+		return false
+	}
+	if latched {
+		return false
+	}
+	// A failed spawn is retryable but must not storm — one attempt per
+	// interval, the latch taken only on success (below).
+	if last := d.lastFleetRecovery.Load(); last != 0 && now.Sub(time.Unix(0, last)) < fleetRecoveryRetryInterval {
+		return false
+	}
+	d.lastFleetRecovery.Store(now.UnixNano())
+
+	reason := "fleet sync wedged: " + lastErr
+	// Written BEFORE the spawn: the successor may read it before this process
+	// is scheduled again, and a marker that lands late is one it did not see.
+	marker := fleetRecoveryMarker{
+		RestartedAt:         now,
+		Error:               lastErr,
+		ConsecutiveFailures: failures,
+		IsolatedFor:         outage.Round(time.Second).String(),
+	}
+	if err := writeFleetRecoveryMarker(d.opt.StateDir, marker); err != nil {
+		// Without the marker the successor cannot know it was born from a
+		// recovery, and an unfixable fault becomes a restart loop. Refusing is
+		// the safe direction: the node stays isolated and says so.
+		slog.Error("fleet sync: could not record the recovery marker; not restarting",
+			"error", err, "would_recover_from", lastErr)
+		return false
+	}
+	slog.Warn("fleet sync: this node has been isolated long enough with a process-local fault; "+
+		"restarting the daemon to clear it",
+		"error", lastErr, "consecutive_failures", failures, "isolated_for", outage)
+	if err := d.opt.RestartSelf(reason); err != nil {
+		// Nothing was started, so this daemon keeps the herd. Stay up,
+		// isolated, and retry on a later heartbeat — and drop the marker, or
+		// the successor of some LATER restart would be latched by a recovery
+		// that never happened.
+		clearFleetRecoveryMarker(d.opt.StateDir)
+		// The descriptor reading goes on THIS line, not just into the health
+		// record, because a fork is itself a descriptor operation: if the
+		// cause is exhaustion, this is the moment the hypothesis proves
+		// itself, and the failure would otherwise read as an unrelated fork
+		// problem sitting next to evidence nobody joined it to.
+		fd := fdprobe.Read()
+		slog.Error("fleet sync: could not order the restart; staying up, isolated",
+			"error", err, "retry_in", fleetRecoveryRetryInterval,
+			"fd_exhausted", fd.Exhausted, "fd_limit_soft", fd.Soft, "fd_open_known", fd.OpenKnown, "fd_open", fd.Open)
+		return false
+	}
+	// Latched, NOT handed off: the command just spawned is what stops this
+	// process, and until its signal arrives this daemon is still the herd's
+	// only monitor. The latch is only about not ordering a second one.
+	d.fleetRecoveryOrdered.Store(true)
+	return true
 }
 
 // fleetRefreshStats reads the engine's counters into the state (best effort).

@@ -7161,6 +7161,19 @@ func (m Model) View() string {
 		}
 		fmt.Fprintf(&b, "%s\n", style.Render(banner))
 	}
+	// The evidence behind a failing sync, under its banner: the descriptor
+	// budget at the failure, whether the automatic restart has been spent, and
+	// the error itself. The banner says what it MEANS; these say what to do
+	// about it, and without them an operator's only route to either was to
+	// leave the TUI and run `hap status`.
+	if m.data.daemonHealth.FleetSyncDegraded {
+		for _, line := range m.data.daemonHealth.FleetSyncDiagLines {
+			fmt.Fprintf(&b, "%s\n", st.warn.Render("  "+line))
+		}
+		if e := m.data.daemonHealth.FleetSyncError; e != "" {
+			fmt.Fprintf(&b, "%s\n", st.warn.Render("  last sync error: "+e))
+		}
+	}
 
 	if m.data.err != nil {
 		fmt.Fprintf(&b, "%s\n", st.err.Render("error: "+m.data.err.Error()))
