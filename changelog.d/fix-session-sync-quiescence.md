@@ -1,0 +1,6 @@
+- Changed the Claude session-name sync to leave you alone: it acts on a session only while the agent is parked, its composer untouched, and it has been sitting quietly — so a `/rename` no longer lands on a session you have just opened and are about to type into. In practice a name now settles a minute or two after an agent goes quiet, rather than seconds.
+- Changed those checks to run twice, the second time immediately before the keystroke and against the agent's live status rather than the status its capture carried, so an agent that went back to work in between is left alone.
+- Changed a refused rename to be retried about a minute later (backing off to fifteen), instead of waiting for an attention event a quiet pane may never produce.
+- Fixed a refused rename counting against the three-keystroke ceiling: being mid-draft three times used to disable the rename for that agent permanently.
+- Fixed a rename still landing on an agent that went back to work and parked again while the check was in flight: the quiet-enough test now runs against the agent's current parked spell, not the one its capture saw.
+- Fixed turning the setting on being silently ignored when a retry happened to be running: the enable is now remembered and the one-shot sync runs as soon as the retry finishes.

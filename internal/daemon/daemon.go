@@ -385,11 +385,25 @@ type Daemon struct {
 	// every attention event (guarded by mu).
 	sessionSyncNoted map[string]string
 
+	// sessionSyncDeferred remembers the agents whose session-name sync was
+	// refused because the agent was not parked, its composer held a draft, or
+	// it had only just parked — and the earliest time the sweep may look again
+	// (guarded by mu). In-memory like sessionRenamePushes: a restart forgets
+	// the backoff, which retries sooner rather than never.
+	sessionSyncDeferred map[string]sessionSyncDefer
+
 	// sessionSyncPassRunning latches the one-shot sync pass a false→true flip
 	// of [agents] sync_claude_session_name starts, so two flips in quick
 	// succession cannot walk the herd twice at once (guarded by mu). Cleared
 	// by the pass's own defer, including when it returns early.
 	sessionSyncPassRunning bool
+
+	// sessionSyncFlipPending records a false→true flip of
+	// [agents] sync_claude_session_name that arrived while sessionSyncPassRunning
+	// was held by another pass (guarded by mu). Without it the enable event is
+	// dropped and nothing re-runs the one-shot live-herd sync — see
+	// releaseSessionSyncPass.
+	sessionSyncFlipPending bool
 
 	// rosterPassRunning latches the goroutine a roster publish spawns for its
 	// shell-out half (guarded by mu). While a TUI is registered the roster
@@ -755,6 +769,7 @@ func New(opt Options) (*Daemon, error) {
 		sweepInFlight:             map[string]bool{},
 		sessionRenamePushes:       map[string]int{},
 		sessionSyncNoted:          map[string]string{},
+		sessionSyncDeferred:       map[string]sessionSyncDefer{},
 		toggleAttempt:             map[string]string{},
 		idleSince:                 map[string]idleMark{},
 		autoTaskClaim:             map[string]taskClaim{},
@@ -1534,6 +1549,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 				rest := withoutAgents(agents, delivered)
 				d.reconcileAttentionWith(ctx, rest)
 				d.autoSendIdleTasks(ctx, rest)
+				// Last, and off the loop. Handed BOTH slices: the whole
+				// listing is what the deferral map is pruned against (an
+				// agent withheld from rest has not vanished), while only
+				// rest may be touched this tick. After autoSendIdleTasks
+				// so d.idleSince is refreshed — the settle window reads it.
+				d.startSessionSyncRetryPass(agents, rest)
 				return nil
 			})
 		case tr := <-d.transitions:
@@ -1755,6 +1776,9 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		delete(d.episodeHandled, tr.PaneID)
 		delete(d.idleSince, tr.AgentID)
 		delete(d.autoTaskClaim, tr.AgentID)
+		// A genuinely new episode: the session-name sync gets its full patience
+		// budget back, and its settle window starts again from the next park.
+		delete(d.sessionSyncDeferred, tr.AgentID)
 		d.mu.Unlock()
 		// The agent is doing something, which is the ONLY evidence that an
 		// unattended hand-out actually reached it (a successful `agent send`

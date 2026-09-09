@@ -292,11 +292,106 @@ whose manifest carries exactly that version).
   - **"No composer" is UNKNOWN, never "unnamed."** The classification read is `--source recent`, a
     consuming delta that routinely shows no footer, and the push direction reads "unnamed" as its
     TRIGGER — so the alternative overwrites an operator's chosen name.
-  - **The push is a DELIVERY**: parked agents only (a working claude QUEUES input and still paints
-    an ordinary composer), `acquirePane`, kill switch + per-agent disable re-asked inside the
+  - **The push is a DELIVERY**: `acquirePane`, kill switch + per-agent disable re-asked inside the
     goroutine, never-auto over the exact text, a `--source visible` re-read before AND after the
     send, a proven-EMPTY composer (`ClaudeComposerReady` proves the sandwich, not that it is
     blank), a ceiling per (agent, terminal, name), and `d.spawn` so shutdown drains it.
+  - **QUIESCENCE is asked twice, and the second time against LIVE state.** Both questions —
+    parked (`sessionRenameParked`: `idle`/`done`, the same set as `autoSendParked`; `blocked` is a
+    modal where Enter is rebound, and an empty status fails closed) and `ComposerEmpty` — are asked
+    at the TOP of `applyClaudeSession` (`sessionSyncQuiescent`), which gates BOTH directions
+    including the store-only adopt, because that is the one seam all three entry points share.
+    They are asked again inside `pushSessionRename`, where the status comes from `liveAgentFor`
+    and NOT from `tr.Status`: the capture's status is seconds old on the attention path and a whole
+    pass old on the flip and retry passes, and claude QUEUES input while it works rather than
+    refusing it. A failed listing refuses — "we could not ask" is not "it is idle". The pane/terminal
+    tenancy compare (`recycledSince`) fails OPEN on an unknown id, because event-socket transitions
+    carry no `terminal_id` at all and a strict compare would refuse every production rename. Order
+    is deliberate: status before the pane read (it is cheaper and skips the read), and the composer
+    proof LAST, because "the operator started typing" changes on one keypress while status changes
+    at a turn boundary.
+  - **A just-parked agent is not a quiet one** (`sessionRenameSettle`, `sessionRenameSettled`,
+    reached through `sessionSyncReady`). The complaint this feature earned is a rename typed into a
+    session the operator opened seconds ago: the composer is empty because they have not typed the
+    FIRST character yet, so both quiescence checks pass and the push races their first keypress. No
+    re-read closes a sub-second race; waiting does. The evidence is `d.idleSince`, already
+    maintained by the sweep and cleared on `working` and on a pane recycle, so it costs one map read
+    — and an ABSENT or foreign mark is UNSETTLED, never settled, which is exactly the state a
+    brand-new agent is in until the first sweep sees it.
+    - **It gates ADOPTION too**, though adoption types nothing and so buys no safety from it. What
+      it buys is that hap's name and the composer's are never knowingly left disagreeing: adopting
+      on the spot while the push waits out the window leaves the pair merely DERIVED from one
+      another for a minute or two, which is the CHARACTER-IDENTICAL contract this whole feature
+      exists to hold. The accepted cost is named: an escalation raised inside that window calls the
+      agent by its generated name. The already-aligned fast path runs ABOVE the gate, so a settled
+      pair still costs nothing at any status.
+    - **It is asked in exactly TWO places, and a third copy is a hazard rather than defence in
+      depth.** `startSessionRename` deliberately carries none: the shared gate already answered over
+      the capture, and `pushSessionRename` re-asks against the LIVE parked spell, which is strictly
+      stronger. A copy over the stale `tr` could only ever agree with the gate that just ran — and
+      it made the mutation deleting the REAL check pass, which is how a duplicate turns into a
+      silent hole.
+    - **The live re-check asks "parked LONG ENOUGH", not just "parked".** An agent can go working
+      and park AGAIN in the gap the goroutine spends on herdr — a NEW spell, exactly the state the
+      window exists for, and one the pre-spawn check knew nothing about. The mark is deleted on the
+      working transition and re-set by the next sweep, so an absent one is UNSETTLED here too.
+      Caught in review (#426).
+    - **The constant is not the knob it looks like.** `d.idleSince` is written only by the 60s
+      sweep and a deferral's first backoff step is also 60s, so the effective wait is ~1–2 minutes
+      whatever `sessionRenameSettle` says, and it applies every time an agent goes quiet rather than
+      only on a fresh session. Lowering the constant changes almost nothing; setting it to 0 removes
+      the gate. Renames are not time-critical, which is what makes that trade acceptable.
+  - **A refusal DEFERS; it never burns a push.** `maxSessionRenamePushes` bounds KEYSTROKES typed
+    at a pane that never takes the rename; `maxSessionSyncDeferrals` bounds READS spent on a pane
+    that is never ready. Conflating them is destructive rather than merely wrong: every refusal used
+    to burn one of the three, so an operator who was mid-draft three times running permanently
+    disabled their own rename — the exact person the gates are for. `pushSessionRename` therefore
+    returns `typed bool` and `releaseSessionRenamePush` refunds by DECREMENT (never by writing back
+    a snapshot, which would hand a concurrent claim its budget too). The one branch that must arm
+    NOTHING is a send that happened but did not verify: a deferral there quietly turns the ceiling
+    into "three pushes per interval, forever".
+  - **The retry is the sweep's, not a timer's.** `sessionSyncDeferred` is a `pollRedrive`-shaped
+    map (attempts, `nextAt`, reason) re-examined by `startSessionSyncRetryPass` off the existing
+    1-minute ticker, at 1→2→4→8→15 minutes. `nextAt` is load-bearing: the ticker has no phase
+    relationship to when a deferral was armed, so without it "about a minute" is 0–60s. The pass is
+    SPAWNED (the sweep arm is the loop that serves every agent) and shares `sessionSyncPassRunning`
+    with the flip pass so two passes never walk the herd typing at once. Sharing it means a
+    false→true flip can arrive while a retry pass holds the latch, and that flip MUST be coalesced
+    (`sessionSyncFlipPending`, honoured by `releaseSessionSyncPass`) rather than dropped: nothing
+    else re-runs the one-shot live-herd sync, and the retry pass cannot stand in for it because it
+    only visits agents that already carry a deferral. Caught in review (#426). It is handed
+    BOTH slices: the whole listing is what the map is PRUNED against (an agent withheld from `rest`
+    has not vanished), while only `rest` may be touched. A not-parked agent is answered from that
+    listing with no shell-out at all.
+  - **The `!ok` capture arms a retry, and the aligned fast path is what makes that affordable.**
+    "No composer in this capture" is the NORMAL state for a quiescent pane — `ReadPane` is a
+    consuming delta — and it is the state the operator's own scenario sits in, so leaving it to
+    "the next capture asks again" leaves the feature with no retry at all for the case it exists
+    for. That arms one deferral per claude agent, which the `sess.Name == agentName` fast path
+    ABOVE the gate then clears on the first retry (the `--source visible` read is authoritative),
+    so a settled herd converges to an empty map after one sweep. Without the fast path, every
+    settled agent that happens to be mid-turn arms a retry instead.
+  - Keep `TestSessionSyncRefusesToAdoptWhileTheOperatorIsTyping` / `…ANonParkedAgent` /
+    `TestSessionSyncAcceptsADoneAgent` (which pins the idle+done decision) /
+    `TestSessionRenameRefusesAnAgentThatJustParked` / `…WithNoParkedMark` /
+    `TestSessionSyncRefusesToAdoptAJustParkedAgent` /
+    `TestSessionRenameRefusesAParkedSpellThatRestartedAfterTheCapture` /
+    `TestSessionRenamePushProceedsOnASettledParkedSpell` (its control) /
+    `TestAFlipArrivingDuringAnotherPassIsNotLost` / `TestReleasingTheLatchWithNoFlipRunsNoPass` /
+    `…ThatWentBackToWorkAfterTheCapture` (the only case that moves the agent AFTER the capture,
+    so it is the only one the live re-read is needed for) / `…ARecycledPane` /
+    `TestSessionRenameProceedsWhenTheTerminalIDIsUnknown` (the control, and not optional) /
+    `…RefusesWhenTheListingIsUnavailable` / `TestADeferralNeverBurnsAPushAttempt` /
+    `TestAFailedVerifyArmsNoDeferral` / `TestADeferredSessionSyncIsRetriedOnTheSweep` /
+    `…WaitsOutItsInterval` (the control) / `TestTheRetryPassSkipsAWorkingAgentWithoutAPaneRead` /
+    `…NeverPrunesAWithheldAgent` / `…IsInertWithTheFeatureOff` / `…DoesNotStallTheSweepArm` /
+    `TestASessionSyncDeferralGivesUpAtItsCeiling` / `TestAWorkingTransitionRestoresTheRetryBudget` /
+    `TestARecycledPaneClearsItsSessionSyncDeferral` / `TestACaptureWithNoComposerArmsARetry` /
+    `TestASettledHerdStopsCostingPaneReads` / `TestAnAlignedPairNeverArmsARetry` /
+    `TestSessionSyncRetryDelayBacksOffAndCaps`. Note the test trap: every gate here fails CLOSED, so
+    a push case that forgets `parkedAndSettled` (pin the listing AND backdate `d.idleSince`) passes
+    for the wrong reason — which is why `TestSessionSyncPushStopsAtItsCeiling` asserts EXACTLY the
+    ceiling rather than "no more than".
   - **`NormalizeAgentName` must stay a FIXED POINT**, or the pushed name is re-folded on the next
     capture and the two names trade spellings forever. Same for `SuffixedAgentName`; collisions
     are idempotent via `domain.AgentNameDerivedFrom`. An identical pair must cost no pane read —
