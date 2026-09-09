@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"slices"
 	"sort"
@@ -2702,7 +2703,7 @@ func taskHints(agent, path string, listing bool) []Hint {
 
 // taskOp runs one checklist operation against an already-resolved target.
 func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path string, args []string) error {
-	usage := "usage: task [<agent> | <source-index> | --path <file> | --node <node> <agent>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | move <n> <position|up|down> | send <n> [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>; <source-index> is a position from `hap config task-source list` (e.g. 0)\nsee: hap help task"
+	usage := "usage: task [<agent> | <source-index> | --path <file> | --node <node> <agent>] list [--status all|pending|done] | get <n> | add <text> | start <n> | done <n> | undone <n> | update <n> <text> | remove <n> | move <n> <position|up|down> | send <n> [--yes] | drop-list [--yes]\n<n> is a task id from the list (e.g. 3.4), or #<position>; <source-index> is a position from `hap config task-source list` (e.g. 0)\nsee: hap help task"
 	if agent == "" && path == "" {
 		return fmt.Errorf("%s", usage)
 	}
@@ -2711,6 +2712,8 @@ func taskOp(ctx context.Context, app *frontend.App, out io.Writer, agent, path s
 	}
 	op, rest := args[0], args[1:]
 	switch op {
+	case "drop-list", "delete-list", "rm-list":
+		return taskDropList(ctx, app, out, agent, path, rest)
 	case "list", "ls":
 		return taskList(app, out, agent, path, rest)
 	case "get", "show":
@@ -2900,6 +2903,97 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	}
 	fmt.Fprintf(out, "task #%d sent to %s and marked [-] in progress\n", idx, agent)
 	return nil
+}
+
+// taskDropList removes a whole checklist from the hap database — the CLI twin
+// of the TUI Tasks tab's shift-X, and the forced counterpart of the daemon's
+// orphan sweep: no age test, no check that a task source still names the list.
+//
+// It is spelled drop-list rather than the obvious rm because `remove|rm|delete|
+// del` is already the ITEM-level delete on this same verb. A list-level removal
+// has to be impossible to type by accident.
+//
+// Only a list kept in hap's own database can be dropped. A local file and a
+// gist entry are the operator's own — hap did not create the directory or the
+// gist and must not delete out of either — which the backend says itself; the
+// check here is the early, friendlier form of the same refusal.
+//
+// It is NOT "prevent recreation": a still-configured source recreates its list
+// on demand with a fresh header, so the confirmation says so before acting.
+func taskDropList(ctx context.Context, app *frontend.App, out io.Writer, agent, path string, rest []string) error {
+	skipConfirm := false
+	for _, a := range rest {
+		switch a {
+		case "--yes", "-y":
+			skipConfirm = true
+		default:
+			return fmt.Errorf("task drop-list takes no arguments (got %q) — it removes the WHOLE list; to delete one task use: task %s remove <n>",
+				a, targetSpelling(agent, path))
+		}
+	}
+	resolved, _, err := app.TaskListFor(agent, path)
+	if err != nil {
+		return err
+	}
+	if !isDBLocator(resolved) {
+		return fmt.Errorf("%s is not kept in the hap database, so it is not hap's to delete — remove it yourself "+
+			"(only sources whose provider is %q can be dropped)", tasklocator.Display(resolved), config.ProviderSQLite)
+	}
+	// A missing list is not a failure here — the caller asked for it to be
+	// gone and it is — so the count degrades to zero rather than aborting.
+	// Without this, dropping an already-gone list errors out before it can
+	// report "nothing to delete", which is also the shape a cross-node drop
+	// takes under the default engine, where another machine's row is simply
+	// not in this database.
+	items, err := app.ListTasks("", resolved)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if !skipConfirm {
+		// Scripted (non-TTY) runs must opt in explicitly, matching task send
+		// and the signatures delete/reset confirmations; tests inject stdin.
+		if stdin == os.Stdin && !stdinIsTTY() {
+			return fmt.Errorf("confirmation needs a terminal; rerun as: task %s drop-list --yes", targetSpelling(agent, path))
+		}
+		// The item count rides along for the same reason task send prints the
+		// task: this is the one moment the operator authorizes the loss, so it
+		// is the last place the size of it may be omitted. The recreation note
+		// is not a caveat but the answer to the question the operator asks
+		// next, and it stops this being filed as a bug.
+		fmt.Fprintf(out, "delete task list %s and its %d task(s)? a configured source recreates it empty [y/N] ",
+			tasklocator.Display(resolved), len(items))
+		answer := ""
+		if _, err := fmt.Fscanln(stdin, &answer); err != nil {
+			answer = "" // EOF or a bare newline both read as the default No
+		}
+		if a := strings.ToLower(strings.TrimSpace(answer)); a != "y" && a != "yes" {
+			fmt.Fprintln(out, "aborted — task list unchanged")
+			return nil
+		}
+	}
+	deleted, err := app.DeleteTaskList(ctx, resolved)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		// Not an error: the caller asked for it to be gone and it is. Under
+		// the default engine each machine has its own database file, so this
+		// is also what a cross-node --node/--path drop reports there — the row
+		// is not missing, it was never on this machine to begin with.
+		fmt.Fprintf(out, "no task list at %s — nothing to delete\n", tasklocator.Display(resolved))
+		return nil
+	}
+	fmt.Fprintf(out, "deleted task list %s (%d task(s))\n", tasklocator.Display(resolved), len(items))
+	return nil
+}
+
+// targetSpelling renders the target back the way the operator named it, so a
+// suggested rerun is one they can paste.
+func targetSpelling(agent, path string) string {
+	if agent != "" {
+		return agent
+	}
+	return "--path " + path
 }
 
 // oneLineText compacts task text for the confirmation prompt, truncating by

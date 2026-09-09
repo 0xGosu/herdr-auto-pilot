@@ -400,6 +400,39 @@ type TaskListStore interface {
 	ListTaskLists(ctx context.Context) ([]domain.StoredTaskList, error)
 }
 
+// TaskListDeleter is the OPTIONAL store capability that removes a task list
+// outright. Separate from TaskListStore rather than a method on it: three
+// fakes implement that interface today, and a store that cannot delete simply
+// never does — the same shape RowRetentionPort has against RetentionPort.
+//
+// locator is the caller's canonical db:// locator for (nodeID, name). The
+// store does not mint one: internal/tasklocator is the ONE canonicalizer and
+// internal/store deliberately does not import it, which would pull
+// internal/config in for a string join. The locator is what addresses the
+// task_reservations rows that pointed at this list — they carry the canonical
+// locator in source_path with no foreign key behind it, and PruneAgedRows
+// spares an unconfirmed one at ANY age so reclaimStrandedTasks can return its
+// item to "[ ]". Left behind, that reclaim re-reads a list that no longer
+// exists on every sweep, forever. So the two deletes are one transaction.
+type TaskListDeleter interface {
+	DeleteTaskList(ctx context.Context, nodeID, name, locator string) (deleted bool, err error)
+}
+
+// TaskListRemover is the OPTIONAL backend capability behind a forced removal,
+// the mirror of EnsureCreator one layer up: it addresses the list by LOCATOR,
+// so it reaches another node's row exactly as Mutate does.
+//
+// Implemented ONLY by the database backend. A local file and a gist entry are
+// the operator's own to remove — hap did not create the directory or the gist
+// and must not delete out of either — so those backends decline and the
+// refusal names the address the operator should go to instead.
+type TaskListRemover interface {
+	// Delete removes the list and reports whether a list was there to remove.
+	// A missing list is (false, nil), never an error: the caller asked for it
+	// to be gone and it is.
+	Delete(ctx context.Context, locator string) (deleted bool, err error)
+}
+
 // RemoteTaskStore marks a store whose reads and writes leave the machine.
 //
 // Optional, and the daemon's whole risk control: absent, every task-list read

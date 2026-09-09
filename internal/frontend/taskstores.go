@@ -193,3 +193,44 @@ func (a *App) ensureList(ctx context.Context, cfg config.Config, locator, initia
 	}
 	return creator.Ensure(ctx, locator, initial)
 }
+
+// deleteList removes a checklist outright, reporting whether one was there.
+//
+// Removal is an OPTIONAL capability and only the database backend has it: a
+// local file and a gist entry belong to the operator, so those decline and the
+// refusal names the address to go to instead. That is also why this resolves
+// through resolveList rather than parsing the locator — the backend is chosen
+// by SCHEME (taskstore.Registry.ForLocator), so a db:// locator naming ANOTHER
+// node resolves to the database backend and the delete reaches that node's row,
+// exactly as MoveTask on a fleet list already does. Nothing below this point
+// reads the source's config, which is what makes a cross-node removal need no
+// daemon and no agent_actions row: no pane is driven and the locator names its
+// own node, unlike a pane id.
+func (a *App) deleteList(ctx context.Context, cfg config.Config, locator string) (bool, error) {
+	l, err := a.resolveList(cfg, locator)
+	if err != nil {
+		return false, err
+	}
+	remover, ok := l.Store.(ports.TaskListRemover)
+	if !ok {
+		return false, fmt.Errorf("this task-list backend cannot delete %s — "+
+			"only lists kept in the hap database are hap's to remove; delete this one yourself", l.Display)
+	}
+	return remover.Delete(ctx, locator)
+}
+
+// DeleteTaskList removes the checklist at locator, whatever node keeps it, and
+// reports whether one was there. It is the forced removal behind
+// `hap task <target> drop-list` and the TUI's Tasks-tab delete: no age test, no
+// check that a task source still names the list.
+//
+// It is NOT "prevent recreation". A still-configured source recreates its list
+// on demand with a fresh header the next time anything writes to it, so both
+// surfaces say so before they act.
+func (a *App) DeleteTaskList(ctx context.Context, locator string) (bool, error) {
+	cfg, err := a.Config()
+	if err != nil {
+		return false, err
+	}
+	return a.deleteList(ctx, cfg, locator)
+}

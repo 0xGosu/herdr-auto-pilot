@@ -2857,6 +2857,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.pruneEscalationsPrompt()
 		case tabConfig:
 			return m.clearDataPrompt()
+		case tabTasks:
+			return m.dropTaskListPrompt()
 		}
 	}
 	return m, nil
@@ -4035,6 +4037,93 @@ func (m Model) deleteTasksPrompt() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m.confirmDeleteTaskTargets(targets, true)
+}
+
+// dropTaskListPrompt deletes a whole checklist from the hap database — the
+// heavier twin of `x`, which on a header retires the SOURCE and keeps the list.
+// Both directions exist because they are genuinely different repairs: a dead
+// [[task_sources]] entry, or a list nothing reads any more.
+//
+// X rather than x for the same reason it is the shift key on the Escalations
+// and Config tabs: it is the bigger, less recoverable version of the key beside
+// it. It is deliberately a HEADER action — a list is what a header names, and
+// binding it to an item row would put "delete this task" and "delete every
+// task" one shift apart on the same row.
+//
+// Local or fleet, one path: the delete addresses the list by LOCATOR, which the
+// store resolves to the owning node's task_lists row, exactly as MoveTask on a
+// fleet list already does. Nothing below this point reads the source's config,
+// which is what makes another node's list reachable without a daemon.
+func (m Model) dropTaskListPrompt() (tea.Model, tea.Cmd) {
+	r := m.selectedTaskRow()
+	if r == nil || !r.header {
+		m.message = "X deletes a whole task list — move the cursor onto a list header (x deletes one task)"
+		return m, nil
+	}
+	g, ok := m.taskGroupAt(r.group)
+	if !ok {
+		// The synthetic error group FleetTaskGroups returns for an unreadable
+		// store: it renders but describes no list, so say what is wrong rather
+		// than acting on a group with no locator.
+		if g.Err != "" {
+			m.message = g.Err
+		}
+		return m, nil
+	}
+	if g.Err != "" {
+		m.message = g.Err
+		return m, nil
+	}
+	if !isDBTaskLocator(g.Locator) {
+		// A file or a gist belongs to the operator — hap did not create the
+		// directory or the gist and must not delete out of either. The backend
+		// refuses too; this is the early, friendlier form.
+		m.message = fmt.Sprintf("%s is not kept in the hap database, so it is not hap's to delete — remove it yourself",
+			g.Display)
+		return m, nil
+	}
+	app, locator, display := m.app, g.Locator, g.Display
+	drop := m.doResult(func(c context.Context) (string, error) {
+		deleted, err := app.DeleteTaskList(c, locator)
+		if err != nil {
+			return "", err
+		}
+		if !deleted {
+			return fmt.Sprintf("no task list at %s — nothing to delete", display), nil
+		}
+		return fmt.Sprintf("task list %s deleted", display), nil
+	})
+	m.confirm = &confirmation{
+		// Consequence first, in the house style of removeTaskSourcePrompt: the
+		// item count because this is the one moment the operator authorizes
+		// the loss, and the recreation note because it is the question they
+		// ask next — without it this gets filed as "the list came back".
+		label: fmt.Sprintf("delete task list %s and its %d task(s)? a configured source recreates it empty",
+			display, len(g.Items)),
+		// Every mark is a positional group#item into a list that is about to
+		// stop existing, and the groups after it all shift up one.
+		clearsTaskMarks: true,
+		// The 2s poll can land between the question and the answer. Re-find
+		// the list by LOCATOR rather than by group index, which is exactly
+		// what a refresh renumbers.
+		revalidate: func(cur Model) (string, bool) {
+			for _, now := range append(append([]frontend.TaskGroup{}, cur.data.tasks...), cur.data.fleetTasks...) {
+				if now.Locator == locator {
+					return "", true
+				}
+			}
+			return fmt.Sprintf("task list %s is no longer listed — re-check and retry", display), false
+		},
+		onConfirm: func() tea.Cmd { return drop },
+	}
+	return m, nil
+}
+
+// isDBTaskLocator reports whether a task group's address names a list kept in
+// the hap database (db://<node>/<name>) — the only lists hap may delete.
+func isDBTaskLocator(locator string) bool {
+	_, ok := tasklocator.ParseDB(locator)
+	return ok
 }
 
 // taskSourceRemovable reports whether a task source may be retired from the
@@ -7268,7 +7357,7 @@ func (m Model) helpLine() string {
 	case tabAgents:
 		return "v: details  x: disable  e: enable  n: rename agent  f: focus in herdr  t: see tasks  /: search  " + common
 	case tabTasks:
-		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  K/J: move up/down  x: delete (source on a header)  space: mark  f: focus in herdr  /: search  " + common
+		return "enter/y: send to agent  v: details  a: add  e: edit  d: done/undone  K/J: move up/down  x: delete (source on a header)  X: delete list  space: mark  f: focus in herdr  /: search  " + common
 	case tabEscalations:
 		// `b` is offered only while the selected row was actually forced by a
 		// builtin rule — on every other escalation the key has nothing to act

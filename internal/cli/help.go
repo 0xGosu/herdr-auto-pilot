@@ -534,6 +534,10 @@ func buildCommands() {
 				"safety rule, not a nicety — auto-accept reads a pending escalation's excerpt as\n" +
 				"the proof that a menu was standing.\n\n" +
 				"The daemon does this once a day on its own; run it by hand to reclaim now.\n" +
+				"Its daily pass does MORE than this verb: it also deletes finished bookkeeping\n" +
+				"rows and reclaims `sqlite`-provider task lists nothing can reach any more\n" +
+				"(`[logging] row_retention_days`). Neither runs here — this verb is the excerpt\n" +
+				"half only. To remove one list now, use `hap task <agent> drop-list`.\n" +
 				"Reclaiming rebuilds the database, which briefly takes a write lock — a running\n" +
 				"daemon may retry an audit write while that happens. Nothing is lost; it is just\n" +
 				"not instant on a large database.",
@@ -1047,13 +1051,14 @@ func buildCommands() {
 				"hap task [<agent> | <source-index> | --path <file>] remove <n>",
 				"hap task [<agent> | <source-index> | --path <file>] move <n> <position|up|down>",
 				"hap task <agent> send <n> [--yes]",
-				"hap task --node <node> <agent> list|get|add|start|done|undone|update|remove|move …",
+				"hap task [<agent> | <source-index> | --path <file>] drop-list [--yes]",
+				"hap task --node <node> <agent> list|get|add|start|done|undone|update|remove|move|drop-list …",
 			},
 			Flags: []FlagDoc{
 				{Name: "--path", Arg: "FILE", Desc: "operate on any checklist file directly, instead of resolving an agent's configured source"},
 				{Name: "--node", Arg: "NODE", Desc: "operate on another machine's list kept in the shared hap database (a `sqlite`-provider source); NODE is its label or node id, followed by the agent or list name"},
 				{Name: "--status", Arg: "S", Default: "all", Desc: "list filter: all, pending, or done"},
-				{Name: "--yes, -y", Desc: "send: skip the y/N confirmation (required when stdin is not a terminal)"},
+				{Name: "--yes, -y", Desc: "send and drop-list: skip the y/N confirmation (required when stdin is not a terminal)"},
 			},
 			Details: "<n> is a task REFERENCE, not always a position: when the list numbers its own\n" +
 				"tasks, use that id (e.g. `done 3.4`); '#3' always means the 3rd item in the file\n" +
@@ -1082,7 +1087,15 @@ func buildCommands() {
 				"and reaches only agents on this machine — `--node` does not extend it, because\n" +
 				"`hap task` reads the list through this node's [[task_sources]]. Use the TUI's\n" +
 				"Tasks tab, which renders fleet lists from the shared database, to send remotely.\n" +
-				"Normally you do not need `send`: the daemon hands out the next task by itself.",
+				"Normally you do not need `send`: the daemon hands out the next task by itself.\n" +
+				"`drop-list` deletes the WHOLE list, not a task — only one kept in the hap\n" +
+				"database (a `sqlite`-provider source); a file or a gist is yours to remove. It\n" +
+				"is spelled out in full because `remove` is already the item-level delete. It\n" +
+				"does not stop the list coming back: a source that still names it recreates it\n" +
+				"empty on demand, so drop the source too (`hap config task-source remove`) when\n" +
+				"that is what you meant. With `--node` it reaches another machine's list, which\n" +
+				"needs a shared store — under the default engine each machine has its own\n" +
+				"database file and another node's list is simply not there.",
 			Examples: []string{
 				"hap task vivid-falcon list",
 				"hap task vivid-falcon list --status pending",
@@ -1092,6 +1105,8 @@ func buildCommands() {
 				"hap task --path ./docs/tasks.md add \"write the migration test\"",
 				"hap task vivid-falcon move 5 1",
 				"hap task vivid-falcon move 3.4 up",
+				"hap task vivid-falcon drop-list",
+				"hap task --node build-box vivid-falcon drop-list --yes",
 			},
 			Next: []Hint{
 				{Cmd: "hap task <agent> list", Why: "the items, with their numbers"},

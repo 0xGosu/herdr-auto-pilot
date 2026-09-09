@@ -12,7 +12,10 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
-var _ ports.TaskListStore = (*Store)(nil)
+var (
+	_ ports.TaskListStore   = (*Store)(nil)
+	_ ports.TaskListDeleter = (*Store)(nil)
+)
 
 // taskListCASAttempts bounds how often MutateTaskList re-reads after losing a
 // revision race. Each loss means another writer committed between the read and
@@ -136,4 +139,51 @@ func scanTaskList(r rowScanner) (domain.StoredTaskList, error) {
 
 func taskListNotFound(nodeID, name string) error {
 	return fmt.Errorf("task list %q on node %s: %w", name, nodeID, fs.ErrNotExist)
+}
+
+// errNoTaskListRow rolls back a delete that matched nothing. It never leaves
+// DeleteTaskList: a missing list is (false, nil), because the caller asked for
+// it to be gone and it is. The rollback is what matters — s.tx calls noteWrite
+// on COMMIT, and every store write arms the 2s-debounced turso push, so a
+// sweep that reclaims nothing must not push.
+var errNoTaskListRow = errors.New("no such task list")
+
+// DeleteTaskList removes one node's list together with the task reservations
+// that addressed it, in one transaction, and reports whether a list was there.
+//
+// locator is the caller's canonical db:// locator for (nodeID, name). This
+// package does not mint one: internal/tasklocator is the ONE canonicalizer,
+// and importing it here would pull internal/config into internal/store for a
+// string join. The store stays a faithful writer of what it is handed.
+//
+// The reservation half is not housekeeping. task_reservations.source_path is
+// that canonical locator with no foreign key behind it, and PruneAgedRows
+// spares an unconfirmed row at ANY age precisely so daemon.reclaimStrandedTasks
+// can return its item to "[ ]". Against a deleted list that reclaim can never
+// succeed and never stops trying, so the rows go with the list they described.
+func (s *Store) DeleteTaskList(ctx context.Context, nodeID, name, locator string) (bool, error) {
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM task_lists WHERE node_id = ? AND name = ?`, nodeID, name)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return errNoTaskListRow
+		}
+		_, err = tx.ExecContext(ctx,
+			`DELETE FROM task_reservations WHERE node_id = ? AND source_path = ?`, nodeID, locator)
+		return err
+	})
+	if errors.Is(err, errNoTaskListRow) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }

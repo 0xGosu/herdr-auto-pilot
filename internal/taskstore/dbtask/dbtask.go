@@ -33,8 +33,9 @@ type Store struct {
 }
 
 var (
-	_ ports.TaskStore     = (*Store)(nil)
-	_ ports.EnsureCreator = (*Store)(nil)
+	_ ports.TaskStore       = (*Store)(nil)
+	_ ports.EnsureCreator   = (*Store)(nil)
+	_ ports.TaskListRemover = (*Store)(nil)
 )
 
 // New returns the database task store over lists. It deliberately does NOT
@@ -87,6 +88,27 @@ func (s *Store) Ensure(ctx context.Context, locator, initial string) (bool, erro
 		return false, fmt.Errorf("%w: %s", ErrBlankContent, tasklocator.Display(locator))
 	}
 	return s.lists.EnsureTaskList(ctx, ref.NodeID, ref.Name, agentOf(ref.Name), initial, s.now())
+}
+
+// Delete removes the list outright and reports whether one was there. It is
+// the only backend that implements ports.TaskListRemover: a local file and a
+// gist entry belong to the operator, while a row in hap's own database is
+// hap's to reclaim.
+//
+// Like every other method here it addresses the list by LOCATOR, so it reaches
+// another node's row exactly as Mutate does — under a shared (turso) store the
+// row is right there; under the default engine each machine has its own file
+// and another node's list is simply not present, which reads as (false, nil).
+func (s *Store) Delete(ctx context.Context, locator string) (bool, error) {
+	ref, err := refOf(locator)
+	if err != nil {
+		return false, err
+	}
+	deleter, ok := s.lists.(ports.TaskListDeleter)
+	if !ok {
+		return false, fmt.Errorf("this store cannot delete task lists: %s", tasklocator.Display(locator))
+	}
+	return deleter.DeleteTaskList(ctx, ref.NodeID, ref.Name, locator)
 }
 
 func refOf(locator string) (tasklocator.DBRef, error) {
