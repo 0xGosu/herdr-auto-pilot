@@ -592,6 +592,13 @@ func TestRealClaudeConsult(t *testing.T) {
 	// throwaway store cannot deliver anything since 0.8.0, so anyone enabling the
 	// real-claude cases to check something else met the same refusal with no clue
 	// why.
+	//
+	// Note what starting it HERE means: the approval is already standing, so the
+	// daemon's startup reconcile captures that pane and raises its own escalation
+	// for it before the confirm below lands. Harmless only because the store is
+	// fresh — with no graduated rule, that pass can escalate and never send, so it
+	// cannot answer the menu out from under this test. A fixture that ever seeded
+	// a rule into this store would break that, not this test's own logic.
 	h := newTestDaemon(t, cli, "")
 	dctx, cancel := context.WithCancel(context.Background())
 	runDaemon(t, dctx, cancel, h.Daemon)
