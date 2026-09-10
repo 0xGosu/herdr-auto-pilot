@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.8
+
+- Fixed the confirm-delivery integration tests, which could not pass since 0.8.0 and had silently switched off the guard on the send-content regression (that confirming a label reply selects the numbered menu digit rather than pasting the label).
+- Fixed the task-summary integration tests, which escalated instead of consulting because their scratch pane's output was short enough to fit on screen, and the daemon's classification read returns nothing until a pane has scrolled.
+
 ## 0.9.7
 
 - Changed the Claude session-name sync to leave you alone: it acts on a session only while the agent is parked, its composer untouched, and it has been sitting quietly — so a `/rename` no longer lands on a session you have just opened and are about to type into. In practice a name now settles a minute or two after an agent goes quiet, rather than seconds.
