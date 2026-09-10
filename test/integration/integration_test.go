@@ -25,10 +25,8 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/classify"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
-	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
 	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
-	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
 // herdrBin resolves the herdr binary the same way the plugin does.
@@ -197,30 +195,76 @@ func startScriptAgent(t *testing.T, name, body string) string {
 	return pane
 }
 
+// fillViewportSh is shell that pushes a scratch pane's output past its own
+// viewport before the interesting part is printed.
+//
+// It exists because `pane read --source recent` — the source the DAEMON
+// classifies from — is a scrollback-shaped delta, not the screen: verified live
+// (2026-09-10, herdr 0.8.2) it returns EMPTY for a pane whose entire output
+// still fits on screen, and returns content once that output has scrolled. Every
+// real agent pane has scrolled (a live claude pane returns kilobytes), which is
+// why production never meets this; a five-line scratch script had not, so the
+// daemon captured nothing and escalated `unclassifiable` / `over_masked` instead
+// of consulting — with no wall-clock involved. Only the cases that drive the real
+// daemon need it; the delivery cases read `--source visible` and are unaffected,
+// but they share these helpers and a scrolled pane is no worse for them.
+//
+// The height comes from `tput lines` INSIDE the pane, so the fixture does not
+// silently depend on how tall the operator's terminal happens to be — which is
+// the same class of hidden environmental assumption as the fixed sleep this
+// replaces. Digit-free filler on purpose: the classifier masks numbers to
+// placeholders, and a salient made mostly of placeholders trips the over-masking
+// floor, which is the other way these captures fail.
+const fillViewportSh = "for _ in $(seq 1 $(( $(tput lines 2>/dev/null || echo 60) + 20 ))); do " +
+	"echo 'preparing the workspace, one moment please'; done\n"
+
 // startMenuAgent spawns a scratch agent that presents a numbered menu
 // (bash `select`, exactly the shape Claude's approvals use) and returns its
 // pane id. The agent writes its picked option to markerPath.
 func startMenuAgent(t *testing.T, markerPath string) string {
 	t.Helper()
 	return startScriptAgent(t, "hapitest", "#!/bin/bash\n"+
+		fillViewportSh+
 		"echo 'Do you want to proceed?'\n"+
 		"select x in Yes No; do echo \"$x\" > "+markerPath+"; break; done\n"+
 		"sleep 60\n")
 }
 
-func waitForMenu(t *testing.T, cli *herdr.CLI, pane string) {
+// paneTextTimeout bounds every "has the scratch pane painted yet" wait.
+//
+// Generous because the thing being waited on is a shell start plus a script's
+// first write, and the suite's own daemons reconcile the whole herd at the same
+// moment. The alternative to waiting is what issue #397 was: a fixed sleep that
+// held on an idle machine and lost under full-suite load.
+const paneTextTimeout = 15 * time.Second
+
+// waitForPaneText blocks until want is on the pane's screen, failing the test
+// (never skipping) if it never arrives — a scratch pane that does not paint is a
+// broken fixture, and falling through would classify an empty screen instead.
+//
+// It reads --source visible, deliberately: --source recent is a CONSUMING delta,
+// so polling it here would eat the very capture the daemon under test is about
+// to take.
+func waitForPaneText(t *testing.T, cli *herdr.CLI, pane, want string) {
 	t.Helper()
-	deadline := time.Now().Add(8 * time.Second)
+	last := ""
+	deadline := time.Now().Add(paneTextTimeout)
 	for time.Now().Before(deadline) {
-		// Visible source: the standing menu is on screen but not in the
-		// consuming "recent" delta ReadPane returns.
-		if content, err := cli.ReadPaneVisible(context.Background(), pane, 20); err == nil &&
-			strings.Contains(content, "1) Yes") {
-			return
+		if content, err := cli.ReadPaneVisible(context.Background(), pane, 20); err == nil {
+			last = content
+			if strings.Contains(content, want) {
+				return
+			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	t.Fatal("menu did not appear in the scratch pane")
+	t.Fatalf("%q never appeared in scratch pane %s within %s; last read:\n%s",
+		want, pane, paneTextTimeout, last)
+}
+
+func waitForMenu(t *testing.T, cli *herdr.CLI, pane string) {
+	t.Helper()
+	waitForPaneText(t, cli, pane, "1) Yes")
 }
 
 // TestRealPaneInfo verifies the InspectorPort against a live herdr pane:
@@ -259,6 +303,14 @@ func TestRealPaneInfo(t *testing.T) {
 // bug: an operator confirming an approval whose learned reply is the option
 // LABEL ("Yes") must actually select the numbered menu — i.e. the plugin
 // delivers the digit "1", not the ignored literal "Yes".
+//
+// Since 0.8.0 that delivery is the DAEMON's, so proving it needs one: the App
+// queues an agent_actions row and waits for the owning node's daemon to type it.
+// This test therefore runs its own daemon over its own temp store (see
+// testDaemon.App for why every field of that wiring is load-bearing) rather than
+// borrowing the operator's live one — which would mean writing the suite's
+// scratch rows into the real store, and under the turso engine pushing them to
+// the operator's cloud database. Issue #396.
 func TestRealConfirmDeliversMenuDigit(t *testing.T) {
 	requireHerdr(t)
 	cli := herdr.NewCLI()
@@ -266,16 +318,12 @@ func TestRealConfirmDeliversMenuDigit(t *testing.T) {
 	pane := startMenuAgent(t, marker)
 	waitForMenu(t, cli, pane)
 
-	// A real frontend.App over a real herdr adapter and a temp store.
-	st, err := store.Open(filepath.Join(t.TempDir(), "hap.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	app := &frontend.App{Store: st, Herdr: cli, Author: "itest"}
+	h := newTestDaemon(t, cli, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	runDaemon(t, ctx, cancel, h.Daemon)
+	app := h.App()
 
-	ctx := context.Background()
-	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+	id, err := h.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: pane, SituationType: domain.SituationApproval, Trigger: "t",
 		Action: "escalated", Status: "escalated",
 		Suggestion: "LLM suggested: Yes", CreatedAt: time.Now(),
@@ -368,15 +416,15 @@ func TestRealConfirmDeliversRemoteEnvSelection(t *testing.T) {
 		t.Fatalf("picker never rendered; last read %q", lastRead)
 	}
 
-	st, err := store.Open(filepath.Join(t.TempDir(), "hap.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	app := &frontend.App{Store: st, Herdr: cli, Author: "itest"}
+	// A daemon of its own for the same reason the menu-digit case has one: the
+	// confirm is queued, and only a daemon over THIS store will type it.
+	h := newTestDaemon(t, cli, "")
+	dctx, cancel := context.WithCancel(context.Background())
+	runDaemon(t, dctx, cancel, h.Daemon)
+	app := h.App()
 
 	ctx := context.Background()
-	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+	id, err := h.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: pane, AgentType: "claude", SituationType: domain.SituationApproval,
 		Trigger: "t", Action: "escalated", Status: "escalated",
 		Suggestion: "LLM suggested: Env-3 (env_03ABCDEFGHIJKLMNOPQRSTUVWX)", CreatedAt: time.Now(),
@@ -538,14 +586,25 @@ func TestRealClaudeConsult(t *testing.T) {
 	// Confirm through the plugin, exactly as an operator pressing Enter in
 	// the Escalations tab would: the learned reply is the LABEL "Yes"; the
 	// send fix must deliver the menu digit so claude proceeds.
-	st, err := store.Open(filepath.Join(work, "hap.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	app := &frontend.App{Store: st, Herdr: cli, Author: "itest"}
+	//
+	// Its own daemon, like the two script-stand-in cases: this construction is
+	// what hid #396 behind HAP_ITEST_CLAUDE — an App with no DaemonInfo and a
+	// throwaway store cannot deliver anything since 0.8.0, so anyone enabling the
+	// real-claude cases to check something else met the same refusal with no clue
+	// why.
+	//
+	// Note what starting it HERE means: the approval is already standing, so the
+	// daemon's startup reconcile captures that pane and raises its own escalation
+	// for it before the confirm below lands. Harmless only because the store is
+	// fresh — with no graduated rule, that pass can escalate and never send, so it
+	// cannot answer the menu out from under this test. A fixture that ever seeded
+	// a rule into this store would break that, not this test's own logic.
+	h := newTestDaemon(t, cli, "")
+	dctx, cancel := context.WithCancel(context.Background())
+	runDaemon(t, dctx, cancel, h.Daemon)
+	app := h.App()
 	ctx := context.Background()
-	id, err := st.AppendAudit(ctx, domain.AuditRecord{
+	id, err := h.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: pane, SituationType: domain.SituationApproval, Trigger: "t",
 		Action: "escalated", Status: "escalated",
 		Suggestion: "LLM suggested: Yes", CreatedAt: time.Now(),

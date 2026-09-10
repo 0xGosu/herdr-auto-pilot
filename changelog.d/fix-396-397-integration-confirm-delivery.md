@@ -1,0 +1,2 @@
+- Fixed the confirm-delivery integration tests, which could not pass since 0.8.0 and had silently switched off the guard on the send-content regression (that confirming a label reply selects the numbered menu digit rather than pasting the label).
+- Fixed the task-summary integration tests, which escalated instead of consulting because their scratch pane's output was short enough to fit on screen, and the daemon's classification read returns nothing until a pane has scrolled.
