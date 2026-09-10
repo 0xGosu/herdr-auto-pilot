@@ -3174,3 +3174,64 @@ func TestSignaturesSearchScreenQuotedPhrase(t *testing.T) {
 		t.Errorf("a quoted phrase must match contiguously:\n%s", out)
 	}
 }
+
+// TestSignaturesSearchHintPreservesPhraseBoundaries — the cross-mode hints are
+// copy-pasteable commands, and for a screen search the argv boundaries ARE the
+// semantics: one entry is one term. Echoing the joined query would re-emit a
+// quoted phrase as separate bare words, so running the suggestion would widen
+// the search and match screens the operator's own command would not.
+func TestSignaturesSearchHintPreservesPhraseBoundaries(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:hintq001", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSignatureSnapshot(ctx, "approval:hintq001", "Bash(ls)\n  1. Yes", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A quoted phrase plus a bare word, matching nothing, so the hints print.
+	out, err := run(t, app, "signatures", "search", "zzz nope", "alsonope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `hap signatures search 'zzz nope' alsonope --screen`) {
+		t.Errorf("keyword hint must re-quote the phrase so the suggestion reproduces the query:\n%s", out)
+	}
+	// The bug being guarded: the phrase re-emitted as bare words.
+	if strings.Contains(out, "search zzz nope alsonope") {
+		t.Errorf("hint dropped the phrase boundary:\n%s", out)
+	}
+
+	// Same from the screen side, pointing back at the default mode.
+	out, err = run(t, app, "signatures", "search", "--screen", "zzz nope", "alsonope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `hap signatures search 'zzz nope' alsonope`) {
+		t.Errorf("screen hint must re-quote the phrase:\n%s", out)
+	}
+
+	// A word carrying a shell metacharacter is quoted too, or the suggestion
+	// is not safe to paste.
+	out, err = run(t, app, "signatures", "search", "--screen", "rm -rf", "nope;echo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `'nope;echo'`) {
+		t.Errorf("a word with a shell metacharacter must be quoted:\n%s", out)
+	}
+
+	// An ordinary single-word query stays unquoted — the common case must not
+	// grow noise.
+	out, err = run(t, app, "signatures", "search", "zzznope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "hap signatures search zzznope --screen") {
+		t.Errorf("a plain word should not be quoted:\n%s", out)
+	}
+}

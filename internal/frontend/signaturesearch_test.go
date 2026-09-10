@@ -487,3 +487,58 @@ func sigsOf(rs []frontend.SignatureSearchResult) []string {
 	}
 	return out
 }
+
+// TestScreenMatchSurvivesWidthChangingCaseFolds is the regression for a match=
+// window that drifted off its own hit.
+//
+// The hit offset is found in the FOLDED screen, but the excerpt is sliced from
+// the ORIGINAL. Runes like "İ" and "ẞ" lose bytes when lower-cased (2→1 and
+// 3→2), so a byte offset taken in the folded text under-counts against the
+// original by one byte per such rune — and enough of them ahead of the hit
+// slide the window clear of the term it exists to show. foldRunewise keeps
+// rune COUNT identical instead, so a rune index means the same thing in both.
+func TestScreenMatchSurvivesWidthChangingCaseFolds(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedSearchRule(t, st, "approval:folds001", "claude", "m.gguf", "permission:proceed", []float32{1, 0, 0})
+	// Far more drift than half the window, so a byte-offset bug cannot land
+	// the term inside the excerpt by luck.
+	drift := strings.Repeat("İ", 200) + strings.Repeat("ẞ", 200)
+	seedScreen(t, st, "approval:folds001", drift+"\nBash(npm install --force)\n  1. Yes")
+
+	got, _, err := app.SearchSignaturesWithStats(ctx, "npm",
+		frontend.SignatureSearchOpts{Screen: true}, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want one match, got %v", sigsOf(got))
+	}
+	if !strings.Contains(got[0].Match, "npm") {
+		t.Errorf("match= drifted off its own hit: %q", got[0].Match)
+	}
+	if !utf8.ValidString(got[0].Match) {
+		t.Errorf("match= is not valid UTF-8: %q", got[0].Match)
+	}
+}
+
+// TestScreenSearchFoldsBothSidesTheSameWay — a needle carrying one of those
+// runes must still match the screen that contains it. Folding only the
+// haystack (or only the needle) makes exactly these terms unsearchable.
+func TestScreenSearchFoldsBothSidesTheSameWay(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedSearchRule(t, st, "approval:folds002", "claude", "m.gguf", "permission:proceed", []float32{1, 0, 0})
+	seedScreen(t, st, "approval:folds002", "Bash(rm -rf /İSTANBUL/data)\n  1. Yes")
+
+	for _, q := range []string{"İSTANBUL", "istanbul", "İstanbul"} {
+		got, _, err := app.SearchSignaturesWithStats(ctx, q,
+			frontend.SignatureSearchOpts{Screen: true, Terms: []string{q}}, domain.SignatureFilter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 {
+			t.Errorf("query %q matched %v, want the rule", q, sigsOf(got))
+		}
+	}
+}

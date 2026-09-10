@@ -413,6 +413,30 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 // fields and its salient text) or, with --semantic, by embedding the query and
 // ranking rules by cosine similarity. Keyword is the default; --semantic needs
 // the configured embedding model.
+// shellJoin renders argv words as a copy-pasteable command tail, single-quoting
+// any word a shell would otherwise re-split or interpret.
+//
+// The hints it feeds are commands an operator is invited to run, and for a
+// screen search the argv boundaries ARE the semantics: one entry is one term,
+// so a quoted phrase re-emitted bare becomes several independent terms and
+// matches screens the original query would not. Quoting is applied to every
+// mode's hint, not just --screen, so a suggested command always reproduces the
+// query it claims to re-run.
+//
+// Single quotes are the safe shell form — nothing inside them is expanded —
+// with an embedded quote closed, escaped and reopened ('\”).
+func shellJoin(words []string) string {
+	out := make([]string, 0, len(words))
+	for _, w := range words {
+		if w != "" && !strings.ContainsAny(w, " \t\n'\"\\$`*?[]{}()<>|&;#~!") {
+			out = append(out, w)
+			continue
+		}
+		out = append(out, "'"+strings.ReplaceAll(w, "'", `'\''`)+"'")
+	}
+	return strings.Join(out, " ")
+}
+
 func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("signatures search", flag.ContinueOnError)
 	semantic := fs.Bool("semantic", false, "embedding search: rank rules by meaning (needs the embedding model)")
@@ -450,6 +474,12 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 	if query == "" {
 		return fmt.Errorf("usage: signatures search <query> [--screen] [--semantic] [--limit N] [--min-score S] [filters] (see: hap help signatures)")
 	}
+	// The cross-mode hints below are meant to be copy-pasted, so they re-quote
+	// the ORIGINAL argv words rather than echoing the joined query: a screen
+	// search reads each argv entry as one term, so re-running an unquoted
+	// `"npm install" force` as three bare words silently widens the phrase and
+	// can match screens the operator's own command would not.
+	quoted := shellJoin(words)
 	switch *situation {
 	case "", "idle", "approval", "choice", "error":
 	default:
@@ -498,15 +528,15 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 		hints := []Hint{{Cmd: "hap signatures list", Why: "every learned rule, unfiltered"}}
 		if *screen {
 			hints = append(hints,
-				Hint{Cmd: "hap signatures search " + query,
+				Hint{Cmd: "hap signatures search " + quoted,
 					Why: "the rule's own fields and its masked salient instead"},
-				Hint{Cmd: "hap signatures search " + query + " --semantic",
+				Hint{Cmd: "hap signatures search " + quoted + " --semantic",
 					Why: "search by meaning instead of exact words"})
 		} else if !*semantic {
 			hints = append(hints,
-				Hint{Cmd: "hap signatures search " + query + " --screen",
+				Hint{Cmd: "hap signatures search " + quoted + " --screen",
 					Why: "search the captured screens, where literal paths and commands survive"},
-				Hint{Cmd: "hap signatures search " + query + " --semantic",
+				Hint{Cmd: "hap signatures search " + quoted + " --semantic",
 					Why: "search by meaning instead of exact words"})
 		} else if drift, derr := app.EmbeddingDrift(ctx); derr == nil && drift.Detected {
 			// Rules exist but their vectors were embedded by a previous model,
@@ -539,10 +569,10 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 	prefix := strings.TrimSuffix(shortSignature(results[0].Signature), "…")
 	hints := []Hint{{Cmd: "hap signatures show " + prefix, Why: "the original situation, plus recent decisions"}}
 	if *screen {
-		hints = append(hints, Hint{Cmd: "hap signatures search " + query,
+		hints = append(hints, Hint{Cmd: "hap signatures search " + quoted,
 			Why: "the same words over the rule's fields and masked salient"})
 	} else if !*semantic {
-		hints = append(hints, Hint{Cmd: "hap signatures search " + query + " --semantic",
+		hints = append(hints, Hint{Cmd: "hap signatures search " + quoted + " --semantic",
 			Why: "the same query, ranked by meaning"})
 	}
 	hints = append(hints, Hint{Cmd: "hap signatures list", Why: "every learned rule, unfiltered"})

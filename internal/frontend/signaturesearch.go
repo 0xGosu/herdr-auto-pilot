@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
@@ -210,7 +212,7 @@ func (a *App) screenSearch(ctx context.Context, query string, opts SignatureSear
 	needles := make([]string, 0, len(terms))
 	for _, t := range terms {
 		if t = strings.TrimSpace(t); t != "" {
-			needles = append(needles, strings.ToLower(t))
+			needles = append(needles, foldRunewise(t))
 		}
 	}
 	if len(needles) == 0 {
@@ -232,15 +234,18 @@ func (a *App) screenSearch(ctx context.Context, query string, opts SignatureSear
 			continue
 		}
 		stats.ScreensSearched++
-		hay := strings.ToLower(excerpt)
+		hay := foldRunewise(excerpt)
 		first, ok := firstHitAll(hay, needles)
 		if !ok {
 			continue
 		}
 		if len(out) < limit {
+			// foldRunewise preserves rune COUNT, so a rune index into the
+			// folded screen indexes the original one too — which is the whole
+			// reason it exists (see its doc comment).
 			out = append(out, SignatureSearchResult{
 				SignatureRow: r,
-				Match:        matchExcerpt(excerpt, first, MatchExcerptRunes),
+				Match:        matchExcerpt(excerpt, utf8.RuneCountInString(hay[:first]), MatchExcerptRunes),
 			})
 		}
 		// The loop runs on past the limit rather than breaking: ScreensSearched
@@ -269,23 +274,39 @@ func firstHitAll(hay string, needles []string) (int, bool) {
 	return first, true
 }
 
-// matchExcerpt returns about width runes of s centred on the byte offset at,
+// foldRunewise lower-cases s one rune at a time, which — unlike
+// strings.ToLower — is guaranteed to preserve the RUNE COUNT.
+//
+// That guarantee is what makes a hit position in the folded text usable
+// against the original. strings.ToLower applies special casing, so a few runes
+// fold to a different number of runes AND bytes ("İ" → "i̇", "ẞ" → "ß"): a
+// match offset taken in that string drifts from the original by one position
+// per such rune, and enough of them ahead of the hit slide the match= window
+// clear of the term it is supposed to be showing. unicode.ToLower is a
+// rune→rune map, so index i means the same thing in both strings.
+//
+// Both sides of a comparison must go through this, or the needle and the
+// haystack disagree on exactly those runes.
+func foldRunewise(s string) string {
+	return strings.Map(unicode.ToLower, s)
+}
+
+// matchExcerpt returns about width runes of s centred on the RUNE index at,
 // with newlines collapsed to spaces so the result stays one tab-separated
 // column, and an ellipsis on either side that was cut.
 //
 // It slices by RUNE, never by byte: captured screens are full of box-drawing
 // glyphs, the "…" truncation marker and non-ASCII typography, and a byte slice
 // through one of those emits replacement characters into an operator's
-// terminal.
+// terminal. The caller converts its folded-text hit with
+// utf8.RuneCountInString, which is exact because foldRunewise preserves rune
+// count.
 func matchExcerpt(s string, at, width int) string {
 	if s == "" {
 		return ""
 	}
 	runes := []rune(s)
-	// Byte offset → rune index. The hit is at a term boundary in the folded
-	// string, and ToLower can change byte lengths, so this is approximate by
-	// construction — it only has to centre the window, never to be exact.
-	hit := len([]rune(s[:min(at, len(s))]))
+	hit := min(max(at, 0), len(runes))
 	start := hit - width/2
 	if start < 0 {
 		start = 0
