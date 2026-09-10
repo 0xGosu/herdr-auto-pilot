@@ -2630,3 +2630,55 @@ func TestCountSignaturesByMode(t *testing.T) {
 		t.Fatalf("shadow count n=%d err=%v, want 1,nil", n, err)
 	}
 }
+
+// TestListSignatureSnapshotsReturnsEveryRawScreen covers the scan a screen
+// search reads. It runs under every HAP_STORE_TEST_MODE like the rest of this
+// suite, which is what proves the new statement survives the sqlbridge socket
+// proxy and the turso engine as well as plain sqlite.
+func TestListSignatureSnapshotsReturnsEveryRawScreen(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+
+	base := time.Now().Add(-time.Hour)
+	if err := st.SaveSignatureSnapshot(ctx, "approval:bbbb", "second screen", base.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSignatureSnapshot(ctx, "approval:aaaa", "first screen", base); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := st.ListSignatureSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("ListSignatureSnapshots = %d rows, want 2", len(got))
+	}
+	// Oldest first, matching ListSignatureEmbeddings.
+	if got[0].Signature != "approval:aaaa" || got[1].Signature != "approval:bbbb" {
+		t.Errorf("order = %q,%q; want oldest created_at first", got[0].Signature, got[1].Signature)
+	}
+	if got[0].Excerpt != "first screen" {
+		t.Errorf("excerpt = %q, want the raw screen back verbatim", got[0].Excerpt)
+	}
+	if got[0].CreatedAt.IsZero() {
+		t.Error("CreatedAt must round-trip")
+	}
+	// An excerpt is stored RAW: the search exists because the masked salient
+	// has already lost this text, so any normalization here would defeat it.
+	raw := "Bash(npm install --force)\n  1. Yes\t2. No  ▐▛▜▌"
+	if err := st.SaveSignatureSnapshot(ctx, "approval:cccc", raw, base.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	got, err = st.ListSignatureSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[len(got)-1].Excerpt != raw {
+		t.Errorf("excerpt was normalized: %q, want %q", got[len(got)-1].Excerpt, raw)
+	}
+}

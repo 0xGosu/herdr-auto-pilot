@@ -3050,3 +3050,188 @@ func TestSignaturesConfirm(t *testing.T) {
 		t.Error("confirm without a signature must print usage")
 	}
 }
+
+// TestSignaturesSearchScreen covers the CLI surface of a screen search: the
+// flag reaches the raw corpus, the match column is appended rather than
+// inserted, the denominator prints on both the hit and the miss, and the two
+// mutually-exclusive flags are refused.
+func TestSignaturesSearchScreen(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:screen11", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// The salient is MASKED — the literal command survives only on the screen.
+	if err := st.UpsertSignatureEmbedding(ctx, domain.SignatureEmbedding{
+		Signature: "approval:screen11", SituationType: domain.SituationApproval,
+		AgentType: "claude", Salient: "permission:proceed | options:no;yes", CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSignatureSnapshot(ctx, "approval:screen11",
+		"Bash(npm install --force)\n  1. Yes\n  2. No", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The default mode cannot find it: that is the bug this flag exists for.
+	out, err := run(t, app, "signatures", "search", "npm", "install")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no rules match") {
+		t.Fatalf("default search should NOT find a masked-away command:\n%s", out)
+	}
+
+	// --screen does, and says which corpus it searched.
+	out, err = run(t, app, "signatures", "search", "--screen", "npm", "install")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "approval:screen1") {
+		t.Errorf("screen search missed the rule:\n%s", out)
+	}
+	if !strings.Contains(out, "1 screen match(es)") {
+		t.Errorf("summary must name the screen mode, so the AND-of-terms divergence is visible:\n%s", out)
+	}
+	if !strings.Contains(out, "screen searched)") {
+		t.Errorf("summary must report the denominator:\n%s", out)
+	}
+	if !strings.Contains(out, `match="`) || !strings.Contains(out, "npm install --force") {
+		t.Errorf("result row must carry the hit excerpt:\n%s", out)
+	}
+	// match= is APPENDED: the columns scripts parse keep their positions, so
+	// the field before it is still the timestamp.
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "match=") {
+			continue
+		}
+		cols := strings.Split(line, "\t")
+		if len(cols) != 9 {
+			t.Errorf("result row has %d columns, want 8 + match=: %q", len(cols), line)
+		}
+		if !strings.HasPrefix(cols[len(cols)-1], "match=") {
+			t.Errorf("match= must be the LAST field: %q", line)
+		}
+	}
+
+	// An empty result still prints the denominator — that is what separates
+	// "nothing matched" from "there was nothing to match against".
+	out, err = run(t, app, "signatures", "search", "--screen", "zzzznope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no rules match the screen search") {
+		t.Errorf("empty screen result should name the mode:\n%s", out)
+	}
+	if !strings.Contains(out, "screen searched)") {
+		t.Errorf("empty screen result must still report the denominator:\n%s", out)
+	}
+
+	// The two corpora are mutually exclusive, and the refusal names both flags.
+	if _, err := run(t, app, "signatures", "search", "--screen", "--semantic", "npm"); err == nil {
+		t.Error("--screen --semantic must be refused")
+	}
+}
+
+// TestSignaturesSearchScreenQuotedPhrase pins the distinction the permuting
+// parser preserves: one shell-quoted argv entry is a phrase that must match
+// contiguously, while separate words are independent terms. Both spellings
+// produce the same joined query, so only threading the argv words apart keeps
+// them different.
+func TestSignaturesSearchScreenQuotedPhrase(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:phrase22", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Both words appear, never adjacently.
+	if err := st.SaveSignatureSnapshot(ctx, "approval:phrase22",
+		"Bash(npm ci)\n  pip install requests\n  1. Yes", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two argv words → two independent terms → match.
+	out, err := run(t, app, "signatures", "search", "--screen", "npm", "install")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "1 screen match(es)") {
+		t.Errorf("separate words are independent terms and should match:\n%s", out)
+	}
+
+	// One argv entry containing a space → a phrase → no match.
+	out, err = run(t, app, "signatures", "search", "--screen", "npm install")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "no rules match") {
+		t.Errorf("a quoted phrase must match contiguously:\n%s", out)
+	}
+}
+
+// TestSignaturesSearchHintPreservesPhraseBoundaries — the cross-mode hints are
+// copy-pasteable commands, and for a screen search the argv boundaries ARE the
+// semantics: one entry is one term. Echoing the joined query would re-emit a
+// quoted phrase as separate bare words, so running the suggestion would widen
+// the search and match screens the operator's own command would not.
+func TestSignaturesSearchHintPreservesPhraseBoundaries(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:hintq001", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveSignatureSnapshot(ctx, "approval:hintq001", "Bash(ls)\n  1. Yes", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A quoted phrase plus a bare word, matching nothing, so the hints print.
+	out, err := run(t, app, "signatures", "search", "zzz nope", "alsonope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `hap signatures search 'zzz nope' alsonope --screen`) {
+		t.Errorf("keyword hint must re-quote the phrase so the suggestion reproduces the query:\n%s", out)
+	}
+	// The bug being guarded: the phrase re-emitted as bare words.
+	if strings.Contains(out, "search zzz nope alsonope") {
+		t.Errorf("hint dropped the phrase boundary:\n%s", out)
+	}
+
+	// Same from the screen side, pointing back at the default mode.
+	out, err = run(t, app, "signatures", "search", "--screen", "zzz nope", "alsonope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `hap signatures search 'zzz nope' alsonope`) {
+		t.Errorf("screen hint must re-quote the phrase:\n%s", out)
+	}
+
+	// A word carrying a shell metacharacter is quoted too, or the suggestion
+	// is not safe to paste.
+	out, err = run(t, app, "signatures", "search", "--screen", "rm -rf", "nope;echo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, `'nope;echo'`) {
+		t.Errorf("a word with a shell metacharacter must be quoted:\n%s", out)
+	}
+
+	// An ordinary single-word query stays unquoted — the common case must not
+	// grow noise.
+	out, err = run(t, app, "signatures", "search", "zzznope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "hap signatures search zzznope --screen") {
+		t.Errorf("a plain word should not be quoted:\n%s", out)
+	}
+}

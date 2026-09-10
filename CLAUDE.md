@@ -1,1782 +1,1039 @@
 # CLAUDE.md
 
-Herd Auto Prompter (**hap**) — a Go plugin for the herdr terminal multiplexer
-that watches every agent pane, auto-answers when a learned rule is confident,
-and escalates to the operator (or a local LLM CLI) when not. `CONTRIBUTING.md`
-has the full ground rules; this file is the day-to-day working reference.
+Herd Auto Prompter (**hap**) — a Go plugin for the herdr terminal multiplexer that
+watches every agent pane, auto-answers when a learned rule is confident, and escalates
+to the operator (or a local LLM CLI) when not. `CONTRIBUTING.md` has the full ground
+rules; this file is the day-to-day working reference.
+
+**How to read the architecture rules.** Each names the identifier that implements it and
+states which way it must fail. The full rationale — mechanism, measured numbers, the
+incident that produced it — is the doc comment on that identifier, which is usually
+richer than what is here; go read it before changing anything the rule covers. What this
+file adds is reach: the hazard is normally in a file you had no reason to open, and the
+**test traps** are the reason each of these regressions shipped green. Find the guarding
+tests with `grep -rn "func Test<Topic>" --include=*_test.go`.
 
 ## Skills (`.claude/skills/`)
 
-Prefer these for how-to detail — this file keeps only what must stay in view.
+Prefer these for how-to detail.
 - **`herdr`** — drive herdr from inside it (workspaces, tabs, panes, agents, waits).
-- **`hap`** — operate the plugin via its CLI `hap`: agent's status, agent's tasks, escalations, config, safety rules, task
-  sources.
+- **`hap`** — operate the plugin via its CLI: status, tasks, escalations, config, safety
+  rules, task sources.
 - **`hap-development-local`** — the local dev loop: link the working tree, rebuild,
-  hot-swap the daemon (`hap daemon --ensure`), and live-test against a real agent.
+  hot-swap the daemon (`hap daemon --ensure`), live-test against a real agent.
 
-The hap skill also ships inside the binary: `hap --skill` prints it, and
-`hap skill install <claude|codex|agents>...` (or the TUI Config-tab shortcut)
-installs it into `~/.claude/skills/hap/`, `~/.codex/skills/hap/`, or
-`~/.agents/skills/hap/`.
+The hap skill also ships in the binary: `hap --skill` prints it,
+`hap skill install <claude|codex|agents>...` (or the TUI Config tab) installs it.
 
 ## Build, test, lint
 
-The semantic matcher links native code (llama.cpp via CGO, FAISS behind bleve's
-`vectors` tag), so **the native deps are needed once** and the `vectors cpu` tags
-always — a build without both fails to link.
+The semantic matcher links native code (llama.cpp via CGO, FAISS behind bleve's `vectors`
+tag), so **the native deps are needed once** and the `vectors cpu` tags always — a build
+without both fails to link.
 
 ```sh
-bash scripts/check-submodule-gitlink.sh        # seconds: submodule must be a gitlink, not a symlink (#265)
+bash scripts/check-submodule-gitlink.sh        # submodule must be a gitlink, not a symlink (#265)
 bash scripts/setup-native.sh                   # one-time: submodules + llama-go libs + FAISS → /usr/local/lib
 go build -tags "vectors cpu" ./...             # CGO; needs a C/C++ toolchain
-go test -tags "vectors cpu" ./... -count=1     # full unit/golden/safety/semantic suite (what CI runs)
+go test -tags "vectors cpu" ./... -count=1     # what CI runs
 gofmt -l . | grep -v submodule && go vet -tags "vectors cpu" ./...
-golangci-lint run --build-tags "vectors,cpu"   # CI runs this too
+golangci-lint run --build-tags "vectors,cpu"
 ```
 
-- The real-model embedder test skips unless `models/all-minilm-l6-v2-q8_0.gguf`
-  exists (download once from the HF repo in `release.yml`, or set `HAP_TEST_EMBED_MODEL`).
+- The real-model embedder test skips unless `models/all-minilm-l6-v2-q8_0.gguf` exists
+  (download once from the HF repo in `release.yml`, or set `HAP_TEST_EMBED_MODEL`).
 - Golden classifier fixtures: `internal/classify/testdata/`; regenerate with
   `UPDATE_GOLDEN=1 go test ./internal/classify/` and review the diff.
 - Run the full suite before every commit that touches Go code.
-- Full pipeline smoke test (fake herdr → real daemon → real LLM CLI):
-  `go build -o /tmp/e2e ./e2e_harness && /tmp/e2e <short-dir> <hap-bin> <config-dir> <state-dir>`,
-  then inspect with `hap audit` / replay `get_context` via `hap mcp`.
-- Iterating on the plugin against a live herdr (link the working tree, rebuild,
-  hot-swap the daemon): see the **`hap-development-local`** skill.
+- Pipeline smoke test (fake herdr → real daemon → real LLM CLI):
+  `go build -o /tmp/e2e ./e2e_harness && /tmp/e2e <short-dir> <hap-bin> <config-dir> <state-dir>`.
 
 ## Local integration suite (real herdr + claude)
 
-`test/integration/` drives an **actual running herdr** (and, when enabled, a
-**real Claude Code CLI**), gated by the `integration` build tag so `go test ./...`
-and CI never run them. Each test **skips** (never fails) when its dependency is
-absent, so these are safe to run anywhere:
+`test/integration/` drives an **actual running herdr** (and, with `HAP_ITEST_CLAUDE=1` /
+`HAP_ITEST_CODEX=1`, a real agent CLI), gated by the `integration` build tag so
+`go test ./...` and CI never run them. Each case **skips** (never fails) when its
+dependency is absent.
 
 ```sh
 go test -tags integration ./test/integration/ -v                    # from inside herdr, or set HERDR_BIN_PATH
-HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v -timeout 20m # also drive a real claude (spends tokens; several real-claude cases can exceed the 10m default)
-go test -tags "integration vectors cpu" ./test/integration/ -v      # include the real-model semantic case
+HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v -timeout 20m  # spends tokens
+go test -tags "integration vectors cpu" ./test/integration/ -v      # + the real-model semantic case
 ```
 
-- Loads `test/integration/testdata/config.toml` (the Claude Code recipe) — edit it
-  to match the CLI you want to exercise.
-- **Anything asserting a CONFIRM runs its own daemon, and an App with no `DaemonInfo` is
-  the trap.** Since 0.8.0 `App.Confirm` queues an `agent_actions` row for the owning node's
-  daemon instead of sending inline, so the obvious construction —
-  `&frontend.App{Store: st, Herdr: cli}` over a throwaway store — cannot deliver anything:
-  `AssessDaemonHealth` derives `Running` from `DaemonInfo`, nil reads as "no daemon"
-  whatever is actually up, and `requireLiveDaemonFor` refuses with a message naming a
-  daemon that IS running. That silently disabled the send-content guard from 0.8.0 to
-  0.9.7 (#396), and it failed LOUDLY only because these cases fatal rather than skip.
-  `testDaemon.App` is the one correct wiring (the daemon's own store, a `DaemonInfo`, the
-  control socket, and NO herdr adapter — a confirm that lands keystrokes with no adapter in
-  hand is the proof delivery went through the daemon). Never point such a test at the
-  operator's live store: under turso that pushes the suite's scratch rows to their cloud
-  database.
-- **A scratch pane the DAEMON will classify must SCROLL, and must be waited for rather than
-  slept on** (#397). Two independent hazards, and the second is the one that made these
-  cases look like a broken decision pipeline:
-  - `pane read --source recent` is a scrollback-shaped delta, not the screen. Verified live
-    (2026-09-10, herdr 0.8.2) it returns **EMPTY** for a pane whose whole output still fits
-    on screen, and content once that output has scrolled — a live claude pane returns
-    kilobytes, which is why production never meets this. A five-line scratch script had not
-    scrolled, so the daemon captured nothing and escalated `unclassifiable` /
-    `over_masked` instead of consulting. `fillViewportSh` pushes the fixture past the pane's
-    own `tput lines`, so it does not depend on how tall the operator's terminal is; its
-    filler is digit-free because a salient masked mostly to placeholders trips the
-    over-masking floor, which is the same failure by the other door.
-  - `pane run` only hands the command to the shell, so the pane is not ready when the helper
-    returns — and the daemon's startup reconcile drives every parked agent it can see, so an
-    unpainted pane is classified empty and its escalation then stops the injected transition
-    re-capturing. Wait for the pane's own CONTENT (`waitForPaneText`), never a fixed sleep:
-    1s against a 50ms capture delay held in isolation and lost under full-suite load.
-- Cases: `TestRealPaneInfo` (herdr `pane get` → cwd/ids); `TestRealConfirmDeliversMenuDigit`
-  (confirming a label reply selects the numbered menu — the send-content regression);
-  `TestRealClaudeConsult` (needs `HAP_ITEST_CLAUDE=1`) drives a real claude
-  (`--model haiku`, override `HAP_ITEST_CLAUDE_MODEL`) to an approval menu and asserts the
-  menu digit reached it — skips if it can't elicit a prompt, so it needs a path OUTSIDE
-  claude's auto-approved dirs (`/tmp`, `/workspaces`, `~/.claude`) and touches a `$HOME`
-  dotfile; `TestRealEmbeddingSemanticMatch` (needs `vectors cpu`) drives a real llama.cpp
-  model + FAISS index so a rule learned for one approval auto-answers a paraphrase
-  (cosine ≥ 0.90) and leaves an unrelated one alone — skips without the model;
-  `TestRealClaudePreviewMCQDelivery` (needs `HAP_ITEST_CLAUDE=1`) drives a real
-  AskUserQuestion form whose options carry PREVIEWS and asserts the answers actually land —
-  the rendering where a digit only moves the caret, which blind digit delivery no-oped on;
-  `TestRealClaudeOneQuestionMultiSelectMCQDelivery` (needs `HAP_ITEST_CLAUDE=1`) drives a real
-  ONE-question multi-select form — the shape whose footer carries no tab hint, so it read as a
-  plain menu and got a bare digit that only toggled its checkbox — and asserts the answer
-  toggles, advances to Submit, and commits. It FAILS (does not skip) when a form is on screen
-  but `MultiTabForm` misses it, so the detection regression can never pass silently.
-  `TestRealClaudeModeCycle` / `TestRealCodexModeToggle` (`agentmode_test.go`, needs
-  `HAP_ITEST_CLAUDE=1` / `HAP_ITEST_CODEX=1`) DISCOVER the session's cycle (never assume
-  `AgentModesFor` — see the per-session rule above), drive the agent to every mode it
-  offers, and assert a mode it does NOT offer fails cleanly and leaves the agent where it
-  was. They are the only check that the Shift+Tab chord ENCODING still reaches an agent and
-  that the mode INDICATOR still renders the labels the parser matches, both of which live
-  in the agent's build, not herdr's. `TestRealClaudeModeRefusesAStandingModal` proves the
-  safety gate against a real modal — it raises `/model` (deterministic, no tool call
-  needed) and asserts the picker is still standing untouched afterwards.
-  `TestRealShiftTabKeyNameIsStillBroken` is a TRIPWIRE on the workaround: it FAILS if
-  herdr's `shift+tab` key name ever starts working, which is the signal to delete
-  `domain.ShiftTab`/`CLI.SendChord` in favor of a plain `pane send-keys`.
-  `TestRealHerdrNotification*` / `TestRealInHerdrDetection` (`notification_test.go`) drive the
-  socket notifier the TUI alerts through: the `notification.show` result shape (`shown` must
-  agree with a `reason` the TUI knows), that two calls in a row both land (herdr closes the
-  connection after each answer, so a pooled connection would EPIPE), and that an empty
-  normalized title is refused locally AND still refused by herdr. They raise real toasts.
+**Recommended: run this once after finishing any feature**, before the PR — the unit suite
+fakes herdr, so only this catches real CLI-shape drift.
 
-**Recommended: run the integration suite once after finishing any feature**, before the
-PR — the unit suite fakes herdr, so only this catches real CLI-shape drift (e.g.
-`pane read --source recent` vs `visible`, `agent send` delivering a digit vs a label).
+Three traps, each of which already cost a shipped regression:
+
+- **Anything asserting a CONFIRM must run its own daemon; an `App` with no `DaemonInfo` is
+  the trap.** `AssessDaemonHealth` derives `Running` from `DaemonInfo`, so nil reads as "no
+  daemon" whatever is actually up and `requireLiveDaemonFor` refuses while naming a daemon
+  that IS running. `testDaemon.App` is the one correct wiring — and it deliberately holds NO
+  herdr adapter, so keystrokes landing at all is the proof delivery went through the daemon.
+  Never point such a test at the operator's live store: under turso that pushes scratch rows
+  to their cloud database.
+- **A scratch pane the DAEMON will classify must SCROLL.** `pane read --source recent`
+  returns EMPTY for a pane whose output still fits on screen (verified live, herdr 0.8.2);
+  a live claude pane returns kilobytes, which is why production never meets this. Use
+  `fillViewportSh` — its filler is digit-free because a salient masked mostly to
+  placeholders trips the over-masking floor, the same failure by the other door.
+- **Wait for a pane's CONTENT (`waitForPaneText`), never sleep.** `pane run` only hands the
+  command to the shell, and the startup reconcile classifies an unpainted pane as empty,
+  whose escalation then stops the injected transition re-capturing. A 1s sleep held in
+  isolation and lost under full-suite load.
+
+Cases worth knowing beyond their names: `TestRealShiftTabKeyNameIsStillBroken` is a
+**tripwire** — it FAILS if herdr's `shift+tab` key name starts working, the signal to delete
+`domain.ShiftTab`/`CLI.SendChord`. `TestRealClaudeOneQuestionMultiSelectMCQDelivery` FAILS
+(does not skip) when a form is on screen but `MultiTabForm` misses it, so that detection
+regression can never pass silently. `TestRealClaudeConsult` needs a path OUTSIDE claude's
+auto-approved dirs (`/tmp`, `/workspaces`, `~/.claude`) to elicit a prompt. The mode-cycle
+cases DISCOVER a session's cycle rather than assuming `AgentModesFor`, and are the only check
+that the Shift+Tab chord ENCODING still reaches an agent and that the mode INDICATOR still
+renders the labels the parser matches — both live in the agent's build, not herdr's.
 
 ## Commits
 
-Format: `#<issue> <type>: <subject>` — a Conventional Commit prefixed with a GitHub
-issue reference. A commit-msg hook **rejects messages that don't start with a
-ticket/issue id**. Examples:
+Format: `#<issue> <type>: <subject>` — a Conventional Commit prefixed with a GitHub issue
+reference; a commit-msg hook rejects anything else. Types: `feat`, `fix`, `docs`, `test`,
+`refactor`, `chore`; breaking → `feat!:`.
 
-```
-#1 feat: enrich LLM consult context — location ids, cwd, configurable pane excerpt
-#1 fix: run daemon from state dir, self-heal stale daemons on upgrade
-```
-
-- Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`; breaking → `feat!:`.
-- Pre-commit hooks also check large files, secrets, trailing whitespace, and line
-  endings — let them run (don't `--no-verify`).
+- Let the pre-commit hooks run (large files, secrets, whitespace, line endings) — no
+  `--no-verify`.
 - Never commit directly to `main`. Branch (`feat/…`, `fix/…`), open a PR.
-- For any non-trivial change, use the **`git-worktree`** skill to create a new isolated
-  worktree from `main` (`worktree-agent-noN` beside the repo) so `main`'s checkout stays
-  clean; remove the worktree and delete the branch (local + origin) after merge.
-- If the current repository has many uncommitted changes, or you detect or suspect that
-  another agent is working in parallel in the same repository, pause before making more
-  changes. Stage only your own changes, then use the **`git-worktree`** skill to create a
-  new worktree from `main` that includes those staged changes, and continue there without
-  disturbing the other work in progress.
+- For any non-trivial change use the **`git-worktree`** skill (`worktree-agent-noN` beside the
+  repo); remove it and delete the branch (local + origin) after merge.
+- If the repo has many uncommitted changes, or another agent may be working in parallel:
+  pause, stage only your own changes, and move to a new worktree from `main` that includes them.
 
 ## Changelog (MANDATORY)
 
-**Every change gets an entry — including patch releases.** No exceptions for
-"small", "internal", or "just a fix": if it merges, it is in the changelog. A PR
-without one is incomplete. Entries are written as **fragments in
-`changelog.d/`**, never into `CHANGELOG.md` directly.
+**Every change gets an entry, patch releases included.** Entries are **fragments in
+`changelog.d/`**, never edits to `CHANGELOG.md`, and **never a version number**:
 
-- **Never edit `CHANGELOG.md` by hand, and never write a version number.** Add a
-  fragment instead — a new file nobody else's PR can touch:
+```sh
+cat > changelog.d/$(git branch --show-current | tr / -).md <<'EOF'
+- Fixed the thing that used to happen
+EOF
+```
 
-  ```sh
-  cat > changelog.d/$(git branch --show-current | tr / -).md <<'EOF'
-  - Fixed the thing that used to happen
-  EOF
-  ```
-
-  Just the bullets, no heading. `changelog.d/README.md` has the full format.
-- **Why:** every PR used to insert its section at the top of one shared file, so
-  two open PRs always conflicted on the same lines even when the changes were
-  unrelated — and each had to GUESS its version, which is only knowable when the
-  release is cut. Fragments make the conflict structurally impossible and delete
-  the guess.
-- On merge, the auto-release workflow runs `scripts/assemble-changelog.sh
-  <version>`, folding every fragment into `CHANGELOG.md` under the real version
-  and deleting them — inside the same commit that bumps `herdr-plugin.toml`.
-  A CI job fails any PR that changes releasing code without a fragment.
-- **Minor/major is the manual exception**: you hand-write the version into
-  `herdr-plugin.toml` inside your PR (see *Version bump & release*), and no bump
-  commit is ever created to assemble into — so run
-  `bash scripts/assemble-changelog.sh X.Y.0` in that same PR and commit the
-  result. The release refuses to tag while unassembled fragments remain.
-- Style: a flat list of verb-first one-liners — `Added …`, `Fixed …`,
-  `Changed …`, `Removed …`. No sub-sections.
-- Write what it MEANS for the reader, not what the diff did. GitHub already
-  generates a per-release list of PR titles; this file exists for what a title
-  cannot carry — the bounds of a new action, what a changed default now does,
-  what a fix stops happening.
-- Mark a breaking change **Breaking.** at the start of its line, matching the
-  `feat!:` commit type.
+- **Why fragments:** every PR used to insert its section at the top of one shared file, so two
+  open PRs always conflicted even when unrelated — and each had to GUESS its version, which is
+  only knowable when the release is cut.
+- On merge, auto-release runs `scripts/assemble-changelog.sh <version>` inside the same commit
+  that bumps `herdr-plugin.toml`. CI fails any PR that changes releasing code without a fragment.
+- **Minor/major is the manual exception**: no bump commit is created to assemble into, so run
+  `bash scripts/assemble-changelog.sh X.Y.0` in that same PR and commit the result. The release
+  refuses to tag while unassembled fragments remain.
+- Style: flat verb-first one-liners (`Added …`, `Fixed …`), no sub-sections. Write what it MEANS
+  for the reader — GitHub already generates a list of PR titles. Mark breaking changes
+  **Breaking.**
 
 ## Version bump & release
 
 Releases are **automated on merge to main** with a bump-then-tag model
-(`.github/workflows/auto-release.yml`); `version` in `herdr-plugin.toml` is the single
-source of truth and always names a version whose GitHub release exists — it TRAILS
-releases, never leads them. This is load-bearing: `herdr plugin install` clones main and
-`scripts/install.sh` downloads the release assets named by the manifest version, so a
-manifest pointing at an unreleased version 404s every install.
+(`.github/workflows/auto-release.yml`); `version` in `herdr-plugin.toml` is the single source of
+truth and always names a version whose release exists — it TRAILS releases, never leads them.
+Load-bearing: `install.sh` downloads the assets named by the manifest version, so a manifest
+pointing at an unreleased version 404s every install.
 
-- **Patch (the default)** — just merge your feature PR. The workflow finds the manifest
-  version already tagged, auto-merges a bump PR (`release/bump-vX.Y.Z+1`, commit marked
-  `[skip release]`), tags that bump commit with the owner's `RELEASE_PAT`, and the tag
-  fires the standard tag-driven `release.yml`. Never bump the manifest for patch work.
-- **Minor/major (the reserved manual path)** — overwrite `version` in `herdr-plugin.toml`
-  INSIDE your feature PR (e.g. `0.4.0`); on merge the workflow finds that version untagged,
-  skips the bump, and tags the merge commit directly. (The same branch self-heals a crashed
-  run that bumped but never tagged.)
+- **Patch (the default)** — just merge; the workflow auto-merges a bump PR (marked
+  `[skip release]`) and tags it. Never bump the manifest for patch work.
+- **Minor/major** — overwrite `version` in `herdr-plugin.toml` INSIDE your feature PR; the
+  workflow finds it untagged and tags the merge commit. (The same branch self-heals a crashed run
+  that bumped but never tagged.)
 - Doc/workflow-only pushes (`**.md`, `docs/**`, `.github/**`) and merge commits containing
-  `[skip release]` do not release. Hand-pushing a `v*.*.*` tag still works (release.yml is
-  unchanged and tag-driven).
-- Never put `[skip ci]`-family keywords ANYWHERE in the squash-merge message (title or
-  body) of a PR that should release: GitHub suppresses ALL workflows for refs whose head
-  commit carries one — including the tag push onto that commit, so the release silently
-  never builds. The workflow refuses to tag such a commit. `[skip release]` (our custom
-  marker) is safe on tagged commits but suppresses auto-release itself, so keep the literal
-  string out of ordinary merge messages too.
-- Between the bump merge and the release publishing (~15 min), main's manifest names a
-  version with no assets — install.sh's ~60 s curl retry only bridges the post-publish
-  upload gap, not the build. Installs no longer 404 there: install.sh **falls back to the
-  newest earlier release that has assets** (git tags, newest-first, HEAD-probed), warns
-  loudly which version it actually installed, and leaves the operator to `hap update` once
-  the intended one publishes. The fallback is refused for an explicit `HAP_VERSION` pin,
-  under `HAP_NO_FALLBACK` (any NON-EMPTY value — set-but-empty means unset, matching
-  `HAP_VERSION=`), and on a checksum mismatch — corruption is never
-  answered with a downgrade. `--ref vX.Y.Z` is NOT one of those refusals: it pins the git
-  clone, which install.sh cannot see, so it only avoids the fallback by naming a release
-  that already has assets. Detached HEAD is not a usable substitute signal either, because
-  auto-release tags the bump commit on main.
-- If the release BUILD fails after the tag exists, re-run the failed release.yml run; do
-  not re-run auto-release (it would advance versions).
+  `[skip release]` do not release.
+- **Never put `[skip ci]`-family keywords ANYWHERE in a squash-merge message** of a PR that should
+  release: GitHub suppresses ALL workflows for that ref, including the tag push, so the release
+  silently never builds. `[skip release]` is our own marker — safe on tagged commits, but keep it
+  out of ordinary merge messages.
+- Between the bump merge and publishing (~15 min) main's manifest names a version with no assets,
+  so install.sh **falls back to the newest earlier release that has assets** and warns loudly.
+  Refused for an explicit `HAP_VERSION` pin, under `HAP_NO_FALLBACK` (any NON-EMPTY value —
+  set-but-empty means unset), and on a checksum mismatch (corruption is never answered with a
+  downgrade). `--ref vX.Y.Z` is NOT a refusal: it pins the git clone, which install.sh cannot see.
+  Detached HEAD is not a usable signal either, because auto-release tags the bump commit on main.
+- If the release BUILD fails after the tag exists, re-run the failed release.yml run; do not re-run
+  auto-release (it would advance versions).
 
-`release.yml` (tag-driven, unchanged) runs the full CI gate, then builds on THREE native
-runners (CGO cannot cross-compile; Intel macOS is deliberately unsupported):
-`hap-{linux-amd64,linux-arm64,darwin-arm64}` (llama.cpp statically linked in), a
-`hap-native-<os>-<arch>.tar.gz` per platform (FAISS shared libs, plus libomp on macOS,
-rpath'd to `<plugin>/lib`), the `all-minilm-l6-v2-q8_0.gguf` embedding model fetched from
-Hugging Face (sha256-pinned), and `SHA256SUMS`; then publishes the GitHub Release.
-`install.sh` treats the binary and native tarball as REQUIRED and the model as optional
-(BM25 fallback).
+`release.yml` (tag-driven) builds on THREE native runners (CGO cannot cross-compile; Intel macOS is
+deliberately unsupported): three binaries, a native tarball per platform (FAISS shared libs, plus
+libomp on macOS, rpath'd to `<plugin>/lib`), the sha256-pinned embedding model, and `SHA256SUMS`.
+install.sh treats the binary and native tarball as REQUIRED and the model as optional (BM25
+fallback).
 
-The invariant: **the tagged commit's `herdr-plugin.toml` version and the git tag MUST
-match** — the automation preserves it by construction (the tag always lands on a commit
-whose manifest carries exactly that version).
-
-- Verify after any release: `gh release view vX.Y.Z` — expect 3 binaries, 3 native
-  tarballs, the model, and SHA256SUMS.
-- `internal/buildinfo.Version` is stamped by the release build via ldflags — never edit
-  it by hand.
-- Bump `min_herdr_version` only when adopting new herdr APIs.
-- Release assets can 504 for a minute or two right after publishing; `scripts/install.sh`
-  retries through that window.
+**The invariant: the tagged commit's manifest version and the git tag MUST match.** Verify with
+`gh release view vX.Y.Z` — 3 binaries, 3 tarballs, the model, SHA256SUMS. `internal/buildinfo.Version`
+is stamped by ldflags — never edit by hand. Bump `min_herdr_version` only when adopting new herdr
+APIs. Assets can 504 for a minute after publishing; install.sh retries through that window.
 
 ## Architecture rules (enforced)
 
-- **`internal/domain` stays pure** — no imports of herdr/SQLite/LLM/adapter packages;
-  `TestDomainPurity` fails otherwise. Side effects live behind the interfaces in
-  `internal/ports` (implementations: `internal/herdr`, `internal/store`, `internal/llm`).
-- **Optional capabilities are optional interfaces** — extend the herdr surface with a new
-  port interface (see `LocatorPort`, `InspectorPort`) and type-assert at the call site,
-  degrading gracefully; don't grow `HerdrPort` and break every fake.
-- **Everything that writes config.toml is a `hap config` subcommand** — one place to learn,
-  and the reason `hap config` is the ONLY visible command in the help's Configure group
-  (`TestConfigureGroupHasOneVisibleCommand` fails on a second one). Topics are TWO-word
-  registry entries (`config rules`, `config task-source`, `config classifier`,
-  `config capture-delay`), resolved longest-spelling-first in `cli.Run`, so each is
-  dispatched and documented on its own rather than routed by the parent's handler — that
-  is what makes `hap config rules --help` reach the topic's page. `hap task` is
-  deliberately NOT here: it edits checklist ITEMS in an agent's markdown file, which is not
-  configuration. The four were top-level verbs once; their old spellings still resolve
-  (`Command.MovedFrom`) and print a migration note on **stderr**, never stdout, because
-  these verbs print tab-separated listings that scripts parse.
-- **Every config key is reachable from the CLI** — the TUI is a convenience, not a
-  capability, and config.toml is never something an operator must open by hand. SCALAR keys
-  go in the `frontend.ConfigFields` registry (`hap config set`); `TestEveryConfigKeyIsRegistered`
-  walks `config.Config` the way BurntSushi's decoder does and fails on any unregistered one.
-  ARRAY and MAP sections cannot be a `config set` key — a list element is addressed by
-  POSITION and a map entry by NAME — so each gets a verb (`hap config rules`, `hap config task-source`,
-  `hap config classifier`, `hap config capture-delay`, `hap config env`) and is named in
-  `configListCommands`, which `TestEveryConfigListHasACLICommand` holds to the same
-  by-construction standard. Both tests also fail on a STALE entry, so neither map can claim
-  coverage for a key that no longer exists. Three rules bind the list editors: **a list
-  ELEMENT's own fields are held to the same standard** where the element is long-lived —
-  every `[[task_sources]]` field has a `hap config task-source set` key
-  (`TestEveryTaskSourceFieldIsEditable`, which drives each key through the real dispatcher
-  so a map entry naming a nonexistent one cannot pass), because a field settable only at
-  creation means remove-and-re-add: retyping every other field and renumbering every later
-  source to change one; **removal
-  compares the WHOLE entry the caller listed**, never one field (several classifier rules
-  share a situation, and one never-auto pattern is legitimately scoped twice — a one-field
-  guard passes on the wrong element exactly when a listing has gone stale); and **an insert
-  must respect the daemon's own lookup order** — `config.CaptureDelay` takes the first rule
-  matching the agent type and `"*"` matches everything, so a specific rule appended after a
-  wildcard one is configured, listed, and never read. Secrets are a DISPLAY rule, not an
-  exemption: `hap config env` never prints a value and reads it from stdin unless `--value`
-  is passed, so a token stays out of shell history and `ps`.
-  **`[[task_sources]]` is the exception to that insert rule, and it inverts it: a new source
-  is always APPENDED.** Its index is a public selector — `hap task 2 …`, the
-  `{task_source_index}` a delivered prompt tells an agent to use, and the number every
-  `hap config task-source` listing, `set` and `remove` takes — so inserting anywhere else
-  silently re-points every selector after it, including commands already sitting in an
-  agent's scrollback. That binds BOTH creating surfaces: `AddTaskSource` (CLI and the TUI
-  Config tab) and `addTaskSourceIfAbsent` (accepting an LLM task suggestion, which registers
-  a source as a side effect). Task sources need no lookup-order insert because they are
-  matched by SELECTOR, not first-match-wins by position. Removal necessarily renumbers what
-  follows, which is why the agent NAME stays the primary selector and the index is the
-  fallback for sources a name cannot address. Keep the paired tests
-  (`TestAddingATaskSourceNeverRenumbersTheExistingOnes` /
-  `TestAcceptingAGeneratedTaskAppendsItsSource`).
-- **A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is never
-  evidence** — `[agents] sync_claude_session_name` (off by default) keeps an agent's hap name and
-  the name `/rename` paints in Claude's composer rule byte-identical: a named session is folded
-  (`domain.NormalizeAgentName`), adopted (`store.AdoptAgentName`), and pushed BACK when either the
-  fold or a name collision changed it; an unnamed one is sent `/rename <hap name>`.
-  - **It is not the terminal title.** `agent list`'s `terminal_title_stripped` carries Claude's
-    churning conversation SUMMARY, free and with no shell-out — adopting it renames every agent
-    after a sentence that changes on its own (verified live 2026-09-01, Claude Code 2.1.252).
-  - **"No composer" is UNKNOWN, never "unnamed."** The classification read is `--source recent`, a
-    consuming delta that routinely shows no footer, and the push direction reads "unnamed" as its
-    TRIGGER — so the alternative overwrites an operator's chosen name.
-  - **The push is a DELIVERY**: `acquirePane`, kill switch + per-agent disable re-asked inside the
-    goroutine, never-auto over the exact text, a `--source visible` re-read before AND after the
-    send, a proven-EMPTY composer (`ClaudeComposerReady` proves the sandwich, not that it is
-    blank), a ceiling per (agent, terminal, name), and `d.spawn` so shutdown drains it.
-  - **QUIESCENCE is asked twice, and the second time against LIVE state.** Both questions —
-    parked (`sessionRenameParked`: `idle`/`done`, the same set as `autoSendParked`; `blocked` is a
-    modal where Enter is rebound, and an empty status fails closed) and `ComposerEmpty` — are asked
-    at the TOP of `applyClaudeSession` (`sessionSyncQuiescent`), which gates BOTH directions
-    including the store-only adopt, because that is the one seam all three entry points share.
-    They are asked again inside `pushSessionRename`, where the status comes from `liveAgentFor`
-    and NOT from `tr.Status`: the capture's status is seconds old on the attention path and a whole
-    pass old on the flip and retry passes, and claude QUEUES input while it works rather than
-    refusing it. A failed listing refuses — "we could not ask" is not "it is idle". The pane/terminal
-    tenancy compare (`recycledSince`) fails OPEN on an unknown id, because event-socket transitions
-    carry no `terminal_id` at all and a strict compare would refuse every production rename. Order
-    is deliberate: status before the pane read (it is cheaper and skips the read), and the composer
-    proof LAST, because "the operator started typing" changes on one keypress while status changes
-    at a turn boundary.
-  - **A just-parked agent is not a quiet one** (`sessionRenameSettle`, `sessionRenameSettled`,
-    reached through `sessionSyncReady`). The complaint this feature earned is a rename typed into a
-    session the operator opened seconds ago: the composer is empty because they have not typed the
-    FIRST character yet, so both quiescence checks pass and the push races their first keypress. No
-    re-read closes a sub-second race; waiting does. The evidence is `d.idleSince`, already
-    maintained by the sweep and cleared on `working` and on a pane recycle, so it costs one map read
-    — and an ABSENT or foreign mark is UNSETTLED, never settled, which is exactly the state a
-    brand-new agent is in until the first sweep sees it.
-    - **It gates ADOPTION too**, though adoption types nothing and so buys no safety from it. What
-      it buys is that hap's name and the composer's are never knowingly left disagreeing: adopting
-      on the spot while the push waits out the window leaves the pair merely DERIVED from one
-      another for a minute or two, which is the CHARACTER-IDENTICAL contract this whole feature
-      exists to hold. The accepted cost is named: an escalation raised inside that window calls the
-      agent by its generated name. The already-aligned fast path runs ABOVE the gate, so a settled
-      pair still costs nothing at any status.
-    - **It is asked in exactly TWO places, and a third copy is a hazard rather than defence in
-      depth.** `startSessionRename` deliberately carries none: the shared gate already answered over
-      the capture, and `pushSessionRename` re-asks against the LIVE parked spell, which is strictly
-      stronger. A copy over the stale `tr` could only ever agree with the gate that just ran — and
-      it made the mutation deleting the REAL check pass, which is how a duplicate turns into a
-      silent hole.
-    - **The live re-check asks "parked LONG ENOUGH", not just "parked".** An agent can go working
-      and park AGAIN in the gap the goroutine spends on herdr — a NEW spell, exactly the state the
-      window exists for, and one the pre-spawn check knew nothing about. The mark is deleted on the
-      working transition and re-set by the next sweep, so an absent one is UNSETTLED here too.
-      Caught in review (#426).
-    - **The constant is not the knob it looks like.** `d.idleSince` is written only by the 60s
-      sweep and a deferral's first backoff step is also 60s, so the effective wait is ~1–2 minutes
-      whatever `sessionRenameSettle` says, and it applies every time an agent goes quiet rather than
-      only on a fresh session. Lowering the constant changes almost nothing; setting it to 0 removes
-      the gate. Renames are not time-critical, which is what makes that trade acceptable.
-  - **A refusal DEFERS; it never burns a push.** `maxSessionRenamePushes` bounds KEYSTROKES typed
-    at a pane that never takes the rename; `maxSessionSyncDeferrals` bounds READS spent on a pane
-    that is never ready. Conflating them is destructive rather than merely wrong: every refusal used
-    to burn one of the three, so an operator who was mid-draft three times running permanently
-    disabled their own rename — the exact person the gates are for. `pushSessionRename` therefore
-    returns `typed bool` and `releaseSessionRenamePush` refunds by DECREMENT (never by writing back
-    a snapshot, which would hand a concurrent claim its budget too). The one branch that must arm
-    NOTHING is a send that happened but did not verify: a deferral there quietly turns the ceiling
-    into "three pushes per interval, forever".
-  - **The retry is the sweep's, not a timer's.** `sessionSyncDeferred` is a `pollRedrive`-shaped
-    map (attempts, `nextAt`, reason) re-examined by `startSessionSyncRetryPass` off the existing
-    1-minute ticker, at 1→2→4→8→15 minutes. `nextAt` is load-bearing: the ticker has no phase
-    relationship to when a deferral was armed, so without it "about a minute" is 0–60s. The pass is
-    SPAWNED (the sweep arm is the loop that serves every agent) and shares `sessionSyncPassRunning`
-    with the flip pass so two passes never walk the herd typing at once. Sharing it means a
-    false→true flip can arrive while a retry pass holds the latch, and that flip MUST be coalesced
-    (`sessionSyncFlipPending`, honoured by `releaseSessionSyncPass`) rather than dropped: nothing
-    else re-runs the one-shot live-herd sync, and the retry pass cannot stand in for it because it
-    only visits agents that already carry a deferral. Caught in review (#426). It is handed
-    BOTH slices: the whole listing is what the map is PRUNED against (an agent withheld from `rest`
-    has not vanished), while only `rest` may be touched. A not-parked agent is answered from that
-    listing with no shell-out at all.
-  - **The `!ok` capture arms a retry, and the aligned fast path is what makes that affordable.**
-    "No composer in this capture" is the NORMAL state for a quiescent pane — `ReadPane` is a
-    consuming delta — and it is the state the operator's own scenario sits in, so leaving it to
-    "the next capture asks again" leaves the feature with no retry at all for the case it exists
-    for. That arms one deferral per claude agent, which the `sess.Name == agentName` fast path
-    ABOVE the gate then clears on the first retry (the `--source visible` read is authoritative),
-    so a settled herd converges to an empty map after one sweep. Without the fast path, every
-    settled agent that happens to be mid-turn arms a retry instead.
-  - Keep `TestSessionSyncRefusesToAdoptWhileTheOperatorIsTyping` / `…ANonParkedAgent` /
-    `TestSessionSyncAcceptsADoneAgent` (which pins the idle+done decision) /
-    `TestSessionRenameRefusesAnAgentThatJustParked` / `…WithNoParkedMark` /
-    `TestSessionSyncRefusesToAdoptAJustParkedAgent` /
-    `TestSessionRenameRefusesAParkedSpellThatRestartedAfterTheCapture` /
-    `TestSessionRenamePushProceedsOnASettledParkedSpell` (its control) /
-    `TestAFlipArrivingDuringAnotherPassIsNotLost` / `TestReleasingTheLatchWithNoFlipRunsNoPass` /
-    `…ThatWentBackToWorkAfterTheCapture` (the only case that moves the agent AFTER the capture,
-    so it is the only one the live re-read is needed for) / `…ARecycledPane` /
-    `TestSessionRenameProceedsWhenTheTerminalIDIsUnknown` (the control, and not optional) /
-    `…RefusesWhenTheListingIsUnavailable` / `TestADeferralNeverBurnsAPushAttempt` /
-    `TestAFailedVerifyArmsNoDeferral` / `TestADeferredSessionSyncIsRetriedOnTheSweep` /
-    `…WaitsOutItsInterval` (the control) / `TestTheRetryPassSkipsAWorkingAgentWithoutAPaneRead` /
-    `…NeverPrunesAWithheldAgent` / `…IsInertWithTheFeatureOff` / `…DoesNotStallTheSweepArm` /
-    `TestASessionSyncDeferralGivesUpAtItsCeiling` / `TestAWorkingTransitionRestoresTheRetryBudget` /
-    `TestARecycledPaneClearsItsSessionSyncDeferral` / `TestACaptureWithNoComposerArmsARetry` /
-    `TestASettledHerdStopsCostingPaneReads` / `TestAnAlignedPairNeverArmsARetry` /
-    `TestSessionSyncRetryDelayBacksOffAndCaps`. Note the test trap: every gate here fails CLOSED, so
-    a push case that forgets `parkedAndSettled` (pin the listing AND backdate `d.idleSince`) passes
-    for the wrong reason — which is why `TestSessionSyncPushStopsAtItsCeiling` asserts EXACTLY the
-    ceiling rather than "no more than".
-  - **`NormalizeAgentName` must stay a FIXED POINT**, or the pushed name is re-folded on the next
-    capture and the two names trade spellings forever. Same for `SuffixedAgentName`; collisions
-    are idempotent via `domain.AgentNameDerivedFrom`. An identical pair must cost no pane read —
-    the at-send screen also refuses the redundant push, so only a read COUNT catches its removal.
-  - **Turning the key ON drives its own one-shot pass, because a config change re-captures
-    NOTHING.** The sync is a side effect of `handleAttention`, and neither `reloadWith` nor the
-    `reconcileAttention` that follows a reload nudge schedules a capture for an already-parked
-    agent — `reconcileAttentionWith` skips every pane in `episodeHandled` (set on the first sweep
-    after start, cleared only by a `working` transition or a pane recycle), skips working agents
-    outright, and skips any agent with an open escalation. So a flip on a settled herd did nothing
-    at all until each agent next went working→parked, which is hours for a parked herd and never
-    for an agent sitting on an approval. `syncClaudeSessionNamesNow` walks the live agents once
-    instead. Four bounds are load-bearing: it reads `--source visible` (`readClaudeSession`), never
-    `ReadPane`'s consuming delta — non-consuming is REQUIRED, since a recent read here swallows the
-    delta a pending classification capture is about to take, and it is also the only reason the
-    flip sees a composer on a quiescent pane at all; clearing `episodeHandled` is NOT the
-    alternative, because that re-drives the whole herd through classify→decide→act, raising
-    escalations and spending LLM consults for a naming feature; the trigger is gated on `!first`,
-    since `reloadWith` also runs inside `New()` before `Run` exists and the startup reconcile
-    already re-drives every PARKED agent (the only set Path 2 can push to) — except one it marks
-    handled and then skips, an agent whose escalation row survived the restart, which is why a
-    daemon STARTED with the key on keeps the pre-fix behaviour for exactly those agents; and the latch
-    (`sessionSyncPassRunning`) is released by the goroutine's own defer AND by hand when `spawn`
-    refuses, or one shutdown-race flip disables the pass for the process. Both entry points share
-    `applyClaudeSession`, so a gate added to either is added to both. Keep
-    `TestFlippingSessionSyncOnRenamesTheLiveHerdWithoutACapture` /
-    `…AdoptsANamedSession` / `TestReloadWithoutAFlipRunsNoSessionSyncPass` /
-    `TestDaemonStartWithTheSettingOnRunsNoSessionSyncPass` /
-    `TestSessionSyncPassSkipsNonClaudeAgents` / `…DoesNotRunTwiceAtOnce` / `…ReleasesItsLatch`,
-    and note the tests wrap the fake so the composer is visible ONLY through `--source visible`:
-    without that the capture path could produce the same rename and none of them would
-    discriminate.
-  - Test trap: the daemon suite's `failingStore` embeds the ports.StorePort INTERFACE, so every
-    type-asserted capability must be forwarded there or the feature is silently off suite-wide.
-- **A front end decides; the DAEMON does** — anything that reaches a live pane, or that is
-  keyed by an identifier only one machine can resolve, is written to `agent_actions` for the
-  node that OWNS it and executed there (`domain.AgentAction`, `daemon.executeAgentAction`).
-  A generated-task confirm is the widest case and the reason the rule is not only about
-  panes: `acceptGeneratedTask` matches the audit row's pane id against a herd (herdr recycles
-  pane ids, so every machine has a pane `1`), mints an `agent_names` row in a node-keyed
-  table, writes the checklist, and registers a `[[task_sources]]` entry in a config.toml that
-  **never enters the shared database**. All of it belongs to one machine, which is why
-  confirming another node's suggestion used to be refused outright.
-  - **It is queued UNCONDITIONALLY, local rows included** (`queueGeneratedTaskConfirm`). The
-    `isSelf` fast path the per-agent verbs use (`RenameAgentOn` and friends run the local verb
-    verbatim) is wrong here for a reason those verbs do not have: this path ends in a pane
-    send, so taking it in-process leaves a TUI or CLI holding a herdr adapter — and a front
-    end and a daemon typing into one pane is the race none of the delivery guards can see.
-    Accepted cost: `hap confirm <id>` without `--send` now needs a live daemon, where it
-    needed none. Keep `TestALocalGeneratedTaskConfirmAlsoQueues`.
-  - **The pane access is RECEIVED, never held** (`ports.TaskSendHost`). The checklist, the
-    config and the reserve→send→roll-back ORDERING stay in `internal/frontend` — splitting
-    that ordering across the seam would break an invariant every comment around it calls
-    load-bearing — while the one step that reaches a pane is a closure the daemon supplies.
-    Only `cmd/hap`'s daemon wiring can build one, so a TUI or CLI process has no path to a
-    pane at all. `herdrpurity_test.go`'s register says exactly this; the entry is PERMANENT
-    and is a weaker claim than the ones it will replace.
-  - **`ConfirmGeneratedTask` and `AcceptGeneratedTask` are two seams on purpose.** The flag
-    they would share is the one that changes what is LEARNED: the automatic path passes
-    `automated=true`, skipping `ResolveEscalation` AND `InsertCorrection`, because a machine's
-    decision to act is not evidence the suggestion was right. An operator's confirm writes
-    both, however far away they typed it — so `author` is threaded from the queued row rather
-    than taken from the daemon's own App, which is authored `"daemon"`. Full self-prompting
-    keeps calling its seam directly rather than queueing: `autoAcceptOne` has already claimed
-    the row into the transient `auto_accepting` status and is already on the owning node.
-  - **`CorrectionID` stays 0 on the queued row.** The correction is written INSIDE the
-    executor, in the same run that marks it sent, so nothing needs the withholding filter —
-    and populating the field would arm `finishWithdrawn`: a retry arriving after attempt 1
-    claimed the escalation refuses with `errEscalationClosed`, and that refusal DELETES the
-    correction attempt 1 wrote.
-  - **`side_effect` is marked inside the host's `Send`, not before the seam.** A row carrying
-    it is FAILED at the next start rather than replayed, with "it may or may not have reached
-    the agent" — true after keystrokes, false before them. An add-only confirm types nothing
-    and both its writes dedupe, so replaying it is harmless. Same reason `focus` marks none.
-    Note the FSP path is handed `taskSendHost(0)`, and the zero guard is load-bearing:
-    marking action 0 is a write against a row that does not exist.
-  - **The staleness gate moved WITH the pane access.** Only the daemon can ask herdr whether
-    the agent is still parked, so `refuseIfAgentBusy` lives there — and its refusal carries
-    `domain.SuggestionStaleMarker` because `AwaitAgentAction` hands `AgentAction.Error` back
-    verbatim through `errors.New`, flattening every sentinel. That one is ACTIONABLE: the TUI
-    answers it by offering to add the tasks to the list instead of sending them, keyed on
-    `errors.Is`. The front end re-wraps on the marker (`interpretConfirmFailure`), the same
-    shape `explainRemoteFailure` uses for an older daemon's unsupported-kind refusal. Keep
-    `TestABusyAgentRefusalSurvivesTheQueue` and `TestAQueuedConfirmRefusesABusyAgentOnlyWhenSending`;
-    both were proved by mutation, and dropping the marker breaks the offer SILENTLY.
-  - The operator path is deliberately NOT screened (`screen` is nil). The daemon's own sends
-    are screened at decide time and an FSP acceptance is screened in the fork because in both
-    cases no human saw the text; here one has, and their confirm has always been the gate.
-  - **The manual task hand-out moved the same way** (`send_task`, a kind that had been
-    declared and reserved for it). `SendTaskToAgentOn` carries the list, the item and the
-    agent's NAME — never a pane id, which repeats on every machine — and the executor
-    re-derives the pane, the agent type, the source's `next_task_template`, its config
-    position and `{cwd}` from the owning node's own config and a live listing. Its idle
-    re-check fails CLOSED and TERMINALLY: "we could not ask" is not "it is idle", and an
-    operator blocking on the row must not wait three sweeps to be told what the first attempt
-    knew. `taskSourceRenderFor` matches by LOCATOR, not by agent alone, or one source's item
-    would render through another's template — the hazard the TUI used to guard with its own
-    snapshot check. `hap task send` is local-only for now (it reads the list through THIS
-    node's `[[task_sources]]`, which never describes another machine's); the TUI's Tasks tab,
-    which renders fleet lists out of the shared database, can hand out a remote node's item.
-  - **The four stage-5 exemptions are retired** — `Herdr`, `ListAgents`, `InspectorPort` and
-    `SendToAgent` are gone from `herdrpurity_test.go`'s `frontend.go` entry, which means
-    `requireIdleAgent` and `paneCwd` had to be DELETED rather than left unused: the scan is on
-    the selector, not on reachability. What replaces them is one PERMANENT entry for
-    `ports.TaskSendHost`, and it is a weaker claim by construction — a received capability,
-    not a held one.
-  - Test trap: `internal/daemon` may not import `internal/frontend`, so its tests drive a FAKE
-    seam and can only prove the EXECUTOR's guards. The confirm's own behaviour is proved in
-    `internal/frontend`, which calls `ConfirmGeneratedTaskForOperator` directly — and the TUI
-    and CLI suites run a stand-in drain that calls the REAL confirm, or their "the tasks file
-    was written" assertions would check nothing.
+### Boundaries
 
-- **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit +
-  log. Wrap new handler/adapter calls in `logging.Guard`.
-- **Safety controls are never bypassed** — LLM submissions and learned rules alike are
-  re-gated through kill switch, never-auto patterns, rate guard, and retry ceiling. Changes
-  touching these must keep/extend the safety-invariant tests; new destructive-command shapes
-  go in `internal/domain/testdata/irreversible_corpus.txt` (CI fails if seed patterns miss a
-  corpus entry).
-- **A multi-tab form's baseline is the swept AGGREGATE, so nothing may compare it to one
-  frame** — the pane shows one question at a time, so `sweepFrames` walks every tab and
-  `AggregateMCQFrames` joins them into the `Situation.Content` that mints the signature and is
-  stored as the audit row's `pane_excerpt`. Anything re-reading the pane later holds a SINGLE
-  frame, and the two can never hash alike. That is not a near miss to be absorbed by a
-  tolerance: a `choice` salient is STRUCTURED, so `SignatureHeldStill` compares it exactly and
-  the mismatch reads as proof the situation moved on. Auto-accept's Guard 3 did exactly this
-  and auto-dismissed EVERY multi-tab escalation as `auto_dismiss_stale` — verified live
-  2026-08-16, 22ms after the escalation was raised, against a form that stood for another 17
-  minutes. Deterministic, never intermittent, and invisible because it looked like the feature
-  working. So a frame is compared FRAME-WISE, the way `daemon.seriesStale` and
-  `deliver/codex.go` already do: same tab count, and the live `ExtractAgentMCQForm` equal to
-  one of `AggregatedMCQFrames(excerpt)`. Guard 3 widens that in two ways `seriesStale` does not
-  need, because it runs after a WAIT rather than immediately before the keystrokes — every
-  frame is a candidate (the operator may have tabbed around, and delivery resets to tab 1 with
-  a Left-arrow burst anyway), and both sides go through `domain.NormalizeMCQFrame`.
-  **Each widening buys a gate, and all four are load-bearing** — every one was proved by
-  mutation, and three of them close hazards the widening itself created:
-  - `NormalizeMCQFrame` folds the caret AND the preview box, because on a preview tab the box
-    is a FUNCTION of the focused option and a digit only moves the caret — so hap's own failed
-    attempt repaints the whole right column. Folding the caret alone fixes nothing there. What
-    survives is header + question + each option's first line, which is what keeps two different
-    forms unequal; the caller answers "held still" by typing a digit series into the pane.
-  - The suggestion must be a series of exactly `AnswerCount` digits. Otherwise `deliver.Deliver`
-    never takes the answer-series branch: it falls to the plain-menu path and maps the reply
-    against **whichever tab is visible**. Such rows exist (`unfamiliar_options` rejects a
-    wrong-shaped multi-tab LLM answer and leaves it pending WITH the answer attached, and that
-    reason is not in `autoAcceptExcludedReasons`) and were simply unreachable while the guard
-    always said no. Without the gate a bare label is delivered and the row reads `auto_accepted`.
-    The token COUNT alone is not enough, because a token may be a comma group (`1,3`) that only
-    a multi-select tab can take: `mcqdeliver.answerTab` does refuse one, but at THAT tab, so a
-    comma group on any tab after the first is caught only after the earlier tabs are already
-    answered and committed — a half-answered form, which is exactly what `verifyTabBaseline`'s
-    all-or-nothing contract exists to prevent. The captured frames carry each tab's mode, so
-    the shape is checked against `domain.MultiSelectTab(frames[i])` before anything is pressed.
-  - `domain.MCQFormFullyUnanswered` — no `☒` in the live header. Answering a tab flips it while
-    the form still stands, delivery resets to tab 1 and retypes EVERY tab, and an answered
-    single-select tab has no `CheckedOutside` equivalent to catch it later. Since
-    `NormalizeMCQFrame` folds the marks, this must be asked BEFORE the comparison, not left to
-    it. Same doctrine as the checkbox baseline: a widened baseline needs evidence.
-  - `domain.LooksLikeAggregatedMCQ` — excerpts are stored through `truncateTailRunes`, which
-    keeps the TAIL and prefixes `…`, and the incident aggregate was 3606 runes against the 4000
-    cap. One more tab and the `[question 1/N]` head is gone; treating "not a complete aggregate"
-    as "some other capture" drops straight back into the whole-vs-frame comparison — the
-    original bug, silently restored. A long enough FINAL frame leaves no marker at all, so the
-    `excerptTruncationMarker` prefix is checked as well — it is then the only surviving evidence
-    that the row is a mangled capture rather than a different kind of capture, which is why the
-    marker is one shared constant with a test pinning writer and reader together.
+- **`internal/domain` stays pure** — no imports of herdr/SQLite/LLM/adapter packages
+  (`TestDomainPurity`). Side effects live behind `internal/ports`.
+- **Optional capabilities are optional interfaces** — add a port interface (see `LocatorPort`,
+  `InspectorPort`) and type-assert at the call site, degrading gracefully; don't grow `HerdrPort`
+  and break every fake.
+  - **Test trap:** the daemon suite's `failingStore` embeds the `ports.StorePort` INTERFACE, so a
+    type-asserted capability not forwarded there is silently off suite-wide. `RowRetentionPort` is
+    separate from `RetentionPort` for the same reason.
+- **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit + log.
+  Wrap new handler/adapter calls in `logging.Guard`.
+- **Safety controls are never bypassed** — LLM submissions and learned rules alike are re-gated
+  through kill switch, never-auto patterns, rate guard and retry ceiling. New destructive-command
+  shapes go in `internal/domain/testdata/irreversible_corpus.txt` (CI fails if seed patterns miss one).
+- **Don't stall the main loop** — the select loop serves all agents; anything shelling out repeatedly
+  (LLM CLI, deep pane reads) belongs in a goroutine funnelling results back through a channel
+  (`consultLLM` / `llmResults`).
+- **Egress has exactly three exceptions, all opt-in and off by default** — `internal/updatecheck`,
+  the `github_gist` task backend (task text only), and the `turso` engine (syncs the WHOLE store to
+  the operator's Turso Cloud database). `internal/privacy` bans the GitHub and Turso SDKs by import
+  path as well as `net/http`, because the walker checks DIRECT imports — an adapter using only an SDK
+  would egress while passing, and the Turso SDK's network code is native so nothing else could catch
+  it. The gist adapter must keep using `github.WithURLs` and `github.WithTimeout` (not a `*url.URL`
+  or a hand-built transport), or `net/url` and the no-remote-dial scan need widening.
 
-  All four refuse as `heldStillUnevaluable` (PENDING), never `heldStillNo`: a malformed answer,
-  a half-answered form and a mangled capture each need a human, not a dismissal. A row carrying
-  no aggregate at all is the same (legacy only — retention never blanks these, since
-  `PruneAuditExcerpts` excludes `escalated`/`auto_accepting` at any age). Keep the paired tests
-  (`TestSweptAggregateStillMatchesItsLiveFrame` / `TestNormalizeMCQFrameFoldsAMovedCaretOnAPreviewTab` /
-  `TestMCQFormFullyUnanswered` / `TestLooksLikeAggregatedMCQCatchesATruncatedCapture` /
-  `TestAutoAcceptDeliversAStandingMultiTabForm` / `…DismissesADifferentFormOfTheSameSize` /
-  `…HoldsAFormParkedOnALaterTab` / `…LeavesAMultiTabFormWithNoCapturePending` /
-  `…RefusesASuggestionThatIsNotAnAnswerSeries` / `…LeavesAPartAnsweredFormAlone` /
-  `…LeavesATruncatedAggregatePending` / `TestGuard3HoldsTheRealPreviewForm`), and note that
-  every OTHER multi-tab fixture in this repo renders options without previews — the real
-  captured pair in `internal/domain/testdata/mcq_preview_*.txt` is the only one that reproduces
-  the layout, which is why this shipped green.
-- **A swept AGGREGATE is the one capture whose HEAD is load-bearing, so it gets its own
-  storage budget** — every other `pane_excerpt` is a pane TAIL (the prompt or error is at the
-  bottom, old scrollback goes first), which is why `truncateTailRunes` keeps the tail and
-  prefixes `…`. An aggregate is the opposite shape: `AggregatedMCQFrames` reads the tab total
-  out of the FIRST `[question 1/N]` marker and demands N markers running 1..N, so shearing the
-  head does not degrade the capture, it DESTROYS it — and `mcqFormHeldStill` then answers
-  `heldStillUnevaluable` on every sweep, forever, at Debug level only. The row is neither
-  delivered nor dismissed and nothing says why. Verified live 2026-08-18 (audit #1092): a 4-tab
-  AskUserQuestion form with preview boxes stored 4001 runes with 3 of its 4 markers left, and
-  sat pending across BOTH the FSP sweep and the 5-minute timed threshold until the operator
-  cleared it by hand. The real 3-tab preview fixture is already 3606 runes, so 4000 never fit
-  four tabs — this is every large form, not an edge case. Hence `aggregateMaxRunes`
-  (`truncateExcerpt`/`excerptBudget`), and three bounds on it: the gate is a **strict parse**,
-  never `LooksLikeAggregatedMCQ` (at write time content is untruncated so a real aggregate always
-  parses, while the marker test would hand the big budget to any pane that merely PRINTED
-  `[question 1/4]` — `LooksLikeAggregatedMCQ` stays the READER's evidence that a stored row is
-  mangled); `SaveSignatureSnapshot` deliberately keeps 4000, because `signature_snapshots` has NO
-  retention path at all and `hap signatures show` prints it unpaged; and
-  `duplicatePendingEscalation` truncates with the new helper but still passes `snapshotMaxRunes`
-  as the `snapshotCap` ARGUMENT, since there it is the "is this a large tail window" threshold
-  that gates the two fuzzy dedup paths, not a storage budget — passing the bigger one would
-  disarm them for exactly the captures most likely to need them. The refusal branches stay: this
-  stops new rows being mangled, it does not make a mangled capture trustworthy. Note the test
-  seeder `seedAgedSweptEscalation` was the only writer of that column anywhere that skipped
-  truncation, which is why every existing test was blind to this; it now goes through
-  `truncateExcerpt` like production. Keep `TestAnOversizeAggregateSurvivesTheCapturePath` /
-  `TestAnOrdinaryCaptureKeepsTheSmallerBudget` / `TestOnlyARealAggregateEarnsTheBiggerBudget` /
-  `TestAnAggregatePastItsOwnBudgetIsStillRefused`.
-- **Full self-prompting may widen the YES side of Guard 3, never the NO side** — the mode gets
-  two extra evidence paths, both reached ONLY after the ordinary comparison has already refused,
-  both gated on the `fsp bool` already threaded through `autoAcceptOne`, and both required to
-  resolve to `heldStillUnevaluable` (PENDING) when they decline. A fallback that could answer
-  `heldStillNo` would turn a widening into a queue-destroying dismissal, which is the one
-  outcome none of this may produce.
-  - `mcqSalientHeldStill` answers the row whose CAPTURE was truncated past its head, using
-    the blocks truncation did NOT reach. `truncateTailRunes` cuts from the top, so every block
-    after the first surviving `[question k/N]` marker is byte-intact
-    (`domain.SurvivingMCQFrames`, which stays structural: one declared total, consecutive
-    indices, and the run must END at that total). Requiring the live frame to equal one of
-    those blocks is the SAME frame-wise relation the intact path uses, just over a partial
-    capture — and that relation is what makes this safe. **The option set alone is NOT
-    sufficient identity and must never become the only gate**: it is the union over every tab,
-    and every AskUserQuestion form ends in a generated `Submit answers`/`Cancel` tab, so a pane
-    parked on ANY form's Submit tab is a subset of ANY other form's set — one form's answer
-    series would be typed into a different form of the same tab count, exactly what
-    `AggregatedMCQFrames` exists to prevent. `domain.LiveMCQMatchesSalient` is kept only as a
-    cheap extra conjunct catching option drift, and it derives BOTH sides through
-    `NormalizedOptionSet` then `MaskVolatile` — the stored salient was masked, so a live side
-    normalized only for case and whitespace could never match a label carrying a path or a
-    number, and would silently no-op for every such form. Three further gates are not optional:
-    tab count must equal the answer-series length (or delivery falls to the plain-menu path and
-    maps the reply against whichever tab is visible), the form must be fully unanswered
-    (delivery resets to tab 1 and retypes EVERY tab), and **no token may be a comma group** —
-    the tabs whose blocks are gone carry no select mode at all, so the shape cannot be verified
-    for the whole form, and an unanswerable safety question is answered NO. A capture with NO
-    surviving block (fully truncated, or a legacy row) has no identity evidence and stays
-    pending: a deliberate limit, not an oversight. Liveness is still proved twice afterwards by
-    `deliver.deliverSeries` and `mcqdeliver`.
-  - `unstructuredHeldStill` answers a PANE-TAIL row using `domain.TailSimilarWithin`, which cuts
-    both salients to the shorter one's length FROM THE TAIL before the trigram compare. The
-    mismatch it exists for is structural, not statistical: the baseline is minted from a
-    `--source recent` CONSUMING DELTA while every re-read is `--source visible`, so symmetric
-    Jaccard is dominated by content only the longer side ever had and refuses however little
-    moved — which is the documented reason idle and generated-task rows never auto-accept.
-    Aligning on the TAIL rather than testing containment is what keeps it safe: a screen that
-    moved on paints its new content at the BOTTOM, inside the compared window, while containment
-    would answer "still there" with a new question sitting below the old one.
-    `domain.MinTailCompareRunes` is the floor, and it is load-bearing for the same reason
-    `embedding.min_salient_chars` is — two short tails compare equal whatever they say, making
-    one near-empty screen a magnet. `fspTailHeldStillJitterPercent` is a SEPARATE constant from
-    `staleDeferredSendJitterPercent` (shared by two other call sites) at the same value: the
-    loosening is the alignment, not the tolerance. Because it runs AFTER `SignatureHeldStill`
-    has refused, it must re-ask the two refusals its caller did not — either side over-masked,
-    or a fresh salient that has become structured. An over-masked salient is mostly repeated
-    `<path>`/`<num>`/`<hash>` placeholders, and two of those share almost every trigram, so they
-    clear any tolerance over any window: the magnet failure arriving by a door the length floor
-    does not cover.
+### Config surface
 
-  A third loosening sits outside Guard 3: under FSP a `@noop` suggestion is RETIRED
-  (`ReasonAutoDismissNoop`) rather than left pending, because the sentinel means SEND NOTHING and
-  can never become deliverable on a later sweep — so under a mode whose premise is that nobody is
-  reading the queue it would sit forever. It is the only auto-accept path that acts with no pane
-  evidence, and it can afford to be: nothing is typed, nothing is learned. It still honours the
-  kill switch, the per-agent disable and the runaway-guard pause, and it makes `autoDismiss`
-  reachable from FOUR places rather than three. Keep
-  `TestFSPAnswersATruncatedAggregateWhoseLiveFrameSurvived` (the #1092 regression) /
-  `TestFSPTruncatedAggregateRefusesADifferentFormOfTheSameSize` (the Submit-tab collision that
-  is why the option set can never be the only gate) / `TestFSPRefusesACaptureWithNoSurvivingBlock` /
-  `TestTimedAutoAcceptStillLeavesATruncatedAggregatePending` /
-  `TestFSPTruncatedAggregateRefusesDriftedOptions` /
-  `…RefusesEveryCommaGroup` / `…RefusesAPartAnsweredForm` / `…OverrideNeverDismisses` /
-  `TestFSPUnstructuredFallbackRefusesAnOverMaskedPair` / `…RefusesANowStructuredLiveSalient` /
-  `TestFSPAnswersAnIdleRowWhoseTailStillMatches` /
-  `TestTimedAutoAcceptCannotEvaluateAMismatchedWindow` (the control proving the pair is not
-  vacuous) / `TestFSPLeavesAMovedOnIdleScreenPending` / `TestFSPRetiresANoopEscalation` /
-  `TestTimedAutoAcceptStillLeavesANoopEscalationPending` /
-  `TestFSPNoopRetirementHonoursADisabledAgent`, and in `internal/domain`
-  `TestLiveMCQMatchesSalient*` (including `…MasksBothSides`) /
-  `TestNormalizedOptionSetRoundTripsThroughSplitOptionSet` / `TestSurvivingMCQFrames*` /
-  `TestTailSimilarWithin*`.
-- **The last look before a claim is COMPLETE, and a content-safety refusal is not a delivery
-  fault** — everything above `ClaimForAutoAccept` (Guard 3's pane re-read especially) is a herdr
-  shell-out with a budget in SECONDS, and the sweep walks every candidate, so the gap between
-  "we checked" and "we send" is wide enough for an operator to act in. `claimBlockedBy` re-asks
-  all three controls there, broadest first: the **kill switch** (FR-017 — not FSP-specific, so
-  timed auto-accept re-reads it too, and it fails closed on a read error), the **mode** and its
-  ceiling latch via `stillPermitted`, and **`accept_generated_task`** for a generated-task row,
-  because that is a SEPARATE opt-in resolved once per sweep into `allowGenerated` — an operator
-  turning off just that key mid-sweep would otherwise still have a task written and handed to an
-  agent. `retireNoopEscalation` takes the same look, and the kill switch matters most there:
-  Guard 1a returns before ANY dismissal precisely so pausing the herd never destroys the queue it
-  protects, and a pause landing mid-sweep must get the same answer as one landing a second
-  earlier. Separately, a refusal from the seam's at-send screen is tagged `errOutboundRefused`
-  and handled like `errAgentDisabled` rather than as a delivery failure: it used to enter the
-  retry budget, so the same never-auto match was refused `maxAutoAcceptAttempts` times and the
-  row was then dismissed as `auto_accept_failed` — deleting from the queue exactly the escalation
-  FR-015 says must always reach a human. The refusal is permanent by nature (the same text
-  screens the same way every sweep), so a budget could only ever end in that dismissal. Reachable
-  only through a custom `next_task_template`, since the daemon's pre-check renders with the
-  DEFAULT one. **And the compensating revert itself needs an obligation**: every claimed row that
-  is not delivered comes back through `revertClaim`, and `auto_accepting` is a TRANSIENT status
-  that both the operator's queue and the candidate query filter out (each selects `escalated`)
-  while the only automatic reclaim runs at daemon START — so a revert that fails leaves the
-  escalation invisible to everyone until a restart, which is the "silently lost escalation" the
-  status exists to make recoverable, arriving through the error path instead of a crash. Failed
-  reverts are therefore remembered and retried every tick (`retryAutoAcceptRevert`), beside the
-  finalize retry and for the same reason it is not gated on the kill switch: it is bookkeeping
-  about a claim that has ALREADY been abandoned, and an operator pausing the herd must not be why
-  a row stays hidden. Only a non-nil error is a failure — `false, nil` means another writer moved
-  the row, which is legitimate. Keep `TestFSPGeneratedTaskSafetyRefusalIsNeverDismissed` (which
-  sweeps past the attempt budget — the single-sweep test could not see it) /
-  `TestFSPRechecksAcceptGeneratedTaskBeforeClaiming` /
-  `TestAutoAcceptRechecksTheKillSwitchBeforeClaiming` (both flavours) /
-  `TestAStrandedClaimIsRetriedUntilItIsReleased` / `…IsReleasedEvenWhilePaused`.
-- **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason),
-  cleared on delivery and pruned with the other per-row state. Before it, every "leave it
-  pending" path was Debug-or-silent (Guard 1b and the pane-busy skip produced no output at ANY
-  level), which is why #1092 took a five-round investigation and a live database query to
-  explain. Once per (row, reason), not per sweep, because the pass re-examines every pending row
-  every minute — but a row whose reason CHANGES is new information and says so. The call sites
-  all sit AFTER `stillEligible` is set: an INELIGIBLE row `continue`s before that, so logging one
-  there would be pruned every tick and re-logged every minute forever. Keep
-  `TestAPendingEscalationSaysWhyExactlyOnce` / `TestAChangedPendingReasonIsReported`.
-- **An option label stops at the preview column** — Claude renders options WITH previews in two
-  columns (option list left, preview box right) and a pane is one flat text grid, so the box
-  lands inside the option's own line. Line-anchored parsing therefore made option 1's label
-  carry the box's top edge and gave an option whose text WRAPPED a label made entirely of
-  preview content — labels that then changed whenever the highlighted preview did, so the same
-  question minted a new signature on every caret move. `ParseNumberedOptions` cuts at the box
-  column (`trimPreviewColumn`). The cut only ever removes a SUFFIX, which is what keeps it away
-  from the checkbox rule below: a `[ ]`/`[✔]` marker is a PREFIX and always survives it, and a
-  label that is nothing but preview text carried no checkbox to lose. A bare `─` is excluded
-  from the glyph set on purpose — agents draw full-width separator rules with it.
-  **A label that trims to nothing is recovered from the next row, never dropped**
-  (`wrappedOptionLabel`): a long enough label starts BELOW its number, leaving that number's row
-  carrying only the box, and dropping it loses a choice the agent is really offering — the
-  option set reads one short and a reply of "2" maps to nothing. Recovery takes the FIRST
-  continuation row only, gated on that row carrying a preview column, because an ordinary menu's
-  indented line under an option is a DESCRIPTION and not part of the label (the repo's own 3-tab
-  fixture renders that way, so getting it wrong would rewrite every existing choice signature).
-  Wrapped rows are deliberately NOT stitched into one label: a terminal wrap is lossy —
-  `…enabl`+`ed` is a mid-word cut needing no separator while `…the very`+`top` lost a space to
-  the break, and measured on the real capture the two differ only by how near the gutter the
-  text ends (4 columns versus 6), which is a property of one terminal width, not a rule. One row
-  per label is stable, deterministic and never invented. Keep
-  `TestWrappedPreviewOptionIsNotDropped` / `TestWrappedLabelsAreNotStitchedTogether` /
-  `TestOrdinaryMenuDescriptionIsNotAnOptionLabel`.
-- **A checkbox tab is answered by TOGGLING, so its baseline is a safety control** — a digit
-  flips a `[ ]`/`[✔]` box rather than selecting it, so pressing one blind is not idempotent:
-  over a pane already carrying an attempt's toggles it CLEARS them and the advance submits an
-  empty answer. The rule is `checked ⊆ chosen`, enforced at DELIVERY (`domain.CheckedOutside`
-  in `daemon.reverifyMultiSelect`, `frontend.verifyTabBaseline`, and again per keystroke in
-  `mcqdeliver.toggleTab`, which presses only the missing boxes): hap's own boxes may already
-  be set, anything else is the operator's and is never cleared. CAPTURE only records — refusing
-  there would strand every form hap itself half-answered, since the next attention event
-  re-captures that pane. The signature folds the checkbox state away
-  (`domain.NormalizedOptionSet`) so a half-delivered form still matches the rule learned for
-  the untouched one. **The widened baseline needs evidence**: it applies only when this daemon
-  recorded its own attempt at this pane+signature (`markToggleAttempt`, in-memory, cleared on
-  a completed delivery and lost across restarts — both fail safe). Without it a tab must be
-  completely clean, because "checked ⊆ chosen" alone would also accept an operator halfway
-  through ticking that very form. Keep all three invariant tests when touching this
-  (`TestMultiTabSweepMultiSelectOwnTogglesComplete` / `…ForeignSelectionEscalates` /
-  `…UnattributedTogglesEscalate`).
-- **An unattended task hand-out is only "delivered" once the agent works** — a successful
-  `agent send` proves herdr took the keystrokes, not that the agent acted on them, so the
-  `[-]` written at delivery is recorded in `task_reservations` and confirmed only by a
-  `working` transition (`daemon.handleTransition`). `daemon.reclaimStrandedTasks` returns an
-  unconfirmed item to `[ ]` once its agent is parked again past `reclaimGrace`, which is what
-  makes each sweep decide from current state rather than a past send. Four bounds are
-  load-bearing and must survive any change here: the daemon releases ONLY a `[-]` it holds a
-  ledger row for (an operator's or an agent's own mark is never cleared); **one unconfirmed
-  hand-out per agent** (`agentsAwaitingHandout`), because confirmation is per-agent and a
-  second hand-out would let one resumption confirm — and so strand — the untaken first;
-  confirm and reclaim both compare `terminal_id`, since herdr recycles pane ids and an agent
-  id IS a pane id; and an item handed out `maxTaskHandouts` times without ever being started
-  is left `[-]` and escalated instead of resent forever. Keep the invariant tests in
-  `autosendidle_test.go` (`…ReclaimsStrandedHandoutAndResends` /
-  `…ConfirmedHandoutIsNeverReclaimed` / `…ReclaimIgnoresForeignInProgressItems` /
-  `…OneUnconfirmedHandoutPerAgent` / `…RecycledPaneCannotConfirmItsPredecessorsHandout` /
-  `…HandoutCapEscalatesInsteadOfResending`).
-- **Full self-prompting's two opt-in keys are OFF by default, and each buys one narrow
-  thing** — `full_self_prompting.honour_limits` and `…accept_generated_task`
-  (`config.FullSelfPrompting`). These bounds are load-bearing:
-  - **`honour_limits = false` means the whole `[limits]` section is INERT, and inertness is
-    one CLAUSE in each gate, never an early return.** The key used to skip only the mode's
-    own pre-check, so the ordinary decision path kept running the runaway guard: an agent
-    that reached `max_consecutive_auto_prompts` had its next decision escalated
-    `rate_limited` AND was paused until a human checked in — and `rate_limited` is in
-    `autoAcceptExcludedReasons`, so that escalation was then permanently operator-only. An
-    unattended mode that benches its own agents, and no setting that switched the ceilings
-    off. `domain.RateLimits.Inert` now short-circuits `CheckRate` (ahead of the `Paused`
-    branch, because the pause is the guard's OWN stand-down and only this guard ever sets
-    one) and gates the FR-014 retry ceiling in `Decide` — `limits.max_error_retries` is the
-    third key in the same section, so an error signature then retries without bound and
-    `retry_exhausted` is never raised. Deliveries still ADVANCE the counters
-    (`noteFSPSend`), so turning the key back on resumes against a real record.
-    The daemon resolves it through `limitsInert` (both config reads first, so an install
-    that never opted in never pays for `fspActive`'s store query) or `limitsInertFor` for a
-    caller that already has an `fspActive` answer — and a per-AGENT loop must use the
-    latter, because `fspActive` also owns the once-per-episode degradation warning.
-    **The three gates that read `rate.Paused` are SHARED** — `sweepAllowed`,
-    `autoAcceptAgentSuppressed`, `eligibleIdleAgents` each carry the per-agent disable
-    (and `sweepAllowed` the kill switch and the never-auto screen) in the same run of
-    checks — so inertness relaxes the pause clause alone. An early return at the top of any
-    of them is a safety bypass, and it passes an end-to-end test because the disable is
-    re-checked at delivery: the guards are therefore driven DIRECTLY. Keep
-    `TestSweepAllowedInertOnlyRelaxesThePause` /
-    `TestAutoAcceptAgentSuppressedInertOnlyRelaxesThePause` /
-    `TestEligibleIdleAgentsInertOnlyRelaxesThePause` (all three proved by mutation) /
-    `TestFSPWithoutHonourLimitsSendsPastTheConsecutiveCeiling` /
-    `…IgnoresALeftoverPause` / `TestLimitsStillApplyWhenFSPCannotActivate` (inert needs the
-    mode ACTIVE, not merely enabled) / `TestLimitsStillApplyWithFSPOff` /
-    `TestLimitsInertDoesNotBypassTheKillSwitch` / `…NeverAuto` /
-    `TestCheckRateInertIgnoresEveryCeilingAndThePause` /
-    `TestInertLimitsIgnoreTheErrorRetryCeiling`.
-  - **A busy pane is not a runaway ceiling.** `domain.ReasonPaneBusy`, not
-    `ReasonRateLimited`, at all four sites that fail on `acquirePane` (`sweep.go`'s series
-    and remote-env deliveries, `daemon.go`'s two LLM-promotion branches). Borrowing the
-    ceiling's tag cost two things neither site wanted: `escalate` pauses the agent on
-    `rate_limited` until a human checks in, over a lock the in-flight interaction releases
-    on its own; and `autoAcceptExcludedReasons` refuses the row forever, so under full
-    self-prompting a momentary collision became permanently operator-only. `pane_busy` is
-    deliberately NOT excluded — the sweep's own `d.paneBusy` defer and Guard 3's re-read
-    are what gate the retry. Keep `TestPaneBusyEscalationDoesNotPauseTheAgent` /
-    `TestPaneBusyIsNotAnAutoAcceptExclusion`.
-  - **The ceiling check must not read a PAUSE as a ceiling.** `domain.CheckRate`'s first
-    branch answers `rate_limited` for a paused agent, but `fspCeilingReached` runs BEFORE
-    Guard 1b (`autoAcceptAgentSuppressed`), which already suppresses paused agents
-    correctly. Passing the rate through unmodified would let one operator-paused agent —
-    or a leftover rate-pause from the ordinary decision path — switch the mode off for the
-    whole herd over a state nothing new happened in. The rate is copied with `Paused`
-    cleared, and only the two counters decide.
-  - **The stand-down latches in memory FIRST, writes config second, and the write runs off
-    the select loop.** `App.UpdateConfig` nudges the daemon's own control socket for the
-    reload, so an inline write would block that loop on a round trip to itself. The latch is
-    what makes the sweep that noticed stop immediately, is checked inside `fspActive` so both
-    the sweep and the escalate-time hook honour it through one gate, de-duplicates the write
-    and the operator notification to one per ceiling, and is cleared on reload so a re-enable
-    takes effect (the rate row is untouched, so a ceiling that still stands re-trips at once).
-  - **The attribution is written at FINALIZE, and the finalize RETRY must carry it.**
-    `retryAutoAcceptFinalize` re-calls `MarkAutoAccepted` on a later tick with only the id,
-    so `autoAcceptNeedsFinalize` is `map[int64]bool` (id → was-FSP), not a set — a set drops
-    the flag on exactly the rows whose bookkeeping already failed once. Claim time is NOT an
-    option: `ReclaimAbandonedAutoAccepts` returns abandoned `auto_accepting` rows to
-    `escalated` at startup and would strand a true flag on a row nothing ever delivered. The
-    store ORs the column rather than assigning it, so a replay can only ever set it.
-  - **A generated task is screened TWICE, and the second one is the real gate.** The task text
-    is authored by the generator LLM AFTER the decision that raised the escalation, so no
-    safety control has ever seen it — `handleTaskGenOutcome` validates only the shape, because
-    the operator's confirm was the gate. This feature removes that gate, so the never-auto and
-    suspected-irreversible screens run in the fork, before the seam, on the RENDERED
-    `DeclaredTask.Prompt()` rather than the stored text (stored items keep line breaks as the
-    literal two-character `\n`, which a line-anchored rule cannot match while the real newline
-    reaching the pane can — screening the stored form fails OPEN, the same trap
-    `tasklistreview` documents). A hit reverts the claim and leaves the row escalated, because
-    FR-015 says a never-auto match always reaches a human.
-    The daemon-side check (`generatedTaskUnsafe`) can only render with the DEFAULT template —
-    the target source, and so its own `next_task_template`, resolved path and index, is chosen
-    inside the seam — so a custom template could frame a benign task into something the rules
-    refuse and still pass it. The seam is therefore handed a `screen func(string) error`
-    (the same shape as `tasklistreview`'s `safe` closure) and calls it with the EXACT prompt
-    immediately before the send, BEFORE the reservation so a refusal strands nothing. The
-    pre-check earns its place by refusing obvious cases before any list is written. Note the
-    daemon's own tests drive a FAKE seam, so only a `frontend` test can prove the real path
-    calls the callback: `TestAutomatedGeneratedTaskScreensTheSourceTemplatePrompt`.
-  - **A generated-task acceptance is the DAEMON's row to finalize.** `autoAcceptOne` has
-    already claimed it (`escalated → auto_accepting`), so the `automated` flag makes
-    `frontend.acceptGeneratedTask` skip BOTH `ResolveEscalation` (whose escalated-guard
-    could now only fail, after the files were written) and `InsertCorrection` — an automatic
-    acceptance must never feed the confidence model, which is the entire reason
-    `AuditStatusAutoAccepted` exists apart from `resolved`. The seams
-    (`Options.AcceptGeneratedTask` / `DisableFSP`) are optional function fields wired in
-    `cmd/hap`, so `internal/daemon` still does not import `internal/frontend`; a nil seam
-    returns the claim rather than stranding the row in the transient status.
-    **EVERY status check on that path has to know it**, including the cheap early-out above
-    the claim (`audit.Status != "escalated"`), and missing THAT one is destructive rather
-    than merely broken: the error propagates to `autoAcceptDeliveryFailed`, which burns one
-    attempt per sweep and DISMISSES the escalation once the budget is spent — so the feature
-    would delete the very suggestions it exists to act on, minutes after each is raised. It
-    shipped green because the daemon tests wire a FAKE seam; only a `frontend` test driving
-    `AcceptGeneratedTaskAutomatically` against an already-claimed row can catch this class
-    (`TestAutomatedGeneratedTaskAcceptsAClaimedRow`, proved by mutation). The seam call
-    also runs INSIDE `WithAgentAutomation`, like every other delivery: it sends the first
-    task to the pane, so a disable landing after Guard 1b must still stop it. Safe against
-    the config lock the seam takes on its way through `addTaskSourceIfAbsent` — the barrier
-    is a per-agent flock and the config lock a separate file, and no path takes them in the
-    opposite order. `TestFSPGeneratedTaskTakesTheLifecycleBarrier` asserts the barrier is
-    TAKEN rather than that a disabled agent is skipped, since Guard 1b makes the latter pass
-    either way.
-  - **EVERY generated-task hand-out gets a ledger row, the operator's included.** The
-    reservation marks the item `[-]` before the send, and a crash in that window used to
-    strand it: the audit row is reclaimed to `escalated` at startup but the checklist marker
-    is not, so the retry reads the item as already taken, burns its attempt budget and the
-    escalation is DISMISSED. `recordTaskReservation` writes the same `task_reservations` row
-    the daemon's own hand-outs use, so `reclaimStrandedTasks` returns the item to `[ ]` once
-    its agent is parked past the grace window; a rolled-back send retires it again. The
-    operator path used to record nothing, on the ground that a human was present to read the
-    error — **that premise died with the queued confirm**: the send now happens inside the
-    OWNING node's daemon, on a machine the operator may not be sitting at, so a hand-out the
-    agent never starts would sit at `[-]` with nothing able to reclaim it. The cost is
-    accepted and worth naming, because it is the likeliest support question:
-    `agentsAwaitingHandout` allows ONE unconfirmed hand-out per agent, so a confirmed agent
-    is withheld from the idle poll until it goes `working` or the row ages out at
-    `staleHandoutTTL`. `TerminalID` now comes from the daemon's published roster row
-    (`liveAgentFor`) rather than being left empty, which is what tells a RECYCLED pane apart.
-    Keep `TestOperatorConfirmRecordsAReservation`.
-  - **The mode is re-asked immediately before the claim** (`stillPermitted`). The guard chain
-    above it does pane READS with a budget in seconds, so an operator switching the mode off
-    mid-chain would otherwise still get the send that follows; `WithAgentAutomation` covers
-    the per-AGENT disable at delivery, not the global mode.
-  - **The ceiling is only read on a row that could actually be DELIVERED.** `ConsecutiveAuto`
-    is reset only by human interaction, so an agent that saturated it and was then killed
-    carries it forever — and its leftover escalation is still a candidate. Reading that as a
-    ceiling stands the mode down for the whole herd over a row nothing could have sent, and
-    because the latch clears on reload it re-trips after every operator re-enable, so the
-    mode can never stay on again; an early exit also skips `autoAcceptOne`, so the absence
-    bookkeeping that would eventually retire that row never advances and the livelock has no
-    end. Hence the `live`/`autoAcceptParked` gate before the check, and `continue` rather
-    than `break` after a stand-down so the remaining candidates still register in
-    `stillEligible` (a `break` hands them to `pruneAutoAcceptState`, silently resetting
-    delivery budgets and absence counts). The two ceilings are tested SEPARATELY rather than
-    through one `CheckRate` call so the stand-down can name which tripped — and the
-    per-minute one honours the window rollover, or a count from a window that elapsed
-    minutes ago would switch the mode off over traffic that has stopped. Keep
-    `TestFSPCeilingIgnoresAnUndeliverableRow` / `…IgnoresAnAgentThatWentBackToWork` /
-    `…StandDownKeepsLaterCandidatesAccounted` / `TestFSPCeilingNamesWhichLimitTripped` /
-    `TestFSPPerMinuteWindowRolloverIsNotACeiling`, and for the three above
-    `TestFSPGeneratedTaskScreensTheExactOutboundPrompt` /
-    `TestAutomatedGeneratedTaskScreensTheSourceTemplatePrompt` /
-    `TestAutomatedGeneratedTaskRecordsAReservation` / `TestOperatorConfirmRecordsNoReservation` /
-    `TestAutomatedGeneratedTaskReleasesTheReservationOnAFailedSend` /
-    `TestFSPRechecksTheModeBeforeClaiming`.
+- **Everything that writes config.toml is a `hap config` subcommand**, which is why it is the ONLY
+  visible command in the help's Configure group. Topics are TWO-word registry entries resolved
+  longest-spelling-first in `cli.Run` — that is what makes `hap config rules --help` reach the
+  topic's own page. `hap task` is deliberately NOT here: it edits checklist ITEMS, not config. Old
+  top-level spellings still resolve (`Command.MovedFrom`) and print their migration note on
+  **stderr** — these verbs print tab-separated listings that scripts parse.
+- **Every config key is reachable from the CLI** — the TUI is a convenience, not a capability.
+  SCALARs go in `frontend.ConfigFields`; ARRAY/MAP sections cannot be a `config set` key (an element
+  is addressed by POSITION, a map entry by NAME) so each gets a verb named in `configListCommands`.
+  Both registry tests fail on a STALE entry too. Four rules bind the list editors:
+  - **A long-lived list ELEMENT's own fields are held to the same standard** — every
+    `[[task_sources]]` field has a `set` key, because settable-only-at-creation means
+    remove-and-re-add: retyping every other field and renumbering every later source to change one.
+  - **Removal compares the WHOLE entry the caller listed**, never one field — a one-field guard
+    passes on the wrong element exactly when a listing has gone stale, and duplicate-ish entries are
+    legitimate.
+  - **An insert must respect the daemon's lookup order** — `config.CaptureDelay` takes the first rule
+    matching the agent type and `"*"` matches everything, so a specific rule appended after a wildcard
+    one is configured, listed, and never read.
+  - **`[[task_sources]]` inverts that: a new source is always APPENDED.** Its index is a public
+    selector (`hap task 2 …`, `{task_source_index}` in delivered prompts, every listing/set/remove),
+    so inserting elsewhere re-points every selector after it — including commands already in an
+    agent's scrollback. Binds BOTH creating surfaces: `AddTaskSource` and `addTaskSourceIfAbsent`
+    (accepting an LLM task suggestion registers a source as a side effect).
+  - Secrets are a DISPLAY rule, not an exemption: `hap config env` never prints a value and reads it
+    from stdin unless `--value` is passed.
 
-  Accepted limitation, not a bug: a generated-task escalation is `idle`-typed, so its
-  baseline salient is unstructured pane-tail and Guard 3 usually answers
-  `heldStillUnevaluable` — the row waits for the operator. Keep the paired tests
-  (`TestFSPHonourLimitsRefusesAtTheCeiling` / `…OffKeepsTodaysBehaviour` /
-  `…IgnoresAPauseThatIsNotACeiling` / `…SwitchesOffOnlyOnce` /
-  `TestFSPCeilingLatchStandsTheModeDownImmediately` / `TestFSPRefusesAGeneratedTaskByDefault` /
-  `TestFSPAcceptsAGeneratedTaskWhenEnabled` / `TestFSPGeneratedTaskWritesNoCorrection` /
-  `TestFSPGeneratedTaskWithNoSeamLeavesItPending` /
-  `TestFSPGeneratedTaskNeverAutoTextStaysPending` /
-  `TestFSPGeneratedTaskScreensTheRenderedForm` / `TestFSPFinalizeRetryKeepsTheAttribution` /
-  `TestMarkAutoAcceptedNeverClearsTheFlag`).
-- **`enable_auto_send_task_when_idle` skips the LEARNING gates, never the safety ones** —
-  a declared task from a source with that flag (`DeclaredTask.Reserve`) resolves ahead of any
-  learned noop precedence (`resolveSituation`) and bypasses BOTH the shadow-mode gate and the
-  confidence gate (`domain.Decide`, keyed on the existing `idleHandout` predicate — the
-  VERIFIED classified situation plus the RESOLVED action, never a sweep-time flag). The flag
-  is an operator instruction about a QUEUE; a learned action is an inference about a SCREEN,
-  and every idle screen mints its own signature, so holding the queue to per-signature
-  graduation means the feature never delivers unattended — which is the only thing it is for.
-  The bypass sits AFTER the variance guard, rate guard and suspected-irreversible heuristic
-  and before nothing else; the kill switch, never-auto patterns, per-agent disable and the
-  optional pre-delivery LLM review all still apply at delivery. Sources without the flag keep
-  the historical behavior exactly. Keep the paired invariant tests
-  (`TestDecideUnattendedSourceSendsWithoutGraduating` / `…OutranksALearnedNoop` /
-  `…StillObeysEverySafetyControl` / `TestDecideAttendedSourceStillWaitsToGraduate` /
-  `TestAutoSendIdleUnattendedSourceSendsWithNoLearnedRule` / `…AttendedSourceStillEscalates…`).
-- **A pending escalation never benches an agent from the idle poll** — `eligibleIdleAgents`
-  has no escalation gate, deliberately. An escalation is a question about what to answer on
-  the agent's SCREEN, not a verdict on whether it can take its next declared task, and gating
-  on one deadlocks the feature against itself: a pending task is what raises
-  `noop_vs_pending_tasks`, which then blocks the poll that would deliver it. Do not reach for
-  the audit `Trigger` to tell "the poll's own" escalations apart either — `daemon.trigger`
-  derives it from `tr.AutoIdleSend`, so EVERY escalation raised on a poll-driven episode is
-  stamped `auto-idle-send:`, which is the common shape for exactly the parked agents this
-  feature exists for. **The bound on an undeliverable task is per ITEM, not per agent**: a
-  failed send rolls its item back to `[ ]` and records NO reservation, so
-  `reclaimStrandedTasks` can never age it — `deliverAutonomousClaimed` therefore counts the
-  attempt itself (`RecordTaskHandoutAttempt`) and at `maxTaskHandouts` skips the rollback,
-  leaving the item `[-]` and escalating (`escalateUndeliverableTask`). Because the poll
-  ignores `episodeHandled` on purpose, an agent whose episodes keep NOT sending is otherwise
-  re-read every sweep forever, so `Daemon.pollRedrive` widens the interval (1, 2, 4 … capped
-  at 15m) and any delivered send clears it — a delay, never a bench. Keep the invariant
-  tests (`…OrdinaryEscalationDoesNotBlockHandout`, whose poll-raised cases pin the trigger
-  trap / `…UndeliverableTaskIsCappedNotRetriedForever` / `…CapsAtExactlyMaxHandouts` /
-  `…CappedTaskLetsTheAgentMoveToTheNextItem` / `…EscalatedAgentStillGetsItsNextTask` /
-  `…BacksOffRedrivingAnAgentThatNeverSends` / `TestTaskReviewFailedSendCountsTheHandoutAndRollsBack`).
-- **An inherited task-source provider is a live link, never a snapshot** — `[task_source_provider]`
-  is the DEFAULT storage backend and each `[[task_sources]]` entry may override it with its own
-  `provider`/`gist_id`. An empty per-source key IS the inheritance and must NEVER be materialized:
-  `normalizeTaskSources` runs on **Load AND Save**, so filling it in "like we do for `max_tasks`"
-  would stamp the current default onto every existing source the first time any surface writes
-  config — and the operator's later `hap config set task_source_provider.provider …` would then
-  move nothing, silently, for every install that already had a config. It fails no obvious test;
-  `TestInheritedProviderIsNeverMaterialized` is the one that catches it. Provider misconfiguration
-  is detected at USE time (`ValidateResolvedProvider`), never at `Load`, and never coerced —
-  coercing an unrecognized provider to `local_fs` would resolve gist-shaped names against the
-  daemon's cwd and CREATE local checklist files while the operator believed their lists were
-  remote. A missing `gist_id` is deliberately not a write-time rule either: it would make the keys
-  order-dependent to set (`TestValidateTaskSourceAcceptsAMissingGistID` pins the omission).
-  **The TOP-LEVEL key is the opposite: it IS materialized, and that is what made flipping its
-  default safe.** `Default()` names `sqlite` and `Load` pins `local_fs` the moment the config FILE
-  exists — before the decode, so an explicit key still wins and every return carries the pin,
-  including the two error paths and the `AutoAccept.validate()` branch that keeps the decoded
-  config rather than rebuilding it. A post-decode pin misses that third one, and the miss is
-  silent: a typo in the file would move an install's storage backend. `ResolveProvider`'s own
-  literal fallback stays `local_fs` — it is reached only by a `Config{}` assembled in memory,
-  where the posture needing no store handle and no node id is the right answer. And
-  `AnyNonDefaultProvider` cannot be written as "anything but local_fs" any more: there are now TWO
-  postures an operator reaches without touching the setting, so it asks whether the config is
-  MIXED and otherwise stays quiet on either local backend — a naive version turns on the provider
-  column for every new install. Keep `TestAFreshConfigDefaultsToSQLite` /
-  `TestAnExistingConfigWithoutTheKeyStaysLocalFS` (the discriminating one: a config built in
-  memory cannot tell "no file yet" from "a file omitting the key", so it must write a real file) /
-  `TestAZeroConfigStillResolvesLocally`. Note the test suites: `internal/cli` and
-  `internal/frontend` fixtures whose list is a FILE now declare it (`localFSApp`/`localFSCfg`)
-  rather than riding on the default — a suite where every test runs on a local file, where a
-  locator IS a path, is the single reason the locator-is-not-a-path bugs kept shipping green, so
-  `testApp` deliberately stays on the DEFAULT and the sqlite path has its own coverage
-  (`tasksource_sqlite_default_test.go`, the sqlite subtest of
-  `TestBootstrapWritesWhereItRegisters`).
-- **A task-list locator is never handled as a FILE outside the local backend** — `taskfile.Mutate`,
-  `MutateWithin` and `WriteFileAtomic` take a path; a locator is not one. Under a remote provider it
-  is a `gist://<id>/<file>` URI that `os.Stat` can only fail on, and the failure reads like a missing
-  file (`stat gist://…: no such file or directory`) rather than like code looking in the wrong place.
-  Every checklist mutation therefore goes through the STORE — `frontend.mutateList`/`mutateTask`,
-  `daemon.mutateTaskList` — and there is deliberately NO local `mutateTaskFile` alias in
-  `internal/frontend` to reach for. `internal/taskstore/local` is the one exemption, because there a
-  locator IS a path. The hazard is that the local twin of a store method passes every test: the
-  generated-task confirm moved its read and write to the store and left the send-time RESERVATION on
-  `taskfile.Mutate`, so under `github_gist` it created the list, registered the source, CLAIMED the
-  escalation and only then died with nothing sent. Reading is the same trap by a different call:
-  `pickAppendTarget` chose among an agent's matched sources with `os.ReadFile`, which cannot resolve a
-  gist source's bare file name, so it silently degraded from "the source with pending work" to "the
-  first source" — wrong list, no error. The bootstrap EXCLUSION had it a third time: it compared that
-  same absolutized path against the local bootstrap path, so under a gist provider an agent's own
-  list read as external and a second confirm took the append path, whose dedupe keys on raw text
-  while the bootstrap flow stores NUMBERED items — appending every listed task again, un-numbered.
-  Comparison is therefore on canonical LOCATORS (`isBootstrapList`) — **plus a declared path**, and
-  that second half is not optional: a DERIVED source (`path` unset, the documented one-list-per-agent
-  form) resolves to `DerivedFileName(agent)`, byte-identical to what the bootstrap registers, so
-  locator equality alone excludes the most idiomatic gist setup, runs the bootstrap flow, and
-  `addTaskSourceIfAbsent` then refuses to register a second source for the agent — failing every
-  retry, after the tasks were already written. Never compare the declared spelling ALONE either: the
-  same file name in a different gist (`gist_id` override) is a different list. The bootstrap
-  locator's own resolution error is likewise DEFERRED past the append early-return, because the
-  append path never needed it — a misconfigured remote default beside a healthy `local_fs` source
-  must still work. Two guards, and they cover
-  different halves: `TestOnlyTheLocalBackendTouchesATaskListAsAFile` bans the path-taking MUTATORS
-  by construction (matched on the selector, so a function value is caught too, and a dot-import of
-  `taskfile` is refused outright since it would make the ban unenforceable; exemptions carry a
-  reason and are checked live), while the READ half needs behavior — hence `App.TaskStoreFor`, the
-  test-only seam that stands a remote backend up in-process. **Every frontend test before it ran on
-  a local file, where a locator IS a path, which is the single reason all of this shipped green** —
-  so a change here belongs in `remote_confirm_test.go`, against a store that refuses a non-gist
-  locator. Keep `TestRemoteConfirmReservesThroughTheStore` /
-  `…RollsBackThroughTheStore` / `TestRemoteAppendTargetReadsCandidatesThroughTheStore` /
-  `TestRemoteSecondConfirmDoesNotDuplicateItsOwnList` /
-  `TestAppendTargetPrecedenceSurvivesTheStoreRewrite`. A compensating write (the reservation
-  rollback) additionally takes `context.WithoutCancel`: a remote store uses the caller's ctx, and
-  the likeliest cause of the failed send it undoes — the operator quitting — is the same
-  cancellation that would abort the release and strand the item at `[-]`.
-- **A task-list locator is canonicalized in exactly one place** — `tasklocator.Canonical`, which
-  `taskfile.LockPath` and both `canonicalTaskPath` copies delegate to. A scheme'd locator
-  (`gist://…`) is returned verbatim, and the hazard of a second copy forgetting that is SILENT:
-  `filepath.Abs` does not fail on one, it returns `<cwd>/gist:/id/file`, and each hap process has a
-  different cwd — so the daemon's claims and the TUI's grouping would stop agreeing with nothing
-  erroring. Each of the three packages has a test pinning the delegation.
-- **A task list is never created BLANK** — GitHub cannot store a blank gist file at all: `""`,
-  `"\n"` and `" "` are all refused with `422 Validation Failed {Resource:Gist Field:files
-  Code:missing_field}` (verified live 2026-08-12), because a blank body reads as "this entry
-  carries no file", the entry is dropped, and the request is then rejected for an empty `files`
-  map. So the error names `files` — never the list, never the content — and nothing is created.
-  `newListHeader` is the ONE seed every create-on-demand path passes to `ensureList`, and the
-  rule is enforced in THREE places on purpose: `frontend.ensureList` refuses a blank `initial`
-  for EVERY backend (a local file takes one happily, so guarding only where it breaks means the
-  next caller is green through the whole unit suite and fails for the first `github_gist`
-  operator — exactly how the generated-task confirm shipped seeding `""`, making accepting an
-  LLM-suggested task impossible); `ports.EnsureCreator` states it as the interface's contract;
-  and `gist.Store.put` refuses with `ErrBlankContent` on EVERY write path, not just a create, so
-  a mutation that empties a list reports what is wrong instead of the 422. Only the CREATE is
-  closed — a mutation may still empty a LOCAL list, which is what removing the last item from a
-  headerless one does. The unit suite could not catch any of this, so `fakeGist` now answers a
-  blank write with GitHub's real 422; a fake that accepts one is what let this through. Keep the
-  paired tests (`TestGistRefusesToWriteBlankContent` / `TestGistFakeRejectsBlankContentLikeGitHub` /
-  `TestBootstrapSeedsTheListWithItsHeaderNotBlank` / `TestNewListHeaderIsNeverBlank` /
-  `TestEnsureListRefusesABlankSeedOnEveryBackend`).
-- **Egress has exactly three exceptions, all opt-in and off by default** — the release check
-  (`internal/updatecheck/fetch.go`), the `github_gist` task-list backend
-  (`internal/taskstore/gist/gist.go`), which carries task text only, and the `turso` store
-  engine (`internal/store/turso/turso.go`), which syncs the WHOLE store with the operator's
-  own Turso Cloud database. `internal/privacy` bans the GitHub SDK and the Turso SDK (plus its
-  native-library loader) by their own import paths as well as `net/http`, because the walker
-  checks DIRECT imports: an adapter using only an SDK would egress while passing — and the
-  Turso SDK's network code is native, so nothing else could ever catch it. The gist adapter
-  must keep using `github.WithURLs` (not a `*url.URL`) and `github.WithTimeout` (not a
-  hand-built transport), or `net/url` and the no-remote-dial scan need widening too.
-- **The store is node-scoped, and the Turso engine is daemon-owned, gated and never
-  cancelled** — several machines may share one database (`[database] engine = "turso"`), and
-  a herdr pane id (`1`, `w1:p2`) repeats on every one of them, so it is never an identity on
-  its own. Every node-owned row carries `node_id` (`store.LoadNodeID`, `<state>/node-id`);
-  machine-local natural keys are composite (`agent_names(node_id, agent_id)` with
-  `UNIQUE(node_id, name)`, `agent_rate`, `error_retries`, `task_handouts`, `agent_roster`,
-  `herdr_locations`, `roster_meta`); INTEGER keys are allocated with node bits under turso
-  (`store.TimeOrderedIDs`, bound as `s.nextID()` — NULL under sqlite so AUTOINCREMENT still
-  assigns). Every OPERATIONAL statement (act, claim, sweep, rate, reclaim-at-startup, pending
-  LLM request, name adoption, roster publish) filters `node_id = self`; FLEET reads span nodes
-  and return `node_id`; by-id statements on fleet-unique ids are exempt by name.
-  `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by construction (an AST walk with an
-  exemption map that must stay live), `TestOperationalReadsNeverSeeAnotherNodesRows` proves it
-  behaviourally, and the store suite runs THREE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso`)
-  so every statement is proven through the socket proxy AND on the Turso engine. The two-node sync tests in `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` + `HAP_TURSO_TEST_TOKEN` point them at a REAL Turso database instead (its hap tables must start empty — run them one at a time and wipe between). The daemon's
-  `hasOpenEscalation` asks the store (`HasOpenEscalation`) rather than filtering the fleet
-  queue by agent id — filtering in Go would let another machine's pane `1` block this one's
-  reconcile. Under turso only the daemon opens the file (the sync engine allows one process);
-  the TUI, CLI verbs and MCP server get a `database/sql` driver over `<state>/store.sock`
-  (`internal/store/sqlbridge`), lazily dialled so `hap config` works with no daemon. The
-  adapter wraps the SDK in a gate (statements read-lock, Push/Pull/Checkpoint write-lock, a
-  transaction holds the lock, rows are returned EAGERLY) over a FIXED pre-warmed pool, and
-  sync ops run on a background context — verified: unguarded they flood `database is locked`
-  and a Push cancelled mid-flight hangs the engine for good. Schema DDL on the shared database
-  is issued only by the holder of the SCHEMA LEASE (`turso.PrepareSharedSchema` /
-  `AcquireSchemaLease`: pull first; claim a row in the shared database, push it, let the remote
-  arbitrate, pull and re-read; migrate only if the row still names you, and RE-PROVE it between
-  migration steps — pull, renew, push — failing closed with `ErrSchemaLeaseLost` if the row went
-  elsewhere, since a background renewal alone is starved by a step's own write lock) because two identical
-  ALTERs wedge the loser SILENTLY — and elapsed time is never ownership: a node that cannot
-  establish the lease fails closed rather than migrating blind. The fleet loop runs every sync
-  op off the loop and waits for it OR shutdown (`fleetRun`), and `turso.DB.Close` waits a
-  bounded time for in-flight ops and refuses to close underneath one — a native call is never
-  cancelled, but neither may it hold the daemon lock forever or be closed under. Config never
-  enters the database. Keep the spike (`internal/store/turso/spike_test.go`, tag `tursospike`),
-  `TestTwoNodesShareEscalationsAndRemoteConfirms`, `TestSchemaLeaseIsExclusiveBetweenTwoNodes` and
-  `TestASlowMigrationKeepsTheLeasePastItsNominalTTL` (skip without `tursodb`), and
-  `TestFleetSyncShutdownIsNotHeldByAHungPull`. Front ends draw ids from the daemon over the store
-  socket and have NO local fallback: an insert the daemon gave no id for fails with the reason
-  (`failedID`), because two processes minting locally in one millisecond collide.
-- **A periodic write is CONDITIONAL, or it is a leak** — the store's every write calls
-  `noteWrite` → `onWrite` → the daemon's `FleetWrites` channel, which arms a **2s-debounced
-  turso push**. So a periodic write that fires more often than that debounce never coalesces:
-  one tick, one row, one push to Turso Cloud, forever, on an install with nothing happening.
-  Two writers were exactly that shape, and each needed a different fix.
-  - **`PublishRoster` compares before it writes.** It UPSERTed every agent row on every
-    publish — every 2s while a TUI is registered, every 60s regardless — and `seen_at` differed
-    each time, so every one was a genuine write storing what was already there (~475k rows/day
-    for ten agents). `rosterRowUnchanged` MIRRORS `upsertRosterRow`'s CASE arms field for field,
-    and the two must change together: a field added to the UPDATE and not to the comparison
-    silently stops being published. Three fields are excluded and each exclusion is reasoned —
-    `seen_at` advances by construction (including it makes every row dirty, which is the whole
-    bug), `cwd`/`cwd_read_at` are never written by a publish at all (`RosterAgentFrom` leaves
-    them zero and the CASE preserves the stored value), and `gone_at` is COMPARED rather than
-    excluded so a returning agent is republished. A **recycled** id is never skipped: its row
-    was DELETEd earlier in the same transaction, so `existing` describes a row that no longer
-    exists — safe today only because a changed `terminal_id` is what triggered the recycle AND
-    is in the compare set, which is a coincidence, so the skip is gated on `recycledIDs`
-    structurally. Roster FRESHNESS is `roster_meta.published_at` (`domain.RosterFresh`), never a
-    per-row `seen_at`, which is why the stamp still happens on every publish — skipping it would
-    make a settled herd read as "no daemon publishing". Not advancing `seen_at` is also more
-    truthful: its one reader outside the store is the TUI's "Last transition", which used to
-    read "now" for an agent that had not moved in an hour. Keep
-    `TestRepublishingASettledHerdWritesNothing` / `TestAChangedAgentIsStillPublished` (the
-    control — without it the first passes for a publish that writes nothing at all) /
-    `TestARecycledPaneIsNeverSkipped` / `TestAReturningAgentIsRepublished` /
-    `TestAReorderedHerdIsRepublished`.
-  - **`domain.NodeHeartbeat` is the ROW cadence and is deliberately SLOWER than
-    `daemonhealth.HeartbeatInterval` — but BOUNDED ABOVE by `daemon.actionStaleAfter`.** They
-    were one constant, so keeping the health FILE current to the second meant a `nodes` row
-    every 10s — ungated on herd size or on anything having changed, since `last_seen` differs
-    every time. The file answers "is this daemon hung" and must be fast; the row answers "is
-    this machine still out there" and no reader asks with more precision than
-    `domain.NodeStale` (three beats). `maybeUpsertNode` throttles it, and its FIRST call always
-    writes so a starting daemon appears in the fleet at once — which is also why `Run`'s
-    startup call goes THROUGH the throttle rather than around it, to arm the interval.
-    **The ceiling is why it is 30s and not the minute the write reduction alone would prefer**:
-    `nodeStaleAfter` is three beats AND is the gate `frontend.requireLiveDaemonFor` refuses a
-    remote confirm on, while a confirm is an operator vouching for a SCREEN whose deliverable
-    life is `actionStaleAfter` (2 minutes). While staleness is the tighter window, a confirm the
-    gate accepts is one the daemon can still honour; a minute inverts that silently. Keep
-    `TestNodeStalenessStaysInsideTheActionBound` (which is what makes the ceiling enforceable —
-    domain cannot import daemon), `TestNodeRowIsWrittenLessOftenThanTheHealthFile` (collapsing
-    the two constants back restores the cost silently) and
-    `TestNodeRowIsNotRewrittenOnEveryHealthBeat`.
-- **A wedged sync engine is REPAIRED once and SAID always, and the two halves have
-  opposite defaults** — under the turso engine a failing `Push`/`Pull` used to be
-  `logging.Guard` + `slog.Warn` + `return nil`, visible only in `hap status`'s fleet-sync
-  line. The daemon kept running, the herd looked quiet, and every fleet read this node
-  served was silently half a fleet short. Verified live 2026-09-09 (macOS, hap 0.9.4): the
-  sync engine's TLS handshake failed every tick with `tls: failed to verify certificate:
-  SecPolicyCreateSSL error: 0` — crypto/x509's darwin verifier reporting that
-  `SecPolicyCreateSSL` returned NULL, a Security-framework allocation failure that says
-  nothing about the certificate — with `last pull never, last push never`, while the TUI
-  showed six escalations and named them all local. One `hap daemon --restart` fixed it.
-  - **The counter spans BOTH directions and the anchor is the last SUCCESS.** A node that
-    pulls fine and cannot push is just as isolated, so `consecutiveFailures` is incremented
-    in `fleetPush` and `fleetPull` alike and reset by `noteSuccess` in either. Isolation is
-    measured from `max(LastPullAt, LastPushAt)` and falls back to `FirstFailureAt`, which
-    is the ONLY anchor a daemon that has never synced has — and "never synced" is the exact
-    shape the incident was reported in. `daemonhealth.FleetSyncIsolatedAfter` is a CLOCK,
-    not a boolean on `LastError`: a banner that fires on one failed tick is a banner nobody
-    reads by Friday, so a fresh failure is `DaemonWarn` and only five minutes without a
-    success is `DaemonError` — which it earns for the reason `BinaryReplaced` does, the
-    daemon being perfectly alive while everything it reports is incomplete. The banner
-    leads with the CONSEQUENCE ("this machine is NOT exchanging rows with the other
-    nodes"), never the TLS text, which is a detail line.
-  - **The automatic restart is gated on the fault being PROCESS-LOCAL, and unknown means
-    NO** (`domain.SyncFailureProcessLocal`, remote shapes checked FIRST so a TLS error
-    nested inside a dial timeout reads as the timeout). Restarting on a remote that is
-    merely down — a token revoked, wifi off, Turso out — buys nothing and costs the herd
-    its in-flight captures and consults every cooldown, forever; declining costs one node
-    that says so loudly and is fixed by hand. Both bounds must clear
-    (`fleetRecoveryMinFailures` AND `fleetRecoveryMinOutage`): a count alone fires on a
-    fast interval, an elapsed time alone on one old failure.
-  - **It spawns `--restart`, NOT the `--ensure` the upgrade handoff uses, and this is the
-    trap.** `EnsureFresh` returns doing NOTHING when the running holder already matches the
-    version and path it would start (`daemonlock.current`) — which is precisely a restart
-    as the SAME binary. An `--ensure` successor would bow out, and a daemon that then
-    stepped aside would leave the herd with no monitor at all. So `checkFleetSyncWedged`
-    latches `fleetRecoveryOrdered` and keeps running rather than taking `handedOff`: the
-    command it spawned is what stops this process, and `--restart` waits for the lock to
-    release before starting, so exiting early would only widen the unmonitored gap.
-  - **The latch is released by EVIDENCE, not by time.** `fleetrecovery.go`'s marker file is
-    written BEFORE the spawn (the successor may read it first) and deleted by the first
-    successful pull or push; a daemon that adopts a fresh one refuses to order another. An
-    unwritable marker REFUSES the restart, because without it an unfixable fault becomes a
-    restart loop that abandons in-flight work every cooldown — strictly worse than the
-    isolation. A failed spawn clears the marker, or a later restart's successor is latched
-    by a recovery that never happened. `fleetRecoveryCooldown` is only the ceiling on how
-    long a marker latches when nothing ever succeeds.
-  - **An unbootstrapped node is a THIRD state, not a degraded one.** `openTurso` retries the
-    first bootstrap forever and `daemonlock.Acquire` runs BEFORE it (`cmd/hap/main.go`), so a
-    wrong URL or a rejected token leaves `hap status` reporting a running daemon that has not
-    begun monitoring anything — worse than isolation, which at least still answers for its own
-    herd. It gets its own banner and its own remedy (the URL and the token), gated on the same
-    clock so a cold start stays a warning; `openTurso` records `FirstFailureAt` for that clock,
-    since nothing else on that path has one. Keep `TestAStuckBootstrapIsNamedSeparately` /
-    `TestAColdBootstrapIsOnlyAWarning`.
-  - `internal/fdprobe` records the descriptor budget at each failure — instrumentation, not
-    a control, because fd exhaustion was the leading explanation and was never MEASURED.
-    `OpenKnown` is separate from `Open` because macOS has no `/proc/self/fd` and rendering
-    its zero as "0 open" would report the opposite of what happened; `Exhausted` is a real
-    syscall and is the only field that is proof.
+### A front end decides; the DAEMON does
 
-  Keep `TestAWedgedSyncEngineRestartsTheDaemon` / `TestARemoteOutageNeverRestartsTheDaemon`
-  (the control — without it, code that restarts on ANY isolation passes the file) /
-  `TestAnOutageMustClearBOTHBounds` / `TestADaemonBornFromARecoveryDoesNotOrderAnother` /
-  `TestARecoveryMarkerPastItsCooldownDoesNotLatch` / `TestASuccessfulSyncReleasesTheRecoveryLatch` /
-  `TestAFailedRecoverySpawnLeavesNoMarker` / `TestAnUnwritableMarkerRefusesTheRestart` /
-  `TestARecoveryIsNotRetriedEveryHeartbeat` / `TestFailuresCountBothDirections` /
-  `TestSyncRecoveryOrdersARestartNotAnEnsure` / `TestSyncRecoveryRefusesWhileTheCrashLoopBreakerHasGivenUp`,
-  in `internal/daemonhealth` `TestIsolationIsMeasuredFromTheLastSuccess` /
-  `TestANodeThatHasNeverSyncedIsStillMeasurable` / `TestAFreshFailureIsNotYetIsolation` /
-  `TestDiagLinesCarryTheDescriptorEvidence`, and in `internal/frontend`
-  `TestAnIsolatedNodeIsADaemonError` / `TestAFreshSyncFailureIsOnlyAWarning` (a pair; either
-  alone passes on code that answers one way for everything).
-- **Retention has TWO windows, and the exemptions are the safety control** —
-  `PruneAuditExcerpts` blanks one COLUMN (`[logging] audit_excerpt_retention_days`);
-  `PruneAgedRows` deletes finished bookkeeping ROWS (`[logging] row_retention_days`, default 30).
-  **`agent_roster` is swept only because `agent_roster_tombstones` exists, and the trap it
-  answers is still live**: a retired row was itself the resurrection guard, not dead weight.
-  `upsertRosterRow`'s INSERT arm hardcodes `gone_at = 0` and only its ON CONFLICT arm honours
-  `authoritative`, so with nothing recording the retirement a non-authoritative EVENT takes the
-  insert path and revives an agent herdr no longer reports — its own doc comment says so ("its
-  row does not exist yet, so the INSERT applies and gone_at starts at 0") — and `LiveRoster` then
-  hands a dead agent to the idle poll and `hap task send` until the next authoritative publish
-  re-retires it. That is why #395's plain delete had to be backed out (#398). What makes the
-  delete safe is a compact sidecar row written by `PublishRoster` at the live→gone transition,
-  and four bounds are load-bearing:
-  - **The prune requires the tombstone, per row** — `PruneAgedRows`'s `EXISTS` guard. A retired
-    row that has none (a legacy database whose heal has not run, a damaged one) is the last guard
-    left, so it is KEPT. `migrate` re-derives missing tombstones from the wide row on EVERY open,
-    not once, the way `reembed.Reconcile` does — the wide row is the only place that information
-    still exists, and the two together fail safe in the same direction.
-  - **The tombstone is discriminated by TERMINAL id, and storing it without reading it is the
-    silent half of the bug.** herdr recycles pane ids and an agent id IS a pane id, so once the
-    wide row is gone the tombstone is the only surviving record of which terminal was retired. A
-    DIFFERENT, non-empty terminal is a genuinely new agent and `UpsertRosterAgent` admits it —
-    matching the `prevTerminal` delete-and-reinsert path that already handles this while the wide
-    row stands. Blocking on agent id alone makes a new agent on a reused pane invisible until the
-    next publish. An empty terminal on EITHER side blocks: "unobserved is never evidence", the
-    same rule `rosterRowUnchanged` and `upsertRosterRow` follow.
-  - **Admitting DELETES the tombstone.** `PublishRoster` upserts on `(node_id, agent_id)`, so a
-    survivor would keep the OLD terminal at this agent's own retirement and the comparison would
-    silently stop discriminating. Same reason the authoritative revive in `upsertRosterRow`
-    clears it.
-  - **The tombstone is permanent, deliberately, and needs no retention of its own.** "This
-    terminal on this pane is retired" is true forever, and any grace period would need a bound on
-    how stale a buffered herdr transition can be that the protocol does not offer — inventing one
-    reopens the hole. Four short columns against `agent_roster`'s twelve, so the table it bounds
-    still shrinks by roughly an order of magnitude. Keep
-    `TestAnAgedRetiredRosterRowPrunesWithoutLateEventResurrection` /
-    `TestARecycledPaneIsAdmittedPastAPrunedAgentsTombstone` (the two discriminate only as a PAIR
-    — either alone passes on code that answers one way for everything) /
-    `TestAnUnidentifiedEventNeverPassesATombstone` / `TestRosterTombstonesDoNotCrossNodeBoundaries` /
-    `TestPruneAgedRowsKeepsARetiredRosterRowWithNoTombstone` /
-    `TestPruneAgedRowsNeverTouchesALiveRosterRow` /
-    `TestSchemaCurrentNoticesAMissingRosterTombstoneTable` /
-    `TestRowRetentionPrunesARetiredAgentWithoutResurrectingIt`.
+Anything that reaches a live pane, or is keyed by an identifier only one machine can resolve, is
+written to `agent_actions` for the OWNING node and executed there (`domain.AgentAction`,
+`daemon.executeAgentAction`). A generated-task confirm is the widest case and the reason this is not
+only about panes: it matches a pane id against a herd (herdr recycles pane ids, so every machine has a
+pane `1`), mints an `agent_names` row in a node-keyed table, writes a checklist, and registers a
+`[[task_sources]]` entry in a config.toml that **never enters the shared database**.
 
-  Note `hap gc` does not reclaim roster rows, because it does not call `PruneAgedRows` at all —
-  pre-existing, and the daemon's daily sweep is what bounds the table.
-  Both run on the daemon's one daily throttle and one background goroutine, and the THROTTLE is
-  taken before either config is read so switching one off cannot change the other's cadence; the
-  `VACUUM` runs once at the end, because deleting rows — like blanking a column — only moves
-  bytes to the freelist under `auto_vacuum=0`.
-  - **`audit_log` and `decisions` are never swept.** The excerpt design says outright that the
-    row survives its column "so `hap audit` history stays complete", and `decisions` feeds
-    `CountDecisionsForSignature`, so deleting from it would change LEARNED BEHAVIOUR rather than
-    reclaim space. Both are operator decisions, not cleanup.
-  - Every other exclusion is a row some path still acts on, never one that merely looks recent:
-    a non-terminal `agent_actions` row is the cross-machine control queue itself (and even a
-    terminal one is what `frontend.AwaitAgentAction` returns as `Result`/`Error` — the ONLY way
-    the surface that queued it learns whether it landed, since the control socket carries no
-    reply channel); a `pending` `llm_requests` row is the consult retry guard and a `pending`
-    `llm_decisions` row is one the daemon has not re-gated; an unprocessed `corrections` or
-    `llm_retries` row is queued work, and `PruneAuditExcerpts` reads both. **The newest
-    `kill_events` row per node survives at any age** — only `LatestKillEvent` decides, so
-    deleting it would silently UNPAUSE a paused herd, which is why the filter is `id < MAX(id)`
-    rather than an age test. **An unconfirmed `task_reservations` row survives at any age** —
-    it is what `reclaimStrandedTasks` needs to return an item to `[ ]`, and a `[-]` with no
-    ledger row is treated as somebody else's and never touched again. `corrections` additionally
-    needs `NOT EXISTS` over `agent_actions.correction_id`: that reference has no foreign key
-    behind it and is what makes `UnprocessedCorrections` withhold a correction whose delivery is
-    still queued.
-  - **A finished consult's payloads go on their OWN grace (`LLMPayloadGrace`, an hour), never at
-    the status transition.** `llm_requests.context_json` and `llm_decisions.captured_output` are
-    the bulk of those tables' bytes, but "terminal status" is NOT proof nothing reads them again:
-    neither `GetLLMRequest` nor `LLMDecisionByRequest` filters on status, so `mcpserver.resolveRequest`
-    serving an explicit `request_id` — or an auto-repair on the same request — would be handed an
-    EMPTY context. The grace is separate from the operator's window precisely because that one
-    may be 0. Keep `TestPruneAgedRowsBlanksFinishedConsultPayloadsOnItsOwnGrace` /
-    `…SparesAFreshConsultPayload`.
-  - **The newest `kill_events` row survives PER SCOPE, not per node.** `LatestKillEventOn`
-    reads `WHERE node_id = ? AND scope = 'global'`, and the table carries a SECOND stream —
-    the full self-prompting toggles `frontend.recordFSPToggle` writes, including the daemon's
-    own ceiling stand-down. A survivor guard keyed on `MAX(id)` alone therefore deletes a
-    standing global PAUSE the moment any newer FSP row exists: `LatestKillEvent` returns nil,
-    `KillStateActive` reads false, and the herd resumes with nothing logged. That is the exact
-    trap `LatestKillEventOn`'s own scope filter exists for, and it shipped green here because
-    the first version of the test seeded only `global` rows —
-    `TestPruneAgedRowsNeverDeletesTheNewestKillEvent` now seeds an FSP row after the pause,
-    which is the only thing that makes it discriminate (proved by mutation).
-  - **The cutoff is FLOORED at `RowRetentionFloor`, because 0 is a supported setting.** Without
-    it the cutoff is `now`, and a terminal `agent_actions` row is deletable in the same second
-    it is written — while `frontend.AwaitAgentAction` is still polling it for the only outcome
-    signal it can get. Same shape for a terminal `llm_requests` row the MCP server can still
-    resolve by id. It is a SEPARATE constant from `LLMPayloadGrace` at the same value, the way
-    `PruneAuditExcerpts` has `AuditExcerptDedupMargin`: that one bounds a COLUMN blank against a
-    live reader, this one bounds a ROW delete against a poller. Keep
-    `TestPruneAgedRowsFloorsAnAggressiveCutoff` and `TestZeroRowRetentionStillSparesLiveWork`.
-  - Every statement is node-scoped, and each is issued at its OWN call site rather than from a
-    table of queries: `TestEveryNodeOwnedStatementIsNodeScoped` flattens a CALL's SQL argument,
-    so a query reached through a struct field flattens to `" ? "` and the whole sweep falls
-    outside the guard — silently, in the one file where an unscoped DELETE does the most damage.
-    Hoisting the SQL into package consts does NOT fix that; only a direct literal at the call
-    site does. `TestPruneAgedRowsOnlyTouchesThisNode` covers it behaviourally as well.
-    `RowRetentionPort` is a SEPARATE
-    optional interface from `RetentionPort` (a store that can blank a column need not be able to
-    prune rows), so the daemon suite's `failingStore` must forward it — the usual trap.
-    Keep `TestPruneAgedRowsRemovesOnlyFinishedWork` / `…KeepsRecentFinishedWork` /
-    `…NeverDeletesTheNewestKillEvent` / `…KeepsAnUnconfirmedReservation` /
-    `…KeepsACorrectionItsActionStillReferences` / `…FloorsAnAggressiveCutoff` /
-    `TestZeroRowRetentionStillSparesLiveWork` / `TestRowRetentionOffKeepsEveryFinishedRow`.
-- **An LLM judge may only ever NARROW what cosine already admitted, and it may
-  never run on the select loop** — `llm.reranking_command` (off by default) turns
-  `embedding.similarity_threshold` into a FILTER: every candidate at or above it is
-  listed for a one-shot CLI, which returns `[{"id": n, "score": s}]` ordered by
-  relevance and hap WALKS it. Six bounds are load-bearing:
-  - **The judge ranks by RELEVANCE and cannot see a rule's learned STATE, so the head is
-    not always actionable.** Its best match is routinely one hap may not act on — shadow
-    mode, below its confidence threshold, an option the screen no longer offers — and only
-    `domain.Decide` knows. `walkRankedDecision` therefore tries each affirmed rule in order
-    and takes the first whose decision is not an escalation; when none is, the HEAD
-    escalates, because that is the rule the operator should be asked about. This cannot
-    loosen a safety control by construction: every gate that does not depend on the
-    SIGNATURE — kill switch, never-auto, suspected-irreversible, rate guard — is fixed in
-    the shared `DecideInput` and vetoes every candidate or none, so the walk lands back on
-    the head. Only the learning-derived refusals vary, which is exactly what it is for.
-    `llm.reranking_top_k` is the DEPTH of that walk, not just a prompt cap, which is why
-    `hap config set` refuses anything below 1 (0 is not "use the default" here) and
-    `RerankTopK` floors an omitted or hand-edited value. Rule provenance is written after
-    the walk, for the rule that ACTED, not for every candidate it looked at. Keep
-    `TestTheEngineFallsBackToALowerRankedRule` / `TestTheBestMatchIsWhatEscalatesWhenNothingCanAct` /
-    `TestASingleRankedRuleBehavesExactlyAsBefore` / `TestTheWalkNeverOutrunsASafetyVeto`.
-  - **The kill switch is asked for HERE, not inherited.** Every other LLM subprocess in
-    the daemon is reached only because `Decide` asked for it, and `Decide` already has
-    `killActive` from `readDecisionState` — but `startRerank` spawns BEFORE that read, so
-    an ungated judge leaves a PAUSED herd launching a subprocess per attention event per
-    parked agent, for decisions that escalate regardless. Refusing is not a degrade: the
-    caller carries on with the cosine fallback, which is what hap answered before this
-    feature existed. A read error refuses too, for the same reason auto-accept's kill
-    re-check fails closed. Keep `TestAPausedHerdNeverSpawnsTheJudge`.
-  - **The resume re-reads the pane, and its drop is SILENT** — `rerankSituationHeldStill`
-    discards the decision and logs one INFO line, leaving the pane to the next attention
-    event. That is the right direction (the alternative resumes a 30-second-old decision
-    into a live menu) but it is also the branch most able to disable the feature without
-    anyone noticing, so it is covered directly rather than through the pipeline tests,
-    which only ever exercise the pass. It carries `handleActionReviewOutcome`'s asymmetry:
-    idle matches on situation TYPE alone, because an idle signature hashes a masked
-    content head that legitimately differs between the original `--source recent` capture
-    and this `--source visible` re-read — comparing signatures there drops every idle
-    resume. The transition's status falls back to the situation's own, since an empty one
-    would mismatch on type and drop everything while every test still passed. Keep
-    `TestARerankResumeDropsAPaneThatMovedOn` / `…ToleratesIdleDrift`.
-  - **A vector-search ERROR is not a cosine miss.** `cosineRerankPass` reports (judged,
-    missed) separately for exactly this: `bm25RetryAllowed` refuses a text retry for any
-    STRUCTURED salient cosine has REFUSED, so collapsing a transient KNN failure into
-    "cosine missed" mints a new key for every approval, choice and error screen — the very
-    population this feature targets. `MatchVector`'s own error branch has always left
-    `cosineMissed` false; this keeps that.
-  - **The candidate set is accept-filtered BEFORE the judge sees it.** The same
-    closure `resolveSignatureN`'s cosine pass uses — the `min_salient_chars` veto plus
-    `remapAllowed`/`ApprovalRemapCompatible` — gates `matcher.VectorCandidates`, so the
-    judge can never pick a candidate the ordinary pass would have refused. Those gates
-    exist because similarity alone bridges two different approval screens that share a
-    verb (#155); delegating them to a model puts the wrong answer into a pane.
-  - **An EMPTY verdict is TERMINAL and skips BM25.** Step 4 of the chain runs "equally
-    when the vector search ran cleanly but found nothing above similarity_threshold", so
-    a veto that fell through is re-admitted by text and the feature is a no-op that looks
-    like it works. `finishRerank` mints instead (`MatchRerankVeto`).
-  - **A judge FAILURE is not a veto.** Missing binary, timeout, non-zero exit, prose with
-    no array, a duplicate or out-of-range id all degrade to the answer step 3 would have
-    given (`fallback`, computed BEFORE the run so no error path reconstructs it). The veto
-    is an empty array — AND equally a verdict whose every entry scored below
-    `relevance_score_threshold`, which is the same statement. `domain.ErrNoRerankVerdict`
-    is the sentinel keeping the two apart, and `lastJSONArray` only accepts a region that
-    already unmarshals as `[{id, score}]`, so prose brackets are never an answer; the one
-    exception is an empty bracket pair, which under last-wins turns an earlier answer into
-    a veto — the safe direction, since a veto escalates.
-  - **It CANNOT run inline.** `resolveSignature` is called from `decideAndAct` on the
-    daemon select loop, which serves every agent — the reason the embed call has
-    `embed_timeout_ms` and the BM25 pass has `bm25MatchTimeout`. So the cosine pass
-    returns a `rerankPlan`, `decideAndAct` suspends, and `handleRerankOutcome` re-enters
-    `decideAndActResolved`. One flight per agent keyed on `sig.Raw` (there is no learning
-    key yet — resolving it is what the run is for), superseded on a different raw and
-    cancelled wherever a pending capture is (`working`, human interaction, pane recycle,
-    `detected`); a token check drops a stale verdict, and `rerankSituationHeldStill`
-    re-reads the pane on resume the way `handleActionReviewOutcome` does — the judge holds
-    the decision for up to 30s, and what resumes can reach `act()`, which maps a learned
-    label to a menu digit against the CAPTURED content. `handleRerankOutcome` also re-asks
-    `RerankingConfigured`, so a verdict already in flight when the operator turned the
-    feature off degrades instead of vetoing. `rerankOutcome` carries `fallback` AND
-    `original` because they are not interchangeable: a veto mints from the ORIGINAL, and
-    minting from the fallback persists the raw hash while returning the candidate the
-    judge just refused.
-  - **Only an ESCALATION row carries `match_method`** (`daemon.escalate`, the sole writer),
-    which predates this feature — so `MatchRerankVeto` is visible in `hap audit` while
-    `MatchRerank` on a delivered row is not. The chosen-rule case is covered by the audit
-    row's `signature` (it names the rule the judge picked) plus one Debug line; do not
-    "fix" this by adding provenance to the auto path without deciding what that does for
-    every existing cosine/bm25 delivery too.
-  - **An IN-FLIGHT run is invalidated by the same events the cache is** (`invalidateRerank`,
-    called from `reloadWith` and `RefreshKnowledge`). Clearing only the cache leaves the
-    hole in its most confusing form: a run started under the old command, prompt or
-    threshold finishes seconds later, passes the per-agent token check — which is about
-    SUPERSESSION, not staleness — applies its answer, and REPOPULATES the cache that was
-    just emptied. A refresh can also DELETE the very rule the verdict names. Each flight
-    carries the `rerankGen` it started under and `handleRerankOutcome` degrades an older
-    one to the cosine fallback. It degrades rather than CANCELS on purpose: a reload
-    follows every `hap config set`, and cancelling would drop a pending decision outright
-    instead of answering it the way an unjudged daemon would.
-    **Two bounds make the counter actually work, and both were proved by mutation.**
-    `invalidateRerank` bumps UNCONDITIONALLY — no "nothing to invalidate" fast path — because
-    a verdict IN TRANSIT is in neither map: `handleRerankOutcome` removes the flight before
-    its visible-pane read, a herdr shell-out wide enough for the fleet-sync goroutine's
-    `RefreshKnowledge` to land inside, and an idle check would then see two empty maps, skip
-    the bump, and let the pre-refresh verdict commit against a generation that never moved.
-    And the generation check and the cache write are ONE critical section
-    (`commitRerankVerdict`): split, an invalidation landing between them commits and caches a
-    pre-invalidation verdict anyway, which no fast-path change reaches. `finishRerank` runs
-    outside the lock on a verdict that was current at that instant — what a linearization
-    point means. `cancelRerank` keeps its own fast path: it is per-EVENT and keyed on one
-    agent, where a missing entry really does mean nothing to cancel. Keep
-    `TestAnInvalidatedVerdictIsNeitherAppliedNorCached` and its control
-    `TestACurrentVerdictIsStillAppliedAndCached` (without the control the first passes on
-    an implementation that discards every verdict) /
-    `TestARefreshLandingInsideTheResumeStillInvalidatesTheVerdict` (deterministic, via the
-    fake herdr's read gate) / `TestTheGenerationCheckAndTheCacheWriteAreOneCriticalSection`.
-  - **The verdict cache keys on the RENDERED listing, never the candidate signatures.**
-    A parked pane re-captures on every attention event, so a cache is required — but the
-    listing carries each rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what
-    makes the judge say "yes, reuse this", and all of those move under an UNCHANGED
-    signature set every time a decision is recorded. Keying on the set alone serves a
-    rule's pre-correction verdict until the set itself happens to change. Cleared on ANY
-    reload and on `RefreshKnowledge`, unconditionally — never gated on a section compare
-    the way `reloadEmbedder`'s port swap is, or turning the judge off and on again
-    resurrects the answers it gave before.
+- **Queued UNCONDITIONALLY, local rows included** (`queueGeneratedTaskConfirm`). The `isSelf` fast path
+  the per-agent verbs use is wrong here because this path ends in a pane send: in-process it leaves a
+  TUI or CLI holding a herdr adapter, and a front end and a daemon typing into one pane is the race
+  none of the delivery guards can see. Accepted cost: `hap confirm <id>` without `--send` needs a live
+  daemon.
+- **The pane access is RECEIVED, never held** (`ports.TaskSendHost`) — the checklist, config and
+  reserve→send→roll-back ORDERING stay in `internal/frontend`; only `cmd/hap`'s daemon wiring can build
+  the closure that reaches a pane.
+- **`ConfirmGeneratedTask` and `AcceptGeneratedTask` are two seams on purpose**: the automatic path
+  passes `automated=true`, skipping BOTH `ResolveEscalation` and `InsertCorrection` — a machine's
+  decision to act is not evidence the suggestion was right. `author` is threaded from the queued row,
+  not the daemon's own App.
+- **`CorrectionID` stays 0 on the queued row**; populating it arms `finishWithdrawn`, whose refusal
+  DELETES the correction the first attempt wrote.
+- **`side_effect` is marked inside the host's `Send`, not before the seam** — a row carrying it is
+  FAILED at next start rather than replayed, which is true after keystrokes and false before them. The
+  FSP path is handed `taskSendHost(0)` and the zero guard is load-bearing: marking action 0 writes
+  against a row that does not exist.
+- **The staleness gate moved WITH the pane access** — `refuseIfAgentBusy` lives in the daemon, and its
+  refusal carries `domain.SuggestionStaleMarker` because `AwaitAgentAction` flattens every sentinel
+  through `errors.New`. That one is ACTIONABLE: the TUI offers to add the tasks to the list instead,
+  keyed on `errors.Is`, and dropping the marker breaks the offer SILENTLY.
+- **The manual hand-out moved the same way** (`send_task`): `SendTaskToAgentOn` carries the agent's
+  NAME, never a pane id, and the executor re-derives everything from the owning node's config and a
+  live listing. Its idle re-check fails CLOSED and TERMINALLY — "we could not ask" is not "it is idle",
+  and an operator blocking on the row must not wait three sweeps. `taskSourceRenderFor` matches by
+  LOCATOR, not agent alone, or one source's item renders through another's template. `hap task send`
+  is local-only; the TUI's Tasks tab can hand out a remote node's item.
+- The operator path is deliberately NOT screened (`screen` is nil): the daemon's own sends are screened
+  because no human saw the text; here one has, and their confirm has always been the gate.
+- **Test trap:** `internal/daemon` may not import `internal/frontend`, so its tests drive a FAKE seam
+  and prove only the EXECUTOR's guards. The confirm's own behaviour is proved in `internal/frontend`;
+  the TUI and CLI suites run a stand-in drain calling the REAL confirm, or their "the tasks file was
+  written" assertions check nothing.
 
-  `match.VectorCandidates` exists for this and re-expresses `MatchVector` rather than
-  duplicating it: `MatchVector`'s "return the first accepted candidate" is sound only
-  because the list is in descending cosine, so first-acceptable is also highest-scoring
-  and one threshold test over the returned hit is correct — a re-ranker breaks that, so
-  the threshold moves to a caller that sees every candidate. Keep
-  `TestRerankingOffLeavesTheChainUnchanged` (if any pre-existing semantic test needs its
-  expectations edited, the gating is wrong) /
-  `TestRerankEmptyVerdictMintsANewSignatureAndSkipsBM25` /
-  `TestRerankJudgeFailureDegradesToCosine` / `TestRerankCandidatesAreAcceptFilteredBeforeTheJudge` /
-  `TestRerankDoesNotStallTheSelectLoop` / `TestRerankVerdictIsCachedPerCandidateSet` /
-  `TestRerankNeverRunsWithoutACandidateAboveThreshold` / `TestRerankJudgesASingleCandidate`,
-  and in `internal/domain` the `ParseRerankVerdict` table (whose two decisive rows are
-  "empty array" and "prose with no array" — the same output to a careless reader, opposite
-  outcomes here).
-- **Don't stall the main loop** — the daemon's select loop handles all agents; anything that
-  shells out repeatedly (LLM CLI, deep pane reads) belongs in a goroutine that funnels
-  results back through a channel (see `consultLLM` / `llmResults`).
-- **Attention events are delay-captured** — the classification pane read waits
-  `[[capture_delay]]` (default 10s on an agent's first event, 2000ms after) via a per-pane
-  `time.AfterFunc` → `delayedTr`, so the agent TUI has painted and event bursts coalesce
-  (latest wins, one capture per burst). Daemon tests inherit a 1ms wildcard rule from the
-  harness.
-- **Semantic matching degrades, never blocks** — situations resolve to learned signatures via
-  embedding + vector search over the MASKED salient content (`daemon.resolveSignature`,
-  `internal/match`, `internal/embedder`), falling back to normalized-BM25 text matching, then
-  exact hash. `SignatureResult.Raw` is the never-remapped content hash (the LLM drift check
-  depends on it); SQLite's `signature_embeddings` is the source of truth and the bleve index
-  under `<state>/match-index` is a disposable cache (mem-only scorch does NOT serve KNN — keep
-  it disk-backed). Embed calls are stall-guarded and latch a degraded mode after 5 consecutive
-  failures (a fixed constant, not configurable).
-- **Learned signatures are FLEET-WIDE, and the embedding model's id is the only thing that
-  scopes them** — `signatures`, `signature_embeddings` and `signature_snapshots` carry NO
-  `node_id` (one row per rule, keyed by the signature), and `decisions` is deliberately absent
-  from `nodeScopedTables` so `CountDecisionsForSignature` graduates a rule on the fleet's
-  evidence rather than one machine's. Exact hash and BM25 are model-independent and therefore
-  cross-machine by construction; a peer's newly learned rule becomes matchable HERE through
-  `fleetPull` → `RefreshKnowledge`, which re-runs `reembed.Reconcile` and republishes the whole
-  bleve index (rebuilding from the store, rather than adding rows, is also what makes a rule
-  DELETED elsewhere disappear here). Do not add a `node_id` to any of them.
-  - **`embedder.ModelIDFor` is therefore a fleet-wide identity, and both halves are
-    load-bearing.** It digests the model FILE. `filepath.Base` failed BOTH ways at once, and
-    both failures are silent. *Not unique enough*: two genuinely different 384-dimension models
-    each installed as `model.gguf` reported the same id, so `Reconcile`'s skip condition
-    (`r.Model == emb.ModelID() && len(r.Vector) == res.Dims`) KEPT the foreign vector and cosine
-    then compared vectors from unrelated models — a hazard no equality filter downstream can
-    catch, because the strings agree. *Not stable enough*: one operator pointing
-    `[embedding] model_path` at a renamed copy of the bundled model gave that node a different
-    id for the same model, so each node read the other's rows as stale, re-embedded them and
-    pushed them back — an unbounded rewrite ping-pong through Turso Cloud (every store write
-    arms the 2s-debounced push) plus a permanent "N rules need re-compute" nag in every TUI.
-    Hence the id carries no file name at all. Unreadable falls back to the base name, never `""`:
-    an empty id compares unequal to every stored row, so a model-less install would report drift
-    no re-embed could clear — and that fallback is NOT cached, or an install whose model arrives
-    later keeps the legacy scheme for the life of the process.
-  - **Anything that compares a stored row's model must resolve the id the SAME way.**
-    `frontend.embeddingDrift` computes it from the path with no embedder in hand, so it calls
-    `embedder.ModelIDFor` rather than taking the base name itself; the two drifting apart is
-    silent and permanent (every row reads stale forever, and `hap signatures reembed` re-embeds
-    every rule on every run without ever clearing it — the trap
-    `store.CountStaleSignatureEmbeddings`'s comment describes). `EmbeddingDrift.ModelName` is a
-    DISPLAY field only; `ModelID` is the comparison key. Keep
-    `TestDriftUsesTheEmbeddersOwnModelIdentity` (proved by mutation),
-    `TestTwoDifferentModelsWithTheSameFileNameGetDifferentIDs`,
-    `TestTheSameModelAtDifferentPathsGetsTheSameID` and `TestTheFallbackIsNotLatched`.
-  - Known and NOT fixed: a fleet whose nodes run genuinely different models, or disagree on
-    `embedding.min_salient_chars`, still ping-pongs — `Reconcile` rewrites peers' rows on every
-    pull, and the below-floor stripping loop (which runs ahead of the warm gate) does the same.
-    The vector is stored per SIGNATURE, not per (signature, model), so ignoring foreign rows at
-    match time instead would confine cosine to rows each node embedded itself. A uniform fleet —
-    every install running the bundled model — is unaffected either way.
-- **A short PANE-TAIL salient is never embedded — on EITHER side of the comparison** — below
-  `embedding.min_salient_chars` (default 100, on the masked salient) matching uses BM25 instead.
-  **STRUCTURED salients are exempt at any length, and that exemption is load-bearing**: they are
-  short by construction (`permission:proceed | options:no;yes` is 35 chars), so a floor over them
-  would switch cosine matching off for every approval, choice and error rule — the paraphrase
-  matching the feature exists for. They are already guarded on their own terms
-  (`ApprovalRemapCompatible`, `StructuredSalient`). If every pre-existing semantic test needs a
-  lowered floor to pass, the floor's scope is wrong — that was the tell the first time.
-  Sentence embeddings are not discriminative on a few generic tokens: any two near-empty screens
-  land above `similarity_threshold`, so ONE almost-empty learned rule becomes a magnet that
-  silently answers every unrelated situation. `domain.EmbeddableSalient` is the single definition
-  and is enforced three times, because closing only the query side still lets a long screen match
-  a short stored rule: the incoming situation skips the embed call, a newly minted short rule is
-  persisted with no vector, and an existing short rule is stripped of its vector by
-  `reembed.Reconcile` AND vetoed again in `resolveSignature`'s vector accept filter (the veto
-  covers the window before a rebuild — an index built by an older build, or a row added under a
-  lower floor). Reconcile runs at every daemon start and `[embedding]` reload, which is what heals
-  an existing database with no migration. Such a rule stays reachable by BM25 and exact hash; only
-  cosine is closed to it. Keep the paired tests
-  (`TestResolveSignatureShortSalientSkipsEmbedding` / `…ShortStoredRuleIsExcludedFromVectorSearch` /
-  `…ShortStoredRuleStillMatchesByText` / `TestReconcileShortSalientRowsAreStrippedOfVectors`).
-- **Agent-TUI chrome is redacted from pane-tail salients, gated on agent type** —
-  `domain.StripClaudeChrome` (banner, `───` rules, spinner/token-counter line, `⏵⏵` mode line,
-  herdr status bar, trailing `❯` composer) for claude; `domain.StripCodexComposer` for codex.
-  Chrome is byte-identical across unrelated panes, so it BOTH inflates similarity between
-  different screens and eats the `pane_salient_chars` window. The strip runs in `salientContent`
-  BEFORE the window is taken, and only on the pane-tail branch — structured salients return
-  earlier. It only ever deletes lines it can positively identify; an unrecognized line is kept, so
-  two different screens stay different (fail-safe). The `❯` filter is anchored on "last non-empty
-  line" because `❯` is also an option-list caret — never widen it to the bare glyph. Every filter is
-  ANCHORED for the same reason (leading spinner glyph, leading mode glyph, banner glyph at line
-  start): a bare substring test deletes a whole line when the agent merely QUOTES the phrase, and
-  the footer window is the entire capture on a short pane. The status bar needs three pieces of
-  evidence together (>=3 pipes, no leading `|`, and the terminal-width padding run before its
-  trailing token) — the pipe count alone also matches a shell pipeline the agent reported running.
-  The banner filter likewise needs positive evidence, not position: it is ARMED only when the head
-  of the capture carries the `Claude Code` marker, and each line must hold >=2 CORNER glyphs
-  (`▐▛▜▌▝▘`, which `█` is not). A capture does not guarantee the logo is on screen — `--source
-  recent` is a consuming delta and a scrolled pane starts mid-output — so `████████ 80% done` can
-  legitimately be line 1, and stripping it would collapse two screens differing only in bar length.
-  Accepted trade-offs: a status bar rendered WITHOUT a trailing token is not recognized (chrome
-  survives into the salient — degraded, never dangerous), and a pane left with only a word or two
-  after the strip trips the over-masking floor and escalates.
+### Multi-tab forms and auto-accept
+
+- **A multi-tab form's baseline is the swept AGGREGATE, so nothing may compare it to one frame.**
+  `sweepFrames` walks every tab and `AggregateMCQFrames` joins them into the `Situation.Content` that
+  mints the signature and is stored as `pane_excerpt`; anything re-reading the pane later holds a
+  SINGLE frame, and a `choice` salient is STRUCTURED so the mismatch reads as proof the situation moved
+  on. Guard 3 did exactly this and auto-dismissed EVERY multi-tab escalation as `auto_dismiss_stale` —
+  deterministic, never intermittent, invisible because it looked like the feature working. Compare
+  FRAME-WISE instead: same tab count, live `ExtractAgentMCQForm` equal to one of
+  `AggregatedMCQFrames(excerpt)`. Guard 3 widens that two ways because it runs after a WAIT, and **each
+  widening buys a gate — all four load-bearing:**
+  - `NormalizeMCQFrame` folds the caret AND the preview box (on a preview tab the box is a FUNCTION of
+    the focused option, so folding the caret alone fixes nothing).
+  - The suggestion must be a series of exactly `AnswerCount` digits, checked against each captured
+    tab's `domain.MultiSelectTab` mode — otherwise `deliver.Deliver` falls to the plain-menu path and
+    maps the reply against whichever tab is visible, and a comma group (`1,3`) on a later tab is caught
+    only after earlier tabs are already committed: a half-answered form. Such rows really exist and were
+    simply unreachable while the guard always said no: `unfamiliar_options` leaves a wrong-shaped LLM
+    answer pending WITH the answer attached, and is not in `autoAcceptExcludedReasons`.
+  - `domain.MCQFormFullyUnanswered` — asked BEFORE the comparison, since `NormalizeMCQFrame` folds the
+    marks away and delivery retypes EVERY tab from tab 1.
+  - `domain.LooksLikeAggregatedMCQ` plus the `excerptTruncationMarker` prefix — treating "not a
+    complete aggregate" as "some other capture" drops straight back into the original bug.
+
+  All four refuse as `heldStillUnevaluable` (PENDING), never `heldStillNo`: a malformed answer, a
+  half-answered form and a mangled capture each need a human. **Note:** every other multi-tab fixture
+  here renders options without previews — `internal/domain/testdata/mcq_preview_*.txt` is the only pair
+  reproducing the layout, which is why this shipped green.
+- **A swept AGGREGATE is the one capture whose HEAD is load-bearing, so it gets its own storage budget**
+  (`aggregateMaxRunes`, `excerptBudget`). Every other excerpt is a pane TAIL, which is why
+  `truncateTailRunes` keeps the tail; an aggregate is the opposite shape, so shearing the head does not
+  degrade the capture but DESTROYS it — it becomes unparseable, and `mcqFormHeldStill`
+  then answers `heldStillUnevaluable` on every sweep forever at Debug level only — neither delivered nor
+  dismissed. Three bounds: the budget gate is a **strict parse**, never `LooksLikeAggregatedMCQ` (which
+  stays the READER's evidence of a mangled row); `SaveSignatureSnapshot` deliberately keeps the smaller
+  cap because `signature_snapshots` has NO retention path; and `duplicatePendingEscalation` still passes
+  `snapshotMaxRunes` as its `snapshotCap` ARGUMENT, where it is a fuzzy-dedup threshold rather than a
+  storage budget.
+  - **Test trap:** the seeder `seedAgedSweptEscalation` was the only writer of that column that skipped
+    truncation, which is why every existing test was blind.
+- **An option label stops at the preview column** (`trimPreviewColumn`) — a pane is one flat grid, so a
+  preview box lands inside the option's own line and line-anchored parsing gave labels that changed on
+  every caret move, minting a new signature each time. The cut only removes a SUFFIX, so a `[ ]`/`[✔]`
+  prefix always survives; a bare `─` is excluded from the glyph set because agents draw separator rules
+  with it.
+  - **A label that trims to nothing is recovered from the next row, never dropped**
+    (`wrappedOptionLabel`) — dropping it loses a choice the agent is really offering, so the option set
+    reads one short and "2" maps to nothing. Recovery takes the FIRST continuation row only and requires
+    that row to carry a preview column, because an ordinary menu's indented line is a DESCRIPTION (the
+    repo's own 3-tab fixture renders that way).
+  - Wrapped rows are deliberately NOT stitched into one label: a terminal wrap is lossy in a way that
+    depends on where the text ends relative to the gutter, so no separator rule is correct at every width.
+- **A checkbox tab is answered by TOGGLING, so its baseline is a safety control.** A blind digit is not
+  idempotent — over a pane already carrying an attempt's toggles it CLEARS them and the advance submits
+  an empty answer. The rule is `checked ⊆ chosen`, enforced at DELIVERY (`domain.CheckedOutside` in
+  `daemon.reverifyMultiSelect`, `frontend.verifyTabBaseline`, per keystroke in `mcqdeliver.toggleTab`).
+  CAPTURE only records — refusing there strands every form hap itself half-answered. The signature folds
+  checkbox state away (`domain.NormalizedOptionSet`), so a half-delivered form still matches the rule
+  learned for the untouched one. **The widened
+  baseline needs evidence**: it applies only where this daemon recorded its own attempt at this
+  pane+signature (`markToggleAttempt`, in-memory, lost across restarts — fails safe); without it a tab
+  must be completely clean, or the rule also accepts an operator halfway through ticking that form.
+- **The last look before a claim is COMPLETE** (`claimBlockedBy`) — everything above
+  `ClaimForAutoAccept` is a herdr shell-out with a budget in SECONDS, so it re-asks all three controls
+  broadest-first: kill switch (FR-017, not FSP-specific, fails closed on a read error), mode + ceiling
+  latch (`stillPermitted`), and `accept_generated_task` for a generated-task row (a SEPARATE opt-in
+  resolved once per sweep). `retireNoopEscalation` takes the same look — Guard 1a returns before ANY
+  dismissal precisely so pausing the herd never destroys the queue it protects.
+  - **A content-safety refusal is not a delivery fault** — tagged `errOutboundRefused` and handled like
+    `errAgentDisabled`. It used to enter the retry budget, so the same never-auto match was refused
+    `maxAutoAcceptAttempts` times and the row dismissed as `auto_accept_failed`, deleting exactly the
+    escalation FR-015 says must always reach a human. Such a refusal is permanent by nature, so a budget
+    could only ever end there.
+  - **The compensating revert needs an obligation of its own.** `auto_accepting` is TRANSIENT and
+    filtered out of both the operator's queue and the candidate query, and the only automatic reclaim
+    runs at daemon START — so a failed `revertClaim` hides the escalation from everyone until a restart.
+    Failed reverts are retried every tick (`retryAutoAcceptRevert`), NOT gated on the kill switch: it is
+    bookkeeping about a claim already abandoned. Only a non-nil error is a failure; `false, nil` means
+    another writer moved the row.
+- **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason). Before
+  it, Guard 1b and the pane-busy skip produced no output at ANY level, which is why the
+  truncated-aggregate bug took a five-round investigation. Per (row, reason), not per sweep — a changed
+  reason is new information. All call sites sit AFTER `stillEligible` is set: an INELIGIBLE row
+  `continue`s before that, so logging one there would be pruned and re-logged every minute forever.
+
+### Full self-prompting (FSP)
+
+**FSP may widen the YES side of Guard 3, never the NO side.** Two extra evidence paths, both reached
+ONLY after the ordinary comparison refused, both gated on the `fsp bool`, and both required to resolve
+to `heldStillUnevaluable` (PENDING) when they decline — a fallback answering `heldStillNo` turns a
+widening into a queue-destroying dismissal.
+
+- `mcqSalientHeldStill` answers a row truncated past its head using the byte-intact blocks
+  (`domain.SurvivingMCQFrames`), keeping the SAME frame-wise relation the intact path uses. **The option
+  set alone is NOT sufficient identity and must never become the only gate**: it is the union over every
+  tab and every AskUserQuestion form ends in a generated `Submit answers`/`Cancel` tab, so a pane parked
+  on ANY form's Submit tab is a subset of ANY other form's set. `domain.LiveMCQMatchesSalient` is only a
+  cheap extra conjunct catching option drift, and must derive BOTH sides through `MaskVolatile` — the
+  stored salient was masked, so an unmasked live side silently no-ops for every label carrying a path or
+  number. Three further gates are not optional: tab count = series length; form fully unanswered; and
+  **no token may be a comma group**, since the missing blocks carry no select mode to verify against. A
+  capture with NO surviving block stays pending — a deliberate limit.
+- `unstructuredHeldStill` answers a PANE-TAIL row via `domain.TailSimilarWithin`, which aligns both
+  salients from the TAIL before comparing. The mismatch is structural, not statistical: the baseline
+  comes from a `--source recent` CONSUMING DELTA while every re-read is `--source visible`, so symmetric
+  Jaccard is dominated by content only the longer side ever had — the documented reason idle and
+  generated-task rows never auto-accept. Aligning on the TAIL rather than testing containment is what
+  keeps it safe: a screen that moved on paints its new content at the BOTTOM, inside the compared window.
+  `domain.MinTailCompareRunes` is the floor, load-bearing for the same reason `min_salient_chars` is.
+  `fspTailHeldStillJitterPercent` is a **separate constant** from `staleDeferredSendJitterPercent` at the
+  same value — the loosening is the alignment, not the tolerance. Running after `SignatureHeldStill`
+  refused, it must re-ask the two refusals its caller did not: either side over-masked (repeated
+  placeholders share almost every trigram, so they clear any tolerance at any window — the magnet
+  failure by a door the length floor does not cover), or a fresh salient that has become structured.
+
+Outside Guard 3, a `@noop` suggestion under FSP is RETIRED (`ReasonAutoDismissNoop`) rather than left
+pending: the sentinel means SEND NOTHING and can never become deliverable, so under a mode whose premise
+is that nobody reads the queue it would sit forever. It is the only auto-accept path acting with no pane
+evidence, and can afford to — nothing is typed, nothing is learned. It still honours the kill switch,
+per-agent disable and runaway pause.
+
+**The two opt-in keys are OFF by default, and each buys one narrow thing** —
+`full_self_prompting.honour_limits` and `…accept_generated_task`.
+
+- **`honour_limits = false` means the whole `[limits]` section is INERT, and inertness is one CLAUSE in
+  each gate, never an early return.** The key used to skip only the mode's pre-check, so the ordinary
+  path kept running the runaway guard: an agent at `max_consecutive_auto_prompts` was escalated
+  `rate_limited` AND paused until a human checked in — and `rate_limited` is in
+  `autoAcceptExcludedReasons`, making that escalation permanently operator-only. `domain.RateLimits.Inert`
+  short-circuits `CheckRate` ahead of the `Paused` branch and gates the FR-014 retry ceiling in `Decide`
+  (`limits.max_error_retries` is in the same section, so without that `retry_exhausted` is never raised).
+  Deliveries still ADVANCE the counters. Resolve it through `limitsInert`, or `limitsInertFor` when an
+  `fspActive` answer is in hand — a per-AGENT loop must use the latter, since `fspActive` owns the
+  once-per-episode degradation warning.
+  **The three gates reading `rate.Paused` are SHARED** — `sweepAllowed`, `autoAcceptAgentSuppressed`,
+  `eligibleIdleAgents` each carry the per-agent disable (and `sweepAllowed` the kill switch and never-auto
+  screen) in the same run of checks — so inertness relaxes the pause clause ALONE. An early return at the
+  top of any of them is a safety bypass that still passes an end-to-end test, because the disable is
+  re-checked at delivery; drive these guards DIRECTLY in tests.
+- **A busy pane is not a runaway ceiling** — `domain.ReasonPaneBusy`, not `ReasonRateLimited`, at all four
+  `acquirePane` failure sites. Borrowing the ceiling's tag pauses the agent over a lock the in-flight
+  interaction releases on its own, and `autoAcceptExcludedReasons` then refuses the row forever.
+  `pane_busy` is deliberately NOT excluded — `d.paneBusy` and Guard 3's re-read gate the retry.
+- **The ceiling check must not read a PAUSE as a ceiling** — `CheckRate`'s first branch answers
+  `rate_limited` for a paused agent, but `fspCeilingReached` runs BEFORE Guard 1b, which already suppresses
+  those. Copy the rate with `Paused` cleared; only the two counters decide, or one paused agent switches
+  the mode off for the whole herd.
+- **The ceiling is only read on a row that could actually be DELIVERED.** `ConsecutiveAuto` is reset only
+  by human interaction, so a killed agent carries a saturated one forever while its leftover escalation is
+  still a candidate — standing the mode down over a row nothing could have sent, re-tripping after every
+  re-enable (the latch clears on reload), and skipping the `autoAcceptOne` bookkeeping that would retire
+  that row, so the livelock has no end. Hence the `live`/`autoAcceptParked` gate before the check, and
+  `continue` rather than `break` after a stand-down so remaining candidates still register in
+  `stillEligible` (a `break` hands them to `pruneAutoAcceptState`, silently resetting delivery budgets and
+  absence counts). The two ceilings are tested SEPARATELY so the stand-down can name which tripped, and
+  the per-minute one honours the window rollover.
+- **The stand-down latches in memory FIRST, writes config second, off the select loop** — `UpdateConfig`
+  nudges the daemon's own control socket, so an inline write blocks that loop on a round trip to itself.
+  The latch stops the noticing sweep immediately, is checked inside `fspActive` so both entry points
+  honour it through one gate, de-duplicates the write and the notification, and clears on reload.
+- **The attribution is written at FINALIZE, and the finalize RETRY must carry it** —
+  `autoAcceptNeedsFinalize` is `map[int64]bool` (id → was-FSP), not a set, or the flag is dropped on
+  exactly the rows whose bookkeeping already failed once. Claim time is NOT an option:
+  `ReclaimAbandonedAutoAccepts` would strand a true flag on a row nothing delivered. The store ORs the
+  column, so a replay can only ever set it.
+- **A generated task is screened TWICE, and the second one is the real gate.** The text is authored by the
+  generator LLM AFTER the decision that raised the escalation, so no safety control has seen it — the
+  operator's confirm was the gate, and this feature removes it. The screens run in the fork, before the
+  seam, on the RENDERED `DeclaredTask.Prompt()` rather than the stored text (stored items keep line breaks
+  as the literal two-character `\n`, which a line-anchored rule cannot match while the real newline
+  reaching the pane can — screening the stored form fails OPEN). A hit reverts the claim and leaves the
+  row escalated (FR-015). The daemon-side `generatedTaskUnsafe` can only render with the DEFAULT template
+  since the target source is chosen inside the seam, so the seam is handed a `screen func(string) error`
+  and calls it with the EXACT prompt immediately before the send, BEFORE the reservation.
+  **Test trap:** the daemon's tests drive a FAKE seam, so only a `frontend` test proves the real path
+  calls the callback.
+- **A generated-task acceptance is the DAEMON's row to finalize** — `automated` makes
+  `frontend.acceptGeneratedTask` skip BOTH `ResolveEscalation` and `InsertCorrection`. The seams
+  (`Options.AcceptGeneratedTask` / `DisableFSP`) are optional function fields wired in `cmd/hap`, so
+  `internal/daemon` still does not import `internal/frontend`; a nil seam returns the claim rather than
+  stranding the row. **EVERY status check on that path has to know it**, including the cheap early-out
+  above the claim (`audit.Status != "escalated"`) — missing THAT one is destructive: the error reaches
+  `autoAcceptDeliveryFailed`, which burns an attempt per sweep and DISMISSES the escalation, so the
+  feature deletes the very suggestions it exists to act on. It shipped green because the daemon tests wire
+  a FAKE seam. The call runs INSIDE `WithAgentAutomation` like every other delivery.
+- **EVERY generated-task hand-out gets a ledger row, the operator's included**
+  (`recordTaskReservation`). A crash between the `[-]` and the send used to strand the item: the audit row
+  is reclaimed at startup but the marker is not, so the retry reads it as taken, burns its budget, and the
+  escalation is DISMISSED. The operator path recorded nothing on the ground that a human was present to
+  read the error — **that premise died with the queued confirm**, since the send now happens on a machine
+  they may not be sitting at. Accepted cost and likeliest support question: `agentsAwaitingHandout` allows
+  ONE unconfirmed hand-out per agent, so a confirmed agent is withheld from the idle poll until it goes
+  `working` or ages out at `staleHandoutTTL`. `TerminalID` comes from `liveAgentFor`, which is what tells
+  a RECYCLED pane apart.
+- **The mode is re-asked immediately before the claim** (`stillPermitted`); `WithAgentAutomation` covers
+  the per-AGENT disable at delivery, not the global mode.
+
+**Accepted limitation, not a bug:** a generated-task escalation is `idle`-typed, so its baseline salient is
+unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — the row waits for the operator.
+
+### Task sources and hand-outs
+
+- **`enable_auto_send_task_when_idle` skips the LEARNING gates, never the safety ones.** A declared task
+  from a flagged source resolves ahead of any learned noop precedence and bypasses the shadow-mode and
+  confidence gates (`domain.Decide`, keyed on the `idleHandout` predicate — the VERIFIED classified
+  situation plus the RESOLVED action, never a sweep-time flag). The flag is an operator instruction about a
+  QUEUE; a learned action is an inference about a SCREEN, and every idle screen mints its own signature, so
+  per-signature graduation means the feature never delivers unattended. The bypass sits AFTER the variance
+  guard, rate guard and irreversibility heuristic and before nothing else; kill switch, never-auto,
+  per-agent disable and the optional pre-delivery LLM review all still apply at delivery.
+- **An unattended hand-out is only "delivered" once the agent works.** `agent send` proves herdr took the
+  keystrokes, not that the agent acted, so the `[-]` is recorded in `task_reservations` and confirmed only
+  by a `working` transition; `reclaimStrandedTasks` returns an unconfirmed item to `[ ]` once its agent is
+  parked again past `reclaimGrace`. Four bounds: the daemon releases ONLY a `[-]` it holds a ledger row for;
+  **one unconfirmed hand-out per agent** (`agentsAwaitingHandout`), since confirmation is per-agent and a
+  second hand-out lets one resumption confirm — and so strand — the untaken first; confirm and reclaim both
+  compare `terminal_id`, because an agent id IS a recycled pane id; and an item handed out `maxTaskHandouts`
+  times without ever being started is left `[-]` and escalated rather than resent forever.
+- **A pending escalation never benches an agent from the idle poll** — `eligibleIdleAgents` has no
+  escalation gate, deliberately: gating on one deadlocks the feature against itself, since a pending task is
+  what raises `noop_vs_pending_tasks`, which then blocks the poll that would deliver it. **Do not reach for
+  the audit `Trigger` to tell "the poll's own" escalations apart either** — `daemon.trigger` derives it from
+  `tr.AutoIdleSend`, so EVERY escalation on a poll-driven episode is stamped `auto-idle-send:`, the common
+  shape for exactly the parked agents this is for. **The bound on an undeliverable task is per ITEM, not per
+  agent**: a failed send rolls back to `[ ]` and records NO reservation, so nothing can age it —
+  `deliverAutonomousClaimed` counts the attempt (`RecordTaskHandoutAttempt`) and at the cap leaves it `[-]`
+  and escalates. Since the poll ignores `episodeHandled` on purpose, `Daemon.pollRedrive` widens the
+  interval (1, 2, 4 … capped at 15m) for an agent whose episodes keep not sending — a delay, never a bench.
+- **An inherited task-source provider is a live link, never a snapshot.** An empty per-source `provider` IS
+  the inheritance and must NEVER be materialized: `normalizeTaskSources` runs on **Load AND Save**, so
+  filling it in "like we do for `max_tasks`" stamps the current default onto every existing source the first
+  time any surface writes config — and the operator's later `hap config set task_source_provider.provider`
+  then moves nothing, silently, for every install that already had a config. It fails no obvious test.
+  Misconfiguration is detected at USE time (`ValidateResolvedProvider`), never at `Load`, and never coerced
+  — coercing an unrecognized provider to `local_fs` resolves gist-shaped names against the daemon's cwd and
+  CREATES local files while the operator believes their lists are remote. A missing `gist_id` is
+  deliberately not a write-time rule either: it would make the keys order-dependent to set.
+  - **The TOP-LEVEL key is the opposite: it IS materialized, and that is what made flipping its default
+    safe.** `Default()` names `sqlite` and `Load` pins `local_fs` the moment the config FILE exists — before
+    the decode, so an explicit key still wins and EVERY return carries the pin, including the two error
+    paths and the `AutoAccept.validate()` branch that keeps the decoded config. A post-decode pin misses
+    that third one silently, so a typo in the file would move an install's storage backend.
+    `ResolveProvider`'s literal fallback stays `local_fs` (reached only by an in-memory `Config{}`), and
+    `AnyNonDefaultProvider` asks whether the config is MIXED rather than "anything but local_fs", since
+    there are now TWO postures an operator reaches without touching the setting.
+  - **Test trap:** `internal/cli` and `internal/frontend` fixtures whose list is a FILE now declare it
+    (`localFSApp`/`localFSCfg`) rather than riding on the default — a suite where every test runs on a local
+    file, where a locator IS a path, is the single reason the locator-is-not-a-path bugs kept shipping
+    green. `testApp` deliberately stays on the DEFAULT.
+- **A task-list locator is never handled as a FILE outside the local backend.** `taskfile.Mutate`,
+  `MutateWithin` and `WriteFileAtomic` take a path; a locator is not one. Under a remote provider it is a
+  `gist://<id>/<file>` URI that `os.Stat` can only fail on, and the failure reads like a missing file rather
+  than like code looking in the wrong place. Every checklist mutation goes through the STORE
+  (`frontend.mutateList`/`mutateTask`, `daemon.mutateTaskList`), and there is deliberately NO local
+  `mutateTaskFile` alias to reach for; `internal/taskstore/local` is the one exemption. **The hazard is that
+  the local twin of a store method passes every test** — three shipped: a send-time reservation left on
+  `taskfile.Mutate` created the list, registered the source, CLAIMED the escalation and died with nothing
+  sent; `pickAppendTarget`'s `os.ReadFile` silently degraded from "the source with pending work" to "the
+  first source"; and the bootstrap exclusion compared absolutized paths, so an agent's own list read as
+  external and the append path duplicated every task un-numbered.
+  - Comparison is on canonical LOCATORS (`isBootstrapList`) — **plus a declared path**, not optional: a
+    DERIVED source resolves to `DerivedFileName(agent)`, byte-identical to what the bootstrap registers, so
+    locator equality alone excludes the most idiomatic gist setup and `addTaskSourceIfAbsent` then refuses
+    to register a second source, failing every retry after the tasks were written. Never compare the
+    declared spelling ALONE either: the same file name in a different gist is a different list. The
+    bootstrap locator's own resolution error is DEFERRED past the append early-return, so a misconfigured
+    remote default beside a healthy `local_fs` source still works.
+  - Two guards cover different halves: `TestOnlyTheLocalBackendTouchesATaskListAsAFile` bans the path-taking
+    MUTATORS by construction (matched on the selector, so a function value is caught and a dot-import of
+    `taskfile` refused), while the READ half needs behavior — hence `App.TaskStoreFor`, the test-only seam
+    standing a remote backend up in-process. Changes here belong in `remote_confirm_test.go`.
+  - The reservation rollback takes `context.WithoutCancel`: a remote store uses the caller's ctx, and the
+    likeliest cause of the failed send it undoes — the operator quitting — is the same cancellation that
+    would abort the release and strand the item at `[-]`.
+- **A task-list locator is canonicalized in exactly one place** — `tasklocator.Canonical`. A second copy
+  forgetting that a scheme'd locator returns verbatim fails SILENTLY: `filepath.Abs` does not error, it
+  returns `<cwd>/gist:/id/file`, and each hap process has a different cwd.
+- **A task list is never created BLANK.** GitHub refuses `""`, `"\n"` and `" "` alike with
+  `422 Validation Failed {Resource:Gist Field:files Code:missing_field}` — a blank body reads as "this entry
+  carries no file", the entry is dropped, and the request fails for an empty `files` map, so the error names
+  `files` and never the content. `newListHeader` is the ONE seed every create-on-demand path passes to
+  `ensureList`, enforced in THREE places: `frontend.ensureList` refuses a blank seed for EVERY backend (a
+  local file takes one happily, so guarding only where it breaks means the next caller is green through the
+  whole unit suite and fails for the first `github_gist` operator — exactly how the generated-task confirm
+  shipped seeding `""`); `ports.EnsureCreator` states it as the interface contract; and `gist.Store.put`
+  refuses with `ErrBlankContent` on EVERY write path. Only the CREATE is closed.
+  **Test trap:** the unit suite could not catch any of this until `fakeGist` was taught to answer a blank
+  write with GitHub's real 422.
+
+### Store, nodes and sync
+
+- **The store is node-scoped, and the Turso engine is daemon-owned, gated and never cancelled.** Several
+  machines may share one database and a herdr pane id repeats on every one, so it is never an identity
+  alone. Node-owned rows carry `node_id` (`store.LoadNodeID`); machine-local natural keys are composite
+  (`agent_names(node_id, agent_id)` with `UNIQUE(node_id, name)`, `agent_rate`, `error_retries`,
+  `task_handouts`, `agent_roster`, `herdr_locations`, `roster_meta`); INTEGER keys get node bits under turso
+  (`store.TimeOrderedIDs` via `s.nextID()` — NULL under sqlite so AUTOINCREMENT still assigns). Every
+  OPERATIONAL statement filters `node_id = self`; FLEET reads span nodes and return `node_id`.
+  `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by AST walk with an exemption map that must stay
+  live; the store suite runs THREE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso`). Two-node sync tests in
+  `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` +
+  `HAP_TURSO_TEST_TOKEN` point them at a REAL database instead — its hap tables must start empty, so run
+  them one at a time and wipe between.
+  - `hasOpenEscalation` asks the store, never filters the fleet queue by agent id in Go — that would let
+    another machine's pane `1` block this one's reconcile.
+  - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a
+    `database/sql` driver over `<state>/store.sock` (`internal/store/sqlbridge`), lazily dialled so
+    `hap config` works with no daemon.
+  - The adapter gates the SDK (statements read-lock, Push/Pull/Checkpoint write-lock, transactions hold the
+    lock, rows returned EAGERLY) over a FIXED pre-warmed pool, with sync ops on a background context —
+    verified: unguarded they flood `database is locked`, and a Push cancelled mid-flight hangs the engine
+    for good.
+  - **Schema DDL on a shared database is issued only by the SCHEMA LEASE holder**
+    (`turso.PrepareSharedSchema` / `AcquireSchemaLease`), which must be RE-PROVEN between migration steps,
+    failing closed with `ErrSchemaLeaseLost` — a background renewal alone is starved by a step's own write
+    lock. Two identical ALTERs wedge the loser SILENTLY, and elapsed time is never ownership: a node that
+    cannot establish the lease fails closed rather than migrating blind.
+  - `fleetRun` runs every sync op off the loop and waits for it OR shutdown; `turso.DB.Close` waits a
+    bounded time and refuses to close underneath an in-flight op.
+  - Config never enters the database. Front ends draw ids from the daemon with NO local fallback: two
+    processes minting locally in one millisecond collide, so an insert with no id fails with the reason
+    (`failedID`).
+- **A periodic write is CONDITIONAL, or it is a leak** — every store write arms a **2s-debounced turso
+  push**, so a writer firing more often than that never coalesces: one tick, one row, one push to Turso
+  Cloud, forever, on an idle install. Two writers were that shape:
+  - **`PublishRoster` compares before it writes** (`rosterRowUnchanged`), which **MIRRORS
+    `upsertRosterRow`'s CASE arms field for field — the two must change together**, or a field added to the
+    UPDATE alone silently stops being published. Three exclusions, each reasoned: `seen_at` advances by
+    construction (including it makes every row dirty — the whole bug), `cwd`/`cwd_read_at` are never written
+    by a publish, and `gone_at` is COMPARED rather than excluded so a returning agent is republished. A
+    **recycled** id is never skipped — its row was DELETEd earlier in the same transaction, so `existing`
+    describes a row that no longer exists, and the gate is on `recycledIDs` structurally rather than on the
+    coincidence that `terminal_id` is in the compare set. Roster FRESHNESS is `roster_meta.published_at`
+    (`domain.RosterFresh`), never a per-row `seen_at`, which is why the stamp still happens every publish.
+  - **`domain.NodeHeartbeat` is a SEPARATE constant from `daemonhealth.HeartbeatInterval` — deliberately
+    slower, but BOUNDED ABOVE by `daemon.actionStaleAfter`.** The file answers "is this daemon hung" and
+    must be fast; the row answers "is this machine still out there", and no reader asks with more precision
+    than `domain.NodeStale` (three beats). `maybeUpsertNode` throttles it and its FIRST call always writes,
+    which is why `Run`'s startup call goes THROUGH the throttle rather than around it. **The ceiling is why
+    it is 30s and not the minute the write reduction alone would prefer**: three beats is also the gate
+    `requireLiveDaemonFor` refuses a remote confirm on, while a confirm vouches for a SCREEN whose
+    deliverable life is `actionStaleAfter` — so a confirm the gate accepts must still be one the daemon can
+    honour, and a minute inverts that silently. (`domain` cannot import `daemon`, so a test is what makes
+    the ceiling enforceable.)
+- **A wedged sync engine is REPAIRED once and SAID always, and the two halves have opposite defaults.** A
+  failing `Push`/`Pull` used to be `logging.Guard` + Warn + `return nil`: the daemon kept running, the herd
+  looked quiet, and every fleet read this node served was silently half a fleet short. Observed live (macOS,
+  hap 0.9.4) as a TLS handshake failing every tick with `last pull never, last push never` while the TUI
+  showed six escalations and named them all local.
+  - **The counter spans BOTH directions and the anchor is the last SUCCESS** — a node that pulls fine and
+    cannot push is just as isolated. Isolation measures from `max(LastPullAt, LastPushAt)`, falling back to
+    `FirstFailureAt`, the ONLY anchor a daemon that has never synced has, which is the exact shape the
+    incident was reported in. `FleetSyncIsolatedAfter` is a CLOCK, not a boolean on `LastError`: a fresh
+    failure is `DaemonWarn` and only five minutes without a success is `DaemonError`. The banner leads with
+    the CONSEQUENCE ("this machine is NOT exchanging rows with the other nodes"), never the TLS text.
+  - **The automatic restart is gated on the fault being PROCESS-LOCAL, and unknown means NO**
+    (`domain.SyncFailureProcessLocal`, remote shapes checked FIRST so a TLS error nested in a dial timeout
+    reads as the timeout). Restarting on a remote that is merely down costs the herd its in-flight captures
+    and consults every cooldown, forever, and buys nothing. Both bounds must clear
+    (`fleetRecoveryMinFailures` AND `fleetRecoveryMinOutage`).
+  - **It spawns `--restart`, NOT the `--ensure` the upgrade handoff uses, and this is the trap.**
+    `EnsureFresh` does NOTHING when the running holder already matches the version and path it would start
+    — precisely a restart as the SAME binary — so an `--ensure` successor bows out and a daemon that then
+    stepped aside leaves the herd unmonitored. `checkFleetSyncWedged` latches `fleetRecoveryOrdered` and
+    keeps running rather than taking `handedOff`.
+  - **The latch is released by EVIDENCE, not by time** — a marker file written BEFORE the spawn (the
+    successor may read it first) and deleted by the first successful sync. An unwritable marker REFUSES the
+    restart, because without it an unfixable fault becomes a restart loop abandoning in-flight work every
+    cooldown, strictly worse than the isolation; a failed spawn clears it.
+  - **An unbootstrapped node is a THIRD state, not a degraded one.** `openTurso` retries the first bootstrap
+    forever and `daemonlock.Acquire` runs BEFORE it, so a wrong URL or rejected token leaves `hap status`
+    reporting a running daemon that has not begun monitoring anything — worse than isolation, which at least
+    answers for its own herd. Its own banner and remedy, on the same clock; `openTurso` records
+    `FirstFailureAt` because nothing else on that path has one.
+  - `internal/fdprobe` is instrumentation, not a control — fd exhaustion was the leading explanation and was
+    never MEASURED. `OpenKnown` is separate from `Open` because macOS has no `/proc/self/fd` and rendering
+    its zero as "0 open" reports the opposite of what happened; `Exhausted` is a real syscall and the only
+    field that is proof.
+- **Retention has TWO windows, and the exemptions are the safety control.** `PruneAuditExcerpts` blanks one
+  COLUMN; `PruneAgedRows` deletes finished bookkeeping ROWS (default 30 days). Both share the daemon's one
+  daily throttle, taken before either config is read so switching one off cannot change the other's cadence.
+  - **`agent_roster` is swept only because `agent_roster_tombstones` exists, and the trap it answers is still
+    live**: a retired row was itself the resurrection guard. `upsertRosterRow`'s INSERT arm hardcodes
+    `gone_at = 0` and only its ON CONFLICT arm honours `authoritative`, so with nothing recording the
+    retirement a non-authoritative EVENT takes the insert path and revives an agent herdr no longer reports
+    — `LiveRoster` then hands a dead agent to the idle poll and `hap task send` until the next
+    authoritative publish re-retires it. (A plain delete was
+    tried, #395, and backed out, #398.) Four bounds:
+    - **The prune requires the tombstone, per row.** A retired row without one (legacy or damaged database)
+      is the last guard left, so it is KEPT; `migrate` re-derives missing tombstones on EVERY open, since the
+      wide row is the only place that information still exists.
+    - **Discriminated by TERMINAL id, and storing it without reading it is the silent half of the bug** —
+      once the wide row is gone the tombstone is the only record of which terminal was retired. A DIFFERENT,
+      non-empty terminal is a genuinely new agent and is admitted; an empty terminal on EITHER side blocks
+      ("unobserved is never evidence").
+    - **Admitting DELETES the tombstone**, or a survivor keeps the OLD terminal at this agent's own
+      retirement and the comparison silently stops discriminating.
+    - **The tombstone is permanent, deliberately** — "this terminal on this pane is retired" is true forever,
+      and a grace period needs a bound on transition staleness the protocol does not offer.
+
+    `hap gc` does not reclaim roster rows because it does not call `PruneAgedRows` at all — pre-existing;
+    the daily sweep is what bounds the table.
+  - **`audit_log` and `decisions` are never swept** — the row survives its blanked column so `hap audit`
+    history stays complete, and `decisions` feeds `CountDecisionsForSignature`, so deleting from it changes
+    LEARNED BEHAVIOUR rather than reclaiming space.
+  - Every other exclusion is a row some path still acts on, never one that merely looks recent: a
+    non-terminal `agent_actions` row is the control queue (and even a terminal one is what
+    `AwaitAgentAction` returns as `Result`/`Error` — the ONLY way the surface that queued it learns whether
+    it landed); `pending` `llm_requests`/`llm_decisions` rows are the retry guard and an un-re-gated
+    decision; unprocessed `corrections`/`llm_retries` rows are queued work. `corrections` additionally needs
+    `NOT EXISTS` over `agent_actions.correction_id` — that reference has no foreign key behind it and is
+    what makes `UnprocessedCorrections` withhold a correction whose delivery is still queued.
+  - **An unconfirmed `task_reservations` row survives at any age** — it is what `reclaimStrandedTasks` needs
+    to return an item to `[ ]`, and a `[-]` with no ledger row is treated as somebody else's.
+  - **The newest `kill_events` row survives PER SCOPE, not per node.** The table carries a SECOND stream (the
+    FSP toggles `recordFSPToggle` writes, including the daemon's ceiling stand-down), so a survivor guard
+    keyed on `MAX(id)` alone deletes a standing global PAUSE the moment any newer FSP row exists —
+    `KillStateActive` reads false and the herd resumes with nothing logged. **Test trap:** this shipped green
+    because the first version of the test seeded only `global` rows.
+  - **A finished consult's payloads go on their OWN grace (`LLMPayloadGrace`), never at the status
+    transition** — neither `GetLLMRequest` nor `LLMDecisionByRequest` filters on status, so
+    `mcpserver.resolveRequest` serving an explicit `request_id` would be handed an EMPTY context. Separate
+    from the operator's window precisely because that one may be 0.
+  - **The cutoff is FLOORED at `RowRetentionFloor`, because 0 is a supported setting** — otherwise a terminal
+    `agent_actions` row is deletable in the same second it is written, while `AwaitAgentAction` is still
+    polling it for the only outcome signal it can get. A **separate constant** from `LLMPayloadGrace` at the
+    same value, the way `PruneAuditExcerpts` has `AuditExcerptDedupMargin`: that one bounds a COLUMN blank
+    against a live reader, this one a ROW delete against a poller.
+  - **Every statement is issued at its OWN call site rather than from a table of queries** —
+    `TestEveryNodeOwnedStatementIsNodeScoped` flattens a CALL's SQL argument, so a query reached through a
+    struct field flattens to `" ? "` and the whole sweep falls outside the guard, silently, in the one file
+    where an unscoped DELETE does the most damage. Hoisting SQL into package consts does NOT fix that; only a
+    direct literal at the call site does.
+
+### Claude session-name sync
+
+**A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is never evidence.**
+`[agents] sync_claude_session_name` (off by default) keeps an agent's hap name and the name `/rename` paints
+in Claude's composer byte-identical: a named session is folded, adopted, and pushed BACK when the fold or a
+collision changed it; an unnamed one is sent `/rename <hap name>`.
+
+- **It is not the terminal title** — `terminal_title_stripped` carries Claude's churning conversation
+  SUMMARY, so adopting it renames every agent after a sentence that changes on its own (Claude Code 2.1.252).
+- **"No composer" is UNKNOWN, never "unnamed"** — the classification read is a consuming delta that routinely
+  shows no footer, and the push direction reads "unnamed" as its TRIGGER, so the alternative overwrites an
+  operator's chosen name.
+- **The push is a DELIVERY**: `acquirePane`, kill switch + per-agent disable re-asked inside the goroutine,
+  never-auto over the exact text, a `--source visible` re-read before AND after the send, a proven-EMPTY
+  composer (`ClaudeComposerReady` proves the sandwich, not that it is blank), a ceiling per (agent, terminal,
+  name), and `d.spawn` so shutdown drains it.
+- **QUIESCENCE is asked twice, and the second time against LIVE state.** Both questions — parked
+  (`sessionRenameParked`: `idle`/`done`; `blocked` is a modal where Enter is rebound, and an empty status
+  fails closed) and `ComposerEmpty` — are asked at the TOP of `applyClaudeSession`, the one seam all three
+  entry points share, gating BOTH directions including the store-only adopt. They are asked again inside
+  `pushSessionRename` from `liveAgentFor`, NOT `tr.Status`: the capture's status is seconds old on the
+  attention path and a whole pass old on the others, and claude QUEUES input while it works rather than
+  refusing it. A failed listing refuses — "we could not ask" is not "it is idle". The tenancy compare
+  (`recycledSince`) fails OPEN on an unknown id, because event-socket transitions carry no `terminal_id` and
+  a strict compare would refuse every production rename. Order is deliberate: status first (cheaper, skips
+  the read), composer proof LAST, because typing changes on one keypress while status changes at a turn
+  boundary.
+- **A just-parked agent is not a quiet one** (`sessionRenameSettle`, via `sessionSyncReady`). The complaint
+  this feature earned is a rename typed into a session the operator opened seconds ago: the composer is empty
+  because they have not typed the FIRST character yet, so both quiescence checks pass and the push races
+  their first keypress. No re-read closes a sub-second race; waiting does. The evidence is `d.idleSince`, and
+  an ABSENT or foreign mark is UNSETTLED — exactly the state a brand-new agent is in.
+  - **It gates ADOPTION too**, though adoption types nothing: what it buys is that the two names are never
+    knowingly left disagreeing, which is the CHARACTER-IDENTICAL contract this feature exists to hold.
+    Accepted cost: an escalation inside that window calls the agent by its generated name.
+  - **It is asked in exactly TWO places, and a third copy is a hazard rather than defence in depth.**
+    `startSessionRename` deliberately carries none — the shared gate already answered over the capture and
+    `pushSessionRename` re-asks against LIVE state, which is strictly stronger. A copy over the stale `tr`
+    could only agree with the gate that just ran, and it made the mutation deleting the REAL check pass.
+  - **The live re-check asks "parked LONG ENOUGH", not just "parked"** — an agent can park AGAIN in the gap
+    the goroutine spends on herdr, a NEW spell the pre-spawn check knew nothing about.
+  - **The constant is not the knob it looks like** — `d.idleSince` is written only by the 60s sweep and a
+    deferral's first backoff step is also 60s, so the effective wait is ~1–2 minutes whatever
+    `sessionRenameSettle` says. Lowering it changes almost nothing; 0 removes the gate.
+- **A refusal DEFERS; it never burns a push.** `maxSessionRenamePushes` bounds KEYSTROKES at a pane that never
+  takes the rename; `maxSessionSyncDeferrals` bounds READS at a pane that is never ready. Conflating them is
+  destructive: every refusal used to burn one of the three, so an operator who was mid-draft three times
+  running permanently disabled their own rename — the exact person the gates are for. `pushSessionRename`
+  returns `typed bool` and the release refunds by DECREMENT (never by writing back a snapshot, which hands a
+  concurrent claim its budget too). The one branch that must arm NOTHING is a send that happened but did not
+  verify: a deferral there turns the ceiling into "three pushes per interval, forever".
+- **The retry is the sweep's, not a timer's** — `sessionSyncDeferred` is a `pollRedrive`-shaped map re-examined
+  off the existing 1-minute ticker at 1→2→4→8→15 minutes, and `nextAt` is load-bearing because the ticker has
+  no phase relationship to when a deferral was armed. The pass shares `sessionSyncPassRunning` with the flip
+  pass so two passes never walk the herd typing at once — which means a false→true flip arriving while a retry
+  holds the latch MUST be coalesced (`sessionSyncFlipPending`) rather than dropped: nothing else re-runs the
+  one-shot live-herd sync, and the retry pass only visits agents that already carry a deferral. It is handed
+  BOTH slices: the whole listing is what the map is PRUNED against (an agent withheld from `rest` has not
+  vanished), while only `rest` may be touched.
+- **The `!ok` capture arms a retry, and the aligned fast path is what makes that affordable.** "No composer in
+  this capture" is the NORMAL state for a quiescent pane and the state the operator's own scenario sits in, so
+  leaving it to the next capture leaves the feature with no retry at all for the case it exists for. That arms
+  one deferral per claude agent, which the `sess.Name == agentName` fast path ABOVE the gate clears on the
+  first retry. Without the fast path, every settled agent that happens to be mid-turn arms a retry instead.
+- **`NormalizeAgentName` must stay a FIXED POINT**, or the pushed name is re-folded on the next capture and
+  the two trade spellings forever. Same for `SuffixedAgentName`; collisions are idempotent via
+  `domain.AgentNameDerivedFrom`. An identical pair must cost no pane read — the at-send screen also refuses
+  the redundant push, so only a read COUNT catches its removal.
+- **Turning the key ON drives its own one-shot pass, because a config change re-captures NOTHING.** Neither
+  `reloadWith` nor its `reconcileAttention` schedules a capture for an already-parked agent, so a flip on a
+  settled herd did nothing until each agent next went working→parked. `syncClaudeSessionNamesNow` walks the
+  live agents once instead, and four bounds are load-bearing: it reads `--source visible`, never `ReadPane`'s
+  consuming delta (which would swallow the delta a pending classification capture is about to take, and is
+  also the only reason the flip sees a composer at all); clearing `episodeHandled` is NOT the alternative,
+  since that re-drives the whole herd through classify→decide→act, raising escalations and spending LLM
+  consults for a naming feature; the trigger is gated on `!first`, because `reloadWith` also runs inside
+  `New()` (so a daemon STARTED with the key on keeps the pre-fix behaviour for agents whose escalation row
+  survived the restart); and the latch is released by the goroutine's defer AND by hand when `spawn` refuses,
+  or one shutdown-race flip disables the pass for the process. Both entry points share `applyClaudeSession`,
+  so a gate added to either is added to both.
+- **Test traps:** every gate fails CLOSED, so a push case that forgets `parkedAndSettled` (pin the listing AND
+  backdate `d.idleSince`) passes for the wrong reason — hence the ceiling test asserts EXACTLY the ceiling
+  rather than "no more than". And the flip tests wrap the fake so the composer is visible ONLY through
+  `--source visible`; without that the capture path could produce the same rename and none would discriminate.
+
+### Semantic matching
+
+- **Semantic matching degrades, never blocks** — situations resolve via embedding + vector search over the
+  MASKED salient (`daemon.resolveSignature`, `internal/match`, `internal/embedder`), falling back to
+  normalized BM25, then exact hash. `SignatureResult.Raw` is the never-remapped content hash (the LLM drift
+  check depends on it); `signature_embeddings` is the source of truth and the bleve index under
+  `<state>/match-index` is a disposable cache (mem-only scorch does NOT serve KNN — keep it disk-backed).
+  Embed calls are stall-guarded and latch a degraded mode after 5 consecutive failures.
+- **Attention events are delay-captured** — the classification read waits `[[capture_delay]]` (10s on an
+  agent's first event, 2000ms after) via a per-pane `time.AfterFunc`, so the agent TUI has painted and bursts
+  coalesce (latest wins, one capture per burst). Daemon tests inherit a 1ms wildcard rule from the harness.
+- **Learned signatures are FLEET-WIDE, and the embedding model's id is the only thing that scopes them.**
+  `signatures`, `signature_embeddings` and `signature_snapshots` carry NO `node_id`, and `decisions` is
+  deliberately absent from `nodeScopedTables` so rules graduate on the fleet's evidence. A peer's rule becomes
+  matchable HERE through `fleetPull` → `RefreshKnowledge`, which rebuilds the whole bleve index from the store
+  rather than adding rows — which is also what makes a rule DELETED elsewhere disappear here. **Do not add a
+  `node_id` to any of them.**
+  - **`embedder.ModelIDFor` is therefore a fleet-wide identity, and both halves are load-bearing.** It digests
+    the model FILE. `filepath.Base` failed BOTH ways at once, silently — *not unique enough*: two different
+    384-dim models installed as `model.gguf` shared an id, so `Reconcile` KEPT foreign vectors and cosine
+    compared across unrelated models, which no downstream equality filter can catch because the strings agree;
+    *not stable enough*: a renamed copy of the bundled model gave one node a different id for the same model,
+    so each node read the other's rows as stale and re-embedded them, an unbounded rewrite ping-pong through
+    Turso Cloud plus a permanent "N rules need re-compute" nag. Unreadable falls back to the base name, never
+    `""` (an empty id compares unequal to every row, so drift could never clear) — and that fallback is NOT
+    cached, or an install whose model arrives later keeps the legacy scheme for the process's life.
+  - **Anything comparing a stored row's model must resolve the id the SAME way** — `frontend.embeddingDrift`
+    calls `embedder.ModelIDFor` rather than taking the base name; the two drifting apart is silent and
+    permanent. `EmbeddingDrift.ModelName` is DISPLAY only; `ModelID` is the comparison key.
+  - **Known and NOT fixed:** a fleet whose nodes run genuinely different models, or disagree on
+    `min_salient_chars`, still ping-pongs — `Reconcile` rewrites peers' rows on every pull. The vector is
+    stored per SIGNATURE, not per (signature, model), so the alternative would confine cosine to rows each
+    node embedded itself. A uniform fleet is unaffected either way.
+- **A short PANE-TAIL salient is never embedded — on EITHER side of the comparison.** Below
+  `embedding.min_salient_chars` (default 100, on the masked salient) matching uses BM25. **STRUCTURED salients
+  are exempt at any length, and that exemption is load-bearing**: they are short by construction
+  (`permission:proceed | options:no;yes` is 35 chars), so a floor over them switches cosine off for every
+  approval, choice and error rule — the paraphrase matching the feature exists for. **If every pre-existing
+  semantic test needs a lowered floor to pass, the floor's scope is wrong** — that was the tell the first
+  time. The reason for the floor: sentence embeddings are not discriminative on a few generic tokens, so any
+  two near-empty screens land above `similarity_threshold` and ONE almost-empty rule becomes a magnet silently
+  answering everything. `domain.EmbeddableSalient` is the single definition, enforced three times because
+  closing only the query side still lets a long screen match a short stored rule — the incoming situation
+  skips the embed, a new short rule is persisted with no vector, and an existing one is stripped by
+  `reembed.Reconcile` AND vetoed again in `resolveSignature`'s accept filter (covering the window before a
+  rebuild). Reconcile runs at every start and `[embedding]` reload, healing an existing database with no
+  migration. Such a rule stays reachable by BM25 and exact hash.
+- **Agent-TUI chrome is redacted from pane-tail salients, gated on agent type** — `domain.StripClaudeChrome`,
+  `domain.StripCodexComposer`. Chrome is byte-identical across unrelated panes, so it BOTH inflates similarity
+  between different screens and eats the `pane_salient_chars` window. It runs BEFORE the window is taken and
+  only on the pane-tail branch, and only ever deletes lines it can positively identify — an unrecognized line
+  is kept, so two different screens stay different.
+  - The `❯` filter is anchored on "last non-empty line" because `❯` is also an option-list caret — **never
+    widen it to the bare glyph.**
+  - Every filter is ANCHORED at line start: a bare substring test deletes a whole line when the agent merely
+    QUOTES the phrase, and the footer window is the entire capture on a short pane.
+  - The status bar needs three pieces of evidence together (≥3 pipes, no leading `|`, the terminal-width
+    padding run) — the pipe count alone matches a shell pipeline the agent reported running.
+  - The banner filter is ARMED only by the `Claude Code` marker at the head, and each line needs ≥2 CORNER
+    glyphs (`▐▛▜▌▝▘`, which `█` is not). A capture does not guarantee the logo is on screen, so
+    `████████ 80% done` can legitimately be line 1 and stripping it collapses two screens differing only in
+    bar length.
+  - Accepted trade-offs: a status bar with no trailing token is not recognized (chrome survives — degraded,
+    never dangerous), and a pane left with a word or two after the strip trips the over-masking floor.
+
+### The LLM re-ranking judge
+
+**An LLM judge may only ever NARROW what cosine already admitted, and it may never run on the select loop.**
+`llm.reranking_command` (off by default) turns `similarity_threshold` into a FILTER: every candidate at or
+above it is listed for a one-shot CLI returning `[{"id": n, "score": s}]` by relevance, and hap WALKS it.
+
+- **The judge ranks by RELEVANCE and cannot see a rule's learned STATE, so the head is not always actionable**
+  — its best match is routinely one hap may not act on (shadow mode, below threshold, an option no longer
+  offered), and only `domain.Decide` knows. `walkRankedDecision` takes the first candidate whose decision is
+  not an escalation; when none is, the HEAD escalates, because that is the rule the operator should be asked
+  about. This cannot loosen a safety control by construction: every gate not depending on the SIGNATURE is
+  fixed in the shared `DecideInput` and vetoes every candidate or none. `llm.reranking_top_k` is the DEPTH of
+  that walk, not a prompt cap, which is why `config set` refuses anything below 1.
+- **The kill switch is asked for HERE, not inherited** — `startRerank` spawns BEFORE `Decide`'s read, so an
+  ungated judge leaves a PAUSED herd launching a subprocess per attention event per parked agent for decisions
+  that escalate regardless. Refusing is not a degrade (the caller uses the cosine fallback); a read error
+  refuses too.
+- **The resume re-reads the pane, and its drop is SILENT** — `rerankSituationHeldStill` discards and logs one
+  INFO line. Right direction (the alternative resumes a 30-second-old decision into a live menu) but the branch
+  most able to disable the feature unnoticed, so cover it directly rather than through the pipeline tests. It
+  carries `handleActionReviewOutcome`'s asymmetry: idle matches on situation TYPE alone, because an idle
+  signature hashes a masked head that legitimately differs between the `recent` capture and this `visible`
+  re-read; the transition's status falls back to the situation's own, or an empty one mismatches on type and
+  drops everything while every test still passes.
+- **A vector-search ERROR is not a cosine miss** — `bm25RetryAllowed` refuses a text retry for any STRUCTURED
+  salient cosine REFUSED, so collapsing a transient KNN failure into "cosine missed" mints a new key for every
+  approval, choice and error screen: the very population this targets.
+- **The candidate set is accept-filtered BEFORE the judge sees it** — the same closure the cosine pass uses
+  (`min_salient_chars` veto plus `remapAllowed`/`ApprovalRemapCompatible`) gates `matcher.VectorCandidates`.
+  Those gates exist because similarity alone bridges two approval screens sharing a verb (#155); delegating
+  them to a model puts the wrong answer into a pane.
+- **An EMPTY verdict is TERMINAL and skips BM25** — step 4 runs equally when the vector search was clean but
+  found nothing above threshold, so a fallen-through veto would be re-admitted by text and the feature becomes
+  a no-op that looks like it works. `finishRerank` mints instead (`MatchRerankVeto`).
+- **A judge FAILURE is not a veto** — missing binary, timeout, non-zero exit, prose with no array, duplicate or
+  out-of-range ids all degrade to `fallback` (computed BEFORE the run, so no error path reconstructs it). The
+  veto is an empty array, and equally a verdict scoring entirely below `relevance_score_threshold`;
+  `domain.ErrNoRerankVerdict` keeps the two apart, and `lastJSONArray` only accepts a region that already
+  unmarshals, so prose brackets are never an answer — except an empty bracket pair, which under last-wins turns
+  an earlier answer into a veto, the safe direction.
+- **It CANNOT run inline** — the cosine pass returns a `rerankPlan`, `decideAndAct` suspends, and
+  `handleRerankOutcome` re-enters `decideAndActResolved`. One flight per agent keyed on `sig.Raw` (there is no
+  learning key yet — resolving it is what the run is for), superseded on a different raw and cancelled wherever
+  a pending capture is; a token check drops a stale verdict, and `RerankingConfigured` is re-asked so a verdict
+  in flight when the operator turned the feature off degrades instead of vetoing. `rerankOutcome` carries
+  `fallback` AND `original` because they are not interchangeable: a veto mints from the ORIGINAL, and minting
+  from the fallback persists the raw hash while returning the candidate the judge just refused.
+- **Only an ESCALATION row carries `match_method`** (`daemon.escalate`, the sole writer, predating this
+  feature) — so `MatchRerankVeto` is visible in `hap audit` while `MatchRerank` on a delivered row is not. Do
+  not "fix" this by adding provenance to the auto path without deciding what that does for every existing
+  cosine/bm25 delivery too.
+- **An IN-FLIGHT run is invalidated by the same events the cache is** (`invalidateRerank`). Clearing only the
+  cache leaves the hole in its most confusing form: a run started under the old command or threshold finishes
+  seconds later, passes the per-agent token check — which is about SUPERSESSION, not staleness — applies its
+  answer, and REPOPULATES the cache just emptied; a refresh can also DELETE the very rule the verdict names.
+  Each flight carries its `rerankGen` and an older one degrades to the cosine fallback rather than CANCELLING,
+  because a reload follows every `hap config set`. **Two bounds make the counter work:** `invalidateRerank`
+  bumps UNCONDITIONALLY — a verdict IN TRANSIT is in neither map, so an "is there anything to invalidate" fast
+  path lets a pre-refresh verdict commit; and the generation check and the cache write are ONE critical section
+  (`commitRerankVerdict`), or an invalidation landing between them caches a pre-invalidation verdict anyway.
+  `cancelRerank` keeps its own fast path: it is per-EVENT and keyed on one agent, where a missing entry really
+  does mean nothing to cancel.
+- **The verdict cache keys on the RENDERED listing, never the candidate signatures** — the listing carries each
+  rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what makes the judge say "reuse this", and all
+  of those move under an UNCHANGED signature set every time a decision is recorded. Cleared on ANY reload and
+  on `RefreshKnowledge`, unconditionally — never gated on a section compare, or turning the judge off and on
+  again resurrects its old answers.
+
+`match.VectorCandidates` exists for this and re-expresses `MatchVector` rather than duplicating it:
+`MatchVector`'s "return the first accepted candidate" is sound only because the list is in descending cosine —
+a re-ranker breaks that, so the threshold moves to a caller that sees every candidate. **If any pre-existing
+semantic test needs its expectations edited to accommodate this feature, the gating is wrong.**
 
 ## Testing practices
 
-- Unit tests are mandatory for behavior changes — table-driven where natural, fakes over
-  mocks (`internal/fakeherdr` fakes the herdr socket + CLI; `daemon_test.go` has in-process
-  fakes and a `newHarness` helper).
-- **Unix socket paths are length-capped** (~104 bytes on macOS): tests must use
-  `testutil.SocketDir(t)`, never `t.TempDir()`, for socket paths.
-- macOS temp dirs live under the `/var → /private/var` symlink — compare paths via
-  `filepath.EvalSymlinks`, not string equality.
-- Anything spawning real subprocesses should tolerate a deleted cwd (see `llm.Adapter.WorkDir`
-  and `chdirStable`) — the daemon can outlive the directory herdr launched it from.
+- Unit tests are mandatory for behavior changes — table-driven where natural, fakes over mocks
+  (`internal/fakeherdr` fakes the herdr socket + CLI; `daemon_test.go` has in-process fakes and `newHarness`).
+- **Unix socket paths are length-capped** (~104 bytes on macOS): use `testutil.SocketDir(t)`, never
+  `t.TempDir()`.
+- macOS temp dirs live under the `/var → /private/var` symlink — compare paths via `filepath.EvalSymlinks`.
+- Anything spawning real subprocesses should tolerate a deleted cwd (`llm.Adapter.WorkDir`, `chdirStable`) —
+  the daemon can outlive the directory herdr launched it from.
+- Where a rule above names a **control** test ("without it the first passes on code that answers one way for
+  everything"), that pairing is the point — don't drop one half.
 
-## herdr integration gotchas (verified against herdr 0.7)
+## herdr integration gotchas
 
-The **`herdr`** skill covers CLI usage; these are the hap-specific protocol facts.
+The **`herdr`** skill covers CLI usage; these are the hap-specific protocol facts. Version stamps are kept
+where the behaviour could revert.
 
-- CLI reads print JSON envelopes (`{"id":…,"result":{…}}`); `pane read --format text` prints
-  plain text. `pane get` exposes `cwd` / `foreground_cwd` (a deleted dir renders as
-  `"/path (deleted)"`).
-- **herdr 0.7.5 REMOVED `agent send`**, and nothing replaces it one-for-one — the old call now
-  exits 2 with a usage banner and nothing reaches the agent. `agent send` quietly did two things
-  and the survivors split them, so `internal/herdr.CLI.submitText` **routes on the content**:
-  - **single-line → `pane send-text` + `pane send-keys enter`.** Literal terminal input, so a
-    menu digit arrives as the KEY it is. This is safety-critical: hap answers an approval by
-    mapping the option to its digit (`domain.MenuKeystroke`), and verified live (2026-07-31)
-    against a real Claude question form, `agent prompt "2"` PASTES the 2 as text and its Enter
-    commits whichever option the caret was on — it answered "Apple" while hap had chosen
-    "Banana", silently, with a success exit code. Never route a digit through paste.
-  - **multi-line → `agent prompt`.** Writes the text AND its Enter in one request honoring the
-    pane's live bracketed-paste mode, so a task hand-out lands as ONE message. `pane send-text`
-    is NOT paste-aware — each embedded newline is a literal Enter, which submits the first line
-    and types the rest into the next prompt.
+- CLI reads print JSON envelopes (`{"id":…,"result":{…}}`); `pane read --format text` prints plain text.
+  `pane get` exposes `cwd` / `foreground_cwd` (a deleted dir renders as `"/path (deleted)"`).
+- **`pane read --source recent` is a consuming delta**, not the screen: after one read it can return just the
+  cursor line. To recover a standing menu at confirm time, read `--source visible`
+  (`herdr.CLI.ReadPaneVisible` / `ports.VisiblePaneReader`).
+- **herdr 0.7.5 REMOVED `agent send`** — the old call exits 2 with a usage banner and nothing reaches the
+  agent. It quietly did two things and the survivors split them, so `internal/herdr.CLI.submitText` **routes on
+  the content**:
+  - **single-line → `pane send-text` + `pane send-keys enter`.** Literal terminal input, so a menu digit
+    arrives as the KEY it is. Safety-critical: verified live against a real Claude question form,
+    `agent prompt "2"` PASTES the 2 as text and its Enter commits whichever option the caret was on — it
+    answered "Apple" while hap had chosen "Banana", silently, with a success exit code. **Never route a digit
+    through paste.**
+  - **multi-line → `agent prompt`.** Writes the text AND its Enter in one request honoring the pane's live
+    bracketed-paste mode, so a hand-out lands as ONE message. `pane send-text` is NOT paste-aware — each
+    embedded newline is a literal Enter, submitting the first line and typing the rest into the next prompt.
 
-  Both fall back to the legacy `agent send` (+ Enter) only on exit status 2 — herdr rejecting the
-  VERB — which keeps `min_herdr_version = 0.7.0` honest. A pane-level failure exits 1 with a JSON
-  error body and is returned as-is, so a real delivery error is never retried as a second send.
-  Keep the paired tests (`TestSingleLineSendTypesTheTextSoAMenuDigitSelects` /
-  `…NeverPastes` / `TestMultiLineSendPastesAsOneMessage`).
-- **`pane send-keys shift+tab` is ACCEPTED and delivers a bare TAB.** Verified live
-  (2026-08-09, herdr 0.7.5): herdr validates the key name, exits 0, and writes `0x09` —
-  the shift modifier is dropped. Proved by sending it to a pane running `cat -v`, where
-  `shift+tab` and `tab` produced byte-identical output, and by both Claude Code and Codex
-  ignoring it across repeated presses while every send reported success. `backtab`, `btab`
-  and `S-Tab` are all rejected outright (`invalid_key`), so there is no key NAME that
-  works. The chord must be written as its raw terminal encoding, CSI Z (`domain.ShiftTab`
-  = `"\x1b[Z"`), through `pane send-text` — which is the right transport precisely because
-  it is not bracketed-paste aware, so the bytes pass through untouched
-  (`herdr.CLI.SendChord`, `ports.ChordSender`). This is the reason
-  `frontend.SetAgentMode` is an open loop that re-reads the pane after every press: a
-  green exit code from herdr is not evidence a chord landed. Keep the paired tests
-  (`TestSendChordTypesTheRawEscapeAndNeverSubmits` /
-  `TestShiftTabIsTheRawEscapeNotAHerdrKeyName` /
-  `TestSetAgentModeGivesUpOnADeafAgent`).
-- **An agent's permission mode is READABLE ONLY FROM ITS PANE, and only positively.**
-  Neither `agent list` nor `pane get` carries a mode field, so `domain.AgentModeFromPane`
-  parses the indicator the agent paints in its composer footer. Two rules are
-  load-bearing. **Absence is UNKNOWN, never a default**: every Claude mode renders a line
-  (verified live against 2.1.226 — including `⏸ manual mode on`, which uniquely omits the
-  `(shift+tab to cycle)` hint), so a capture with no line is a capture that does not show
-  the footer. **Matching is on the LABEL, never the glyph**: `accept edits on` and
-  `auto mode on` both render `⏵⏵`, so a glyph-keyed parser cannot tell the most permissive
-  mode from the middle one. Codex is the mirror image — it appends a right-aligned
-  `Plan mode (shift+tab to cycle)` to its `model · cwd` footer in Plan mode and nothing at
-  all in Default — so "no segment" only means Default once the footer itself is
-  recognized.
-- **The mode cycle is per-SESSION, not per-agent-type, so a set must detect a closed
-  rotation.** Verified live (2026-08-09): a `--model haiku` Claude session rotates through
-  only three modes — manual, acceptEdits, plan — while a default-model session in the same
-  build offers all four. `domain.AgentModesFor` is therefore a SUPERSET, never a promise.
-  `frontend.SetAgentMode` tracks the modes it has observed and stops the moment the
-  rotation returns to one, because the naive alternative is not merely a worse error
-  message: pressing to the ceiling leaves the agent parked in an arbitrary PERMISSION mode
-  nobody asked for. A failed set therefore also ROTATES THE AGENT BACK to where it started
-  (`restoreMode`). Note the two diagnoses are distinct — a mode that did not change at all
-  means the chord did not land and must keep pressing to the ceiling; only a mode that
-  CHANGED into one already seen means the cycle closed. Keep the paired tests
-  (`TestSetAgentModeDetectsAModeThisSessionDoesNotOffer` /
-  `TestSetAgentModeGivesUpOnADeafAgent`).
-- **Shift+Tab is REBOUND inside Claude's modals, so a mode press needs positive composer
-  evidence.** A standing plan approval renders `shift+tab to approve with this feedback`
-  (see `internal/classify/testdata/transcripts/approval_claude_plan.txt`), so pressing the
-  chord there APPROVES THE PLAN. `domain.ClaudeComposerReady` therefore requires the
-  composer SANDWICH — a `───` rule, the `❯` input line, and a second rule below it — not
-  the bare `❯`, which is also the caret an option list draws in front of its highlighted
-  choice. Refusing merely because a known form was *detected* is not enough; the ordinary
-  composer must be *proven*. Readiness is re-checked before EVERY press, not once up
-  front, because a prompt can appear between two presses. Keep the paired tests
-  (`TestClaudeComposerReadyRefusesAStandingApproval` /
-  `TestSetAgentModeRefusesAModalThatAppearsMidRotation`).
+  Both fall back to the legacy `agent send` only on exit status 2 — herdr rejecting the VERB — which keeps
+  `min_herdr_version = 0.7.0` honest. A pane-level failure exits 1 with a JSON error body and is returned
+  as-is, so a real delivery error is never retried as a second send.
+- **`pane send-keys shift+tab` is ACCEPTED and delivers a bare TAB** (herdr 0.7.5) — herdr validates the key
+  name, exits 0, and writes `0x09`; `backtab`, `btab` and `S-Tab` are rejected outright, so no key NAME works.
+  The chord must be its raw encoding, CSI Z (`domain.ShiftTab` = `"\x1b[Z"`), through `pane send-text` — the
+  right transport precisely because it is not paste-aware, so the bytes pass through untouched
+  (`CLI.SendChord`, `ports.ChordSender`). This is why `frontend.SetAgentMode` is an open loop re-reading the
+  pane after every press: a green exit code is not evidence a chord landed.
+- **An agent's permission mode is READABLE ONLY FROM ITS PANE, and only positively** — neither `agent list` nor
+  `pane get` carries a mode field, so `domain.AgentModeFromPane` parses the composer footer. **Absence is
+  UNKNOWN, never a default**: every Claude mode renders a line (2.1.226, including `⏸ manual mode on`, which
+  uniquely omits the cycle hint), so no line means the footer is not shown. **Matching is on the LABEL, never
+  the glyph**: `accept edits on` and `auto mode on` both render `⏵⏵`. Codex is the mirror image — it appends a
+  right-aligned `Plan mode` segment in Plan and nothing in Default, so "no segment" only means Default once the
+  footer itself is recognized.
+- **The mode cycle is per-SESSION, not per-agent-type, so a set must detect a closed rotation** — verified live,
+  a `--model haiku` Claude session offers three modes while a default-model session in the same build offers
+  four, so `domain.AgentModesFor` is a SUPERSET, never a promise. `SetAgentMode` tracks the modes it has
+  observed and stops when the rotation returns to one, because pressing to the ceiling parks the agent in an
+  arbitrary PERMISSION mode nobody asked for; a failed set also ROTATES THE AGENT BACK (`restoreMode`). The two
+  diagnoses are distinct: a mode that did not change means the chord did not land and must keep pressing; only
+  a mode that CHANGED into one already seen means the cycle closed.
+- **Shift+Tab is REBOUND inside Claude's modals, so a mode press needs positive composer evidence** — a
+  standing plan approval renders `shift+tab to approve with this feedback`, so pressing the chord there
+  APPROVES THE PLAN. `domain.ClaudeComposerReady` requires the composer SANDWICH (a `───` rule, the `❯` line, a
+  second rule), not the bare `❯`, which is also an option list's caret. Refusing because a known form was
+  *detected* is not enough; the ordinary composer must be *proven*, and re-proven before EVERY press.
 - **A herdr agent name is 1-32 chars of `[a-z0-9_-]` starting with a lowercase letter**
-  (`invalid_agent_name`), and `agent start` refuses a name already in use. Integration cases
-  therefore derive a unique short name from `t.Name()` — a shared one made whichever case ran
-  second fail to start.
-- **`agent prompt` needs the agent to be interactively READY, and says so.** Verified live
-  (2026-07-31): a prompt issued in the seconds after `agent start`, or while claude still shows
-  its release-notes screen, lands in the composer WITHOUT submitting. The status-gated
-  retry-Enter loop in `CLI.send` is what recovers that, so do not remove it on the grounds that
-  submission is atomic now. A pane whose agent is not the foreground process is refused outright
-  with `agent_not_ready` — which is why an externally reported agent (`pane report-agent` over a
-  bash stand-in) can never receive `agent prompt`.
-- **Numbered menus want the digit, not the label.** A Claude approval/choice (`1. Yes / 2. No`)
-  only accepts the option's number; sending the literal label ("Yes") is silently ignored — it
-  reads as "nothing happened" on confirm. Map the chosen option to its digit with
-  `domain.MenuKeystroke` before delivering (both the daemon `act` and frontend confirm paths do).
-- **A label that maps to NO option must never be delivered — the literal fall-through commits
-  option 1.** Verified live (2026-07-31, Claude Code 2.1.220): typing an unmatched reply at a
-  standing Bash approval runs the command under plain "Yes" and reports success — the agent
-  ignores the letters and the trailing Enter commits whatever option the caret rests on, which is
-  always the first. So "no digit could be mapped" is not a safe default on a menu:
-  `domain.UnmatchedMenuReply` is the gate, and **all FOUR send paths** refuse on it — `daemon.act`,
-  the LLM promotion in `handleLLMOutcome`, the rewritten reply in `handleActionReviewOutcome`, and
-  `deliver.Deliver` for operator-confirm/auto-accept. Two things make a correct label fail to map,
-  and both are load-bearing: **typography** — the same build renders `Yes, and don’t ask again for:
-  npm *` with U+2019 while every rule, LLM answer and fixture in this repo writes the ASCII
-  `don't`, so all label comparisons go through `domain.FoldMenuText` (punctuation, case,
-  whitespace); and **drift** — a rule learned on one render of an option (`use auto mode` vs
-  `switch to auto mode`, a path that has since changed) names an option no longer offered, which is
-  exactly what must escalate. Three ordering rules are deliberate and easy to undo by accident:
-  the gate runs AFTER the multi-tab answer-series and remote-environment branches on every path
-  (each answers its own protocol); it runs AFTER `llm.enable_rewrite_action` dispatches in
-  `act`, because adapting a drifted label to the live options is exactly what the rewrite is for —
-  `handleActionReviewOutcome` re-checks the result, so nothing skips the gate by going that way;
-  and matching is unique-or-refuse on BOTH the exact and the prefix pass, since one capture can
-  hold two renders of a menu that number the same label differently. Keep the paired tests
-  (`TestMenuKeystrokeFoldsTypographicPunctuation` / `…FoldKeepsDistinctOptionsDistinct` /
-  `…DuplicateRendersRefuse` / `TestUnmatchedMenuReply` / `TestDeliverUnmatchedMenuReplyRefuses` /
-  `TestDeliverUnreadablePaneWithMenuEvidenceRefuses` / `TestAutoActMatchesLabelAcrossTypography` /
-  `TestAutoActUnmatchedMenuReplyEscalatesInsteadOfSending` /
-  `TestLLMPromotionUnmatchedMenuReplyRejects`). Two accepted trade-offs: an approval whose real
-  prompt is a bare `y/n` while unrelated numbered lines sit in the scrollback now escalates instead
-  of typing `y`; and an UNREADABLE pane refuses only when the decision's own capture proves a menu
-  was standing (`req.PaneExcerpt`) — with no such evidence the literal send still stands, so legacy
-  rows that carry no excerpt behave as before.
-- **A digit does NOT always commit — AskUserQuestion has two protocols, per tab.** Verified live
-  (2026-07-16): on **plain** options (`1. Apple / 2. Banana`) the digit selects AND auto-advances,
-  but on **preview** options (option list left, `┌──┐` preview box right, `Notes: press n to add
-  notes`) the digit only **moves the caret** like ↑/↓ — **Enter** commits and advances. The footer
-  is identical in both and never mentions digits, and one form mixes them (a preview form's
-  generated Submit tab renders plain). Blind digit-only delivery is a silent no-op on preview
-  forms: nothing is answered and the agent stays blocked. Never plan a whole keystroke series up
-  front — `internal/mcqdeliver` presses the digit, re-reads, and only presses Enter if the answer
-  did not commit (and refuses if the caret never reached the chosen option).
-- **Claude's "Select remote environment" picker (remote sub-agent launch) reports IDLE, not
-  blocked.** Herdr shows no blocked status while the modal stands (verified live 2026-07-17), so
-  hap detects it structurally (`domain.ClaudeRemoteEnvForm`: title + `❯ N.` options + end-anchored
-  "Enter to select · Esc to cancel" footer) and classifies it as a parked APPROVAL at idle/done —
-  same exception pattern as Codex's Plan approval. Verified live (2026-07-17): despite the
-  "Enter to select" footer, the digit alone COMMITS the selection (the picker closes, no Enter) —
-  but all paths still answer it adaptively via `mcqdeliver.ClaudeRemoteEnv` (digit → verify
-  caret → Enter only if still standing) in case a build ships the caret binding, failing closed
-  when the learned label matches none of the offered environments.
-- **`pane read --source recent` is a consuming delta**, not the screen: after one read (e.g. the
-  daemon's classification read) it can return just the cursor line. To recover a standing menu at
-  confirm time, read `--source visible` (`herdr.CLI.ReadPaneVisible` / `ports.VisiblePaneReader`).
-- One `events.subscribe` per socket connection; status subscriptions require a concrete
-  `pane_id`; existing panes are replayed as `pane_created`.
-- Adding a pane makes the subscriber reconnect ("pane set changed", 1s backoff) — tests pushing
-  transitions right after `AddPane` must wait past the resubscribe.
-- The herdr binary is resolved via `HERDR_BIN_PATH` (fallback: `herdr` on PATH); the events
-  socket via `HERDR_SOCKET_PATH`.
+  (`invalid_agent_name`), and `agent start` refuses a name already in use — integration cases derive a unique
+  short name from `t.Name()`.
+- **`agent prompt` needs the agent to be interactively READY, and says so** — a prompt in the seconds after
+  `agent start`, or during claude's release-notes screen, lands in the composer WITHOUT submitting, which is
+  what the status-gated retry-Enter loop in `CLI.send` recovers; do not remove it on the grounds that
+  submission is atomic now. A pane whose agent is not the foreground process is refused with
+  `agent_not_ready`, which is why an externally reported agent can never receive `agent prompt`.
+- **Numbered menus want the digit, not the label** — sending the literal label is silently ignored, reading as
+  "nothing happened" on confirm. Map with `domain.MenuKeystroke` before delivering.
+- **A label that maps to NO option must never be delivered — the literal fall-through commits option 1.**
+  Verified live (Claude Code 2.1.220): an unmatched reply at a standing Bash approval runs the command under
+  plain "Yes" and reports success, because the agent ignores the letters and the trailing Enter commits
+  whatever option the caret rests on. So "no digit could be mapped" is not a safe default:
+  `domain.UnmatchedMenuReply` is the gate and **all FOUR send paths** refuse on it — `daemon.act`, the LLM
+  promotion in `handleLLMOutcome`, the rewritten reply in `handleActionReviewOutcome`, and `deliver.Deliver`.
+  - Two things make a correct label fail to map, both load-bearing. **Typography** — the same build renders
+    `don’t` with U+2019 while every rule, LLM answer and fixture here writes ASCII, so comparisons go through
+    `domain.FoldMenuText`. **Drift** — a rule learned on one render names an option no longer offered, which is
+    exactly what must escalate.
+  - Three ordering rules are deliberate and easy to undo: the gate runs AFTER the multi-tab answer-series and
+    remote-environment branches (each answers its own protocol); AFTER `llm.enable_rewrite_action` dispatches
+    in `act`, because adapting a drifted label is what the rewrite is for (and the result is re-checked, so
+    nothing skips the gate that way); and matching is unique-or-refuse on BOTH the exact and prefix passes,
+    since one capture can hold two renders numbering the same label differently.
+  - Two accepted trade-offs: an approval whose real prompt is a bare `y/n` with unrelated numbered lines in the
+    scrollback now escalates instead of typing `y`; and an UNREADABLE pane refuses only when the decision's own
+    capture proves a menu was standing (`req.PaneExcerpt`), so legacy rows with no excerpt behave as before.
+- **A digit does NOT always commit — AskUserQuestion has two protocols, per tab.** On **plain** options the
+  digit selects AND auto-advances; on **preview** options (list left, `┌──┐` box right) the digit only **moves
+  the caret** and **Enter** commits. The footer is identical in both and never mentions digits, and one form
+  mixes them (a preview form's generated Submit tab renders plain), so blind digit-only delivery is a silent
+  no-op. **Never plan a whole keystroke series up front** — `internal/mcqdeliver` presses, re-reads, and only
+  presses Enter if the answer did not commit (refusing if the caret never reached the chosen option).
+- **Claude's "Select remote environment" picker reports IDLE, not blocked** — herdr shows no blocked status
+  while the modal stands, so hap detects it structurally (`domain.ClaudeRemoteEnvForm`) and classifies it as a
+  parked APPROVAL at idle/done, the same exception pattern as Codex's Plan approval. Despite its "Enter to
+  select" footer the digit alone COMMITS, but all paths still answer adaptively via `mcqdeliver.ClaudeRemoteEnv`
+  in case a build ships the caret binding, failing closed when the learned label matches no offered environment.
+- One `events.subscribe` per socket connection; status subscriptions require a concrete `pane_id`; existing
+  panes are replayed as `pane_created`.
+- Adding a pane makes the subscriber reconnect ("pane set changed", 1s backoff) — tests pushing transitions
+  right after `AddPane` must wait past the resubscribe.
+- The herdr binary resolves via `HERDR_BIN_PATH` (fallback: `herdr` on PATH); the events socket via
+  `HERDR_SOCKET_PATH`.
 
 ## Where things live
 

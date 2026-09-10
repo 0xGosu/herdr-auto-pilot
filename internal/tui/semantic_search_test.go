@@ -265,3 +265,113 @@ func TestSemanticSearchEditingRevertsToKeyword(t *testing.T) {
 		t.Error("editing should have torn down the semantic result set")
 	}
 }
+
+// TestScreenSearchEndToEnd drives ctrl+g on the Rules tab: it dispatches a
+// screen search, the result set renders, and — the trap — it does NOT bring the
+// SEM column with it. Screen results carry no cosine, so sharing the semantic
+// render path would print "0.00" on every row and read as a ranking that scored
+// everything at zero.
+func TestScreenSearchEndToEnd(t *testing.T) {
+	m := semanticModel(t)
+	// Give one rule a captured screen carrying a literal command. App.Store is
+	// the READ port here, so the write goes through the concrete store.
+	saver, ok := m.app.Store.(interface {
+		SaveSignatureSnapshot(context.Context, string, string, time.Time) error
+	})
+	if !ok {
+		t.Fatal("test store cannot save a snapshot")
+	}
+	if err := saver.SaveSignatureSnapshot(m.ctx, "approval:hit",
+		"Bash(npm install --force)\n  1. Yes", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	m = press(t, m, "/")
+	m = typeRunes(t, m, "npm")
+
+	upd, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	m = upd.(Model)
+	if cmd == nil {
+		t.Fatal("ctrl+g on the Rules tab must dispatch a screen search")
+	}
+	if m.searching {
+		t.Error("dispatching a screen search should leave search-input mode")
+	}
+	msg := cmd()
+	sm, ok := msg.(semanticSearchMsg)
+	if !ok {
+		t.Fatalf("command produced %T, want semanticSearchMsg", msg)
+	}
+	if !sm.screen {
+		t.Fatal("the result message must be marked as a screen search")
+	}
+	if sm.err != nil {
+		t.Fatalf("screen search errored: %v", sm.err)
+	}
+	upd, _ = m.Update(sm)
+	m = upd.(Model)
+
+	vis := m.visibleSignatures()
+	if len(vis) != 1 || vis[0].Signature != "approval:hit" {
+		t.Fatalf("visible = %+v, want only the rule with a matching screen", vis)
+	}
+	view := m.View()
+	if !strings.Contains(view, "screen: 1 match(es)") {
+		t.Errorf("view should name the screen mode:\n%s", view)
+	}
+	// The trap: no cosine column, and specifically no 0.00 masquerading as one.
+	if m.sigSemanticScores() != nil {
+		t.Error("a screen search must expose no scores — it has none")
+	}
+	if strings.Contains(view, "0.00") {
+		t.Errorf("screen results must not render a zeroed SEM column:\n%s", view)
+	}
+}
+
+// TestScreenSearchHintIsOfferedForOneWord — the semantic hint needs 2+ words
+// because embedding a phrase differs from a substring filter, but a screen
+// search over a bare command name is the motivating case, so it must be
+// offered for a single word too. Still exactly ONE hint line: listPageSize
+// budgets one, and a second would overflow the pane by a row.
+func TestScreenSearchHintIsOfferedForOneWord(t *testing.T) {
+	m := semanticModel(t)
+	m = press(t, m, "/")
+	m = typeRunes(t, m, "npm")
+	if m.semanticHintVisible() {
+		t.Fatal("a single word must not offer the semantic search")
+	}
+	if m.sigSearchHint() == "" {
+		t.Fatal("a single word must still offer the screen search")
+	}
+	view := m.View()
+	if !strings.Contains(view, "ctrl+g") {
+		t.Errorf("single-word view should advertise ctrl+g:\n%s", view)
+	}
+	if n := strings.Count(view, "ctrl+g: screen search"); n != 1 {
+		t.Errorf("want exactly one hint line, got %d:\n%s", n, view)
+	}
+
+	// Two words offer both, still on one line.
+	m = typeRunes(t, m, " install")
+	hint := m.sigSearchHint()
+	if !strings.Contains(hint, "enter:") || !strings.Contains(hint, "ctrl+g") {
+		t.Errorf("a 2-word query should offer both modes on one line, got %q", hint)
+	}
+	if strings.Contains(hint, "\n") {
+		t.Errorf("the hint must stay one line, got %q", hint)
+	}
+}
+
+// TestScreenSearchNeedsAQuery — ctrl+g with an empty box does nothing rather
+// than searching for "".
+func TestScreenSearchNeedsAQuery(t *testing.T) {
+	m := semanticModel(t)
+	m = press(t, m, "/")
+	upd, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlG})
+	m = upd.(Model)
+	if cmd != nil {
+		t.Error("ctrl+g with an empty query must not dispatch a search")
+	}
+	if !m.searching {
+		t.Error("an ignored ctrl+g should leave search-input mode intact")
+	}
+}
