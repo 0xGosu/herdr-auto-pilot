@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/buildinfo"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemon"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
@@ -103,10 +105,24 @@ func (c *capturingLLM) forAgent(agentID string) string {
 // immediate (production defaults to a 10s settle on an agent's first event).
 const tinyCaptureDelayTOML = "\n[[capture_delay]]\nagent_type = \"*\"\nstart_ms = 50\nevent_ms = 50\n"
 
+// testDaemon is a real daemon.Daemon wired for a test, together with the seams
+// a front end needs in order to reach it: the store it drains and the control
+// socket its wake nudge arrives on.
+type testDaemon struct {
+	Daemon *daemon.Daemon
+	Events *manualEvents
+	LLM    *capturingLLM
+	// Store is the daemon's own store — the one an operator action must be
+	// queued into, since nothing else drains it.
+	Store       *store.Store
+	ConfigPath  string
+	ControlPath string
+}
+
 // newTestDaemon wires a real daemon.Daemon to a real Herdr adapter (for
 // actual pane I/O against the caller's scratch pane) and an isolated event
 // source + LLM stub (so the pipeline never touches any other real pane).
-func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) (*daemon.Daemon, *manualEvents, *capturingLLM) {
+func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) *testDaemon {
 	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
@@ -121,9 +137,10 @@ func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) (*daemon.Daemon
 
 	events := newManualEvents()
 	llm := &capturingLLM{}
+	ctlPath := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	d, err := daemon.New(daemon.Options{
 		ConfigPath:        cfgPath,
-		ControlSocketPath: filepath.Join(testutil.SocketDir(t), "ctl.sock"),
+		ControlSocketPath: ctlPath,
 		Store:             st,
 		Herdr:             cli,
 		Events:            events,
@@ -133,7 +150,46 @@ func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) (*daemon.Daemon
 	if err != nil {
 		t.Fatal(err)
 	}
-	return d, events, llm
+	return &testDaemon{
+		Daemon: d, Events: events, LLM: llm, Store: st,
+		ConfigPath: cfgPath, ControlPath: ctlPath,
+	}
+}
+
+// App builds the frontend.App an operator's confirm would run through, wired to
+// THIS daemon — the only construction that can actually deliver since 0.8.0.
+//
+// App.Confirm no longer types into a pane: it queues an agent_actions row and
+// waits for the owning node's daemon to drain it. So three fields are
+// load-bearing, and the obvious construction (`&frontend.App{Store: st, Herdr:
+// cli, Author: "itest"}`) gets all three wrong at once:
+//
+//   - Store must be the store the daemon drains. A throwaway one nobody reads
+//     leaves the action pending until the front end's own timeout.
+//   - DaemonInfo is where App.AssessDaemonHealth derives Running from. Left nil
+//     it reports "not running" whatever daemon is actually up, so
+//     requireLiveDaemonFor refuses before anything is written — the misleading
+//     "no healthy hap daemon is running" these tests failed with while one was
+//     (issue #396).
+//   - ControlPath makes the wake nudge land, so the drain is sub-second instead
+//     of waiting out the daemon's sweep inside AwaitAgentAction's budget.
+//
+// StateDir is deliberately left EMPTY: AssessDaemonHealth returns early without
+// one, so the health-derived refusals (hung, binary replaced) are never weighed
+// against a heartbeat record this in-process daemon may not have written yet.
+//
+// Herdr is deliberately left NIL as well, and that is the assertion rather than
+// an omission: a front end no longer touches herdr at all, so a confirm that
+// lands the keystrokes with no adapter in hand is proof the delivery really went
+// through the daemon.
+func (h *testDaemon) App() *frontend.App {
+	return &frontend.App{
+		Store:       h.Store,
+		Author:      "itest",
+		ConfigPath:  h.ConfigPath,
+		ControlPath: h.ControlPath,
+		DaemonInfo:  func() (bool, int, string) { return true, os.Getpid(), buildinfo.Version },
+	}
 }
 
 // runDaemon starts d.Run in a goroutine and registers cleanup that cancels
@@ -172,13 +228,23 @@ func waitForConsult(t *testing.T, llm *capturingLLM, agentID string) map[string]
 	return nil
 }
 
+// idleAgentMarker is the line startIdleAgent's scratch shell prints. It is a
+// named constant because a caller has to WAIT for it: the string the pane paints
+// and the string the test polls for must be the same one, or the wait silently
+// becomes a timeout.
+const idleAgentMarker = "All tests pass. Task is complete."
+
 // startIdleAgent spawns a scratch agent whose pane settles on unremarkable,
 // non-prompting output — the shape hap's classifier reads as idle once the
 // daemon is told (via the injected transition) that herdr reports it idle.
+//
+// The pane is not ready when this returns: `pane run` only hands the command to
+// the shell. Callers must wait for idleAgentMarker (waitForPaneText) before
+// starting a daemon that would classify it.
 func startIdleAgent(t *testing.T) string {
 	t.Helper()
 	return startScriptAgent(t, "hapitest-idle",
-		"#!/bin/bash\necho 'All tests pass. Task is complete.'\nsleep 60\n")
+		"#!/bin/bash\n"+fillViewportSh+"echo '"+idleAgentMarker+"'\nsleep 60\n")
 }
 
 // TestRealConsultContextTaskSourceSummary drives a real approval consult (a
@@ -199,16 +265,16 @@ func TestRealConsultContextTaskSourceSummary(t *testing.T) {
 	// The review is opt-in, and this test exists to exercise its context.
 	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\n"+
 		"enable_llm_review_before_auto_send = true\n", pane, taskFile)
-	d, events, llm := newTestDaemon(t, cli, cfgTOML)
+	h := newTestDaemon(t, cli, cfgTOML)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	runDaemon(t, ctx, cancel, d)
+	runDaemon(t, ctx, cancel, h.Daemon)
 
-	events.transitions <- domain.AgentTransition{
+	h.Events.transitions <- domain.AgentTransition{
 		AgentID: pane, PaneID: pane, AgentType: "claude", Status: "blocked", At: time.Now(),
 	}
 
-	m := waitForConsult(t, llm, pane)
+	m := waitForConsult(t, h.LLM, pane)
 	if got, _ := m["situation_type"].(string); got != "approval" {
 		t.Fatalf("situation_type = %q, want approval (context: %v)", got, m)
 	}
@@ -255,9 +321,20 @@ func TestRealIdleUnlearnedSignatureConsultsInsteadOfReviewing(t *testing.T) {
 	requireHerdr(t)
 	cli := herdr.NewCLI()
 	pane := startIdleAgent(t)
-	// Give the scratch shell a moment to print its line before the daemon's
-	// classification read.
-	time.Sleep(1 * time.Second)
+	// The scratch shell must have PAINTED before the daemon starts: its startup
+	// reconcile drives every parked agent it can see, so a pane still empty is
+	// classified empty and escalates unclassifiable — and that escalation then
+	// keeps the injected transition from re-capturing, so the consult this test
+	// waits for never happens. This used to be a fixed 1s sleep against a 50ms
+	// capture delay, which held on an idle machine and lost under full-suite load
+	// (issue #397); waiting for the CONTENT removes the wall-clock assumption
+	// rather than moving its threshold.
+	//
+	// It is the second of the fixture's two preconditions — fillViewportSh above
+	// is the first, and the one that actually kept this case red. Waiting alone
+	// is not enough: a pane that has painted but not SCROLLED still gives the
+	// daemon's `--source recent` read nothing at all.
+	waitForPaneText(t, cli, pane, idleAgentMarker)
 
 	taskFile := filepath.Join(t.TempDir(), "tasks.md")
 	if err := os.WriteFile(taskFile, []byte("- [x] scaffold\n- [-] warm caches\n- [ ] refactor\n- [ ] ship\n"), 0o600); err != nil {
@@ -266,16 +343,16 @@ func TestRealIdleUnlearnedSignatureConsultsInsteadOfReviewing(t *testing.T) {
 	// The review is opted IN, so a fork upstream of Decide would fire here.
 	cfgTOML := fmt.Sprintf("[[task_sources]]\nagent = %q\npath = %q\n"+
 		"enable_llm_review_before_auto_send = true\n", pane, taskFile)
-	d, events, llm := newTestDaemon(t, cli, cfgTOML)
+	h := newTestDaemon(t, cli, cfgTOML)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	runDaemon(t, ctx, cancel, d)
+	runDaemon(t, ctx, cancel, h.Daemon)
 
-	events.transitions <- domain.AgentTransition{
+	h.Events.transitions <- domain.AgentTransition{
 		AgentID: pane, PaneID: pane, AgentType: "claude", Status: "idle", At: time.Now(),
 	}
 
-	m := waitForConsult(t, llm, pane)
+	m := waitForConsult(t, h.LLM, pane)
 	// Review-only fields: absent, because no rule has graduated so nothing has
 	// resolved to a declared-task SEND for the review to filter.
 	for _, key := range []string{"proposed_task", "current_task", "tasks", "pending_tasks"} {

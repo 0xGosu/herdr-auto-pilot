@@ -60,6 +60,36 @@ go test -tags "integration vectors cpu" ./test/integration/ -v      # include th
 
 - Loads `test/integration/testdata/config.toml` (the Claude Code recipe) — edit it
   to match the CLI you want to exercise.
+- **Anything asserting a CONFIRM runs its own daemon, and an App with no `DaemonInfo` is
+  the trap.** Since 0.8.0 `App.Confirm` queues an `agent_actions` row for the owning node's
+  daemon instead of sending inline, so the obvious construction —
+  `&frontend.App{Store: st, Herdr: cli}` over a throwaway store — cannot deliver anything:
+  `AssessDaemonHealth` derives `Running` from `DaemonInfo`, nil reads as "no daemon"
+  whatever is actually up, and `requireLiveDaemonFor` refuses with a message naming a
+  daemon that IS running. That silently disabled the send-content guard from 0.8.0 to
+  0.9.7 (#396), and it failed LOUDLY only because these cases fatal rather than skip.
+  `testDaemon.App` is the one correct wiring (the daemon's own store, a `DaemonInfo`, the
+  control socket, and NO herdr adapter — a confirm that lands keystrokes with no adapter in
+  hand is the proof delivery went through the daemon). Never point such a test at the
+  operator's live store: under turso that pushes the suite's scratch rows to their cloud
+  database.
+- **A scratch pane the DAEMON will classify must SCROLL, and must be waited for rather than
+  slept on** (#397). Two independent hazards, and the second is the one that made these
+  cases look like a broken decision pipeline:
+  - `pane read --source recent` is a scrollback-shaped delta, not the screen. Verified live
+    (2026-09-10, herdr 0.8.2) it returns **EMPTY** for a pane whose whole output still fits
+    on screen, and content once that output has scrolled — a live claude pane returns
+    kilobytes, which is why production never meets this. A five-line scratch script had not
+    scrolled, so the daemon captured nothing and escalated `unclassifiable` /
+    `over_masked` instead of consulting. `fillViewportSh` pushes the fixture past the pane's
+    own `tput lines`, so it does not depend on how tall the operator's terminal is; its
+    filler is digit-free because a salient masked mostly to placeholders trips the
+    over-masking floor, which is the same failure by the other door.
+  - `pane run` only hands the command to the shell, so the pane is not ready when the helper
+    returns — and the daemon's startup reconcile drives every parked agent it can see, so an
+    unpainted pane is classified empty and its escalation then stops the injected transition
+    re-capturing. Wait for the pane's own CONTENT (`waitForPaneText`), never a fixed sleep:
+    1s against a 50ms capture delay held in isolation and lost under full-suite load.
 - Cases: `TestRealPaneInfo` (herdr `pane get` → cwd/ids); `TestRealConfirmDeliversMenuDigit`
   (confirming a label reply selects the numbered menu — the send-content regression);
   `TestRealClaudeConsult` (needs `HAP_ITEST_CLAUDE=1`) drives a real claude
