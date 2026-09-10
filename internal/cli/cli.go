@@ -416,7 +416,8 @@ func signaturesReembed(ctx context.Context, app *frontend.App, out io.Writer, ar
 func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("signatures search", flag.ContinueOnError)
 	semantic := fs.Bool("semantic", false, "embedding search: rank rules by meaning (needs the embedding model)")
-	limit := fs.Int("limit", frontend.DefaultSemanticSearchLimit, "semantic: max matches to return")
+	screen := fs.Bool("screen", false, "search the captured pane (raw, unmasked) instead of the rule's masked salient")
+	limit := fs.Int("limit", frontend.DefaultSemanticSearchLimit, "semantic/screen: max matches to return")
 	minScore := fs.Float64("min-score", frontend.DefaultSemanticSearchFloor, "semantic: minimum cosine score in (0,1]; 0 uses the default")
 	situation := fs.String("type", "", "filter by situation type (idle|approval|choice|error)")
 	mode := fs.String("mode", "", "filter by mode (shadow|autonomous)")
@@ -440,9 +441,14 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 		words = append(words, rest[0])
 		rest = rest[1:]
 	}
+	// words is kept ALONGSIDE the joined query, not replaced by it: a screen
+	// search treats each argv entry as one term, so a shell-quoted
+	// `"npm install"` is a phrase that must match contiguously while three bare
+	// words are three independent terms. Joining and re-splitting downstream
+	// collapses those into the same search.
 	query := strings.TrimSpace(strings.Join(words, " "))
 	if query == "" {
-		return fmt.Errorf("usage: signatures search <query> [--semantic] [--limit N] [--min-score S] [filters] (see: hap help signatures)")
+		return fmt.Errorf("usage: signatures search <query> [--screen] [--semantic] [--limit N] [--min-score S] [filters] (see: hap help signatures)")
 	}
 	switch *situation {
 	case "", "idle", "approval", "choice", "error":
@@ -454,8 +460,11 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 	default:
 		return fmt.Errorf("invalid --mode %q (shadow|autonomous)", *mode)
 	}
-	results, err := app.SearchSignatures(ctx, query,
-		frontend.SignatureSearchOpts{Semantic: *semantic, Limit: *limit, MinScore: *minScore},
+	results, stats, err := app.SearchSignaturesWithStats(ctx, query,
+		frontend.SignatureSearchOpts{
+			Semantic: *semantic, Screen: *screen, Terms: words,
+			Limit: *limit, MinScore: *minScore,
+		},
 		domain.SignatureFilter{
 			SituationType: domain.SituationType(*situation),
 			AgentType:     *agentType,
@@ -466,15 +475,39 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 		return err
 	}
 	kind := "keyword"
-	if *semantic {
+	switch {
+	case *semantic:
 		kind = "semantic"
+	case *screen:
+		kind = "screen"
+	}
+	// The denominator earns its line: it is what separates "nothing matched"
+	// from "there was nothing to match against" — a herd whose rules all
+	// predate snapshots searches 0 screens and would otherwise read as a
+	// working search that found nothing.
+	searched := ""
+	if *screen {
+		unit := "screens"
+		if stats.ScreensSearched == 1 {
+			unit = "screen"
+		}
+		searched = fmt.Sprintf(" (%d %s searched)", stats.ScreensSearched, unit)
 	}
 	if len(results) == 0 {
-		fmt.Fprintf(out, "no rules match the %s search %q\n", kind, query)
+		fmt.Fprintf(out, "no rules match the %s search %q%s\n", kind, query, searched)
 		hints := []Hint{{Cmd: "hap signatures list", Why: "every learned rule, unfiltered"}}
-		if !*semantic {
-			hints = append(hints, Hint{Cmd: "hap signatures search " + query + " --semantic",
-				Why: "search by meaning instead of exact words"})
+		if *screen {
+			hints = append(hints,
+				Hint{Cmd: "hap signatures search " + query,
+					Why: "the rule's own fields and its masked salient instead"},
+				Hint{Cmd: "hap signatures search " + query + " --semantic",
+					Why: "search by meaning instead of exact words"})
+		} else if !*semantic {
+			hints = append(hints,
+				Hint{Cmd: "hap signatures search " + query + " --screen",
+					Why: "search the captured screens, where literal paths and commands survive"},
+				Hint{Cmd: "hap signatures search " + query + " --semantic",
+					Why: "search by meaning instead of exact words"})
 		} else if drift, derr := app.EmbeddingDrift(ctx); derr == nil && drift.Detected {
 			// Rules exist but their vectors were embedded by a previous model,
 			// so semantic search skips them all — this reads as "no rules" until
@@ -490,15 +523,25 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 		if *semantic {
 			fmt.Fprintf(out, "sem=%.2f\t", r.Score)
 		}
-		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%s\ttop=%q\t%s\n",
+		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%s\ttop=%q\t%s",
 			shortSignature(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
 			r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence),
 			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
+		// A screen match names a signature and nothing an operator recognizes,
+		// so it carries the hit itself. Appended as a trailing field, never
+		// inserted, so the existing columns scripts parse keep their positions.
+		if *screen {
+			fmt.Fprintf(out, "\tmatch=%q", r.Match)
+		}
+		fmt.Fprintln(out)
 	}
-	fmt.Fprintf(out, "\n%d %s match(es) for %q\n", len(results), kind, query)
+	fmt.Fprintf(out, "\n%d %s match(es) for %q%s\n", len(results), kind, query, searched)
 	prefix := strings.TrimSuffix(shortSignature(results[0].Signature), "…")
 	hints := []Hint{{Cmd: "hap signatures show " + prefix, Why: "the original situation, plus recent decisions"}}
-	if !*semantic {
+	if *screen {
+		hints = append(hints, Hint{Cmd: "hap signatures search " + query,
+			Why: "the same words over the rule's fields and masked salient"})
+	} else if !*semantic {
 		hints = append(hints, Hint{Cmd: "hap signatures search " + query + " --semantic",
 			Why: "the same query, ranked by meaning"})
 	}

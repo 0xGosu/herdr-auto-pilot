@@ -920,6 +920,10 @@ type ReadStore interface {
 	// GetSignatureSnapshot returns the pane excerpt a signature was first
 	// seen with, or "" when none was captured (pre-snapshot rules).
 	GetSignatureSnapshot(ctx context.Context, signature string) (string, error)
+	// ListSignatureSnapshots returns every stored pane excerpt — the RAW
+	// screens, for a search that must see the literal text the masked salient
+	// in signature_embeddings has already replaced with placeholders.
+	ListSignatureSnapshots(ctx context.Context) ([]domain.SignatureSnapshot, error)
 }
 
 // Clock abstracts time for deterministic tests.

@@ -1,0 +1,3 @@
+- Added `hap signatures search --screen`, which searches the captured pane instead of the rule's masked salient — the literal paths, commands and version numbers a salient replaces with `<path>`/`<num>` placeholders are findable again. It matches every term anywhere in the screen (quote a phrase to require it contiguous), reports how many screens it searched so an empty result tells you whether there was anything to search, and each result carries the text around its first hit.
+- Added ctrl+g on the TUI Rules tab, running that same screen search over the captured panes.
+- Changed `--limit` to bound a `--screen` search as well as a `--semantic` one; keyword search stays unbounded.

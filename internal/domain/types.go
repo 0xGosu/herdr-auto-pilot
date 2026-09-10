@@ -951,3 +951,17 @@ type SignatureEmbedding struct {
 	Salient       string
 	CreatedAt     time.Time
 }
+
+// SignatureSnapshot is the RAW pane excerpt a signature was first minted from,
+// as stored in signature_snapshots — the unmasked counterpart to
+// SignatureEmbedding.Salient.
+//
+// The distinction is the whole point of a screen search: the salient has
+// already had every literal path, version, hash and number replaced by
+// <path>/<num>/<hash> before it is stored, so the command an operator actually
+// remembers survives ONLY here.
+type SignatureSnapshot struct {
+	Signature string
+	Excerpt   string
+	CreatedAt time.Time
+}

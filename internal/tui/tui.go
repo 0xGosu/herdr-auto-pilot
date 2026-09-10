@@ -115,6 +115,9 @@ type semanticSearchMsg struct {
 	query   string
 	results []frontend.SignatureSearchResult
 	err     error
+	// screen marks a captured-screen search, so the stored result set can
+	// suppress the SEM column it has no scores for.
+	screen bool
 }
 
 // doublePressWindow is how long after a first "r" a second one still reads as
@@ -1062,6 +1065,11 @@ func (m Model) matchesQuery(t tab, fields ...string) bool {
 type semanticSigSearch struct {
 	query   string
 	results []frontend.SignatureSearchResult
+	// screen marks this as a captured-screen search rather than an embedding
+	// one. It gates the SEM column: a screen result has no cosine, so rendering
+	// it through the same path would print "0.00" on every row and read as a
+	// ranking that scored everything at zero.
+	screen bool
 }
 
 // semanticHintVisible reports whether the "press enter for semantic search"
@@ -1069,6 +1077,24 @@ type semanticSigSearch struct {
 // embedding the whole phrase is meaningfully different from a substring filter.
 func (m Model) semanticHintVisible() bool {
 	return m.searching && m.tab == tabSignatures && len(strings.Fields(m.query[tabSignatures])) >= 2
+}
+
+// sigSearchHint is the ONE hint line under the Rules-tab search box, or "" when
+// none applies. It is deliberately one line carrying both offers rather than a
+// line each: listPageSize budgets exactly one, so a second would overflow the
+// pane by a row.
+//
+// The screen offer needs only a non-empty query — a bare command name is the
+// motivating case — while the semantic one still wants 2+ words, where
+// embedding a phrase differs meaningfully from a substring filter.
+func (m Model) sigSearchHint() string {
+	if !m.searching || m.tab != tabSignatures || strings.TrimSpace(m.query[tabSignatures]) == "" {
+		return ""
+	}
+	if m.semanticHintVisible() {
+		return "enter: semantic search (rank by meaning) · ctrl+g: screen search (the captured panes)"
+	}
+	return "ctrl+g: screen search — match this in the captured panes, where literal commands survive"
 }
 
 // semanticActive reports whether the Rules tab is currently showing a semantic
@@ -1082,9 +1108,10 @@ func (m Model) semanticActive() bool {
 
 // sigSemanticScores maps signature → cosine score for the active semantic
 // search, or nil when none is active (renderSignatures uses it to add the SEM
-// column).
+// column). A screen search is deliberately nil here: its results carry no
+// cosine, so sharing the column would print "0.00" on every row.
 func (m Model) sigSemanticScores() map[string]float64 {
-	if !m.semanticActive() {
+	if !m.semanticActive() || m.sigSemantic.screen {
 		return nil
 	}
 	scores := make(map[string]float64, len(m.sigSemantic.results))
@@ -1099,6 +1126,21 @@ func (m Model) sigSemanticScores() map[string]float64 {
 // SearchSignatures). The inflight Add mirrors do(): Run's drain never races the
 // counter from zero.
 func (m Model) semanticSearchCmd(query string) tea.Cmd {
+	return m.sigSearchCmd(query, false)
+}
+
+// screenSearchCmd searches the captured panes instead — the raw screens, where
+// the literal paths and commands a masked salient has already replaced with
+// placeholders still exist. Same dispatch, same message, same off-loop
+// guarantee as the semantic search.
+func (m Model) screenSearchCmd(query string) tea.Cmd {
+	return m.sigSearchCmd(query, true)
+}
+
+// sigSearchCmd runs one Rules-tab search off the update loop. screen picks the
+// corpus; the flag rides back on the message so the result set knows not to
+// render a SEM column it has no scores for.
+func (m Model) sigSearchCmd(query string, screen bool) tea.Cmd {
 	app, ctx, wg := m.app, m.ctx, m.inflight
 	if wg != nil {
 		wg.Add(1)
@@ -1107,10 +1149,13 @@ func (m Model) semanticSearchCmd(query string) tea.Cmd {
 		if wg != nil {
 			defer wg.Done()
 		}
-		// Zero Limit/MinScore fall back to the recall-oriented defaults.
+		// Zero Limit/MinScore fall back to the recall-oriented defaults. Terms
+		// is left nil: the TUI's query is one free-text box with no argv
+		// boundaries, so whitespace splitting is the honest reading of it.
 		results, err := app.SearchSignatures(ctx, query,
-			frontend.SignatureSearchOpts{Semantic: true}, domain.SignatureFilter{})
-		return semanticSearchMsg{query: query, results: results, err: err}
+			frontend.SignatureSearchOpts{Semantic: !screen, Screen: screen},
+			domain.SignatureFilter{})
+		return semanticSearchMsg{query: query, results: results, err: err, screen: screen}
 	}
 }
 
@@ -2264,12 +2309,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.clampListViewport()
 			return m, nil
 		}
-		m.sigSemantic = &semanticSigSearch{query: msg.query, results: msg.results}
+		m.sigSemantic = &semanticSigSearch{query: msg.query, results: msg.results, screen: msg.screen}
 		// A fresh ranking: start at the top match, not wherever the keyword
 		// cursor sat.
 		m.cursors[tabSignatures] = 0
 		m.offsets[tabSignatures] = 0
-		m.message = fmt.Sprintf("semantic: %d match(es) for %q", len(msg.results), msg.query)
+		kind := "semantic"
+		if msg.screen {
+			kind = "screen"
+		}
+		m.message = fmt.Sprintf("%s: %d match(es) for %q", kind, len(msg.results), msg.query)
 		m.clampListViewport()
 		return m, nil
 	case tea.KeyMsg:
@@ -2559,6 +2608,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.Type {
 		case tea.KeyCtrlC:
 			return m, tea.Quit
+		case tea.KeyCtrlG:
+			// Screen search: the captured panes rather than the masked
+			// salients. Unlike the semantic search it needs no embedding model
+			// and is useful for a ONE-word query (a bare command name is the
+			// motivating case), so it is not gated on semanticHintVisible.
+			if m.tab == tabSignatures && strings.TrimSpace(m.query[tabSignatures]) != "" {
+				q := m.query[tabSignatures]
+				m.searching = false
+				m.message = "searching captured screens…"
+				m.clampListViewport()
+				return m, m.screenSearchCmd(q)
+			}
+			return m, nil
 		case tea.KeyEsc, tea.KeyEnter:
 			// On the Rules tab, Enter over a 2+-word query runs a semantic
 			// (embedding) search instead of just committing the keyword filter.
@@ -5219,8 +5281,8 @@ func (m Model) chromeRows() int {
 	} else if m.tab.isList() && m.query[m.tab] != "" {
 		chrome++
 	}
-	if m.semanticHintVisible() {
-		chrome++ // the extra "enter: semantic search" hint line under the box
+	if m.sigSearchHint() != "" {
+		chrome++ // the one search-mode hint line under the box
 	}
 	if m.tab == tabSignatures && m.sigMode != "" {
 		chrome++
@@ -7208,13 +7270,16 @@ func (m Model) View() string {
 		for _, l := range m.searchBox().render(func(s string) string { return st.section.Render(s) }) {
 			fmt.Fprintf(&b, "%s\n", l)
 		}
-		if m.semanticHintVisible() {
-			fmt.Fprintf(&b, "%s\n", st.help.Render(
-				"enter: semantic search — embed this query to rank rules by meaning"))
+		if hint := m.sigSearchHint(); hint != "" {
+			fmt.Fprintf(&b, "%s\n", st.help.Render(hint))
 		}
 	} else if m.semanticActive() {
+		kind := "semantic"
+		if m.sigSemantic.screen {
+			kind = "screen"
+		}
 		fmt.Fprintf(&b, "%s\n", st.help.Render(
-			fmt.Sprintf("semantic: %q — / to edit, backspace to clear", m.query[tabSignatures])))
+			fmt.Sprintf("%s: %q — / to edit, backspace to clear", kind, m.query[tabSignatures])))
 	} else if m.tab.isList() && m.query[m.tab] != "" {
 		fmt.Fprintf(&b, "%s\n", st.help.Render(
 			fmt.Sprintf("filter: %q — / to edit, backspace to clear", m.query[m.tab])))

@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -195,4 +197,293 @@ func TestSearchSignaturesSemanticDegradesCleanly(t *testing.T) {
 	if got, err := app.SearchSignatures(ctx, "x", frontend.SignatureSearchOpts{}, domain.SignatureFilter{}); err != nil || len(got) != 1 {
 		t.Errorf("keyword search must still work: got %+v err %v", got, err)
 	}
+}
+
+// seedScreen attaches a RAW captured pane to an already-seeded rule.
+func seedScreen(t *testing.T, st interface {
+	SaveSignatureSnapshot(context.Context, string, string, time.Time) error
+}, sig, excerpt string) {
+	t.Helper()
+	if err := st.SaveSignatureSnapshot(context.Background(), sig, excerpt, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestScreenSearchReadsTheRawPaneNotTheMaskedSalient is the whole feature, and
+// it only discriminates as a PAIR: one rule whose SCREEN carries the query but
+// whose masked salient does not, and one the other way round.
+//
+// Either case alone passes on code that searches the wrong corpus — which is
+// exactly the bug reported. The masking is not incidental to the fixture: a
+// salient really does have every literal path and number replaced before it is
+// stored, which is why "npm install --force" is unfindable by default.
+func TestScreenSearchReadsTheRawPaneNotTheMaskedSalient(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+
+	// Screen has the literal command; the salient it was masked into does not.
+	seedSearchRule(t, st, "approval:screen01", "claude", "m.gguf",
+		"permission:proceed | options:no;yes", []float32{1, 0, 0})
+	seedScreen(t, st, "approval:screen01",
+		"Bash(npm install --force)\n  1. Yes\n  2. Yes, and don't ask again\n  3. No")
+
+	// Salient carries the words; the screen does not.
+	seedSearchRule(t, st, "approval:salient1", "claude", "m.gguf",
+		"permission:npm install force packages", []float32{0, 1, 0})
+	seedScreen(t, st, "approval:salient1", "Edit(<path>)\n  1. Yes\n  2. No")
+
+	// Default (masked-salient) search finds only the salient rule.
+	got, err := app.SearchSignatures(ctx, "npm install force",
+		frontend.SignatureSearchOpts{}, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Signature != "approval:salient1" {
+		t.Fatalf("default search = %+v, want only the salient rule", sigsOf(got))
+	}
+
+	// Screen search finds only the screen rule — the opposite answer over the
+	// same query, which is what proves the corpus actually changed.
+	got, stats, err := app.SearchSignaturesWithStats(ctx, "npm install force",
+		frontend.SignatureSearchOpts{Screen: true, Terms: []string{"npm", "install", "force"}},
+		domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Signature != "approval:screen01" {
+		t.Fatalf("screen search = %+v, want only the screen rule", sigsOf(got))
+	}
+	if stats.ScreensSearched != 2 {
+		t.Errorf("ScreensSearched = %d, want 2 (both rules have a snapshot)", stats.ScreensSearched)
+	}
+	if !strings.Contains(got[0].Match, "npm install --force") {
+		t.Errorf("Match must carry the hit, got %q", got[0].Match)
+	}
+}
+
+// TestScreenSearchRequiresEveryTermAnywhere pins the AND-of-terms divergence
+// from the default mode's whole-query substring: the terms are scattered
+// across the screen and must all be found, in any order, but a term that is
+// absent refuses the whole row.
+func TestScreenSearchRequiresEveryTermAnywhere(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedSearchRule(t, st, "approval:scatter1", "claude", "m.gguf", "permission:proceed", []float32{1, 0, 0})
+	seedScreen(t, st, "approval:scatter1",
+		"Bash(npm install --force)\n  1. Yes\n  2. No\n  cwd: /srv/app")
+
+	// Scattered and out of order: the whole query is NOT a substring anywhere.
+	got, _, err := app.SearchSignaturesWithStats(ctx, "cwd npm",
+		frontend.SignatureSearchOpts{Screen: true, Terms: []string{"cwd", "npm"}},
+		domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("scattered terms = %+v, want the rule", sigsOf(got))
+	}
+	// One absent term refuses the row: this is AND, never OR.
+	got, _, err = app.SearchSignaturesWithStats(ctx, "npm terraform",
+		frontend.SignatureSearchOpts{Screen: true, Terms: []string{"npm", "terraform"}},
+		domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("one absent term must refuse the row, got %+v", sigsOf(got))
+	}
+}
+
+// TestScreenSearchPhraseIsNotThreeTerms is the reason SignatureSearchOpts
+// carries Terms at all: the CLI's permuting parser joins its words for display,
+// so a search driven from the joined string alone cannot tell a shell-quoted
+// phrase from three independent words. Both spellings reach here with the same
+// Query and MUST answer differently.
+func TestScreenSearchPhraseIsNotThreeTerms(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedSearchRule(t, st, "approval:phrase01", "claude", "m.gguf", "permission:proceed", []float32{1, 0, 0})
+	// "npm" and "install" both appear, but never adjacently.
+	seedScreen(t, st, "approval:phrase01", "Bash(npm ci)\n  pip install requests\n  1. Yes")
+
+	q := "npm install"
+	// Three-ish independent terms: both words exist somewhere → match.
+	got, _, err := app.SearchSignaturesWithStats(ctx, q,
+		frontend.SignatureSearchOpts{Screen: true, Terms: []string{"npm", "install"}},
+		domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("independent terms = %+v, want a match", sigsOf(got))
+	}
+	// One quoted phrase: must occur contiguously, and does not → no match.
+	got, _, err = app.SearchSignaturesWithStats(ctx, q,
+		frontend.SignatureSearchOpts{Screen: true, Terms: []string{"npm install"}},
+		domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("a quoted phrase must match contiguously, got %+v", sigsOf(got))
+	}
+	// Nil Terms falls back to splitting the query — the TUI's reading, which
+	// has no argv boundaries to offer.
+	got, _, err = app.SearchSignaturesWithStats(ctx, q,
+		frontend.SignatureSearchOpts{Screen: true}, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("nil Terms must split the query, got %+v", sigsOf(got))
+	}
+}
+
+// TestScreenSearchCountsOnlyScreensItRead is what makes an empty result
+// legible: the denominator must mean "screens actually examined", so a rule
+// with no snapshot (learned before snapshots existed) and a rule the structured
+// filter dropped both contribute nothing. Counting every stored snapshot
+// instead would report a healthy corpus for a search that read one row.
+func TestScreenSearchCountsOnlyScreensItRead(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedSearchRule(t, st, "approval:withsnap", "claude", "m.gguf", "permission:proceed", []float32{1, 0, 0})
+	seedScreen(t, st, "approval:withsnap", "Bash(ls -la)\n  1. Yes")
+	// A pre-snapshot rule: learned state, no captured screen.
+	seedSearchRule(t, st, "approval:nosnap00", "claude", "m.gguf", "permission:proceed", []float32{0, 1, 0})
+	// Another node's agent type, dropped by the filter below though it HAS a screen.
+	seedSearchRule(t, st, "approval:filtered", "codex", "m.gguf", "permission:proceed", []float32{0, 0, 1})
+	seedScreen(t, st, "approval:filtered", "Bash(ls -la)\n  1. Yes")
+
+	_, stats, err := app.SearchSignaturesWithStats(ctx, "terraform",
+		frontend.SignatureSearchOpts{Screen: true}, domain.SignatureFilter{AgentType: "claude"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ScreensSearched != 1 {
+		t.Fatalf("ScreensSearched = %d, want 1 (the pre-snapshot rule was not read, the codex rule was filtered out)",
+			stats.ScreensSearched)
+	}
+}
+
+// TestScreenSearchRefusesSemantic — snapshots carry no vectors, so serving one
+// of the two would silently answer a different question over a different
+// corpus.
+func TestScreenSearchRefusesSemantic(t *testing.T) {
+	app, _ := testApp(t)
+	_, _, err := app.SearchSignaturesWithStats(context.Background(), "anything",
+		frontend.SignatureSearchOpts{Screen: true, Semantic: true}, domain.SignatureFilter{})
+	if err == nil {
+		t.Fatal("--screen with --semantic must be refused, not silently resolved")
+	}
+	if !strings.Contains(err.Error(), "--screen") || !strings.Contains(err.Error(), "--semantic") {
+		t.Errorf("refusal must name both flags, got %q", err)
+	}
+}
+
+// TestScreenSearchKeepsDecisionRecencyOrder — App.Signatures returns
+// newest-updated-first and a screen search must not re-sort by match position,
+// which would bury a rule an operator just taught under an older one that
+// happens to mention the term earlier.
+func TestScreenSearchKeepsDecisionRecencyOrder(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	older := time.Now().Add(-2 * time.Hour)
+	newer := time.Now()
+	for _, tc := range []struct {
+		sig     string
+		at      time.Time
+		excerpt string
+	}{
+		// The older rule mentions the term at offset 0; the newer one buries it.
+		{"approval:older000", older, "npm install\n  1. Yes"},
+		{"approval:newer000", newer, "a very long preamble line here\n  Bash(npm install)\n  1. Yes"},
+	} {
+		if err := st.UpsertSignature(ctx, domain.SignatureState{
+			Signature: tc.sig, SituationType: domain.SituationApproval, AgentType: "claude",
+			Mode: domain.ModeShadow, UpdatedAt: tc.at,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		seedScreen(t, st, tc.sig, tc.excerpt)
+	}
+	got, _, err := app.SearchSignaturesWithStats(ctx, "npm",
+		frontend.SignatureSearchOpts{Screen: true}, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Signature != "approval:newer000" {
+		t.Fatalf("screen search order = %v, want newest-updated first", sigsOf(got))
+	}
+}
+
+// TestScreenMatchExcerptIsRuneSafe — captured screens are full of box-drawing
+// glyphs and the "…" truncation marker, so a byte slice through one emits
+// replacement characters into the operator's terminal.
+func TestScreenMatchExcerptIsRuneSafe(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	seedSearchRule(t, st, "approval:glyphs00", "claude", "m.gguf", "permission:proceed", []float32{1, 0, 0})
+	// Multi-byte glyphs on both sides of the hit, and enough of them that the
+	// 100-rune window has to cut through the run.
+	pad := strings.Repeat("▐▛▜▌▝▘─│┌┐", 20)
+	seedScreen(t, st, "approval:glyphs00", pad+"\nBash(npm install)\n"+pad)
+
+	got, _, err := app.SearchSignaturesWithStats(ctx, "npm",
+		frontend.SignatureSearchOpts{Screen: true}, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want one match, got %v", sigsOf(got))
+	}
+	m := got[0].Match
+	if !utf8.ValidString(m) {
+		t.Fatalf("Match is not valid UTF-8: %q", m)
+	}
+	if strings.ContainsRune(m, utf8.RuneError) {
+		t.Errorf("Match sliced through a multi-byte glyph: %q", m)
+	}
+	if !strings.Contains(m, "npm") {
+		t.Errorf("Match lost the hit: %q", m)
+	}
+	if strings.ContainsAny(m, "\n\r\t") {
+		t.Errorf("Match must collapse newlines so it stays one column: %q", m)
+	}
+	// The window is bounded — a whole 4000-rune screen is not a column.
+	if n := utf8.RuneCountInString(m); n > frontend.MatchExcerptRunes+4 {
+		t.Errorf("Match is %d runes, want ~%d", n, frontend.MatchExcerptRunes)
+	}
+}
+
+// TestScreenSearchLimitCapsResultsButNotTheDenominator — --limit bounds what is
+// printed; ScreensSearched must still report the whole corpus that was read, or
+// a capped search reads as a tiny one.
+func TestScreenSearchLimitCapsResultsButNotTheDenominator(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	for _, sig := range []string{"approval:cap00001", "approval:cap00002", "approval:cap00003"} {
+		seedSearchRule(t, st, sig, "claude", "m.gguf", "permission:proceed", []float32{1, 0, 0})
+		seedScreen(t, st, sig, "Bash(npm install)\n  1. Yes")
+	}
+	got, stats, err := app.SearchSignaturesWithStats(ctx, "npm",
+		frontend.SignatureSearchOpts{Screen: true, Limit: 2}, domain.SignatureFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("limit=2 returned %d results", len(got))
+	}
+	if stats.ScreensSearched != 3 {
+		t.Errorf("ScreensSearched = %d, want 3 — the limit caps output, not the read", stats.ScreensSearched)
+	}
+}
+
+// sigsOf renders just the signatures of a result set, for readable failures.
+func sigsOf(rs []frontend.SignatureSearchResult) []string {
+	out := make([]string, 0, len(rs))
+	for _, r := range rs {
+		out = append(out, r.Signature)
+	}
+	return out
 }

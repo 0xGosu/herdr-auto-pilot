@@ -1560,6 +1560,38 @@ func (s *Store) GetSignatureSnapshot(ctx context.Context, signature string) (str
 	return excerpt, nil
 }
 
+// ListSignatureSnapshots returns every stored pane excerpt, oldest first.
+//
+// It mirrors ListSignatureEmbeddings deliberately: the caller already loads the
+// embeddings table whole and matches in Go, so a screen search intersects two
+// in-memory maps rather than pushing a LIKE into SQL. That keeps the matching
+// semantics (AND-of-terms, case-insensitive, rune-safe excerpting) in one place
+// and out of a dialect that has to work identically on sqlite, through the
+// sqlbridge socket proxy, and on the turso engine.
+//
+// signature_snapshots carries no node_id on purpose — a signature is a
+// fleet-unique content hash — so this needs no node scoping and no exemption.
+func (s *Store) ListSignatureSnapshots(ctx context.Context) ([]domain.SignatureSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT signature, pane_excerpt, created_at
+		FROM signature_snapshots ORDER BY created_at, signature`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.SignatureSnapshot
+	for rows.Next() {
+		var snap domain.SignatureSnapshot
+		var created int64
+		if err := rows.Scan(&snap.Signature, &snap.Excerpt, &created); err != nil {
+			return nil, err
+		}
+		snap.CreatedAt = fromUnix(created)
+		out = append(out, snap)
+	}
+	return out, rows.Err()
+}
+
 // LatestAuditForSignature returns the newest audit row for a signature
 // (nil when none) — display context for list/detail views.
 func (s *Store) LatestAuditForSignature(ctx context.Context, signature string) (*domain.AuditRecord, error) {

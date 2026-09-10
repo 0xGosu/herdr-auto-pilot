@@ -686,7 +686,7 @@ func buildCommands() {
 			Summary: "inspect and manage learned rules",
 			Usage: []string{
 				"hap signatures [list] [--type T] [--mode M] [--agent-type A] [--min-conf C]",
-				"hap signatures search <query> [--semantic] [--limit N] [--min-score S] [filters]",
+				"hap signatures search <query> [--screen] [--semantic] [--limit N] [--min-score S] [filters]",
 				"hap signatures show <sig-or-prefix>",
 				"hap signatures delete <sig-or-prefix> [--yes]",
 				"hap signatures reset <sig-or-prefix> [--yes]",
@@ -699,7 +699,8 @@ func buildCommands() {
 				{Name: "--agent-type", Arg: "A", Desc: "list/search filter: agent type (claude, codex, …)"},
 				{Name: "--min-conf", Arg: "C", Default: "0", Desc: "list/search filter: minimum live confidence (0-1)"},
 				{Name: "--semantic", Desc: "search: rank rules by meaning (embeds the query with the model) instead of keyword substring"},
-				{Name: "--limit", Arg: "N", Default: "20", Desc: "search --semantic: max matches to return"},
+				{Name: "--screen", Desc: "search: match the captured pane (raw, unmasked) instead of the rule's masked salient — every term, anywhere"},
+				{Name: "--limit", Arg: "N", Default: "20", Desc: "search --semantic/--screen: max matches to return"},
 				{Name: "--min-score", Arg: "S", Default: "0.3", Desc: "search --semantic: minimum cosine score in (0,1]; 0 uses the default"},
 				{Name: "--yes", Desc: "delete/reset: skip the interactive confirmation (required when stdin is not a terminal)"},
 				{Name: "--delta", Arg: "N", Default: "1", Desc: "confirm: signed change to the confirmation streak (e.g. -1 to walk it back)"},
@@ -709,7 +710,24 @@ func buildCommands() {
 				"agent type, mode, confirmation streak / graduation N, confidence, top action.\n" +
 				"`search` finds rules by keyword (substring over the rule's fields and its salient\n" +
 				"text); with `--semantic` it embeds the whole query and ranks rules by cosine\n" +
-				"similarity (needs the embedding model). `show` adds the original pane excerpt and\n" +
+				"similarity (needs the embedding model).\n" +
+				"\n" +
+				"`--screen` searches the CAPTURED PANE instead. A rule's salient is masked before\n" +
+				"it is stored — every literal path, version, hash and number is already `<path>`,\n" +
+				"`<num>` or `<hash>` — so the command you remember typing is findable only here.\n" +
+				"It matches EVERY term ANYWHERE in the screen, not the whole query as one\n" +
+				"substring: a screen is thousands of runes with the words scattered across a\n" +
+				"prompt, a menu and a footer. Quote a phrase to require it contiguous —\n" +
+				"`--screen \"npm install\" force` is a phrase AND a term, while `--screen npm\n" +
+				"install force` is three independent terms. Results carry a `match=` field with\n" +
+				"the text around the first hit; `show` prints the whole screen. `--screen` cannot\n" +
+				"be combined with `--semantic` (captured screens carry no embeddings), and the\n" +
+				"count of screens searched is reported so an empty result tells you whether there\n" +
+				"was anything to search. Note captured screens are stored UNMASKED and are never\n" +
+				"pruned, so a secret that appeared on a pane stays searchable — as it already is\n" +
+				"in `signatures show`.\n" +
+				"\n" +
+				"`show` adds the original pane excerpt and\n" +
 				"recent decisions — pass any unique prefix. `delete` erases the rule and its\n" +
 				"decisions (audit rows are kept). `reset` keeps the history but returns the rule to\n" +
 				"shadow with a cleared streak and confidence, so it must re-earn graduation — prefer\n" +
@@ -722,6 +740,7 @@ func buildCommands() {
 			Examples: []string{
 				"hap signatures list --mode autonomous",
 				"hap signatures search \"approve the file write\" --semantic",
+				"hap signatures search --screen \"npm install\" force",
 				"hap signatures show a1b2c3",
 				"hap signatures reset a1b2c3 --yes",
 				"hap signatures confirm a1b2c3",
