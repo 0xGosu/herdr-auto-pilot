@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.15
+
+- `hap status` and `hap agents` no longer hash the whole ~25 MB embedding model on every run: the model's id is remembered per machine and re-checked only when the file changes (tens of milliseconds on an idle machine, much more on a busy one)
+- The CLI verbs no longer ask the daemon for per-agent lifetime counters they never print (two full audit-log aggregations per `hap status`)
+- `hap agents` reads its agents' permission modes in parallel instead of one herdr call after another
+
 ## 0.9.14
 
 - Cut the daemon's memory: its startup peak no longer climbs to ~130MB while the semantic index is rebuilt (the burst is collected tightly and handed back to the OS at once), and each of the Turso engine's pooled connections keeps a far smaller page cache
