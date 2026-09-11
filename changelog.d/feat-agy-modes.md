@@ -1,4 +1,0 @@
-- `hap mode` and the `hap agents` MODE column now cover agy: its `default → acceptEdits → plan` cycle is read from agy's status bar and set with shift+tab (agy's own `accept-edits` spelling works too); hap presses into agy only at an empty composer, and a status bar with no model shows `-` rather than a guessed `default`
-- An agy launched with `--dangerously-skip-permissions` shows no mode indicator, so it reports whatever its cycle shows (`default` at launch); `hap help mode` and the README say so
-- An agy LLM command run with `--output-format json` now has its conversation id recorded on the audit row, like codex's session id
-- `hap skill install agy` (and the TUI's skill shortcut) installs the hap skill into agy's global skills directory, `~/.gemini/antigravity-cli/skills`

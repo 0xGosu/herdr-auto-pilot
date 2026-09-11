@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.20
+
+- `hap mode` and the `hap agents` MODE column now cover agy: its `default → acceptEdits → plan` cycle is read from agy's status bar and set with shift+tab (agy's own `accept-edits` spelling works too); hap presses into agy only at an empty composer, and a status bar with no model shows `-` rather than a guessed `default`
+- An agy launched with `--dangerously-skip-permissions` shows no mode indicator, so it reports whatever its cycle shows (`default` at launch); `hap help mode` and the README say so
+- An agy LLM command run with `--output-format json` now has its conversation id recorded on the audit row, like codex's session id
+- `hap skill install agy` (and the TUI's skill shortcut) installs the hap skill into agy's global skills directory, `~/.gemini/antigravity-cli/skills`
+
 ## 0.9.19
 
 - hap now answers agy's prompts itself — learned rules, LLM answers, auto-accept and `hap confirm/resolve --send` alike: a numbered approval or question gets the option's digit with no Enter, the trust-folder prompt gets its caret walked to the chosen row and confirmed, and the plan-artifact review panel gets `y`/`n`; every key is checked against a fresh read of the pane, and hap stops rather than press a key twice
