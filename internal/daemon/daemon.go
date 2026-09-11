@@ -386,6 +386,10 @@ type Daemon struct {
 	rerankGen        uint64
 	rerankCache      map[string][]domain.RerankResult
 	rerankCacheOrder []string
+	// rerankKnowledge is the rule-knowledge digest (candidate rows plus learned
+	// state) at the last knowledge-driven invalidation ("" = unknown). A fleet
+	// pull invalidates only when it moved; see invalidateRerankForKnowledge.
+	rerankKnowledge string
 
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
@@ -465,6 +469,10 @@ type Daemon struct {
 	// rosterRemoteAt is when the roster was last published FOR A REMOTE
 	// watcher (guarded by mu); see remoteRosterInterval.
 	rosterRemoteAt time.Time
+	// rosterWatchersAt / rosterWatched cache the store's RemoteWatchers answer
+	// for remoteRosterInterval (see remoteWatched); guarded by mu.
+	rosterWatchersAt time.Time
+	rosterWatched    bool
 
 	// fleet is the sync loop's state for the health record (own mutex).
 	fleet fleetSyncState

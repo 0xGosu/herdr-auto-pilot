@@ -35,6 +35,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/mcpserver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/profiling"
 	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
@@ -108,7 +109,13 @@ func main() {
 		return
 	}
 
-	if err := run(verb, args); err != nil {
+	// Opt-in (HAP_PROFILE_DIR); a no-op otherwise. Stopped by hand rather than
+	// deferred, because os.Exit below skips defers and the last window is the
+	// one a short command is profiled for.
+	stopProfile := profiling.FromEnv(verb)
+	err := run(verb, args)
+	stopProfile()
+	if err != nil {
 		// `hap status` on an unhealthy daemon already printed the human detail;
 		// exit non-zero for scripts without a redundant "error:" line.
 		if !errors.Is(err, cli.ErrUnhealthy) {

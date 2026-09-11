@@ -233,6 +233,13 @@ func TestRemoteWatcherRaisesRosterCadenceToTheSyncInterval(t *testing.T) {
 	if err := other.StampWatching(context.Background(), time.Now().Add(30*time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	// The store is asked at most once per remoteRosterInterval — the 2s tick
+	// asks on the select loop — so inside it the cached answer stands...
+	if lvl := d.rosterDemandLevel(); lvl != rosterDemandNone {
+		t.Fatalf("demand inside the cache interval = %v, want the cached none", lvl)
+	}
+	// ...and once it lapses the remote watcher is seen.
+	expireRemoteWatchers(d)
 	if lvl := d.rosterDemandLevel(); lvl != rosterDemandRemote {
 		t.Fatalf("demand with a remote TUI watching = %v, want remote", lvl)
 	}
@@ -263,9 +270,18 @@ func TestRemoteWatcherRaisesRosterCadenceToTheSyncInterval(t *testing.T) {
 	if err := other.StampWatching(context.Background(), time.Now().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
+	expireRemoteWatchers(d)
 	if lvl := d.rosterDemandLevel(); lvl != rosterDemandNone {
 		t.Fatalf("demand with an expired remote stamp = %v, want none", lvl)
 	}
+}
+
+// expireRemoteWatchers lapses the cached RemoteWatchers answer, standing in
+// for remoteRosterInterval passing.
+func expireRemoteWatchers(d *Daemon) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.rosterWatchersAt = time.Time{}
 }
 
 // nudgeDaemon wakes the daemon over its control socket, the way a front end

@@ -67,8 +67,25 @@ repo root. But repointing it means `hap status` / `hap daemon --ensure` in any
 shell hit your dev build, which is what you usually want.
 
 To go back to the released plugin later: `herdr plugin unlink herd-auto-prompter`
-then `herdr plugin install 0xGosu/herdr-auto-pilot` (and repoint or remove the
-symlink).
+then `herdr plugin install 0xGosu/herdr-auto-pilot --yes` (and repoint or remove
+the symlink).
+
+### GOTCHA: give the linked tree its embedding model
+
+`models/*.gguf` is gitignored and fetched only by `scripts/install.sh`, which
+`link` never runs — so a fresh checkout or worktree has **no `models/`**, and a
+daemon started from it runs with the embedder DEGRADED (text matching only, no
+vector index). Nothing fails loudly; `hap status` says so and the log repeats
+`embedder unavailable … stat <tree>/models/all-minilm-l6-v2-q8_0.gguf: no such
+file`. Any CPU or memory number taken that way is not comparable with a release.
+Borrow the installed copy before the first swap, and add it to the shared exclude
+(the `models/` ignore rule does not match a symlink):
+
+```bash
+ln -s ~/.config/herdr/plugins/github/herd-auto-prompter-*/models /workspaces/<tree>/models
+echo /models >> "$(git rev-parse --git-common-dir)/info/exclude"
+hap status | grep -i degraded   # must print nothing once the daemon restarted
+```
 
 ## the iteration loop (every code change)
 
@@ -249,6 +266,7 @@ classification. cross-check the shape:
 |---|---|
 | link working tree | `herdr plugin link /workspaces/herdr-auto-pilot` |
 | fix PATH symlink (once) | `ln -sf /workspaces/herdr-auto-pilot/bin/hap /usr/local/bin/hap` |
+| give the tree its model (once) | `ln -s ~/.config/herdr/plugins/github/herd-auto-prompter-*/models <tree>/models` |
 | rebuild | `go build -tags "vectors cpu" -o bin/hap ./cmd/hap` |
 | hot-swap daemon | `hap daemon --ensure` |
 | confirm swap | `hap status` → `running dev` |
@@ -263,3 +281,5 @@ classification. cross-check the shape:
 - **the daemon does not hot-reload** — always `hap daemon --ensure` after a rebuild.
 - **omitting `vectors cpu` breaks the build** — both tags always.
 - **`dev` is the tell** — a `dev` version = your local build; a `vX.Y.Z` version = a release.
+- **a linked tree has no embedding model** — symlink the installed `models/` in, or the dev
+  daemon runs DEGRADED and every measurement against a release is confounded.

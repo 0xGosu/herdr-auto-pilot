@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"log/slog"
 	"math"
 	"net/url"
@@ -756,48 +757,120 @@ func (s *Store) ListSignatureEmbeddings(ctx context.Context) ([]domain.Signature
 // SignatureEmbeddingsFingerprint digests every column of every row the
 // semantic index is built from, so the daemon can tell a fleet pull that moved
 // a rule apart from one that only moved bookkeeping (see
-// ports.KnowledgeFingerprinter). The vector BYTES are hashed too, not just
-// their length: the read costs a few milliseconds against a rebuild costing
-// hundreds, and "same length, different vector" is then never a question.
+// ports.KnowledgeFingerprinter).
+//
+// A vector contributes its length and its first 16 bytes (four float32s), not
+// its whole body. Reading every vector on every pull was measured at ~40% of
+// an idle turso daemon's CPU (1.2MB through the SDK every 5s for 785 rules),
+// and the whole body buys nothing the prefix does not: a row is only ever
+// re-embedded under a different model or dims — both in the digest — and a
+// vector that differs at all, even in float rounding between two machines'
+// builds, differs in its leading components.
 //
 // Each field is length-prefixed so no two different rows can serialize to the
 // same bytes, and the order is by signature, the primary key, so the digest
 // does not depend on insertion order.
 func (s *Store) SignatureEmbeddingsFingerprint(ctx context.Context) (string, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT signature, situation_type, agent_type, model, dims, vector, salient, created_at
+		SELECT signature, situation_type, agent_type, model, dims,
+			substr(vector, 1, 16), length(vector), salient, created_at
 		FROM signature_embeddings ORDER BY signature`)
 	if err != nil {
 		return "", err
 	}
 	defer rows.Close()
-	h := sha256.New()
-	var n [binary.MaxVarintLen64]byte
-	field := func(b []byte) {
-		h.Write(n[:binary.PutUvarint(n[:], uint64(len(b)))])
-		h.Write(b)
-	}
+	d := newFieldDigest()
 	for rows.Next() {
 		var sig, st, agent, model, salient string
 		var dims, created int64
-		var blob []byte
-		if err := rows.Scan(&sig, &st, &agent, &model, &dims, &blob, &salient, &created); err != nil {
+		var head []byte
+		var size sql.NullInt64
+		if err := rows.Scan(&sig, &st, &agent, &model, &dims, &head, &size, &salient, &created); err != nil {
 			return "", err
 		}
-		field([]byte(sig))
-		field([]byte(st))
-		field([]byte(agent))
-		field([]byte(model))
-		field(binary.AppendVarint(nil, dims))
-		field(blob)
-		field([]byte(salient))
-		field(binary.AppendVarint(nil, created))
+		d.str(sig)
+		d.str(st)
+		d.str(agent)
+		d.str(model)
+		d.int(dims)
+		d.bytes(head)
+		if size.Valid {
+			d.int(size.Int64)
+		} else {
+			d.int(-1) // NULL, distinct from an empty blob
+		}
+		d.str(salient)
+		d.int(created)
 	}
 	if err := rows.Err(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return d.sum(), nil
 }
+
+// RuleStateFingerprint digests the learned STATE the re-rank judge is shown
+// about each rule: its mode and decision floor (signatures) and the decision
+// history its listed confidence is computed from. With
+// SignatureEmbeddingsFingerprint it covers everything the rendered candidate
+// listing reads, so the daemon can keep in-flight verdicts across a fleet pull
+// that moved none of it (see ports.RuleStateFingerprinter).
+//
+// Decisions are summarized by count and highest id rather than hashed row by
+// row. The table is append-only — a rule's rows leave only with the rule
+// itself, which the signatures half sees — and it is never swept, so it is the
+// one table here that grows without bound. Count catches a delete or a peer's
+// row carrying a lower id; the maximum catches an insert that a delete in the
+// same pull would otherwise cancel out.
+func (s *Store) RuleStateFingerprint(ctx context.Context) (string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT signature, mode, decision_floor_id FROM signatures ORDER BY signature`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	d := newFieldDigest()
+	for rows.Next() {
+		var sig, mode string
+		var floor int64
+		if err := rows.Scan(&sig, &mode, &floor); err != nil {
+			return "", err
+		}
+		d.str(sig)
+		d.str(mode)
+		d.int(floor)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	var n, maxID int64
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*), COALESCE(MAX(id), 0) FROM decisions`).Scan(&n, &maxID); err != nil {
+		return "", err
+	}
+	d.int(n)
+	d.int(maxID)
+	return d.sum(), nil
+}
+
+// fieldDigest hashes a sequence of length-prefixed fields, so no two different
+// sequences serialize to the same bytes.
+type fieldDigest struct {
+	h hash.Hash
+	n [binary.MaxVarintLen64]byte
+}
+
+func newFieldDigest() *fieldDigest { return &fieldDigest{h: sha256.New()} }
+
+func (d *fieldDigest) bytes(b []byte) {
+	d.h.Write(d.n[:binary.PutUvarint(d.n[:], uint64(len(b)))])
+	d.h.Write(b)
+}
+
+func (d *fieldDigest) str(s string) { d.bytes([]byte(s)) }
+
+func (d *fieldDigest) int(v int64) { d.bytes(binary.AppendVarint(nil, v)) }
+
+func (d *fieldDigest) sum() string { return fmt.Sprintf("%x", d.h.Sum(nil)) }
 
 // CountSignatureEmbeddings reports how many semantic identity rows exist.
 func (s *Store) CountSignatureEmbeddings(ctx context.Context) (int64, error) {
