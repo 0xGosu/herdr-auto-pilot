@@ -35,12 +35,14 @@ func TestGoldenTranscripts(t *testing.T) {
 		"approval_agy_shell.txt":           "done",
 		"approval_agy_shell_amend.txt":     "done",
 		"approval_agy_shell_plan_mode.txt": "done",
+		"approval_agy_shell_recent.txt":    "done",
 		"approval_agy_shell_wide.txt":      "done",
 		"approval_agy_shell_wrapped.txt":   "done",
 		"approval_agy_trust_folder.txt":    "idle",
 		"choice_agy_mcq.txt":               "done",
 		"choice_agy_mcq_two.txt":           "done",
 		"choice_agy_mcq_two_q2.txt":        "done",
+		"choice_agy_mcq_two_recent.txt":    "done",
 		"error_agy_interrupted.txt":        "done",
 		"error_agy_model_warning.txt":      "idle",
 		"error_agy_offline.txt":            "idle",
@@ -68,11 +70,6 @@ func TestGoldenTranscripts(t *testing.T) {
 		"error_codex_usage_limit.txt": "codex",
 		"error_codex_banner.txt":      "codex",
 	}
-	for name := range statusFor {
-		if strings.Contains(name, "_agy_") {
-			agentTypeFor[name] = "agy"
-		}
-	}
 
 	entries, err := os.ReadDir("testdata/transcripts")
 	if err != nil {
@@ -95,6 +92,9 @@ func TestGoldenTranscripts(t *testing.T) {
 			status = "blocked"
 		}
 		agentType := agentTypeFor[name]
+		if strings.Contains(name, "_agy_") {
+			agentType = "agy"
+		}
 		if agentType == "" {
 			agentType = "claude"
 		}

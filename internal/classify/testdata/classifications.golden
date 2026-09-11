@@ -4,6 +4,7 @@ approval_agy_file_create.txt status=done type=idle verb= options=0
 approval_agy_shell.txt status=done type=idle verb= options=0
 approval_agy_shell_amend.txt status=done type=idle verb= options=0
 approval_agy_shell_plan_mode.txt status=done type=idle verb= options=0
+approval_agy_shell_recent.txt status=done type=idle verb= options=0
 approval_agy_shell_wide.txt status=done type=idle verb= options=0
 approval_agy_shell_wrapped.txt status=done type=idle verb= options=0
 approval_agy_trust_folder.txt status=idle type=idle verb= options=0
@@ -15,6 +16,7 @@ approval_yn.txt status=blocked type=approval verb= options=0
 choice_agy_mcq.txt status=done type=idle verb= options=0
 choice_agy_mcq_two.txt status=done type=idle verb= options=0
 choice_agy_mcq_two_q2.txt status=done type=idle verb= options=0
+choice_agy_mcq_two_recent.txt status=done type=idle verb= options=0
 choice_claude_mcq.txt status=blocked type=choice verb= options=5
 choice_claude_mcq_tabs.txt status=blocked type=choice verb= options=5
 choice_claude_mcq_tabs_one_question.txt status=blocked type=choice verb= options=6

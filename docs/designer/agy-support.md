@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-11 · **Status:** inventory + corpus + design; nothing implemented
 **Captured against:** agy 1.2.1, herdr 0.8.2 (agy manifest `2026.06.24.1`), hap 0.9.16
-**Corpus:** `internal/classify/testdata/transcripts/*_agy_*.txt` (29 fixtures, golden-pinned)
+**Corpus:** `internal/classify/testdata/transcripts/*_agy_*.txt` (31 fixtures, golden-pinned)
 
 This is the plan phases 2–5 build on. Every claim below was observed live on scratch agy
 agents (model `gemini-3.6-flash-low`, cwd a temp dir, hap disabled on each) unless it is
@@ -70,6 +70,15 @@ marked **unverified**.
 - **What was saved:** `pane read --source visible|recent|recent-unwrapped`,
   `agent read --source detection`, `agent explain --verbose` and `agent get` per screen.
   Fixtures are the `visible` text with trailing blanks trimmed.
+- **`recent` captures:** two screens are ALSO committed as the `recent` read, since that is
+  the shape the daemon classifies: `approval_agy_shell_recent`, `choice_agy_mcq_two_recent`.
+  They differ from `visible` in two ways:
+  - a blank line separates every block, and the launch line and banner are included;
+  - the MCQ capture still holds the EARLIER, answered question (`? Which fruit do you
+    prefer?` / `> Banana`) above the live form.
+
+  That second point is the two-render hazard §4 warns about. The other read sources and the
+  `explain` output were session-local and are not retained beyond what this document quotes.
 - **Redaction:** the account e-mail becomes `operator@example.com`, and the OAuth
   `client_id`, `code_challenge` and `state` become `<redacted>`.
 - **Widths:** option labels WRAP to column 0 in a narrow pane. `approval_agy_shell_wrapped`

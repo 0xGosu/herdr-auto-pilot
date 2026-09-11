@@ -1,0 +1,27 @@
+root ➜ /tmp/agyscratch.H2CE $ agy --model gemini-3.6-flash-low
+
+      ▄▀▀▄        Antigravity CLI 1.2.1
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.6 Flash (Low)
+   ▄▀▀    ▀▀▄     /tmp/agyscratch.H2CE
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Use your shell tool to run exactly this command: ls -la /tmp/agyscratch.H2CE . Then reply with one line.
+
+● Bash(ls -la /tmp/agyscratch.H2CE) (ctrl+o to expand)
+
+Command
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   ls -la /tmp/agyscratch.H2CE
+
+Run this command?
+> 1. Yes, run command
+  2. Yes, and always allow in this conversation for commands that start with 'ls'
+  3. Yes, and always allow for commands that start with 'ls' (Persist to settings.json)
+  4. No, cancel
+
+  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command
+esc to cancel                                                                                                                                                       Gemini 3.6 Flash · low
