@@ -85,6 +85,13 @@ func TestAutoAcceptIneligible(t *testing.T) {
 			suggestion: "Yes", wantWhy: "excluded reason: suspected_irreversible",
 		},
 		{
+			// hap cannot type into an agy form yet, so waiting never makes the
+			// reply deliverable.
+			name:       "reply_withheld is excluded in code",
+			rec:        escalation("[reply_withheld] hap does not answer agy forms yet"),
+			suggestion: "Yes", wantWhy: "excluded reason: reply_withheld",
+		},
+		{
 			// This one rule is what excludes sweep-demoted escalations, which
 			// carry a bare err.Error() with no tag.
 			name:       "unparseable reason fails closed",

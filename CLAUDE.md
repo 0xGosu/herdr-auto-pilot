@@ -764,6 +764,33 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     where an unscoped DELETE does the most damage. Hoisting SQL into package consts does NOT fix that; only a
     direct literal at the call site does.
 
+### agy (Antigravity CLI)
+
+**herdr never reports an agy modal as blocked, so every agy form is recognized structurally and
+PARKED at idle/done** (`internal/domain/agy.go`, corpus and design in
+`docs/designer/agy-support.md`). Each parser requires the form's own anchors AND its key-hint
+line at the true bottom of the capture — agy renders inline, so its whole transcript is in every
+read and an earlier form is always somewhere above.
+
+- **Replies to agy approvals and choices are WITHHELD** (`domain.AgyReplyWithheld`) on all four
+  send paths — `daemon.act` (ahead of the action-review dispatch), the action-review outcome, the
+  LLM promotion, and `deliver.Deliver` (which the operator's `--send` and auto-accept reach): every
+  path types the digit then Enter, and agy commits on the digit alone, so that Enter answers the
+  NEXT screen (on a two-question form, option 1 of question 2, unseen). A new send path must ask it
+  too. Auto-accept maps `deliver.ErrReplyWithheld` to `errOutboundRefused`, or the refusal burns
+  the attempt budget and dismisses the row. **Not covered:** a generated-task `--send`, whose busy
+  check reads herdr's status only — phase 3's composer-ready proof closes it.
+- **Never set `MCQKind`/`AnswerCount` on an agy situation, and keep `ParseMCQForm` false for agy**
+  until an agy series deliverer exists: `EffectiveAnswerCount() > 1` routes into `sweepFrames` and
+  `mcqdeliver.ClaudeTabs`, which press Right/Left into the pane BEFORE they refuse.
+- Setup (sign-in, terms) and operator UI (pickers, panels, slash popup, the Tab-amend field, the
+  survey) classify **unclassifiable**, ahead of every rule including the operator's — no consult,
+  no suggestion, no keystroke. Enter on the terms screen flips the data-sharing consent.
+- The agy approval `PermissionVerb` carries the command UNMASKED on purpose:
+  `IrreversibleScanContent` reads it raw alongside the 40-line pane tail, and `MaskVolatile` turns
+  `of=/dev/sda` into `of=<path>` — the tail usually carries the raw command too, but a long
+  wrapped command can push it out, and the verb is then the only raw copy.
+
 ### Claude session-name sync
 
 **A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is never evidence.**
