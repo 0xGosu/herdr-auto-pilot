@@ -53,6 +53,48 @@ const fspTailHeldStillJitterPercent = 15
 // not purge escalations whose agents are alive and simply not listed yet.
 const autoAcceptAbsenceConfirmations = 2
 
+// autoAcceptCutoffs is the created_at bound, per situation type, under which a
+// pending escalation is old enough to auto-accept; a type absent from the map
+// never auto-accepts.
+func autoAcceptCutoffs(cfg config.Config, fsp bool, now time.Time) map[domain.SituationType]time.Time {
+	cutoffs := make(map[domain.SituationType]time.Time)
+	if fsp {
+		// Full self-prompting: zero wait for ALL five types — including idle
+		// and unclassifiable, whose timed auto-accept defaults are disabled.
+		// cutoff=now satisfies created_at <= cutoff for every pending row.
+		// A parallel builder rather than a change to AutoAcceptAfter: that
+		// accessor stays the source of truth for TIMED auto-accept, and
+		// full self-prompting works with escalations.auto_accept.enabled false. When
+		// both are on, these cutoffs strictly dominate.
+		for _, st := range config_AutoAcceptTypes() {
+			cutoffs[st] = now
+		}
+		return cutoffs
+	}
+	for _, st := range config_AutoAcceptTypes() {
+		if after, ok := cfg.AutoAcceptAfter(string(st)); ok {
+			cutoffs[st] = now.Add(-after)
+		}
+	}
+	return cutoffs
+}
+
+// autoAcceptPassReport records what one auto-accept pass looked at, for the
+// orchestrator stream: a row the pass merely PUT OFF is not a row it left for a
+// human, and announcing one would set an orchestrator racing the daemon for the
+// same pane on the next sweep.
+type autoAcceptPassReport struct {
+	// ran is false when the pass never reached its candidates (both features
+	// off, the kill switch on, the query failed).
+	ran     bool
+	cutoffs map[domain.SituationType]time.Time
+	// examined is every candidate the (capped) query returned.
+	examined map[int64]bool
+	// deferred is every eligible candidate put off this pass: another row on
+	// its agent went first, its pane was busy, or the mode stood down.
+	deferred map[int64]bool
+}
+
 // autoAcceptEscalations delivers the suggestion of any escalation that has
 // waited past its configured threshold and whose situation is still
 // demonstrably live (FR-018's escape hatch: the operator's queue becomes a slow
@@ -69,6 +111,9 @@ const autoAcceptAbsenceConfirmations = 2
 // would only incidentally catch the second — and only if its pane re-read
 // happened to land after the first delivery. One-per-agent makes that ordering
 // irrelevant rather than load-bearing.
+//
+// What the pass looked at is left in d.lastAutoAccept for the orchestrator
+// stream, which must not announce a row this pass merely put off.
 func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.AgentTransition) map[string]bool {
 	// Before anything else, and before every early return below: settle rows
 	// whose reply already landed but whose finalize did not stick. That is pure
@@ -84,29 +129,14 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	cfg, _, _ := d.snapshot()
 	now := d.opt.Clock.Now()
 
-	cutoffs := make(map[domain.SituationType]time.Time)
 	fsp := d.fspActive(ctx, cfg)
+	cutoffs := autoAcceptCutoffs(cfg, fsp, now)
+	// Recorded on every return below, including the early ones.
+	rep := &autoAcceptPassReport{cutoffs: cutoffs}
+	defer func() { d.lastAutoAccept = *rep }()
 	// One resolution for the whole pass, from the same snapshot fsp came from:
 	// every per-row gate below reads this rather than paying for fspActive again.
 	limitsInert := limitsInertFor(cfg, fsp)
-	if fsp {
-		// Full self-prompting: zero wait for ALL five types — including idle
-		// and unclassifiable, whose timed auto-accept defaults are disabled.
-		// cutoff=now satisfies created_at <= cutoff for every pending row.
-		// A parallel builder rather than a change to AutoAcceptAfter: that
-		// accessor stays the source of truth for TIMED auto-accept, and
-		// full self-prompting works with escalations.auto_accept.enabled false. When
-		// both are on, these cutoffs strictly dominate.
-		for _, st := range config_AutoAcceptTypes() {
-			cutoffs[st] = now
-		}
-	} else {
-		for _, st := range config_AutoAcceptTypes() {
-			if after, ok := cfg.AutoAcceptAfter(string(st)); ok {
-				cutoffs[st] = now.Add(-after)
-			}
-		}
-	}
 	if len(cutoffs) == 0 {
 		return nil // both features off, or every type disabled
 	}
@@ -129,6 +159,9 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		slog.Warn("auto-accept: candidate query failed; skipping this sweep", "error", err)
 		return nil
 	}
+	rep.ran = true
+	rep.examined = make(map[int64]bool, len(candidates))
+	rep.deferred = make(map[int64]bool)
 
 	live := make(map[string]domain.AgentTransition, len(agents))
 	for _, a := range agents {
@@ -166,6 +199,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 
 	for i := range candidates {
 		rec := &candidates[i]
+		rep.examined[rec.ID] = true
 		suggestion := domain.SuggestedAction(rec)
 		if why := domain.AutoAcceptIneligible(rec, suggestion, allowGenerated); why != "" {
 			// Ineligible is NOT stale: the escalation stays pending for the
@@ -187,6 +221,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		// One per agent per tick; candidates arrive oldest-first, so the agent's
 		// longest-waiting escalation is the one taken.
 		if handledAgent[rec.AgentID] {
+			rep.deferred[rec.ID] = true
 			continue
 		}
 		// Another pane interaction owns this agent — an FSP immediate
@@ -195,6 +230,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		// it on a later tick.
 		if d.paneBusy(rec.AgentID) {
 			d.notePending(rec, "another pane interaction owns this agent")
+			rep.deferred[rec.ID] = true
 			continue
 		}
 		// The [limits] ceilings, when the operator asked full self-prompting to
@@ -235,6 +271,7 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 		// pruneAutoAcceptState, silently resetting their delivery budgets and
 		// absence counts.
 		if stoodDown {
+			rep.deferred[rec.ID] = true
 			continue
 		}
 

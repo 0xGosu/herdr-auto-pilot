@@ -161,7 +161,21 @@ func (a *App) mutateList(ctx context.Context, cfg config.Config, locator string,
 	if err != nil {
 		return nil, err
 	}
-	return l.Store.Mutate(ctx, locator, 0, fn)
+	// The mutator may run more than once (a remote store retries on a
+	// revision conflict), so only the LAST successful pass describes what was
+	// written.
+	var before, after string
+	items, err := l.Store.Mutate(ctx, locator, 0, func(content string) (string, error) {
+		out, mErr := fn(content)
+		if mErr == nil {
+			before, after = content, out
+		}
+		return out, mErr
+	})
+	if err == nil {
+		a.emitChecklistDiff(ctx, cfg, locator, before, after)
+	}
+	return items, err
 }
 
 // ensureList creates a checklist that does not exist yet, reporting whether it
@@ -191,7 +205,11 @@ func (a *App) ensureList(ctx context.Context, cfg config.Config, locator, initia
 	if !ok {
 		return false, fmt.Errorf("this task-list backend cannot create %s on demand", l.Display)
 	}
-	return creator.Ensure(ctx, locator, initial)
+	created, err := creator.Ensure(ctx, locator, initial)
+	if err == nil && created {
+		a.emitTaskList(ctx, domain.StreamTaskListCreated, locator)
+	}
+	return created, err
 }
 
 // deleteList removes a checklist outright, reporting whether one was there.
@@ -216,7 +234,11 @@ func (a *App) deleteList(ctx context.Context, cfg config.Config, locator string)
 		return false, fmt.Errorf("this task-list backend cannot delete %s — "+
 			"only lists kept in the hap database are hap's to remove; delete this one yourself", l.Display)
 	}
-	return remover.Delete(ctx, locator)
+	deleted, err := remover.Delete(ctx, locator)
+	if err == nil && deleted {
+		a.emitTaskList(ctx, domain.StreamTaskListDeleted, locator)
+	}
+	return deleted, err
 }
 
 // DeleteTaskList removes the checklist at locator, whatever node keeps it, and

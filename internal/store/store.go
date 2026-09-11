@@ -1335,6 +1335,50 @@ func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domai
 	return s.scanAudits(rows)
 }
 
+// EscalationsAwaitingAttention returns up to limit of this node's escalations
+// still awaiting an answer, with id above afterID, in ascending id order — a
+// keyset page, so a caller walks a backlog of any size and any age in full.
+// Unlike AutoAcceptableEscalations it pushes NO eligibility filter down: a row
+// with no suggestion or no baseline is exactly one only a human can answer.
+// The transient 'auto_accepting' status is included (Status says which) so a
+// caller remembering what it announced does not forget a row mid-claim.
+//
+// Only the fields the orchestrator stream reads are selected (ID, AgentID,
+// Status, SituationType, CreatedAt, and whether SigRaw and Suggestion are
+// present): a full audit row carries the pane excerpt and the LLM output.
+func (s *Store) EscalationsAwaitingAttention(ctx context.Context, afterID int64, limit int) ([]domain.AuditRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent_id, status, situation_type, created_at,
+		sig_raw != '', suggestion != '' FROM audit_log
+		WHERE node_id = ? AND status IN ('escalated', 'auto_accepting') AND id > ?
+		ORDER BY id LIMIT ?`, s.self, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []domain.AuditRecord
+	for rows.Next() {
+		var a domain.AuditRecord
+		var situation string
+		var created int64
+		var hasSig, hasSuggestion bool
+		if err := rows.Scan(&a.ID, &a.AgentID, &a.Status, &situation, &created, &hasSig, &hasSuggestion); err != nil {
+			return nil, err
+		}
+		a.NodeID = s.self
+		a.SituationType = domain.SituationType(situation)
+		a.CreatedAt = fromUnix(created)
+		// Presence only: a placeholder the caller reads as "has one".
+		if hasSig {
+			a.SigRaw = "present"
+		}
+		if hasSuggestion {
+			a.Suggestion = "present"
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // autoAcceptCandidateLimit bounds one sweep's candidate fetch. Each row can
 // carry a multi-KB pane excerpt and the pass runs on the daemon's select loop,
 // so the fetch is capped to keep that work constant no matter how large an

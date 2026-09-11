@@ -283,6 +283,8 @@ func (d *Daemon) pruneOrphanTaskLists(ctx context.Context, now time.Time) bool {
 			}
 			if gone {
 				deleted++
+				d.emitStream(ctx, domain.StreamTaskListDeleted, domain.StreamStr("list", locator),
+					domain.StreamStr("reason", "retention"))
 				slog.Info("task list reclaim: removed an unreachable checklist",
 					"list", tasklocator.Display(locator), "reason", why,
 					"last_written", l.UpdatedAt.Format(time.RFC3339),

@@ -648,6 +648,62 @@ func buildCommands() {
 			},
 		},
 		{
+			Name:    "stream",
+			Group:   groupOperate,
+			Summary: "follow a live, resumable event stream (topic: orchestrator)",
+			Usage:   []string{"hap stream orchestrator [--resume N]"},
+			Details: "A stream prints one line per event until it is interrupted, for an agent to\n" +
+				"watch (for instance with Claude's Monitor tool). The only topic today is\n" +
+				"`orchestrator` — see `hap help stream orchestrator`.",
+			Examples: []string{"hap stream orchestrator", "hap stream orchestrator --resume 1024"},
+			Next: []Hint{
+				{Cmd: "hap help stream orchestrator", Why: "the event catalogue and the resume rules"},
+			},
+			Handler: func(_ context.Context, _ *frontend.App, _ io.Writer, args []string) error {
+				if len(args) > 0 {
+					return fmt.Errorf("unknown stream %q (usage: hap stream orchestrator [--resume N])", args[0])
+				}
+				return fmt.Errorf("name a stream (usage: hap stream orchestrator [--resume N])")
+			},
+		},
+		{
+			Name:    "stream orchestrator",
+			Hidden:  true,
+			Group:   groupOperate,
+			Summary: "every change an orchestrating agent reacts to, one line per event, resumable",
+			Usage:   []string{"hap stream orchestrator [--resume N]"},
+			Flags: []FlagDoc{
+				{Name: "--resume", Arg: "N", Desc: "replay every event after N (the last seq you handled), then keep following"},
+			},
+			Details: "Prints one line per event as it happens, and runs until interrupted:\n\n" +
+				"  <seq> <time UTC> <kind> [key=value ...] by=<author>\n\n" +
+				"The payload is ids only — fetch details with the hap CLI. Kinds:\n" +
+				"  config.changed keys=…            task_source.added|removed|updated source=N\n" +
+				"  task.created|updated|deleted|moved list=… [source=N] index=N [mark=…]\n" +
+				"  tasklist.created|deleted list=db://…      escalation id=… agent=… type=…\n" +
+				"  escalation.dismissed id=…        correction id=… escalation=… agent=… [send=…]\n" +
+				"  pause.on|off scope=…             fsp.on|off\n" +
+				"  rule.streak|reset|deleted sig=…  daemon.started version=…\n\n" +
+				"An escalation is announced once auto-accept has had its look at it and left it\n" +
+				"for a human — up to a minute after it was raised under full self-prompting, or\n" +
+				"once its threshold has passed under timed auto-accept — so the stream never\n" +
+				"names a row the daemon is about to answer itself. A row auto-accept can never\n" +
+				"take (no suggestion) is announced at the next sweep.\n\n" +
+				"Sequence numbers only ever increase; they are not guaranteed consecutive.\n\n" +
+				"The first line is always `# hap stream orchestrator head=H floor=F`. Without\n" +
+				"--resume the stream starts at the head and replays nothing. With --resume N it\n" +
+				"replays every event after N first. Events are kept for 7 days: a cursor older\n" +
+				"than that prints `# gap missed=A..B` before replaying what is left, and a cursor\n" +
+				"above the head (the log was reset) prints `# reset …` and follows from the head.\n\n" +
+				"The log is per machine: an action taken on another node of a shared fleet\n" +
+				"appears in that machine's stream, and a hand edit to config.toml or to a task\n" +
+				"file outside hap is not an event.",
+			Examples: []string{"hap stream orchestrator", "hap stream orchestrator --resume 1024"},
+			// Every line is for a machine to read; a footer on exit is noise.
+			Bare:    true,
+			Handler: streamOrchestrator,
+		},
+		{
 			Name:     "state-dir",
 			Group:    groupOperate,
 			Summary:  "print the state directory (DB, logs, socket, match index)",

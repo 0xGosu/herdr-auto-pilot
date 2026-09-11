@@ -776,6 +776,17 @@ func (f *failingStore) PendingEscalationExcerpts(ctx context.Context, agentID, a
 	return f.StorePort.PendingEscalationExcerpts(ctx, agentID, agentType, resolvedSince)
 }
 
+// EscalationsAwaitingAttention forwards the optional capability the
+// orchestrator stream type-asserts for. failingStore embeds the StorePort
+// INTERFACE, so without this the capability would be silently off suite-wide.
+func (f *failingStore) EscalationsAwaitingAttention(ctx context.Context, afterID int64, limit int) ([]domain.AuditRecord, error) {
+	l, ok := f.StorePort.(ports.EscalationAttentionLister)
+	if !ok {
+		return nil, errors.New("store cannot list pending escalations")
+	}
+	return l.EscalationsAwaitingAttention(ctx, afterID, limit)
+}
+
 // --- harness ---
 
 type harness struct {

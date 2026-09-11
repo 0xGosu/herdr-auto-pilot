@@ -38,6 +38,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/turso"
+	"github.com/0xGosu/herdr-auto-pilot/internal/streamlog"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tui"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tuisession"
 )
@@ -279,6 +280,9 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// Opened lazily on the first event, so a command that emits nothing never
+	// touches the file.
+	events := streamlog.InStateDir(paths.StateDir)
 	app := &frontend.App{
 		Store:       st,
 		Herdr:       herdr.NewCLI(),
@@ -289,6 +293,7 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 		DaemonInfo: func() (bool, int, string) {
 			return daemonlock.Info(paths)
 		},
+		Stream: events,
 	}
 	// Desktop notifications only exist when herdr launched us as a managed
 	// pane — it injects HERDR_ENV=1 and the control socket there. Outside
@@ -296,7 +301,7 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 	if herdr.InHerdr() {
 		app.Notifier = herdr.NewSocketNotifier(herdr.SocketPath())
 	}
-	return app, func() { st.Close() }, nil
+	return app, func() { st.Close(); events.Close() }, nil
 }
 
 func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []string) error {
@@ -553,6 +558,10 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 	// Author "daemon" so the automation history says who switched the mode off;
 	// an operator reading `hap kill-history` must not see their own name
 	// against a machine's decision.
+	// The orchestrator event log, shared by the daemon and its in-process App
+	// so both write through one handle.
+	events := streamlog.InStateDir(paths.StateDir)
+	defer events.Close()
 	fspApp := &frontend.App{
 		Store:       st,
 		Herdr:       cliAdapter,
@@ -564,6 +573,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		// flag it would refuse its own actions (no lock file to read) and
 		// deadlock on any it queued.
 		InDaemon: true,
+		Stream:   events,
 	}
 
 	d, err := daemon.New(daemon.Options{
@@ -572,6 +582,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		Store:             st,
 		Herdr:             cliAdapter,
 		Events:            herdr.NewSubscriber(socketPath),
+		Stream:            events,
 		// Socket first, CLI as the transport backstop: `notification.show`
 		// answers whether the toast was actually painted, which is the
 		// difference between "the operator was told about this escalation" and

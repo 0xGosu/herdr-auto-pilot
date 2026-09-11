@@ -179,6 +179,41 @@ type EventPort interface {
 	Subscribe(ctx context.Context, out chan<- domain.AgentTransition) error
 }
 
+// EscalationAttentionLister is the OPTIONAL store capability the daemon uses to
+// announce escalations on the orchestrator stream: this node's rows still
+// awaiting an answer ('escalated', plus the transient 'auto_accepting' so a
+// claim that reverts is still known), with no eligibility filter and no age
+// limit, in ascending id order after afterID — a keyset page, so a backlog of
+// any size is walked in full.
+type EscalationAttentionLister interface {
+	EscalationsAwaitingAttention(ctx context.Context, afterID int64, limit int) ([]domain.AuditRecord, error)
+}
+
+// StreamLog is the machine-local orchestrator event log behind
+// `hap stream orchestrator` (internal/streamlog).
+//
+// Append is BEST-EFFORT by contract: it runs after the change it describes has
+// committed, so a caller logs a failure and carries on — an event log must
+// never turn a change that landed into a reported failure. A nil StreamLog
+// means no events, which is what keeps every existing fake usable.
+type StreamLog interface {
+	// Append records ev, returning its sequence number, or 0 when ev.Dedupe
+	// named an event already in the log.
+	Append(ctx context.Context, ev domain.StreamEvent) (int64, error)
+	// Head is the highest sequence number ever assigned (0 for a fresh log).
+	Head(ctx context.Context) (int64, error)
+	// Floor is the lowest sequence number still retained (0 when empty).
+	Floor(ctx context.Context) (int64, error)
+	// Since returns up to limit events after seq, oldest first.
+	Since(ctx context.Context, after int64, limit int) ([]domain.StreamEvent, error)
+	// Seen reports whether this dedupe mark is set.
+	Seen(ctx context.Context, dedupe string) (bool, error)
+	// Prune deletes events recorded before cutoff; dedupe marks are kept.
+	Prune(ctx context.Context, cutoff time.Time) (int64, error)
+	// ForgetMarks removes the dedupe marks under prefix that keep rejects.
+	ForgetMarks(ctx context.Context, prefix string, keep func(key string) bool) (int64, error)
+}
+
 // NotifyPort surfaces escalations and critical failures to the operator.
 type NotifyPort interface {
 	Notify(ctx context.Context, title, body string) error
