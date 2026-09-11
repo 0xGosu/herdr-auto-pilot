@@ -117,7 +117,7 @@ func TestAuditAndEscalationRenderLLMConfidence(t *testing.T) {
 
 	m.tab = tabAudit
 	audit := m.View()
-	assertLineOrder(t, audit, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
+	assertLineOrder(t, audit, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "BY", "ACTION")
 	assertLineOrder(t, audit, "#1", "#1", "approval", "claude", "patient-lemur", "85", "shadow", "0.50", "auto", "auto:1")
 	if !strings.Contains(audit, "1.00") || !strings.Contains(audit, "  - ") {
 		t.Errorf("audit learned row should show computed confidence and no LLM score:\n%s", audit)
@@ -255,7 +255,7 @@ func TestEscalationAuditAndRulesListsRenderSingleHeader(t *testing.T) {
 
 	m.tab = tabAudit
 	audit := m.View()
-	assertLineOrder(t, audit, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
+	assertLineOrder(t, audit, "ID", "ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "BY", "ACTION")
 	for _, repeated := range []string{"agent=", "conf=", "llm=", "rule="} {
 		if strings.Contains(audit, repeated) {
 			t.Errorf("audit rows should not repeat label %q:\n%s", repeated, audit)

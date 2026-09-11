@@ -654,7 +654,25 @@ type AuditRecord struct {
 	// DISMISSALS (nothing was delivered there, so there is no action to
 	// attribute).
 	WhileFSPModeOn bool
-	CreatedAt      time.Time
+	// Actor names who SETTLED this row from a front end — resolved it,
+	// dismissed it, or wrote the correction lineage row — as the author that
+	// process ran under (OperatorAuthor, OrchestratorAuthor). It exists because
+	// the status cannot say so: "resolved" and "dismissed" read the same
+	// whether the operator or the orchestrator agent acted.
+	//
+	// Written in the same statement as the status it explains; a status
+	// written through Store.UpdateAuditStatus(By) always replaces it, so the
+	// daemon returning a corrected row to "escalated" clears it. The other
+	// status writers never touch it, which is safe only because none of them
+	// takes a row a front end settled. Empty on every row the daemon settles
+	// on its own (auto-sent, auto-dismissed), on an LLM retry (the queued
+	// request carries no author), and on rows predating the column — "not
+	// attributable", never a claim that the operator acted. Also empty on a
+	// row settled while a turso front end was talking to a daemon whose schema
+	// predates the column (an upgrade handoff): the store degrades to
+	// unattributed writes there rather than failing the settle.
+	Actor     string
+	CreatedAt time.Time
 }
 
 // WithSignatureBaseline stamps sig's full result onto the record — the

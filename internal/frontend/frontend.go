@@ -1086,7 +1086,11 @@ func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.Au
 	// Atomically CLAIM the escalation. Only the writer that flips
 	// escalated→resolved proceeds to the non-idempotent send, so a
 	// double-submit can never send the task twice.
-	claimed, err := a.Store.ResolveEscalation(ctx, audit.ID)
+	author := opt.author
+	if author == "" {
+		author = a.Author
+	}
+	claimed, err := a.resolveEscalationBy(ctx, audit.ID, author)
 	if err != nil {
 		return 0, err
 	}
@@ -1096,10 +1100,6 @@ func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.Au
 	// Best-effort: the escalation is already resolved and the source
 	// established, so a failed learning write must not fail the confirm — it
 	// only skips a learning event.
-	author := opt.author
-	if author == "" {
-		author = a.Author
-	}
 	corrID, corrErr := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 		AuditID: audit.ID, CorrectedAction: domain.ActionNextDeclaredTask,
 		Author: author, CreatedAt: time.Now(),
@@ -2209,7 +2209,7 @@ func (a *App) Dismiss(ctx context.Context, auditID int64) error {
 	if audit.Status != "escalated" {
 		return fmt.Errorf("audit record %d is %q, not a pending escalation", auditID, audit.Status)
 	}
-	if err := a.Store.DismissEscalation(ctx, auditID); err != nil {
+	if err := a.dismissEscalationBy(ctx, auditID, a.Author); err != nil {
 		return err
 	}
 	a.emit(ctx, domain.StreamEscalationDismissed, domain.StreamInt("id", auditID))
@@ -2282,7 +2282,7 @@ func (a *App) PruneEscalations(ctx context.Context, olderThan time.Duration) (in
 	if olderThan <= 0 {
 		return 0, fmt.Errorf("prune age must be positive, got %s", olderThan)
 	}
-	n, err := a.Store.DismissEscalationsBefore(ctx, time.Now().Add(-olderThan))
+	n, err := a.dismissEscalationsBeforeBy(ctx, time.Now().Add(-olderThan), a.Author)
 	if err != nil {
 		return 0, err
 	}
@@ -2295,7 +2295,7 @@ func (a *App) PruneEscalationsOn(ctx context.Context, olderThan time.Duration, n
 	if olderThan <= 0 {
 		return 0, fmt.Errorf("prune age must be positive, got %s", olderThan)
 	}
-	n, err := a.Store.DismissEscalationsBeforeOn(ctx, time.Now().Add(-olderThan), orSelf(a, nodeID))
+	n, err := a.dismissEscalationsBeforeOnBy(ctx, time.Now().Add(-olderThan), orSelf(a, nodeID), a.Author)
 	if err != nil {
 		return 0, err
 	}

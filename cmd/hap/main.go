@@ -288,6 +288,18 @@ func drainSubmitRetries(app *frontend.App) {
 }
 
 func buildApp(paths config.Paths) (*frontend.App, func(), error) {
+	// Who this process acts as. HAP_ACTOR can name the orchestrator, and a
+	// command run inside the orchestrator's own pane is the orchestrator
+	// whatever the environment says: that author is an LLM's, not the
+	// operator's, so the daemon screens what it sends and refuses it while the
+	// herd is paused (daemon.actionScreen), and it is named on the stream and
+	// on every escalation it settles. Resolved before anything is opened, so a
+	// mistyped value fails the command without touching the store.
+	author, err := domain.ResolveActor(os.Getenv(domain.ActorEnv),
+		daemon.CallerIsOrchestrator(paths.StateDir, os.Getenv("HERDR_PANE_ID")))
+	if err != nil {
+		return nil, nil, err
+	}
 	st, err := openProcessStore(paths)
 	if err != nil {
 		return nil, nil, err
@@ -300,18 +312,12 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 		Herdr:       herdr.NewCLI(),
 		ConfigPath:  paths.File(),
 		ControlPath: paths.ControlSocketPath(),
-		Author:      "operator",
+		Author:      author,
 		StateDir:    paths.StateDir,
 		DaemonInfo: func() (bool, int, string) {
 			return daemonlock.Info(paths)
 		},
 		Stream: events,
-	}
-	// A command the orchestrator session runs is an LLM's, not the operator's:
-	// its author makes the daemon screen what it sends and refuse it while
-	// the herd is paused (daemon.actionScreen), and names it on the stream.
-	if daemon.CallerIsOrchestrator(paths.StateDir, os.Getenv("HERDR_PANE_ID")) {
-		app.Author = domain.OrchestratorAuthor
 	}
 	// Desktop notifications only exist when herdr launched us as a managed
 	// pane — it injects HERDR_ENV=1 and the control socket there. Outside
@@ -323,6 +329,14 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 }
 
 func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []string) error {
+	// The daemon is never a front-end actor, and nothing it starts may inherit
+	// one. `hap daemon --ensure` run by an orchestrator carries its HAP_ACTOR,
+	// and every child — the detached daemon, each LLM CLI, any `hap` command
+	// those run — would otherwise act as the orchestrator for the life of the
+	// process.
+	if err := os.Unsetenv(domain.ActorEnv); err != nil {
+		return fmt.Errorf("clear %s: %w", domain.ActorEnv, err)
+	}
 	// Flags are parsed as a SET, not by position: `hap daemon --replace-only
 	// --ensure` used to fall through to the foreground daemon, which acquires
 	// the lock and blocks forever — inside scripts/install.sh that would hang

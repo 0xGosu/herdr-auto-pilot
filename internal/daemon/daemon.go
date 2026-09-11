@@ -5435,7 +5435,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		// to have been wrong ABOUT. Note this is not about an absent
 		// SUGGESTION — a suggestion-less escalation still teaches (see
 		// domain.NoSuggestionText).
-		return eff, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
+		return eff, d.markCorrectionResolved(ctx, c)
 	}
 
 	history, err := d.opt.Store.DecisionsForSignature(ctx, audit.Signature, 50)
@@ -5567,7 +5567,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 		Trigger:       domain.TriggerOperatorCorrection,
 		SituationType: audit.SituationType, Action: "corrected:" + c.CorrectedAction,
 		Input: c.CorrectedAction, Rationale: map[bool]string{true: domain.RationaleOperatorConfirmed, false: domain.RationaleOperatorCorrected}[isConfirmation],
-		CorrectsAuditID: c.AuditID, Status: "resolved", CreatedAt: now,
+		CorrectsAuditID: c.AuditID, Status: "resolved", Actor: c.Author, CreatedAt: now,
 	})
 
 	// A real CORRECTION (not a confirmation) is the one thing worth teaching the
@@ -5607,7 +5607,7 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 			Correction:    c.CorrectedAction,
 		}
 	}
-	return eff, d.opt.Store.UpdateAuditStatus(ctx, c.AuditID, "resolved")
+	return eff, d.markCorrectionResolved(ctx, c)
 }
 
 // correctionEffects are the side effects one processed correction earns, to be

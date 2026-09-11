@@ -5862,6 +5862,12 @@ func (m Model) auditDetailLines(r domain.AuditRecord, snapshot string, w int, op
 		lines = m.detailField(lines, w, "Node", m.data.status.NodeLabel(r.NodeID))
 	}
 	lines = m.detailField(lines, w, "Status", r.Status)
+	// Who settled it — the operator or the orchestrator agent. Only when the
+	// row names someone: an empty actor is "not attributable", and a line
+	// saying so on every daemon row would read as a claim.
+	if r.Actor != "" {
+		lines = m.detailField(lines, w, "Settled by", r.Actor)
+	}
 	// Only worth a line when true: it explains the amber row, and its absence
 	// on an ordinary row is not information the operator needs repeated.
 	if r.WhileFSPModeOn {
@@ -8030,22 +8036,24 @@ func (m Model) renderAudit(b *strings.Builder) {
 	// self-reported 0-100 ("-" when the row has no LLM score).
 	// The STATUS column is sized from the label width rather than hardcoded, so
 	// adding a longer status label cannot silently shift the ACTION column.
-	auditRowFmt := fmt.Sprintf("%%-6s %%-14s %%-10s %%-8s %%-15s %%4s %%-6s %%5s %%-%ds  %%s",
-		frontend.AuditStatusWidth)
+	// BY names who settled the row (frontend.AuditActorLabel): the operator or
+	// the orchestrator agent, "-" for the daemon's own rows.
+	auditRowFmt := fmt.Sprintf("%%-6s %%-14s %%-10s %%-8s %%-15s %%4s %%-6s %%5s %%-%ds %%-%ds  %%s",
+		frontend.AuditStatusWidth, frontend.AuditActorWidth)
 	// Every column before ACTION: 6+14+10+8+15+4+6+5 = 68 cells of fixed
-	// fields plus ten gap cells (eight single separators and the double before
-	// ACTION) — hand-maintained like escPrefix, so recompute it whenever a
-	// width above changes — and then the STATUS column, ADDED from
-	// frontend.AuditStatusWidth rather than folded in as a number. Folding it
-	// in is what silently defeated "adding a longer status label cannot shift
-	// the ACTION column": the constant was written for an 8-wide STATUS while
-	// AuditStatusWidth is 11, so a row whose action filled its column rendered
-	// two cells past contentWidth and WRAPPED, drawing more terminal lines
-	// than window()/listPageSize() budgeted.
-	const auditFixedPrefix = 78
-	actWidth, _ := m.budget(auditFixedPrefix+frontend.AuditStatusWidth, false)
+	// fields plus eleven gap cells (nine single separators and the double
+	// before ACTION) — hand-maintained like escPrefix, so recompute it whenever
+	// a width above changes — and then the STATUS and BY columns, ADDED from
+	// frontend.AuditStatusWidth / AuditActorWidth rather than folded in as a
+	// number. Folding one in is what silently defeated "adding a longer status
+	// label cannot shift the ACTION column": the constant was written for an
+	// 8-wide STATUS while AuditStatusWidth is 11, so a row whose action filled
+	// its column rendered two cells past contentWidth and WRAPPED, drawing more
+	// terminal lines than window()/listPageSize() budgeted.
+	const auditFixedPrefix = 79
+	actWidth, _ := m.budget(auditFixedPrefix+frontend.AuditStatusWidth+frontend.AuditActorWidth, false)
 	header := fmt.Sprintf(auditRowFmt,
-		"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "ACTION")
+		"ID", "WHEN", "SITUATION", "TYPE", "AGENT", "LLM", "RULE", "CONF", "STATUS", "BY", "ACTION")
 	fmt.Fprintln(b, m.styles().section.Render(header))
 	start, end := m.window(len(rows))
 	for i := start; i < end; i++ {
@@ -8058,7 +8066,7 @@ func (m Model) renderAudit(b *strings.Builder) {
 			shortAuditID(r.ID), humanizeWhen(r.CreatedAt, m.renderNow()),
 			r.SituationType, oneLine(orDash(m.agentTypeFor(r)), 8), oneLine(orDash(agent), agentNameColWidth),
 			llmConfShort(r.LLMConfidence), m.ruleMarker(r.Signature), frontend.ConfidenceLabel(r.Confidence),
-			frontend.AuditStatusLabel(r),
+			frontend.AuditStatusLabel(r), frontend.AuditActorLabel(r),
 			oneLine(r.Action, actWidth))
 		if st, ok := auditRowStyle(m.styles(), r, i == m.cursors[m.tab]); ok {
 			line = st.Render(line)

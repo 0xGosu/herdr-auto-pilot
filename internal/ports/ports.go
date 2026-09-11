@@ -217,6 +217,18 @@ type EscalationAttentionLister interface {
 	EscalationsAwaitingAttention(ctx context.Context, afterID int64, limit int) ([]domain.AuditRecord, error)
 }
 
+// AuditActorWriter is the OPTIONAL store capability that settles an audit row
+// AND names who settled it (domain.AuditRecord.Actor) in the same statement —
+// the same guards and return values as the StorePort method each one extends.
+// Display-only: a store without it settles the row unattributed.
+type AuditActorWriter interface {
+	ResolveEscalationBy(ctx context.Context, auditID int64, actor string) (bool, error)
+	DismissEscalationBy(ctx context.Context, auditID int64, actor string) error
+	UpdateAuditStatusBy(ctx context.Context, auditID int64, status, actor string) error
+	DismissEscalationsBeforeBy(ctx context.Context, cutoff time.Time, actor string) (int64, error)
+	DismissEscalationsBeforeOnBy(ctx context.Context, cutoff time.Time, nodeID, actor string) (int64, error)
+}
+
 // StreamLog is the machine-local orchestrator event log behind
 // `hap stream orchestrator` (internal/streamlog).
 //

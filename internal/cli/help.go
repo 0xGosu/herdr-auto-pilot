@@ -557,10 +557,14 @@ func buildCommands() {
 				{Name: "--limit", Arg: "N", Default: "30", Desc: "number of records, newest first"},
 			},
 			Details: "Columns: #id, time, status, situation type, action, confidence, LLM score,\n" +
-				"rule mode, rationale, agent, node. This is the record to read when something\n" +
+				"rule mode, rationale, agent, by, node. This is the record to read when something\n" +
 				"was answered automatically and you want to know why. On a fleet, agent= reads\n" +
 				"name@node for another machine's row — a herdr pane id repeats across machines,\n" +
-				"so the name alone is not an identity.",
+				"so the name alone is not an identity.\n\n" +
+				"by= names who settled the row from a front end: operator, or orchestrator for\n" +
+				"the orchestrator agent (or a command run with HAP_ACTOR=orchestrator). by=-\n" +
+				"names nobody — hap's own rows, LLM retries, and rows written before this was\n" +
+				"recorded.",
 			Examples: []string{"hap audit", "hap audit --limit 100"},
 			Next: []Hint{
 				{Cmd: "hap signatures show <prefix>", Why: "inspect the rule behind a row"},
@@ -697,7 +701,10 @@ func buildCommands() {
 				"above the head (the log was reset) prints `# reset …` and follows from the head.\n\n" +
 				"The log is per machine: an action taken on another node of a shared fleet\n" +
 				"appears in that machine's stream, and a hand edit to config.toml or to a task\n" +
-				"file outside hap is not an event.",
+				"file outside hap is not an event.\n\n" +
+				"An orchestrating agent hap did not start itself should run its own hap\n" +
+				"commands with HAP_ACTOR=orchestrator, so they read by=orchestrator here and in\n" +
+				"`hap audit`, and get the orchestrator's screening and pause refusal.",
 			Examples: []string{"hap stream orchestrator", "hap stream orchestrator --resume 1024"},
 			// Every line is for a machine to read; a footer on exit is noise.
 			Bare:    true,
@@ -1364,6 +1371,8 @@ func Overview(out io.Writer) {
 	fmt.Fprintln(out, "    `hap config set cli.ai_agent_friendly_output false` (default true).")
 	fmt.Fprintln(out, "  - Listings are tab-separated; ids shown as #N are passed without the #.")
 	fmt.Fprintln(out, "  - `hap status` exits non-zero when the daemon is unhealthy.")
+	fmt.Fprintln(out, "  - An orchestrating agent runs hap as HAP_ACTOR=orchestrator, so its decisions")
+	fmt.Fprintln(out, "    are recorded as the orchestrator's, not the operator's.")
 
 	PrintNextSteps(out, []Hint{
 		{Cmd: "hap help <command>", Why: "full guide for one command, with every flag"},
