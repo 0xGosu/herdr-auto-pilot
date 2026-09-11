@@ -779,3 +779,40 @@ What shipped, and where it deliberately departs from §4:
   agy-specific code. The TUI's skill shortcut label names agy.
 - **fakeherdr.** It already carries any agent label verbatim (`AddAgentPane(pane, ws, "agy")`),
   so only its comment changed.
+
+## 12. Phase 5 as built (real-agy integration cases)
+
+`test/integration/agy_test.go`, gated on `HAP_ITEST_AGY=1`. It uses the cheapest model,
+overridable with `HAP_ITEST_AGY_MODEL`. Each case starts agy in a scratch workspace of its own,
+clears the trust prompt through the production parser, and begins only at a proven empty
+composer.
+
+| Case | Proves | Tokens |
+|---|---|---|
+| `TestRealAgyDetection` | herdr labels the pane agy; a fresh screen classifies idle; `AgyComposerReady`; the mode reads | none |
+| `TestRealAgyApprovalConfirm` | a live `touch` approval, confirmed through a daemon of its own (`hap confirm --send`), runs the command: the digit alone landed | one turn |
+| `TestRealAgyChoiceConfirm` | a live question form commits `Banana` and closes | one turn |
+| `TestRealAgyTaskHandout` | the operator hand-out (`hap task send`) is refused over a draft with the list untouched, then delivered at an empty composer and answered | one turn |
+| `TestRealAgyModeToggle` | the cycle is exactly `default → acceptEdits → plan`, every mode is reached by `SetAgentMode`, and a draft refuses the set with the mode unchanged | none |
+
+All five pass live (agy 1.2.1, herdr 0.8.2). Found and fixed on the way:
+
+- **The suite opened its agents beside the operator.** `newScratchPane` ran `tab create` with
+  no `--workspace`, which lands in whatever workspace the UI has focused. It now creates a
+  workspace per case and closes it afterwards. This applies to the claude and codex cases too.
+- **The operator hand-out lost an id-keyed source's template.**
+  `frontend.taskSourceRenderFor` matched `[[task_sources]] agent` against the agent's name
+  only, while the config documents "agent id or name". An id-keyed source's hand-out went out
+  under the default template, and agy then asked to run the `hap task` command that template
+  carries. It now matches both.
+- **The mode cases could never pass.** `modeApp` gave the front end a store no daemon writes,
+  so the roster gate (#386) refused every target. It now publishes herdr's listing, which is
+  also what `TestRealClaudeModeCycle` had been failing on.
+
+Two constraints of a working machine shape these cases:
+
+- **The operator's own daemon watches the scratch panes.** From 0.9.19 on it answers agy forms,
+  so each case `hap disable`s its pane (`quietOperatorDaemon`).
+- **That daemon also reads `--source recent`.** That source is a delta every reader consumes,
+  so the hand-out case uses the operator path, which reads `--source visible` only, rather than
+  the idle poll. The poll's agy gate stays covered by the daemon unit suite.

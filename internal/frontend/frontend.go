@@ -4473,7 +4473,7 @@ func (a *App) SendTaskForOperator(ctx context.Context, p domain.SendTaskPayload,
 	// an item that came from a different list would pair one source's text with
 	// another's template — the hazard the TUI used to guard with its own
 	// "task sources changed" snapshot check.
-	template, sourceIndex, err := a.taskSourceRenderFor(agentName, p.Locator)
+	template, sourceIndex, err := a.taskSourceRenderFor(agentID, agentName, p.Locator)
 	if err != nil {
 		return err
 	}
@@ -4577,14 +4577,19 @@ func (a *App) terminalIDFor(ctx context.Context, nodeID, target string) (string,
 // printed {task_source_index} differs. An agent whose sources do not include
 // the locator (a --path hand-out, say) gets the default template and no index,
 // and the prompt then addresses the list by the agent's name.
-func (a *App) taskSourceRenderFor(agentName, locator string) (template, sourceIndex string, err error) {
+//
+// A source names its agent by id OR name (config.TaskSource.Agent), so both
+// are matched: comparing the name alone dropped the template and index of
+// every source keyed by pane id, and the hand-out went out under the default
+// template instead (found by TestRealAgyTaskHandout).
+func (a *App) taskSourceRenderFor(agentID, agentName, locator string) (template, sourceIndex string, err error) {
 	cfg, err := a.Config()
 	if err != nil {
 		return "", "", err
 	}
 	want := tasklocator.Canonical(locator)
 	for i, src := range cfg.TaskSources {
-		if src.Agent != agentName {
+		if src.Agent == "" || (src.Agent != agentName && src.Agent != agentID) {
 			continue
 		}
 		if a.sourceLocatorMatches(cfg, src, agentName, want) {

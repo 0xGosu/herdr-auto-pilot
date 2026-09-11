@@ -1710,6 +1710,33 @@ func TestConfirmGeneratedTaskUsesSourceTemplate(t *testing.T) {
 	}
 }
 
+// TestSendTaskUsesTheTemplateOfASourceKeyedByPaneID: a task source may name its
+// agent by pane id as well as by name, and the operator hand-out must find its
+// template either way. It matched the name alone, so an id-keyed source's
+// hand-out went out under the DEFAULT template — found live by
+// TestRealAgyTaskHandout, where agy then asked to run the `hap task` command
+// that template carries.
+func TestSendTaskUsesTheTemplateOfASourceKeyedByPaneID(t *testing.T) {
+	app, st := localFSApp(t)
+	fake := &fakeHerdr{}
+	app.Herdr = fake
+	ctx := context.Background()
+	name, _ := st.EnsureAgentName(ctx, "w1:p1")
+	path := filepath.Join(t.TempDir(), "tasks.md")
+	if err := os.WriteFile(path, []byte("- [ ] Ship it\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.AddTaskSource(ctx, "w1:p1", "", path, "DO {next_task_content}"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sendTask(app, ctx, "w1:p1", "claude", name, path, 1, "Ship it"); err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.inputs) != 1 || fake.inputs[0] != "DO Ship it" {
+		t.Errorf("delivered %v, want the id-keyed source's template %q", fake.inputs, "DO Ship it")
+	}
+}
+
 func TestConfirmGeneratedTaskAppendCreatesMissingDeclaredFile(t *testing.T) {
 	// A declared source whose file does not exist yet still receives the
 	// tasks at ITS path — never a second bootstrap source.
