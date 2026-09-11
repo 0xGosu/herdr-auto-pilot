@@ -1906,6 +1906,7 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		frontend.FSPAcceptGeneratedTaskFieldKey,
 		frontend.FSPOrchestratorCommandFieldKey,
 		frontend.FSPOrchestratorPromptFieldKey,
+		frontend.FSPOrchestratorCwdFieldKey,
 	}
 	var items []ruleItem
 	for _, key := range fspKeys {

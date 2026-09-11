@@ -129,6 +129,11 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # Replace the built-in brief sent to the orchestrator once it is ready;
 # {self} expands to this hap binary's path.
 #orchestrator_agent_prompt = ""
+#
+# The orchestrator session's working directory: an absolute path (~ and
+# $VAR expand) that must already exist. Empty is <state>/orchestrator,
+# created on demand. Read when the session is created.
+#orchestrator_agent_cwd = ""
 
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.

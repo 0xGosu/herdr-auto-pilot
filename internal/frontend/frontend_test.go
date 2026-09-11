@@ -2293,6 +2293,10 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"full_self_prompting.orchestrator_agent_command", "codex exec", true},
 		{"full_self_prompting.orchestrator_agent_command", "", false},
 		{"full_self_prompting.orchestrator_agent_prompt", "Keep the herd moving.", false},
+		{"full_self_prompting.orchestrator_agent_cwd", "/srv/orchestrator", false},
+		{"full_self_prompting.orchestrator_agent_cwd", "~/orchestrator", false},
+		{"full_self_prompting.orchestrator_agent_cwd", "relative/dir", true},
+		{"full_self_prompting.orchestrator_agent_cwd", "", false},
 		{"llm.enable_rewrite_action", "true", false},
 		{"llm.enable_rewrite_action", "maybe", true},
 		{"llm.rewrite_action_fallback_template", "Act on: {original_text}", false},
@@ -2373,6 +2377,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"full_self_prompting.accept_generated_task":      "true",
 		"full_self_prompting.orchestrator_agent_command": "claude --model opus",
 		"full_self_prompting.orchestrator_agent_prompt":  "Keep the herd moving.",
+		"full_self_prompting.orchestrator_agent_cwd":     "/srv/orchestrator",
 		"safety.disable_never_auto_seed_patterns":        "true",
 		"llm.command":                          `claude -p "decide"`,
 		"llm.timeout_seconds":                  "60",
@@ -2549,6 +2554,7 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 	readOnly := map[string]bool{
 		"full_self_prompting.orchestrator_agent_command": true,
 		"full_self_prompting.orchestrator_agent_prompt":  true,
+		"full_self_prompting.orchestrator_agent_cwd":     true,
 		"llm.command":                          true,
 		"llm.rewrite_action_fallback_template": true,
 		"llm.task_generate_command":            true,
@@ -5136,6 +5142,7 @@ var configKeysExemptFromRegistry = map[string]string{
 	"escalations.full_self_prompting.honour_limits":             "deprecated alias for full_self_prompting.honour_limits",
 	"escalations.full_self_prompting.accept_generated_task":     "deprecated alias for full_self_prompting.accept_generated_task",
 	"escalations.full_self_prompting.orchestrator_agent_prompt": "deprecated alias for full_self_prompting.orchestrator_agent_prompt",
+	"escalations.full_self_prompting.orchestrator_agent_cwd":    "deprecated alias for full_self_prompting.orchestrator_agent_cwd",
 }
 
 // tomlScalarKeys reports every key BurntSushi/toml would accept as a SCALAR

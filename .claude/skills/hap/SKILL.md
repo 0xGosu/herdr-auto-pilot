@@ -512,6 +512,7 @@ tab-separated stdout is unaffected.
 | `full_self_prompting.accept_generated_task` | false | also act on an idle escalation whose suggestion is an LLM-generated task |
 | `full_self_prompting.orchestrator_agent_command` | (disabled) | keep an interactive `orchestrator` claude session alive while the mode is on (`--preset claude`) |
 | `full_self_prompting.orchestrator_agent_prompt` | (built-in brief) | replace the brief sent to the orchestrator; `{self}` = this hap binary |
+| `full_self_prompting.orchestrator_agent_cwd` | `<state>/orchestrator` | the orchestrator's working directory: absolute (`~`/`$VAR` expand), must exist; read at creation |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic rule |
 | `llm.command` | (disabled) | argv for the consult CLI; this key alone gates the LLM fallback |
 | `llm.timeout_seconds` | 60 | timeout for one consult |
@@ -1230,11 +1231,15 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
 ```
 
 - It runs as the herdr agent **`orchestrator`** (also its hap name) in its own
-  **`hap-orchestrator`** workspace, cwd `<state>/orchestrator`. An existing agent
-  of that name is adopted, never duplicated — and never briefed.
+  **`hap-orchestrator`** workspace, cwd `<state>/orchestrator` (or
+  `full_self_prompting.orchestrator_agent_cwd`, which must already exist). An
+  existing agent of that name is adopted, never duplicated — and never briefed.
 - Once its composer is ready the daemon sends it a brief (load `hap --skill` and
-  `herdr --skill`, run `Monitor` on `hap stream orchestrator`, how to act, what
-  never to do). Replace it with `full_self_prompting.orchestrator_agent_prompt`.
+  `herdr --skill`, run `Monitor` on `hap stream orchestrator`, schedule an hourly
+  `CronCreate` health check of `hap status` / `hap agents` that restarts a stopped
+  daemon with `hap daemon --ensure` — deleted on `fsp.off`, re-created on
+  `fsp.on` — how to act, what never to do). Replace it with
+  `full_self_prompting.orchestrator_agent_prompt`.
   **Type your goals into that session.** If claude shows a first-run prompt
   (trusting the new directory), answer it once — hap never types into a modal.
 - **hap ignores it completely**: no capture, classification, escalation, audit

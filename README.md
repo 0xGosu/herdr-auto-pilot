@@ -1585,7 +1585,11 @@ self-prompting is on, the daemon keeps an interactive claude session named
 `orchestrator` alive in its own `hap-orchestrator` herdr workspace: briefed to
 watch that stream and unblock the herd toward the goals you type into it, and
 ignored by hap entirely (highlighted on the TUI Agents tab). It is re-created if
-it disappears — at most 3 times an hour — and never closed by hap.
+it disappears — at most 3 times an hour — and never closed by hap. Its brief also
+has it schedule an hourly health check (Claude's `CronCreate`) that restarts a
+stopped hap daemon and looks in on hung agents, removed while the mode is off. It
+runs in `<state>/orchestrator` unless `full_self_prompting.orchestrator_agent_cwd`
+names another existing directory.
 
 ## Pause/kill switch & audit
 

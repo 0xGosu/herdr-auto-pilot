@@ -188,6 +188,11 @@ type FullSelfPrompting struct {
 	// orchestrator once it is ready. {self} expands to this hap binary's path.
 	// Empty means the built-in brief.
 	OrchestratorAgentPrompt string `toml:"orchestrator_agent_prompt,omitempty"`
+	// OrchestratorAgentCwd is the orchestrator session's working directory: an
+	// absolute path, ~ and $VAR expanded, which must already exist. Empty
+	// means <state>/orchestrator, created on demand. Read when the session is
+	// CREATED, so changing it does not move a running one.
+	OrchestratorAgentCwd string `toml:"orchestrator_agent_cwd,omitempty"`
 }
 
 // OrchestratorConfigured reports whether an orchestrator command is set.

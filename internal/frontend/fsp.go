@@ -37,6 +37,7 @@ const (
 const (
 	FSPOrchestratorCommandFieldKey = "full_self_prompting.orchestrator_agent_command"
 	FSPOrchestratorPromptFieldKey  = "full_self_prompting.orchestrator_agent_prompt"
+	FSPOrchestratorCwdFieldKey     = "full_self_prompting.orchestrator_agent_cwd"
 )
 
 // DeprecatedFSPFieldKey is the pre-move spelling. It is NOT registered — it may

@@ -276,6 +276,9 @@ func TestOrchestratorConfigKeysRoundTrip(t *testing.T) {
 	if got := frontend.FieldValue(cfg, frontend.FSPOrchestratorPromptFieldKey); got != "(built-in brief)" {
 		t.Errorf("unset prompt renders %q", got)
 	}
+	if got := frontend.FieldValue(cfg, frontend.FSPOrchestratorCwdFieldKey); got != "(default: <state>/orchestrator)" {
+		t.Errorf("unset cwd renders %q", got)
+	}
 	if _, err := app.SetField(ctx, frontend.FSPOrchestratorCommandFieldKey, "claude --model opus"); err != nil {
 		t.Fatal(err)
 	}

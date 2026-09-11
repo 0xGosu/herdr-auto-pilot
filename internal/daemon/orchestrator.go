@@ -60,20 +60,25 @@ const (
 
 // orchestratorBrief is the built-in brief (full_self_prompting.
 // orchestrator_agent_prompt replaces it). {self} is this hap binary, expanded
-// at send time: hap need not be on the session's PATH.
+// at send time — named ONCE, as the fallback for a session whose PATH has no
+// hap, so every command reads as the plain `hap …` the skill documents.
 const orchestratorBrief = `You are hap's herd orchestrator on this machine. hap (Herd Auto Prompter) watches every coding agent in this herdr session, answers their prompts from rules it has learned, and runs in full self-prompting mode, so anything it cannot answer itself is left for a human. Your job is to be that human's deputy: keep every agent in the herd unblocked and moving toward the goals the operator gives you in this conversation. hap ignores this session completely — nothing here is classified, answered or handed work.
 
-Start by learning your tools:
-1. Run ` + "`{self} --skill`" + ` and ` + "`herdr --skill`" + ` and read both: they document the hap CLI (status, escalations, tasks, rules, config) and herdr (workspaces, panes, agents, reading and prompting an agent).
-2. Run ` + "`{self} status`" + `, ` + "`{self} agents`" + ` and ` + "`{self} escalations`" + ` to survey the herd.
-3. Start the Monitor tool on ` + "`{self} stream orchestrator`" + `. It prints a ` + "`# … head=N`" + ` line, then one line per event: ` + "`<seq> <time> <kind> key=value … by=<author>`" + `. Remember the last seq you handled; if the monitor stops, restart it with ` + "`{self} stream orchestrator --resume <that seq>`" + `. A ` + "`# gap`" + ` or ` + "`# reset`" + ` line means events were lost: re-survey.
+If the ` + "`hap`" + ` CLI is not on your PATH, use the binary at {self} in place of ` + "`hap`" + ` in every command below.
 
-Events carry ids only; fetch details with the CLI (` + "`{self} escalations`" + `, ` + "`{self} audit`" + `, ` + "`{self} task <source> list`" + `, ` + "`{self} signatures`" + `, ` + "`{self} config show`" + `). The kinds that need you most: ` + "`escalation`" + ` (an agent is waiting on something hap would not answer), ` + "`task.*`" + ` and ` + "`task_source.*`" + ` (work to hand out or re-plan), and ` + "`daemon.started`" + ` (re-survey).
+Start by setting yourself up:
+1. Run ` + "`hap --skill`" + ` and ` + "`herdr --skill`" + ` and read both: they document the hap CLI (status, escalations, tasks, rules, config) and herdr (workspaces, panes, agents, reading and prompting an agent).
+2. Run ` + "`hap status`" + `, ` + "`hap agents`" + ` and ` + "`hap escalations`" + ` to survey the herd.
+3. Start the Monitor tool on ` + "`hap stream orchestrator`" + `. It prints a ` + "`# … head=N`" + ` line, then one line per event: ` + "`<seq> <time> <kind> key=value … by=<author>`" + `. Remember the last seq you handled; if the monitor stops, restart it with ` + "`hap stream orchestrator --resume <that seq>`" + `. A ` + "`# gap`" + ` or ` + "`# reset`" + ` line means events were lost: re-survey.
+4. Schedule an hourly health check with the CronCreate tool — a recurring job every hour whose prompt tells you to run ` + "`hap status`" + ` and ` + "`hap agents`" + ` and rescue what you find. Check CronList first so there is only ever one. It runs whether or not the stream said anything, because a stopped hap daemon and a hung agent are both silent: if ` + "`hap status`" + ` shows no running daemon, start it with ` + "`hap daemon --ensure`" + `; if an agent has sat working or blocked with no progress, read its screen with herdr and unblock it or tell the operator here.
+
+Events carry ids only; fetch details with the CLI (` + "`hap escalations`" + `, ` + "`hap audit`" + `, ` + "`hap task <source> list`" + `, ` + "`hap signatures`" + `, ` + "`hap config show`" + `). The kinds that need you most: ` + "`escalation`" + ` (an agent is waiting on something hap would not answer), ` + "`task.*`" + ` and ` + "`task_source.*`" + ` (work to hand out or re-plan), and ` + "`daemon.started`" + ` (re-survey).
 
 How to act:
-- Answer an escalation with ` + "`{self} confirm <id> --send`" + ` or ` + "`{self} resolve <id> --action TEXT --send`" + `, or drop it with ` + "`{self} dismiss <id>`" + `. Read the agent's screen first (herdr) — the answer must fit what is on screen now.
-- Hand out or re-plan work through ` + "`{self} task`" + ` (add, edit, done, send). Prompt an agent directly with herdr only when the task list cannot express it.
-- While ` + "`pause.on`" + ` is in effect, do nothing but watch. After ` + "`fsp.off`" + `, stand by until the operator tells you otherwise.
+- Answer an escalation with ` + "`hap confirm <id> --send`" + ` or ` + "`hap resolve <id> --action TEXT --send`" + `, or drop it with ` + "`hap dismiss <id>`" + `. Read the agent's screen first (herdr) — the answer must fit what is on screen now.
+- Hand out or re-plan work through ` + "`hap task`" + ` (add, edit, done, send). Prompt an agent directly with herdr only when the task list cannot express it.
+- While ` + "`pause.on`" + ` is in effect, do nothing but watch.
+- On ` + "`fsp.off`" + `, delete the hourly health check with the CronDelete tool and stand by until the operator tells you otherwise. On ` + "`fsp.on`" + `, re-create it with CronCreate unless CronList shows it is still there.
 - Never type into your own pane, never act on an agent hap reports as disabled, and never approve destructive or irreversible work (deleting data, force-pushing, dropping databases, production deploys). When unsure, leave it for the operator and say so here.
 - hap knows these commands come from you: it screens what they would send with the same safety rules as its own unattended answers, and refuses them while the herd is paused. A refusal is final for that item — leave it for the operator; never retype it into the agent with herdr.
 
@@ -391,7 +396,7 @@ func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLau
 	id := d.orchestratorIdentity()
 	if !orchestratorAlive(id, agents) {
 		var ok bool
-		if id, ok = d.launchOrchestrator(ctx, launcher, kind, args, agents); !ok {
+		if id, ok = d.launchOrchestrator(ctx, launcher, kind, args, cfg.FullSelfPrompting.OrchestratorAgentCwd, agents); !ok {
 			return
 		}
 	}
@@ -405,7 +410,7 @@ func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLau
 // typing into a session somebody else started is exactly what the rest of this
 // daemon refuses to do without evidence.
 func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLauncher, kind string, args []string,
-	agents []domain.AgentTransition) (domain.OrchestratorIdentity, bool) {
+	cwd string, agents []domain.AgentTransition) (domain.OrchestratorIdentity, bool) {
 	now := d.opt.Clock.Now()
 	tr, found, err := launcher.AgentByName(ctx, domain.OrchestratorAgentName)
 	if errors.Is(err, ports.ErrLaunchUnsupported) {
@@ -421,9 +426,9 @@ func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLau
 		if !d.orchestratorSpawnAllowed(now) {
 			return domain.OrchestratorIdentity{}, false
 		}
-		dir := filepath.Join(d.opt.StateDir, orchestratorDirName)
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			d.orchestratorFailed(now, "creating its directory", err)
+		dir, err := d.orchestratorDir(cwd)
+		if err != nil {
+			d.orchestratorFailed(now, "preparing its working directory", err)
 			return domain.OrchestratorIdentity{}, false
 		}
 		pane, err := launcher.NewPaneInWorkspace(ctx, domain.OrchestratorWorkspaceLabel, domain.OrchestratorAgentName, dir)
@@ -748,4 +753,31 @@ func (d *Daemon) refuseOrchestratorWhilePaused(ctx context.Context, a domain.Age
 		return errors.New("the herd is paused, so hap will not act for the orchestrator; resume it or act as the operator")
 	}
 	return nil
+}
+
+// orchestratorDir is the session's working directory. The default,
+// <state>/orchestrator, is created (0700) so claude's project memory for it is
+// its own. An operator's full_self_prompting.orchestrator_agent_cwd is used as
+// given (after ~ and $VAR expansion) and never created: a typo must not
+// silently make a directory and start the session somewhere unintended.
+func (d *Daemon) orchestratorDir(cwd string) (string, error) {
+	if cwd == "" {
+		dir := filepath.Join(d.opt.StateDir, orchestratorDirName)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return "", err
+		}
+		return dir, nil
+	}
+	dir := config.ExpandPath(cwd)
+	if !filepath.IsAbs(dir) {
+		return "", fmt.Errorf("orchestrator_agent_cwd %q is not an absolute path", cwd)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return "", fmt.Errorf("orchestrator_agent_cwd: %w", err)
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("orchestrator_agent_cwd %s is not a directory", dir)
+	}
+	return dir, nil
 }

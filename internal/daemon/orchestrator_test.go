@@ -227,8 +227,9 @@ func TestOrchestratorIsStartedNamedDisabledAndBriefed(t *testing.T) {
 		t.Errorf("disabled = %v (%v), want true", disabled, err)
 	}
 	brief := h.herdr.sentInputs()[0]
-	if !strings.Contains(brief, "/opt/hap/bin/hap stream orchestrator") || strings.Contains(brief, "{self}") {
-		t.Errorf("brief did not expand {self}:\n%s", brief)
+	if strings.Count(brief, "/opt/hap/bin/hap") != 1 || strings.Contains(brief, "{self}") ||
+		!strings.Contains(brief, "`hap stream orchestrator`") {
+		t.Errorf("brief must name the binary once, as the PATH fallback, and say plain `hap` elsewhere:\n%s", brief)
 	}
 
 	// A later pass over a listing that holds the live, briefed session does
@@ -642,4 +643,46 @@ func TestOrchestratorIdentitySurvivesARestart(t *testing.T) {
 		t.Fatal("a restarted daemon forgot the orchestrator")
 	}
 	_ = h
+}
+
+// The built-in brief names the binary ONCE (the PATH fallback) and sets up the
+// hourly health check that notices a stopped daemon or a hung agent, torn
+// down on fsp.off and re-created on fsp.on.
+func TestOrchestratorBriefShape(t *testing.T) {
+	if n := strings.Count(orchestratorBrief, "{self}"); n != 1 {
+		t.Fatalf("{self} appears %d times, want once", n)
+	}
+	for _, want := range []string{
+		"`hap --skill`", "`hap stream orchestrator`", "CronCreate", "CronList", "CronDelete",
+		"`hap daemon --ensure`", "`fsp.off`", "`fsp.on`",
+	} {
+		if !strings.Contains(orchestratorBrief, want) {
+			t.Errorf("the brief does not mention %s", want)
+		}
+	}
+}
+
+// An operator's working directory is where the session starts; one that does
+// not exist is never created — the start fails and backs off instead.
+func TestOrchestratorUsesTheConfiguredCwd(t *testing.T) {
+	h, l, _ := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+	dir := t.TempDir()
+	cfg.FullSelfPrompting.OrchestratorAgentCwd = dir
+	h.daemon.ensureOrchestrator(context.Background(), l, cfg, nil)
+	if created, _, _ := l.snapshot(); len(created) != 1 || !strings.HasSuffix(created[0], "|"+dir) {
+		t.Fatalf("panes created = %q, want one in %s", created, dir)
+	}
+
+	h2, l2, _ := newOrchHarness(t, "", nil)
+	cfg2 := orchestratorModeOnIn(h2)
+	missing := filepath.Join(t.TempDir(), "not-there")
+	cfg2.FullSelfPrompting.OrchestratorAgentCwd = missing
+	h2.daemon.ensureOrchestrator(context.Background(), l2, cfg2, nil)
+	if created, _, _ := l2.snapshot(); len(created) != 0 {
+		t.Fatalf("started in a directory that does not exist: %q", created)
+	}
+	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the missing working directory was created (%v)", err)
+	}
 }

@@ -2403,6 +2403,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: FSPAcceptGeneratedTaskFieldKey, TUIEditable: true},
 	{Key: FSPOrchestratorCommandFieldKey},
 	{Key: FSPOrchestratorPromptFieldKey},
+	{Key: FSPOrchestratorCwdFieldKey},
 	{Key: "confidence_thresholds.minimum", TUIEditable: true},
 	{Key: "confidence_thresholds.idle", TUIEditable: true},
 	{Key: "confidence_thresholds.approval", TUIEditable: true},
@@ -2717,6 +2718,11 @@ func FieldValue(cfg config.Config, key string) string {
 			return "(built-in brief)"
 		}
 		return cfg.FullSelfPrompting.OrchestratorAgentPrompt
+	case FSPOrchestratorCwdFieldKey:
+		if cfg.FullSelfPrompting.OrchestratorAgentCwd == "" {
+			return "(default: <state>/orchestrator)"
+		}
+		return cfg.FullSelfPrompting.OrchestratorAgentCwd
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -3055,6 +3061,15 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			return nil
 		case FSPOrchestratorPromptFieldKey:
 			cfg.FullSelfPrompting.OrchestratorAgentPrompt = value // empty restores the built-in brief
+			return nil
+		case FSPOrchestratorCwdFieldKey:
+			// Stored as typed (~ and $VAR expand at use, like every other path
+			// key), but it must be absolute once expanded: a relative path
+			// would resolve against whatever directory the daemon runs in.
+			if value != "" && !filepath.IsAbs(config.ExpandPath(value)) {
+				return fmt.Errorf("%s: %q is not an absolute path (~ and $VAR are fine)", key, value)
+			}
+			cfg.FullSelfPrompting.OrchestratorAgentCwd = value // empty restores <state>/orchestrator
 			return nil
 		case "escalations.auto_accept.approval":
 			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)
