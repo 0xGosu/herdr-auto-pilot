@@ -109,3 +109,76 @@ func TestASettledHerdBacksTheRosterTickOff(t *testing.T) {
 	t.Cleanup(session.Release)
 	expect(at+8.5, 10, "a TUI that just opened gets a listing before the old wait ran out")
 }
+
+// TestATUIReopenedUnderARemoteWatcherStartsFast: the fast-tick reset for a TUI
+// that has just opened must see a transition from ANY other demand, including
+// one whose ticks all left early — a remote watcher's pacing returns before a
+// listing, and a level recorded only on a listing kept reading "local" there.
+func TestATUIReopenedUnderARemoteWatcherStartsFast(t *testing.T) {
+	dir := t.TempDir()
+	session, err := tuisession.Register(dir)
+	if err != nil {
+		t.Skipf("cannot register a TUI session here: %v", err)
+	}
+	dbPath := filepath.Join(dir, "test.db")
+	raw, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+	fh := &fakeHerdr{}
+	fh.setAgents([]domain.AgentTransition{{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude", Status: "idle"}})
+	start := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	clock := &stepClock{now: start}
+	d := &Daemon{opt: Options{StateDir: dir, Store: raw, Herdr: fh, Clock: clock}}
+	ctx := context.Background()
+	tickAt := func(sec float64) int {
+		t.Helper()
+		clock.set(start.Add(time.Duration(sec * float64(time.Second))))
+		d.startRosterTickPass(ctx)
+		waitFor(t, 2*time.Second, func() bool {
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			return !d.rosterTickRunning
+		})
+		return fh.listAgentsCallCount()
+	}
+	// Backed off: listings at 0, 2, 6 — the next is due at 14.
+	for _, sec := range []float64{0, 2, 6} {
+		tickAt(sec)
+	}
+	if got := fh.listAgentsCallCount(); got != 3 {
+		t.Fatalf("%d listings while backing off, want 3", got)
+	}
+
+	// The local TUI closes while another node's TUI is watching.
+	session.Release()
+	other, err := store.OpenAs(dbPath, otherNodeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { other.Close() })
+	if err := other.StampWatching(ctx, start.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	expireRemoteWatchers(d)
+	if got := tickAt(7); got != 3 {
+		t.Fatalf("remote pacing listed again inside its interval (%d listings)", got)
+	}
+	d.mu.Lock()
+	level := d.rosterTickLevel
+	d.mu.Unlock()
+	if level != rosterDemandRemote {
+		t.Fatalf("the remote tick recorded demand %v, want remote", level)
+	}
+
+	// Reopened before the old wait (14) ran out: it must list at once.
+	session, err = tuisession.Register(dir)
+	if err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	t.Cleanup(session.Release)
+	if got := tickAt(8); got != 4 {
+		t.Errorf("a TUI reopened under a remote watcher waited out the old backoff (%d listings, want 4)", got)
+	}
+}

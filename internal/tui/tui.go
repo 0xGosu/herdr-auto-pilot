@@ -98,7 +98,12 @@ type refreshMsg struct {
 	// anything, "" when the App cannot tell. Sampling first means a change
 	// landing mid-read costs one extra refresh, never a missed one.
 	changeKey string
-	err       error
+	// polledAt is the tick (or keypress) that asked for this refresh — what
+	// the backstop measures from, since the next tick is scheduled from the
+	// same moment. Stamping arrival instead made every other slow tick a
+	// probe: the next one lands 30s after the ask, under 30s after arrival.
+	polledAt time.Time
+	err      error
 }
 
 // probeMsg is a poll that found nothing changed (frontend.App.ChangeKey held
@@ -1751,7 +1756,10 @@ func (m Model) clockInterval(now time.Time) time.Duration {
 	return fastClockInterval
 }
 
-func (m Model) refresh() tea.Cmd {
+func (m Model) refresh() tea.Cmd { return m.refreshAt(time.Now()) }
+
+// refreshAt is refresh for a poll asked for at now.
+func (m Model) refreshAt(now time.Time) tea.Cmd {
 	app, ctx := m.app, m.ctx
 	// Only the agent whose detail overlay is OPEN needs its permission mode: it
 	// is the sole place the TUI renders one, and reading it costs a `herdr pane
@@ -1767,6 +1775,7 @@ func (m Model) refresh() tea.Cmd {
 		if ok {
 			msg.changeKey = key
 		}
+		msg.polledAt = now
 		return msg
 	}
 }
@@ -1775,7 +1784,9 @@ func (m Model) refresh() tea.Cmd {
 // refresh derives from the CLOCK rather than from stored data — roster
 // freshness, the update check's due time, the model file's presence — moves
 // with no write to key on, so it is re-read on this schedule. It matches the
-// idle poll, so a backed-off TUI re-reads on every tick exactly as before.
+// idle poll, so a backed-off TUI re-reads on every tick exactly as before —
+// which holds because it is measured from when each refresh was ASKED for
+// (refreshMsg.polledAt), the same moment the next tick is timed from.
 const refreshBackstop = slowPollInterval
 
 // poll is the tick's refresh. It re-reads everything only when something may
@@ -1787,7 +1798,7 @@ const refreshBackstop = slowPollInterval
 // daemon's while a TUI was open.
 func (m Model) poll(now time.Time) tea.Cmd {
 	if m.lastChangeKey == "" || m.detailAgentID() != "" || now.Sub(m.lastFullRefresh) >= refreshBackstop {
-		return m.refresh()
+		return m.refreshAt(now)
 	}
 	app, ctx, groups, last := m.app, m.ctx, m.data.tasks, m.lastChangeKey
 	return func() tea.Msg {
@@ -1799,6 +1810,7 @@ func (m Model) poll(now time.Time) tea.Cmd {
 		if ok {
 			msg.changeKey = key
 		}
+		msg.polledAt = now
 		return msg
 	}
 }
@@ -2194,7 +2206,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.lastChangeKey = ""
 		} else {
-			m.lastChangeKey, m.lastFullRefresh = msg.changeKey, time.Now()
+			m.lastChangeKey, m.lastFullRefresh = msg.changeKey, msg.polledAt
+			if m.lastFullRefresh.IsZero() {
+				m.lastFullRefresh = time.Now()
+			}
 		}
 		if msg.err != nil {
 			m.lastActivity = time.Now()

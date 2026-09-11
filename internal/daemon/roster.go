@@ -163,38 +163,30 @@ func (d *Daemon) rosterShellOutTTLs() (cwd, locations time.Duration) {
 // refuses, or one shutdown race disables the tick for the life of the process.
 func (d *Daemon) startRosterTickPass(ctx context.Context) {
 	level := d.rosterDemandLevel()
-	if level == rosterDemandNone {
-		// Recorded, so a TUI opening later restarts from the fast tick.
-		d.mu.Lock()
-		d.rosterTickLevel = level
+	d.mu.Lock()
+	// A TUI that has just opened starts from the fast tick rather than
+	// inheriting a wait backed off before it was there. Recorded before ANY
+	// return below, or a tick that leaves early — nobody watching, a listing
+	// still running, a remote watcher's pacing — hides the transition.
+	if level == rosterDemandLocal && d.rosterTickLevel != rosterDemandLocal {
+		d.rosterTickEvery, d.rosterTickNextAt = 0, time.Time{}
+	}
+	d.rosterTickLevel = level
+	if level == rosterDemandNone || d.rosterTickRunning {
 		d.mu.Unlock()
 		return
 	}
 	now := d.opt.Clock.Now()
-	d.mu.Lock()
-	if d.rosterTickRunning {
-		d.mu.Unlock()
-		return
-	}
 	// A remote watcher gets a publish per sync interval, not per tick.
 	if level == rosterDemandRemote && !d.rosterRemoteAt.IsZero() && now.Sub(d.rosterRemoteAt) < remoteRosterInterval {
 		d.mu.Unlock()
 		return
 	}
 	// A local watcher is paced by the backoff (see rosterTickMaxInterval).
-	// A TUI that has just opened starts from the fast tick rather than
-	// inheriting a wait backed off before it was there.
-	if level == rosterDemandLocal {
-		if d.rosterTickLevel != rosterDemandLocal {
-			d.rosterTickEvery, d.rosterTickNextAt = 0, time.Time{}
-		}
-		if now.Before(d.rosterTickNextAt) {
-			d.rosterTickLevel = level
-			d.mu.Unlock()
-			return
-		}
+	if level == rosterDemandLocal && now.Before(d.rosterTickNextAt) {
+		d.mu.Unlock()
+		return
 	}
-	d.rosterTickLevel = level
 	d.rosterRemoteAt = now
 	d.rosterTickRunning = true
 	d.mu.Unlock()

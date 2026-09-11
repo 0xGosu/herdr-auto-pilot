@@ -118,3 +118,88 @@ func TestAStoreWithoutAChangeKeyIsReReadEveryTick(t *testing.T) {
 		t.Errorf("a tick without a change key produced %T, want refreshMsg", got)
 	}
 }
+
+// TestTheBackstopIsMeasuredFromTheAsk pins the backstop to the moment a refresh
+// was asked for: the next tick is timed from that moment, so measuring from
+// the refresh's ARRIVAL left every other slow tick a probe — a 30s backstop
+// that was really 60s on an idle TUI.
+func TestTheBackstopIsMeasuredFromTheAsk(t *testing.T) {
+	m, _ := probeModel(t, nil)
+	asked := m.lastFullRefresh.Add(refreshBackstop)
+	got, ok := m.poll(asked)().(refreshMsg)
+	if !ok {
+		t.Fatalf("the backstop tick produced %T, want refreshMsg", got)
+	}
+	mm, _ := m.Update(got)
+	m = mm.(Model)
+	if !m.lastFullRefresh.Equal(asked) {
+		t.Errorf("lastFullRefresh = %v, want the ask %v", m.lastFullRefresh, asked)
+	}
+	if _, ok := m.poll(asked.Add(refreshBackstop))().(refreshMsg); !ok {
+		t.Error("the next slow tick, one backstop after the ask, probed instead of re-reading")
+	}
+}
+
+// lateWriteStore lands a write in the middle of a refresh — after the
+// escalations were read — the race the key's sample-before-read order exists
+// for. Revision is promoted from the embedded store.
+type lateWriteStore struct {
+	*store.Store
+	armed bool
+	id    int64
+}
+
+func (s *lateWriteStore) KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error) {
+	if s.armed {
+		s.armed = false
+		id, err := s.AppendAudit(ctx, domain.AuditRecord{AgentID: "a1", SituationType: domain.SituationApproval,
+			Trigger: "t", Action: "escalated", Status: "escalated", CreatedAt: time.Now()})
+		if err != nil {
+			return nil, err
+		}
+		s.id = id
+	}
+	return s.Store.KillEvents(ctx, limit)
+}
+
+// TestAWriteDuringARefreshIsNotLost: the key is sampled BEFORE the read, so a
+// write that lands mid-refresh leaves the recorded key stale and the next tick
+// re-reads. Sampled after, the key would already include the write while the
+// data does not, and the screen would miss it until the backstop.
+func TestAWriteDuringARefreshIsNotLost(t *testing.T) {
+	dir := t.TempDir()
+	raw, err := store.Open(filepath.Join(dir, "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { raw.Close() })
+	st := &lateWriteStore{Store: raw}
+	m, _ := probeModel(t, st)
+	st.armed = true
+	now := m.lastFullRefresh.Add(refreshBackstop)
+	mid, ok := m.poll(now)().(refreshMsg)
+	if !ok {
+		t.Fatalf("the backstop tick produced %T, want refreshMsg", mid)
+	}
+	if st.id == 0 {
+		t.Fatal("the late write did not happen")
+	}
+	for _, e := range mid.escalations {
+		if e.ID == st.id {
+			t.Fatal("the escalations were read after the late write; the test no longer lands it mid-refresh")
+		}
+	}
+	mm, _ := m.Update(mid)
+	m = mm.(Model)
+	next, ok := m.poll(now.Add(fastPollInterval))().(refreshMsg)
+	if !ok {
+		t.Fatalf("the tick after a mid-refresh write produced %T, want refreshMsg", next)
+	}
+	found := false
+	for _, e := range next.escalations {
+		found = found || e.ID == st.id
+	}
+	if !found {
+		t.Errorf("the mid-refresh write never reached the screen: %v", next.escalations)
+	}
+}
