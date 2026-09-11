@@ -27,6 +27,37 @@ func TestGoldenTranscripts(t *testing.T) {
 		"error_codex_usage_limit.txt":    "idle",
 		"error_codex_banner.txt":         "idle",
 		"approval_claude_remote_env.txt": "idle",
+		// agy: herdr's own status at capture time (docs/designer/agy-support.md).
+		// Every agy modal arrives idle/done — herdr's agy manifest never matches.
+		"approval_agy_artifact_review.txt": "done",
+		"approval_agy_file_access.txt":     "done",
+		"approval_agy_file_create.txt":     "done",
+		"approval_agy_shell.txt":           "done",
+		"approval_agy_shell_amend.txt":     "done",
+		"approval_agy_shell_plan_mode.txt": "done",
+		"approval_agy_shell_wide.txt":      "done",
+		"approval_agy_shell_wrapped.txt":   "done",
+		"approval_agy_trust_folder.txt":    "idle",
+		"choice_agy_mcq.txt":               "done",
+		"choice_agy_mcq_two.txt":           "done",
+		"choice_agy_mcq_two_q2.txt":        "done",
+		"error_agy_interrupted.txt":        "done",
+		"error_agy_model_warning.txt":      "idle",
+		"error_agy_offline.txt":            "idle",
+		"idle_agy_after_turn.txt":          "done",
+		"idle_agy_composer_draft.txt":      "done",
+		"idle_agy_declined.txt":            "done",
+		"idle_agy_effort_picker.txt":       "idle",
+		"idle_agy_fresh.txt":               "idle",
+		"idle_agy_mode_accept_edits.txt":   "idle",
+		"idle_agy_mode_plan.txt":           "idle",
+		"idle_agy_model_picker.txt":        "idle",
+		"idle_agy_shortcuts_overlay.txt":   "idle",
+		"idle_agy_signin_method.txt":       "idle",
+		"idle_agy_signin_url.txt":          "idle",
+		"idle_agy_slash_popup.txt":         "idle",
+		"idle_agy_terms.txt":               "idle",
+		"working_agy_spinner.txt":          "working",
 	}
 	agentTypeFor := map[string]string{
 		"approval_codex_plan.txt":     "codex",
@@ -36,6 +67,11 @@ func TestGoldenTranscripts(t *testing.T) {
 		"error_codex_rate_limit.txt":  "codex",
 		"error_codex_usage_limit.txt": "codex",
 		"error_codex_banner.txt":      "codex",
+	}
+	for name := range statusFor {
+		if strings.Contains(name, "_agy_") {
+			agentTypeFor[name] = "agy"
+		}
 	}
 
 	entries, err := os.ReadDir("testdata/transcripts")

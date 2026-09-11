@@ -1,0 +1,1 @@
+- Added a recorded corpus of Antigravity CLI (agy) screens and a design for supporting it; hap's handling of agy is unchanged for now (every agy screen still reads as idle)

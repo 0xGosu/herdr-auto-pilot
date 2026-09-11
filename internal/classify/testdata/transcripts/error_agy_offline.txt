@@ -1,0 +1,24 @@
+   ▄▀▀    ▀▀▄
+  ▄▀▀      ▀▀▄
+
+⚠ Warning
+  ⎿  model gemini-3.6-flash-low is not recognized as a known model or custom model in
+     settings. Ignoring the flag.
+
+⚠ Eligibility Check
+  ⎿  Eligibility check failed: Post
+     "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": proxyconnect
+     tcp: dial tcp 127.0.0.1:9: connect: connection refused
+
+────────────────────────────────────────────────────────────
+> say hi
+
+⚠ Eligibility Check
+  ⎿  Eligibility check failed: Post
+     "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist": proxyconnect
+     tcp: dial tcp 127.0.0.1:9: connect: connection refused
+
+───────────────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts

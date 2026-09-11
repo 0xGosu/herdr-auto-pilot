@@ -1,0 +1,16 @@
+root ➜ /tmp/agyscratch.H2CE $ agy --model bogus-model-xyz
+
+      ▄▀▀▄        Antigravity CLI 1.2.1
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (High)
+   ▄▀▀    ▀▀▄     /tmp/agyscratch.H2CE
+  ▄▀▀      ▀▀▄
+
+⚠ Warning
+  ⎿  model bogus-model-xyz is not recognized as a known model or custom model in settings.
+     Using "Gemini 3.8 Flash (High)" instead.
+
+───────────────────────────────────────────────────────────────────────────────────────────
+>
+───────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                     Gemini 3.8 Flash · high

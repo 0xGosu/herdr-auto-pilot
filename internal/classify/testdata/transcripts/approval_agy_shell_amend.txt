@@ -1,0 +1,25 @@
+> /config
+  ⎿  Exited /config command
+
+────────────────────────────────────────────────────────────
+> Use your shell tool to run exactly: rm -rf /tmp/agyscratch.H2CE/hello.txt
+
+● Bash(rm -rf /tmp/agyscratch.H2CE/hello.txt) (ctrl+o to expand)
+
+Command
+────────────────────────────────────────────────────────────────────────────────────────────
+
+Requesting permission for:
+   rm -rf /tmp/agyscratch.H2CE/hello.txt
+
+Run this command?
+> 1. Yes, and tell Antigravity CLI what to do next
+    > █
+  2. Yes, and always allow in this conversation for commands that start with 'rm -rf
+/tmp/agyscratch.H2CE/hello.txt'
+  3. Yes, and always allow for commands that start with 'rm -rf
+/tmp/agyscratch.H2CE/hello.txt' (Persist to settings.json)
+  4. No, cancel
+
+  enter Submit
+esc to cancel                                                         Gemini 3.6 Flash · low

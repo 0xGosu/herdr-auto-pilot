@@ -1,0 +1,50 @@
+      ▄▀▀▄        Antigravity CLI 1.2.1
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.6 Flash (Low)
+   ▄▀▀    ▀▀▄     /tmp/agyscratch.H2CE
+  ▄▀▀      ▀▀▄
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Antigravity CLI   general    commands    shortcuts   (←/→ or tab to cycle)
+Keyboard Shortcuts
+  /keybindings to customize
+
+> /                               Open slash commands
+  \ + enter                       Insert newline fallback
+  alt+enter, ctrl+j, shift+enter  Insert newline
+  alt+j                           Manage subagent
+  alt+v, ctrl+v                   Paste image/video
+  ctrl+_, ctrl+shift+-            Undo
+  ctrl+c, esc                     Go back / dismiss
+  ctrl+d                          Exit
+  ctrl+end                        Go to bottom
+  ctrl+g                          Open prompt in $EDITOR
+  ctrl+home                       Go to top
+  ctrl+k                          Approve subagent fast
+  ctrl+l                          Clear CLI screen
+  ctrl+o                          Toggle trajectory view
+  ctrl+r                          Review artifact
+  ctrl+shift+z                    Redo
+  ctrl+y                          Yank (paste from kill ring)
+  ctrl+z                          Suspend CLI
+  down                            Move down
+  enter                           Send message or confirm
+  f2                              Rename
+  f4                              Delete
+  f5                              Start voice dictation
+  left                            Move left / Prev tab
+  pgdown                          Page down
+  pgup                            Page up
+  right                           Move right / Next tab
+  shift+down                      Half page down
+  shift+tab                       Cycle mode
+  shift+up                        Half page up
+  shift/alt+click                 Select and copy text
+  tab                             Tab
+  up                              Move up
+
+Keyboard: ↑/↓ Navigate  ←/→ Switch View  esc Close
+
+                                                                                                                                                                       Gemini 3.6 Flash · low

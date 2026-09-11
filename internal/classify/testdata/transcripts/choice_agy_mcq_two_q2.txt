@@ -1,0 +1,24 @@
+  until I answer.
+
+? Which fruit do you prefer?
+> Banana
+
+  Thank you! You selected Banana.
+
+────────────────────────────────────────────────────────────
+> Using your interactive question tool, ask me TWO multiple-choice questions in a single call: (1) favourite colour: Red, Green, Blue; (2) favourite pet: Cat, Dog. Do nothing else.
+
+? What is your favourite colour?
+? What is your favourite pet?
+
+Question
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Question 2/2: What is your favourite pet?
+
+> 1. Cat
+  2. Dog
+  3. Write-in...
+
+  ↑/↓ Navigate · ← Back · enter Select · esc Skip
+esc to cancel                                                                                                                                                       Gemini 3.6 Flash · low
