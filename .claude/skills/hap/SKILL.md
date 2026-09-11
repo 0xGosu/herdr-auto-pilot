@@ -43,6 +43,10 @@ document is convenience.
 - **`hap clear-data --yes` is irreversible** (all learned rules, decisions and
   audit rows). **`hap update` mutates the install** — never run it unprompted.
 - **`@noop` means "no reply is needed"** and never sends anything to a pane.
+- **An orchestrating agent runs hap as `HAP_ACTOR=orchestrator`** (see "the
+  orchestrator agent") so the operator can tell its decisions from their own.
+  Never set it to anything else — only `orchestrator` and `operator` are
+  accepted, and an unknown value fails the command.
 - **Read-only, safe to run anytime:** `status`, `agents`, `audit`,
   `escalations` (bare), `kill-history`, `signatures list|show|search`,
   `config show|fields|path`, `config env list` (names only, never values),
@@ -402,8 +406,18 @@ hap audit [--limit N]     # newest first, default 30
 ```
 
 Columns: `#id`, time, status, situation type, action, confidence, LLM score,
-rule mode, rationale. Every automated action and every escalation writes a row.
-Correct a past decision with `hap resolve <audit-id> --action TEXT`.
+rule mode, rationale, then the keyed `agent=`, `by=` and `node=` tokens
+(appended, so positional parsers keep working; `node=` is always last). Every automated action and every
+escalation writes a row. Correct a past decision with
+`hap resolve <audit-id> --action TEXT`.
+
+**`by=` names who settled the row from a front end:** `operator`, or
+`orchestrator` for the orchestrator agent (or anything run with
+`HAP_ACTOR=orchestrator`). It is set when an escalation is confirmed, resolved,
+dismissed or pruned, and on the correction row that records the answer. `by=-`
+means nobody is named: the daemon's own rows (`auto`, `auto-sent`, `fsp-sent`,
+`dism:*`), an escalation sent back to the LLM (`retried`), and rows written
+before hap recorded it — never read `-` as "the operator did it".
 
 Statuses worth knowing: `auto-sent` (a timed auto-accept answered it),
 `fsp-sent` (full self-prompting answered it), `denied`, `dismissed`,
@@ -1257,10 +1271,25 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
   retry time, and the Config tab flags an `orchestrator_agent_cwd` that does not
   exist.
 - **hap knows when the orchestrator is acting.** A `hap` command run inside its
-  pane is authored `orchestrator` (`by=orchestrator` on the stream): its
-  generated-task confirms and `hap task … send` go through the same never-auto
-  and irreversibility screen as hap's own unattended sends, and all its sends are
+  pane is authored `orchestrator` (`by=orchestrator` on the stream and in
+  `hap audit`, `orch` in the TUI Audit tab's BY column): its generated-task
+  confirms and `hap task … send` go through the same never-auto and
+  irreversibility screen as hap's own unattended sends, and all its sends are
   refused while the herd is paused. Your own commands are unaffected.
+- **`HAP_ACTOR=orchestrator` declares it explicitly** — for an orchestrating
+  agent hap did not start (your own claude or codex session, a script), or any
+  process outside the orchestrator's pane:
+
+  ```bash
+  HAP_ACTOR=orchestrator hap confirm 5812 --send   # recorded by=orchestrator
+  ```
+
+  It carries the same screening and pause refusal as the pane, and it can only
+  *add* the label: inside the orchestrator's pane every command is the
+  orchestrator whatever `HAP_ACTOR` says. Accepted values are `orchestrator`
+  and `operator` (the default); anything else — `daemon` included — fails the
+  command rather than silently acting as the operator. The daemon clears it at
+  start, so neither it nor anything it launches inherits the label.
 
 ## disk usage and cleanup
 
@@ -1362,6 +1391,12 @@ The TUI's Config tab offers the same install.
   `hap daemon --ensure`.
 - **The daemon is crash-looping or hung** — `hap status` exits non-zero and says
   which; `hap status --stderr` prints the captured daemon stderr tail.
+- **A hap process burns CPU or memory** — set `HAP_PROFILE_DIR=<dir>` (and
+  optionally `HAP_PROFILE_SECONDS`, default 60) and restart it, e.g.
+  `HAP_PROFILE_DIR=/tmp/hap-prof hap daemon --restart`. It writes rolling
+  `<verb>-<pid>.cpu.pprof` / `.heap.pprof` files, always the latest complete
+  window; read one with `go tool pprof -top <hap binary> <file>`. Nothing is
+  written or listened on when the variable is unset.
 - **Semantic matching degraded** — `hap status` reports the embedder's failure
   count, whether they were stall-guard timeouts, and the budgets in force. A
   model larger than the bundled MiniLM can exceed them on every call: raise
@@ -1371,8 +1406,11 @@ The TUI's Config tab offers the same install.
 ## the TUI
 
 `hap tui` (or the herdr pane) is a convenience, not a capability: every config
-key and every action it offers is reachable from the CLI alone. Tabs: Status,
-Agents, Tasks, Escalations, Audit, Rules, Config. `/` searches on most tabs, `v`
+key and every action it offers is reachable from the CLI alone. Tabs: Agents,
+Tasks, Escalations, Audit, Rules, Config, Pause/Kill. The Audit tab's **BY**
+column says who settled a row — `op` (you), `orch` (the orchestrator agent),
+`-` (hap itself, or not recorded) — and its detail view spells it out as
+`Settled by`. `/` searches on most tabs, `v`
 opens a detail view, `space` marks a run for batch actions. The escalation
 detail offers confirm, resolve, dismiss, and **retry LLM** (the twin of
 `hap escalations retry <id>`). On the Rules tab, `+`/`-` nudge the selected

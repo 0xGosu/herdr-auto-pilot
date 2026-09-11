@@ -443,14 +443,14 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 					action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 					corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
 					sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
-					while_fsp_mode_on, created_at)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					while_fsp_mode_on, actor, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			s.nextID(), s.self, a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
 			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
 			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
 			string(a.MatchMethod), a.MatchScore, a.EmbedError,
 			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars,
-			a.LLMSessionID, a.WhileFSPModeOn, unix(a.CreatedAt))
+			a.LLMSessionID, a.WhileFSPModeOn, a.Actor, unix(a.CreatedAt))
 		if err != nil {
 			return err
 		}
@@ -460,11 +460,19 @@ func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, e
 	return id, err
 }
 
-// UpdateAuditStatus updates an audit row's status (e.g. escalated → resolved).
+// UpdateAuditStatus updates an audit row's status (e.g. escalated → resolved),
+// clearing its actor: a status nobody is named for is not attributable.
 func (s *Store) UpdateAuditStatus(ctx context.Context, auditID int64, status string) error {
+	return s.UpdateAuditStatusBy(ctx, auditID, status, "")
+}
+
+// UpdateAuditStatusBy is UpdateAuditStatus naming who set the status
+// (ports.AuditActorWriter). The actor moves WITH the status, so a row returned
+// to "escalated" never keeps the name of whoever settled it before.
+func (s *Store) UpdateAuditStatusBy(ctx context.Context, auditID int64, status, actor string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = ? WHERE id = ?`, status, auditID)
+			`UPDATE audit_log SET status = ?, actor = ? WHERE id = ?`, status, actor, auditID)
 		return err
 	})
 }
@@ -1399,10 +1407,16 @@ func (s *Store) DeleteSignature(ctx context.Context, signature string) (int64, e
 // recorded, so nothing is learned. The status guard in the WHERE clause
 // makes a concurrent resolve/confirm win over the dismiss.
 func (s *Store) DismissEscalation(ctx context.Context, auditID int64) error {
+	return s.DismissEscalationBy(ctx, auditID, "")
+}
+
+// DismissEscalationBy is DismissEscalation naming who dismissed it
+// (ports.AuditActorWriter), in the same guarded statement.
+func (s *Store) DismissEscalationBy(ctx context.Context, auditID int64, actor string) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'dismissed' WHERE id = ? AND status = 'escalated'`,
-			auditID)
+			`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE id = ? AND status = 'escalated'`,
+			actor, auditID)
 		if err != nil {
 			return err
 		}
@@ -1424,11 +1438,18 @@ func (s *Store) DismissEscalation(ctx context.Context, auditID int64) error {
 // one-time side effects (writing a file, appending config, sending) only when
 // it actually claimed the escalation.
 func (s *Store) ResolveEscalation(ctx context.Context, auditID int64) (bool, error) {
+	return s.ResolveEscalationBy(ctx, auditID, "")
+}
+
+// ResolveEscalationBy is ResolveEscalation naming who resolved it
+// (ports.AuditActorWriter). One statement, so the claim stays atomic and the
+// name can never land on a row another writer won.
+func (s *Store) ResolveEscalationBy(ctx context.Context, auditID int64, actor string) (bool, error) {
 	var claimed bool
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'resolved' WHERE id = ? AND status = 'escalated'`,
-			auditID)
+			`UPDATE audit_log SET status = 'resolved', actor = ? WHERE id = ? AND status = 'escalated'`,
+			actor, auditID)
 		if err != nil {
 			return err
 		}
@@ -1704,11 +1725,17 @@ func (s *Store) guardedStatus(ctx context.Context, auditID int64, from, to strin
 // TestEveryNodeOwnedStatementIsNodeScoped flattens, so a statement spanning
 // nodes would pass the guard silently.
 func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) (int64, error) {
+	return s.DismissEscalationsBeforeBy(ctx, cutoff, "")
+}
+
+// DismissEscalationsBeforeBy is DismissEscalationsBefore naming who pruned
+// (ports.AuditActorWriter).
+func (s *Store) DismissEscalationsBeforeBy(ctx context.Context, cutoff time.Time, actor string) (int64, error) {
 	var dismissed int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'dismissed' WHERE status = 'escalated' AND created_at < ?`,
-			unix(cutoff))
+			`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE status = 'escalated' AND created_at < ?`,
+			actor, unix(cutoff))
 		if err != nil {
 			return err
 		}
@@ -1726,11 +1753,17 @@ func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) 
 // auto_accepting row is mid-claim on its own machine, and only an escalated one
 // is the operator's to retire.
 func (s *Store) DismissEscalationsBeforeOn(ctx context.Context, cutoff time.Time, nodeID string) (int64, error) {
+	return s.DismissEscalationsBeforeOnBy(ctx, cutoff, nodeID, "")
+}
+
+// DismissEscalationsBeforeOnBy is DismissEscalationsBeforeOn naming who pruned
+// (ports.AuditActorWriter).
+func (s *Store) DismissEscalationsBeforeOnBy(ctx context.Context, cutoff time.Time, nodeID, actor string) (int64, error) {
 	var dismissed int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
 		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'dismissed' WHERE node_id = ? AND status = 'escalated' AND created_at < ?`,
-			nodeID, unix(cutoff))
+			`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE node_id = ? AND status = 'escalated' AND created_at < ?`,
+			actor, nodeID, unix(cutoff))
 		if err != nil {
 			return err
 		}
@@ -1925,7 +1958,7 @@ func (s *Store) scanAudits(rows *sql.Rows) ([]domain.AuditRecord, error) {
 			&a.LLMOutput, &a.CorrectsAuditID, &a.Status, &a.Suggestion, &a.PaneExcerpt,
 			&matchMethod, &a.MatchScore, &a.EmbedError,
 			&a.SigRaw, &a.SigSalient, &sigVerdict, &a.SigSalientChars,
-			&a.LLMSessionID, &a.WhileFSPModeOn, &created); err != nil {
+			&a.LLMSessionID, &a.WhileFSPModeOn, &a.Actor, &created); err != nil {
 			return nil, err
 		}
 		a.MatchMethod = domain.MatchMethod(matchMethod)
@@ -1947,7 +1980,7 @@ const auditCols = `id, node_id, decision_id, agent_id, agent_type, signature, tr
 	action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 	corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
 	sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
-	while_fsp_mode_on, created_at`
+	while_fsp_mode_on, actor, created_at`
 
 // llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
 // NULL (no LLM score), a value stores the 0-100 score.

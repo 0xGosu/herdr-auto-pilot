@@ -288,6 +288,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	-- so an operator can tell FSP's answers from timed auto-accept's (the
 	-- status is 'auto_accepted' for both). 0 on every other row.
 	while_fsp_mode_on INTEGER NOT NULL DEFAULT 0,
+	-- Who settled the row from a front end ('operator', 'orchestrator'), in
+	-- the same statement as its status. '' = not attributable.
+	actor TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_log(status, id DESC);
@@ -507,6 +510,11 @@ var columnAdds = []columnAdd{
 	// log. NOT backfilled: 0 on every pre-migration row, which reads as
 	// "not attributable to FSP" rather than as a false claim either way.
 	{"audit_log", "while_fsp_mode_on", `ALTER TABLE audit_log ADD COLUMN while_fsp_mode_on INTEGER NOT NULL DEFAULT 0`},
+	// Who settled the row from a front end — the operator or the orchestrator
+	// agent — since 'resolved'/'dismissed' read the same for both. NOT
+	// backfilled: '' on every pre-migration row reads as "not attributable",
+	// never as a claim that the operator acted.
+	{"audit_log", "actor", `ALTER TABLE audit_log ADD COLUMN actor TEXT NOT NULL DEFAULT ''`},
 	{"llm_requests", "session_id", `ALTER TABLE llm_requests ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`},
 	{"llm_decisions", "confident_score", `ALTER TABLE llm_decisions ADD COLUMN confident_score INTEGER NOT NULL DEFAULT -1`},
 	// A pre-delivery task review's submission: the ordered checklist edits

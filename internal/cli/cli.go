@@ -1465,13 +1465,16 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		if row, ok := rules[r.Signature]; ok {
 			rule = string(row.Mode)
 		}
-		// agent= is APPENDED rather than folded into the positional columns:
-		// these rows are tab-separated and parsed by scripts, so a new keyed
-		// token beside node= cannot shift a field anything already reads.
-		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\tagent=%s\tnode=%s\n",
+		// agent= and by= are APPENDED rather than folded into the positional
+		// columns: these rows are tab-separated and parsed by scripts, so a new
+		// keyed token beside node= cannot shift a field anything already reads.
+		// node= stays LAST, as every fleet listing ends with its machine.
+		// by= names who settled the row (operator / orchestrator), "-" when
+		// nobody is named.
+		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\tagent=%s\tby=%s\tnode=%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), frontend.AuditStatusLabel(r), r.SituationType,
 			r.Action, frontend.ConfidenceLabel(r.Confidence), llmConfCLI(r.LLMConfidence), rule, r.Rationale,
-			st.RecordAgent(r), st.NodeLabel(r.NodeID))
+			st.RecordAgent(r), orDashCLI(r.Actor), st.NodeLabel(r.NodeID))
 	}
 	return nil
 }

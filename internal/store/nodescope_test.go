@@ -44,7 +44,7 @@ var explicitIDTables = map[string]bool{
 // FLEET read that returns node_id per row for the unified view. Adding an entry
 // here is a review event: the default for a new statement is to scope it.
 var nodeScopeExemptions = map[string]string{
-	"UpdateAuditStatus#1":            "by id: an operator surface resolves any node's escalation",
+	"UpdateAuditStatusBy#1":          "by id: an operator surface resolves any node's escalation",
 	"EscalateAudit#1":                "by id",
 	"MarkCorrectionProcessed#1":      "by id",
 	"MarkCorrectionSent#1":           "by id",
@@ -52,8 +52,8 @@ var nodeScopeExemptions = map[string]string{
 	"UpdateLLMRequestContext#1":      "by request_id",
 	"UpdateLLMDecisionStatus#1":      "by id",
 	"auditNodeTx#1":                  "looks up a row's node so the caller can stamp it",
-	"DismissEscalation#1":            "by id: dismiss works on any node's escalation",
-	"ResolveEscalation#1":            "by id: resolve works on any node's escalation",
+	"DismissEscalationBy#1":          "by id: dismiss works on any node's escalation",
+	"ResolveEscalationBy#1":          "by id: resolve works on any node's escalation",
 	"MarkAutoAccepted#1":             "by id, guarded on the daemon's own auto_accepting claim",
 	"DismissEscalationWithReason#1":  "by id",
 	"LatestAuditForSignature#1":      "knowledge view: a rule's latest sighting on any node",
@@ -63,7 +63,7 @@ var nodeScopeExemptions = map[string]string{
 	"GetAudit#1":                     "by id, returns node_id",
 	"CountPendingEscalations#1":      "fleet read: the unified pending count",
 	"PendingEscalations#1":           "fleet read: the unified queue, node_id per row",
-	"DismissEscalationsBefore#1":     "fleet write: the operator prunes the unified queue they are looking at",
+	"DismissEscalationsBeforeBy#1":   "fleet write: the operator prunes the unified queue they are looking at",
 	"MarkLLMRetryProcessed#1":        "by id",
 	"RetireEscalationForRetry#1":     "by id",
 	"GetLLMRequest#1":                "by request_id",
