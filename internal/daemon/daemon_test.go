@@ -647,6 +647,17 @@ func (s *failingStore) PruneAgedRows(ctx context.Context, now, cutoff time.Time)
 	return rp.PruneAgedRows(ctx, now, cutoff)
 }
 
+// SignatureEmbeddingsFingerprint forwards the OPTIONAL
+// ports.KnowledgeFingerprinter capability for the same reason: without it every
+// knowledge refresh in the suite silently rebuilds the index.
+func (s *failingStore) SignatureEmbeddingsFingerprint(ctx context.Context) (string, error) {
+	kf, ok := s.StorePort.(ports.KnowledgeFingerprinter)
+	if !ok {
+		return "", errors.New("wrapped store cannot fingerprint signature embeddings")
+	}
+	return kf.SignatureEmbeddingsFingerprint(ctx)
+}
+
 // PruneAuditExcerpts, FreelistPages and Vacuum forward ports.RetentionPort for
 // the same reason. All three are needed together: the daemon asserts the
 // interface, not the methods.

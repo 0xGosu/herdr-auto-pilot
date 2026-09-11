@@ -28,6 +28,11 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 		return
 	}
 
+	// Digest the rows BEFORE loading them: a rule landing between the two then
+	// costs one redundant rebuild on the next refresh, never a missed rule. (A
+	// Reconcile that rewrites rows below costs the same single extra rebuild.)
+	fp := d.knowledgeFingerprint(ctx)
+
 	// Warm the embedder and re-embed rows minted by another model (or with
 	// stale dims) from their stored salient text, so a model swap keeps
 	// every signature matchable. Warm failure is not fatal: the index still
@@ -53,7 +58,17 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 	if d.semanticGen.Load() != gen {
 		return // superseded by a newer reload; let its run own the index
 	}
-	if err := d.matcher.Rebuild(res.Rows, res.Dims); err != nil {
+	// A build degraded by a TRANSIENT embedder fault (a cold worker's warmup
+	// timing out, one row failing to embed) is text-only where it should not
+	// be, and the store does not change to say so — record its digest and
+	// every later refresh skips the rebuild that would have recovered it. A
+	// permanently absent or latched-degraded embedder is the opposite case:
+	// retrying would rebuild on every pull forever for nothing.
+	if (res.WarmErr != nil || res.Downgraded > 0) && !d.embedderPermanentlyDown() {
+		fp = ""
+	}
+	published, err := d.matcher.RebuildPublished(res.Rows, res.Dims)
+	if err != nil {
 		if !errors.Is(err, match.ErrCleanup) {
 			slog.Warn("semantic index rebuild failed; matching stays exact-hash", "error", err)
 			return
@@ -63,7 +78,13 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 		// semantic matching enabled.
 		slog.Warn("semantic index rebuilt; previous-generation cleanup failed", "error", err)
 	}
-	if d.semanticGen.Load() != gen {
+	if !published {
+		// A newer Rebuild owns the index. The matcher orders builds by when
+		// they STARTED and semanticGen by when they were SPAWNED, and the two
+		// can disagree — so this run cannot vouch for whatever index stands.
+		fp = ""
+	}
+	if !d.publishKnowledge(gen, fp) {
 		return // a newer reload raced past; it decides readiness
 	}
 	d.semanticReady.Store(true)
@@ -458,6 +479,15 @@ func remapAllowed(s domain.Situation, sig domain.SignatureResult, hit match.Hit)
 // store (rather than adding rows) is what also makes a rule DELETED elsewhere
 // disappear here. Superseded runs abort on the generation counter, so a burst
 // of pulls costs one rebuild.
+//
+// The REBUILD is skipped when signature_embeddings digests the same as when
+// the published index was built: a pull reports a change for any row at all,
+// and under turso that is nearly every pull. The rows are not the index's only
+// input — the embedder's health at build time decides which of them get
+// vectors — so initSemantic records a digest only for a build that was
+// complete, or whose embedder is down for good (see embedderPermanentlyDown).
+// The verdict invalidation is NOT gated: the cache keys on rule STATE
+// (signatures, decisions), which the digest does not cover.
 func (d *Daemon) RefreshKnowledge() {
 	if d.matcher == nil {
 		return
@@ -469,6 +499,9 @@ func (d *Daemon) RefreshKnowledge() {
 	// still answerable: a re-rank is one subprocess, a wrong reuse is a wrong
 	// rule.
 	d.invalidateRerank()
+	if d.knowledgeUnchanged(d.knowledgeFingerprint(d.shutdownCtx)) {
+		return
+	}
 	gen := d.semanticGen.Add(1)
 	d.spawn(func() {
 		_ = logging.Guard("semantic-refresh", func() error {
@@ -476,6 +509,60 @@ func (d *Daemon) RefreshKnowledge() {
 			return nil
 		})
 	})
+}
+
+// knowledgeFingerprint digests the rows the semantic index is built from, or
+// "" when the store cannot say — which every caller reads as "rebuild".
+func (d *Daemon) knowledgeFingerprint(ctx context.Context) string {
+	kf, ok := d.opt.Store.(ports.KnowledgeFingerprinter)
+	if !ok {
+		return ""
+	}
+	fp, err := kf.SignatureEmbeddingsFingerprint(ctx)
+	if err != nil {
+		slog.Debug("knowledge fingerprint unavailable; rebuilding the semantic index", "error", err)
+		return ""
+	}
+	return fp
+}
+
+// embedderPermanentlyDown reports whether a degraded index build is the best
+// this embedder will do until the next reload: none is configured (disabled,
+// crash-guard suppressed), or its failure latch has tripped. Anything else may
+// recover, so its degraded build must not be recorded as the index's state.
+func (d *Daemon) embedderPermanentlyDown() bool {
+	emb := d.embedderPort()
+	if emb == nil {
+		return true
+	}
+	dg, ok := emb.(interface{ Degraded() bool })
+	return ok && dg.Degraded()
+}
+
+// knowledgeUnchanged reports whether fp is known and is the digest the
+// published index was built from.
+func (d *Daemon) knowledgeUnchanged(fp string) bool {
+	if fp == "" {
+		return false
+	}
+	d.knowledgeMu.Lock()
+	defer d.knowledgeMu.Unlock()
+	return d.builtKnowledge == fp
+}
+
+// publishKnowledge records fp as the published index's digest, and reports
+// false without recording when gen is no longer current. It is called only
+// AFTER Matcher.Rebuild published: recording at pull time instead would mark a
+// failed or superseded rebuild as built, and a peer's new rule would then never
+// become matchable here.
+func (d *Daemon) publishKnowledge(gen int64, fp string) bool {
+	d.knowledgeMu.Lock()
+	defer d.knowledgeMu.Unlock()
+	if d.semanticGen.Load() != gen {
+		return false
+	}
+	d.builtKnowledge = fp
+	return true
 }
 
 // embedderPort returns the current embedder (rebuilt on reload when the
@@ -508,7 +595,12 @@ func (d *Daemon) reloadEmbedder(prev, next config.Config, first bool) {
 	}
 
 	d.semanticReady.Store(false)
+	// A reload always rebuilds, and until that run publishes no refresh may
+	// skip: forget the digest in the same step that supersedes older runs.
+	d.knowledgeMu.Lock()
+	d.builtKnowledge = ""
 	gen := d.semanticGen.Add(1)
+	d.knowledgeMu.Unlock()
 	// Tracked + rooted at shutdownCtx so daemon teardown cancels the reembed /
 	// index rebuild and awaits it before the matcher (and store) close.
 	d.spawn(func() {

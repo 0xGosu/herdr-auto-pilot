@@ -261,6 +261,17 @@ type Daemon struct {
 	semanticReady atomic.Bool
 	semanticGen   atomic.Int64
 
+	// builtKnowledge is the signature_embeddings digest the PUBLISHED index was
+	// built from ("" = unknown, so the next refresh rebuilds). It lets
+	// RefreshKnowledge skip a rebuild when a fleet pull moved nothing the index
+	// reads — under turso nearly every pull reports a change (heartbeats,
+	// roster), and rebuilding on each one kept an idle node at ~20% CPU.
+	// knowledgeMu makes "the generation is still ours" and the write ONE step,
+	// and pairs reloadEmbedder's clear with its generation bump, so a
+	// superseded run can never record a digest over a newer run's index.
+	knowledgeMu    sync.Mutex
+	builtKnowledge string
+
 	// taskSnapshots caches REMOTE task lists so the main select loop never
 	// waits on a network read (see taskcache.go). A local store is never
 	// cached — it reads through exactly as it always has.

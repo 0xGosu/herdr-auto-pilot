@@ -399,6 +399,47 @@ func TestRebuildStaleGenerationDoesNotClobber(t *testing.T) {
 	}
 }
 
+// TestRebuildPublishedReportsASupersededBuild: the daemon records what the
+// live index was built from only when RebuildPublished says this call's index
+// is live. The superseded build returns a nil error exactly like a success, so
+// without the flag it would vouch for rows it discarded. B (newer) publishes;
+// A (older) reaches publish last and must answer false.
+func TestRebuildPublishedReportsASupersededBuild(t *testing.T) {
+	m := New(t.TempDir())
+	defer m.Close()
+	alpha := []domain.SignatureEmbedding{
+		row("approval:alpha", domain.SituationApproval, "claude", "permission: alpha", nil),
+	}
+	bravo := []domain.SignatureEmbedding{
+		row("approval:bravo", domain.SituationApproval, "claude", "permission: bravo", nil),
+	}
+	bPublished := make(chan struct{})
+	m.publishBarrier = func(gen int) {
+		if gen == 1 {
+			<-bPublished
+		}
+	}
+
+	var aPublished bool
+	var aErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		aPublished, aErr = m.RebuildPublished(alpha, 0)
+	}()
+	waitForGen(t, m, 1)
+	bOK, bErr := m.RebuildPublished(bravo, 0)
+	close(bPublished)
+	<-done
+
+	if bErr != nil || !bOK {
+		t.Errorf("newer build: published=%v err=%v, want true, nil", bOK, bErr)
+	}
+	if aErr != nil || aPublished {
+		t.Errorf("superseded build: published=%v err=%v, want false, nil", aPublished, aErr)
+	}
+}
+
 // TestRebuildCleansUpSupersededDirectories: each successful Rebuild removes the
 // previous generation's directory, so a long-lived matcher never accumulates
 // stale index dirs.

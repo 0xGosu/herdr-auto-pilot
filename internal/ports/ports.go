@@ -130,6 +130,15 @@ type RowRetentionPort interface {
 	PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domain.PruneCounts, error)
 }
 
+// KnowledgeFingerprinter is implemented by stores that can digest the rows
+// the semantic match index is built from (signature_embeddings), so the daemon
+// can skip a rebuild when a fleet pull moved nothing the index reads. Optional:
+// absent — or on an error — the daemon rebuilds on every refresh, as it always
+// did. Equal digests must mean identical rows; the value is otherwise opaque.
+type KnowledgeFingerprinter interface {
+	SignatureEmbeddingsFingerprint(ctx context.Context) (string, error)
+}
+
 // VisiblePaneReader is implemented by Herdr adapters that can read the pane's
 // current on-screen content (as opposed to ReadPane's consuming "recent"
 // delta). Used to recover a standing numbered menu when delivering an
