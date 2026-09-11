@@ -1225,6 +1225,7 @@ func (d *Daemon) writeHealth(startedAt time.Time) {
 		ExePath:        d.exePath,
 		BinaryReplaced: d.binaryReplaced.Load(),
 		FleetSync:      d.fleetHealth(),
+		Orchestrator:   d.orchestratorHealth(),
 	}
 	if err := daemonhealth.Write(d.opt.StateDir, h); err != nil {
 		slog.Debug("heartbeat write failed", "error", err)

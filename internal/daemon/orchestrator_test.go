@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
@@ -684,5 +685,53 @@ func TestOrchestratorUsesTheConfiguredCwd(t *testing.T) {
 	}
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the missing working directory was created (%v)", err)
+	}
+}
+
+// A start that keeps failing, and a brief held by a claude prompt, reach the
+// heartbeat — the only way the TUI and `hap status` hear of either — and go
+// away once the session is up, or once the feature is switched off.
+func TestOrchestratorTroubleReachesTheHeartbeat(t *testing.T) {
+	h, l, state := newOrchHarness(t, "", func(l *orchLauncher) { l.failStart = true })
+	cfg := orchestratorModeOnIn(h)
+	ctx := context.Background()
+	if h.daemon.orchestratorHealth() != nil {
+		t.Fatal("trouble reported before anything was tried")
+	}
+	h.daemon.ensureOrchestrator(ctx, l, cfg, nil)
+	h.daemon.writeHealth(time.Now())
+	rec, ok := daemonhealth.Read(state)
+	if !ok || !rec.Orchestrator.Failing() || !strings.Contains(rec.Orchestrator.LastError, "induced start failure") ||
+		rec.Orchestrator.RetryAt.IsZero() {
+		t.Fatalf("heartbeat orchestrator = %+v, want the start failure with a retry time", rec.Orchestrator)
+	}
+
+	// Switched off: nothing to report, whatever happened before.
+	h.daemon.mu.Lock()
+	h.daemon.cfg.FullSelfPrompting.Enabled = false
+	h.daemon.mu.Unlock()
+	if o := h.daemon.orchestratorHealth(); o != nil {
+		t.Fatalf("a switched-off feature still reports %+v", o)
+	}
+	h.daemon.mu.Lock()
+	h.daemon.cfg.FullSelfPrompting.Enabled = true
+	h.daemon.mu.Unlock()
+
+	// It starts, but claude shows a first-run prompt: waiting, not failing.
+	l.lmu.Lock()
+	l.failStart = false
+	l.visible = "Do you trust the files in this folder?\n❯ 1. Yes, proceed\n  2. No, exit\n"
+	l.lmu.Unlock()
+	h.daemon.ensureOrchestrator(ctx, l, cfg, nil)
+	o := h.daemon.orchestratorHealth()
+	if o == nil || o.Failing() || !o.Waiting {
+		t.Fatalf("orchestrator health = %+v, want waiting and not failing", o)
+	}
+
+	// Briefed: all clear.
+	l.setVisible(emptyComposer(t))
+	h.daemon.ensureOrchestrator(ctx, l, cfg, nil)
+	if o := h.daemon.orchestratorHealth(); o != nil {
+		t.Fatalf("a briefed orchestrator still reports %+v", o)
 	}
 }

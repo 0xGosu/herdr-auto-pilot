@@ -302,3 +302,35 @@ func TestBannerSeverityPrecedence(t *testing.T) {
 		t.Errorf("give-up must win the banner over auto-disable, got %q", h.Banner())
 	}
 }
+
+// The orchestrator's trouble, from the heartbeat, is a WARNING with its own
+// banner and status line — and ranks below the hard failures.
+func TestAssessOrchestratorTrouble(t *testing.T) {
+	app := appWithDaemon(t, true, 100, buildinfo.Version)
+	if err := daemonhealth.Write(app.StateDir, daemonhealth.Health{
+		PID: 100, Version: buildinfo.Version, HeartbeatAt: time.Now(), Embedder: daemonhealth.EmbedderReady,
+		Orchestrator: &daemonhealth.OrchestratorHealth{
+			LastError: "starting it failed: agent_pane_busy", Failures: 2, RetryAt: time.Now().Add(4 * time.Minute),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h := app.AssessDaemonHealth()
+	if !h.OrchestratorFailing || h.Severity() != DaemonWarn {
+		t.Fatalf("health = %+v severity %v, want a failing orchestrator at warn", h, h.Severity())
+	}
+	if b := h.Banner(); !strings.Contains(b, "orchestrator could not start") || !strings.Contains(b, "agent_pane_busy") {
+		t.Errorf("banner = %q", b)
+	}
+	if !strings.Contains(h.OrchestratorLine, "NOT RUNNING") || !strings.Contains(h.OrchestratorLine, "next try in") {
+		t.Errorf("status line = %q", h.OrchestratorLine)
+	}
+	if hung := (DaemonHealth{Hung: true, OrchestratorFailing: true}); !strings.Contains(hung.Banner(), "NOT RESPONDING") {
+		t.Errorf("a hung daemon must outrank the orchestrator, got %q", hung.Banner())
+	}
+
+	waiting := DaemonHealth{Running: true, OrchestratorWaiting: true}
+	if waiting.Severity() != DaemonWarn || !strings.Contains(waiting.Banner(), "waiting on a claude prompt") {
+		t.Errorf("waiting: severity %v banner %q", waiting.Severity(), waiting.Banner())
+	}
+}

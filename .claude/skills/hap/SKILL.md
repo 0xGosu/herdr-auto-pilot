@@ -1251,6 +1251,11 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
 - Re-created when it disappears, at most 3 times an hour; never while paused,
   with the mode off, or after the mode stood down at a `[limits]` ceiling. hap
   never closes it — turning the mode off leaves it running.
+- **A start that keeps failing is shown, not just logged**: the TUI banner reads
+  `⚠ orchestrator could not start — <reason>` (or `… waiting on a claude prompt`
+  while its brief is held), `hap status` prints an `orchestrator:` line with the
+  retry time, and the Config tab flags an `orchestrator_agent_cwd` that does not
+  exist.
 - **hap knows when the orchestrator is acting.** A `hap` command run inside its
   pane is authored `orchestrator` (`by=orchestrator` on the stream): its
   generated-task confirms and `hap task … send` go through the same never-auto

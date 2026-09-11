@@ -73,6 +73,47 @@ type Health struct {
 	// FleetSync is the shared database's sync state under the turso engine;
 	// absent under the local engine and on older daemons.
 	FleetSync *FleetSyncHealth `json:"fleet_sync,omitempty"`
+	// Orchestrator is the full-self-prompting orchestrator session's trouble:
+	// a start that keeps failing, or a brief held by a claude prompt only the
+	// operator should answer. Absent when the feature is off or all is well
+	// (and on older daemons) — its failures otherwise live only in the log.
+	Orchestrator *OrchestratorHealth `json:"orchestrator,omitempty"`
+}
+
+// OrchestratorHealth is the heartbeat's copy of the orchestrator's state.
+type OrchestratorHealth struct {
+	// LastError is why the last attempt to start, adopt or brief the session
+	// failed; empty once one succeeds.
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitempty"`
+	// Failures counts failed attempts in a row; RetryAt is when the daemon
+	// tries again (zero: at the next sweep).
+	Failures int       `json:"failures,omitempty"`
+	RetryAt  time.Time `json:"retry_at,omitempty"`
+	// Waiting: the session is up but its brief is held because claude shows a
+	// prompt (trusting a new directory, say) the daemon will not answer.
+	Waiting   bool   `json:"waiting,omitempty"`
+	Workspace string `json:"workspace,omitempty"`
+}
+
+// Failing reports that the last attempt failed.
+func (o *OrchestratorHealth) Failing() bool { return o != nil && o.LastError != "" }
+
+// Line is the status-page rendering, or "" when there is nothing to report.
+func (o *OrchestratorHealth) Line(now time.Time) string {
+	switch {
+	case o == nil:
+		return ""
+	case o.LastError != "":
+		next := "at the next sweep"
+		if o.RetryAt.After(now) {
+			next = "in " + o.RetryAt.Sub(now).Round(time.Second).String()
+		}
+		return fmt.Sprintf("NOT RUNNING — %s (%d failed attempt(s); next try %s)", o.LastError, o.Failures, next)
+	case o.Waiting:
+		return fmt.Sprintf("waiting on a claude prompt in workspace %s — answer it once and hap sends the brief", o.Workspace)
+	}
+	return ""
 }
 
 // FleetSyncIsolatedAfter is how long a node may go without a SUCCESSFUL pull

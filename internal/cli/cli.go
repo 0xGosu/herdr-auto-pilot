@@ -1061,6 +1061,9 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	for _, line := range h.FleetSyncDiagLines {
 		fmt.Fprintf(out, "  fleet sync %s\n", line)
 	}
+	if h.OrchestratorLine != "" {
+		fmt.Fprintf(out, "orchestrator:        %s\n", h.OrchestratorLine)
+	}
 	// The evidence behind the state: which budgets are in force, how many calls
 	// hit them, and the last error. Printed even when NOT degraded, so a run of
 	// timeouts is visible before the latch trips (the diag lines are empty

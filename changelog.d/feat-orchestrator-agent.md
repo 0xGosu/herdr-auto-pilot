@@ -2,3 +2,4 @@
 - The orchestrator's row is highlighted on the TUI Agents tab.
 - Added `full_self_prompting.orchestrator_agent_cwd` to start the orchestrator in a directory of your choosing (it must already exist) instead of `<state>/orchestrator`.
 - The orchestrator's built-in brief schedules an hourly health check that restarts a stopped hap daemon and looks in on hung agents, and removes it while full self-prompting is off.
+- A failure to start the orchestrator (or a first-run claude prompt holding its brief) now shows as a TUI banner and in `hap status`, and the Config tab warns when `orchestrator_agent_cwd` does not exist.

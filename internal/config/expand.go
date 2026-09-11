@@ -1,6 +1,8 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -72,4 +74,29 @@ func expandPathOnce(path string) string {
 		return home
 	}
 	return filepath.Join(home, path[2:])
+}
+
+// OrchestratorCwdProblem reports why an operator's
+// full_self_prompting.orchestrator_agent_cwd cannot be used, or nil when it
+// can (and for the empty default, which the daemon creates on demand). The
+// daemon refuses to start the orchestrator on a non-nil answer; the TUI
+// shows the same answer beside the setting, so the two cannot disagree.
+func OrchestratorCwdProblem(cwd string) error {
+	if cwd == "" {
+		return nil
+	}
+	dir := ExpandPath(cwd)
+	if !filepath.IsAbs(dir) {
+		return fmt.Errorf("%q is not an absolute path", cwd)
+	}
+	info, err := os.Stat(dir)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return fmt.Errorf("%s does not exist", dir)
+	case err != nil:
+		return err
+	case !info.IsDir():
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	return nil
 }

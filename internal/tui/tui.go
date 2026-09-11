@@ -1888,7 +1888,28 @@ func (m Model) updateCheckCmd() tea.Cmd {
 
 // configFieldLabel renders one config field's row: the key, then its value.
 func configFieldLabel(cfg config.Config, key string) string {
+	if warning := configFieldWarning(cfg, key); warning != "" {
+		// Ahead of the value: rows truncate to one line, and the warning is
+		// the part that must survive a narrow terminal.
+		return fmt.Sprintf("%-38s %s  %s", key, warning, frontend.FieldValue(cfg, key))
+	}
 	return fmt.Sprintf("%-38s %s", key, frontend.FieldValue(cfg, key))
+}
+
+// configFieldWarning is a problem with a setting's current value that the
+// Config tab must show beside it, or "". Today one: the orchestrator's working
+// directory, the one path the daemon refuses to create — checked with the
+// same function the daemon applies (config.OrchestratorCwdProblem), so the tab
+// and the daemon cannot disagree. Read when the rows are built, i.e. on every
+// config load.
+func configFieldWarning(cfg config.Config, key string) string {
+	if key != frontend.FSPOrchestratorCwdFieldKey {
+		return ""
+	}
+	if err := config.OrchestratorCwdProblem(cfg.FullSelfPrompting.OrchestratorAgentCwd); err != nil {
+		return "⚠ " + err.Error() + " — the orchestrator cannot start there"
+	}
+	return ""
 }
 
 // buildRuleItems lays out the Config tab rows from the current config.
@@ -7963,6 +7984,9 @@ func (m Model) renderAudit(b *strings.Builder) {
 type configLine struct {
 	text    string
 	itemIdx int
+	// warn renders the row in the warning style (a setting whose value the
+	// daemon cannot use — configFieldWarning).
+	warn bool
 }
 
 // configLines flattens the Config tab into its ordered display lines. Item
@@ -8024,7 +8048,8 @@ func (m Model) configLines() []configLine {
 			lastKind = item.kind
 		}
 		// Long values (argv templates, paths) truncate to one line (CR-037).
-		lines = append(lines, configLine{text: "  " + oneLine(item.label, m.contentWidth()-2), itemIdx: i})
+		lines = append(lines, configLine{text: "  " + oneLine(item.label, m.contentWidth()-2), itemIdx: i,
+			warn: (item.kind == "fsp" || item.kind == "field") && configFieldWarning(m.data.cfg, item.key) != ""})
 	}
 	if !emptySectionsRendered {
 		emptySections()
@@ -8053,8 +8078,11 @@ func (m Model) renderConfig(b *strings.Builder) {
 	start, end := m.window(len(lines))
 	for i := start; i < end; i++ {
 		text := lines[i].text
-		if lines[i].itemIdx >= 0 && lines[i].itemIdx == m.cursors[tabConfig] {
+		switch {
+		case lines[i].itemIdx >= 0 && lines[i].itemIdx == m.cursors[tabConfig]:
 			text = st.selected.Render(text)
+		case lines[i].warn:
+			text = st.warn.Render(text)
 		}
 		fmt.Fprintln(b, text)
 	}

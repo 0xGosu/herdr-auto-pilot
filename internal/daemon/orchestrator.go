@@ -42,6 +42,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
@@ -97,6 +98,12 @@ type orchestratorState struct {
 	// failures and retryAt are the doubling backoff after a failed pass.
 	failures int
 	retryAt  time.Time
+	// lastErr and lastErrAt are why the last attempt failed, and waiting that
+	// the brief is held by a claude prompt — both surfaced on the heartbeat
+	// (orchestratorHealth) so the TUI and `hap status` show them.
+	lastErr   string
+	lastErrAt time.Time
+	waiting   bool
 	// Once-only notices, so a condition that holds for hours logs once.
 	waitingNoted    bool
 	noLauncherNoted bool
@@ -175,6 +182,7 @@ func (d *Daemon) setOrchestratorIdentity(id domain.OrchestratorIdentity) {
 	defer d.orch.mu.Unlock()
 	d.orch.id = id
 	d.orch.waitingNoted = false
+	d.orch.waiting = false
 	d.saveOrchestratorLocked(id)
 }
 
@@ -321,6 +329,7 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 		d.orch.mu.Lock()
 		noted := d.orch.noLauncherNoted
 		d.orch.noLauncherNoted = true
+		d.orch.lastErr, d.orch.lastErrAt = "this herdr adapter cannot start agents", d.opt.Clock.Now()
 		d.orch.mu.Unlock()
 		if !noted {
 			slog.Warn("orchestrator: this herdr adapter cannot start agents; no orchestrator will run")
@@ -387,6 +396,7 @@ func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLau
 		d.orch.mu.Lock()
 		noted := d.orch.badCommandNoted == strings.Join(argv, "\x00")
 		d.orch.badCommandNoted = strings.Join(argv, "\x00")
+		d.orch.lastErr, d.orch.lastErrAt = err.Error(), d.opt.Clock.Now()
 		d.orch.mu.Unlock()
 		if !noted {
 			slog.Warn("orchestrator: not starting one", "error", err)
@@ -578,6 +588,15 @@ func (d *Daemon) briefOrchestrator(ctx context.Context, id domain.OrchestratorId
 	}
 	err = ports.SendToAgent(ctx, d.opt.Herdr, id.PaneID, domain.OrchestratorAgentKind, d.orchestratorPrompt(cfg))
 	id.BriefAttempts++
+	d.orch.mu.Lock()
+	if err != nil {
+		d.orch.lastErr = fmt.Sprintf("sending the brief failed (attempt %d of %d): %v",
+			id.BriefAttempts, orchestratorBriefAttempts, err)
+		d.orch.lastErrAt = d.opt.Clock.Now()
+	} else {
+		d.orch.lastErr, d.orch.waiting = "", false
+	}
+	d.orch.mu.Unlock()
 	if err != nil {
 		slog.Warn("orchestrator: sending the brief failed", "attempt", id.BriefAttempts, "error", err)
 	} else {
@@ -610,6 +629,7 @@ func (d *Daemon) noteOrchestratorWaiting(ctx context.Context) {
 	d.orch.mu.Lock()
 	noted := d.orch.waitingNoted
 	d.orch.waitingNoted = true
+	d.orch.waiting = true
 	d.orch.mu.Unlock()
 	if noted {
 		return
@@ -649,6 +669,9 @@ func (d *Daemon) orchestratorSpawnAllowed(now time.Time) bool {
 	d.orch.spawns = kept
 	if len(kept) >= orchestratorMaxSpawnsPerHour {
 		d.orch.retryAt = kept[0].Add(time.Hour)
+		d.orch.lastErr = fmt.Sprintf("re-created %d times in the last hour; hap is waiting before the next start",
+			len(kept))
+		d.orch.lastErrAt = now
 		slog.Warn("orchestrator: started too often in the last hour; waiting before the next",
 			"spawns", len(kept), "retry_at", d.orch.retryAt.Format(time.RFC3339))
 		return false
@@ -665,6 +688,7 @@ func (d *Daemon) orchestratorFailed(now time.Time, what string, err error) {
 		delay = orchestratorBackoffMax
 	}
 	d.orch.retryAt = now.Add(delay)
+	d.orch.lastErr, d.orch.lastErrAt = what+" failed: "+err.Error(), now
 	d.orch.mu.Unlock()
 	slog.Warn("orchestrator: "+what+" failed; retrying later", "retry_in", delay.String(), "error", err)
 }
@@ -676,6 +700,7 @@ func (d *Daemon) orchestratorUnsupported(now time.Time, err error) {
 	noted := d.orch.noLauncherNoted
 	d.orch.noLauncherNoted = true
 	d.orch.retryAt = now.Add(orchestratorBackoffMax)
+	d.orch.lastErr, d.orch.lastErrAt = "herdr cannot start agents here (agent get / agent start); upgrade herdr", now
 	d.orch.mu.Unlock()
 	if !noted {
 		slog.Warn("orchestrator: herdr cannot start one; upgrade herdr to use orchestrator_agent_command", "error", err)
@@ -706,6 +731,7 @@ func (d *Daemon) orchestratorSucceeded() {
 	d.orch.mu.Lock()
 	d.orch.failures = 0
 	d.orch.retryAt = time.Time{}
+	d.orch.lastErr = ""
 	d.orch.mu.Unlock()
 }
 
@@ -768,16 +794,28 @@ func (d *Daemon) orchestratorDir(cwd string) (string, error) {
 		}
 		return dir, nil
 	}
-	dir := config.ExpandPath(cwd)
-	if !filepath.IsAbs(dir) {
-		return "", fmt.Errorf("orchestrator_agent_cwd %q is not an absolute path", cwd)
-	}
-	info, err := os.Stat(dir)
-	if err != nil {
+	if err := config.OrchestratorCwdProblem(cwd); err != nil {
 		return "", fmt.Errorf("orchestrator_agent_cwd: %w", err)
 	}
-	if !info.IsDir() {
-		return "", fmt.Errorf("orchestrator_agent_cwd %s is not a directory", dir)
+	return config.ExpandPath(cwd), nil
+}
+
+// orchestratorHealth is the orchestrator's trouble for the heartbeat, or nil
+// when there is none to show — including whenever the feature is off, so a
+// failure from before the operator turned it off does not linger.
+func (d *Daemon) orchestratorHealth() *daemonhealth.OrchestratorHealth {
+	cfg, _, _ := d.snapshot()
+	if !d.orchestratorModeOn(cfg) {
+		return nil
 	}
-	return dir, nil
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	if d.orch.lastErr == "" && !d.orch.waiting {
+		return nil
+	}
+	return &daemonhealth.OrchestratorHealth{
+		LastError: d.orch.lastErr, LastErrorAt: d.orch.lastErrAt,
+		Failures: d.orch.failures, RetryAt: d.orch.retryAt,
+		Waiting: d.orch.waiting, Workspace: domain.OrchestratorWorkspaceLabel,
+	}
 }
