@@ -2,6 +2,7 @@ package frontend_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -231,3 +232,44 @@ func TestNoStreamIsANoOp(t *testing.T) {
 }
 
 func itoa(n int64) string { return domain.StreamInt("", n).Value }
+
+// failingStreamLog is a log every append to which fails.
+type failingStreamLog struct{ *streamlog.Log }
+
+func (failingStreamLog) Append(context.Context, domain.StreamEvent) (int64, error) {
+	return 0, errors.New("induced stream failure")
+}
+
+// The event log may never turn a change that landed into a reported failure.
+func TestAFailingStreamNeverFailsTheCommand(t *testing.T) {
+	app, _ := testApp(t)
+	app.Stream = failingStreamLog{streamlog.InStateDir(t.TempDir())}
+	ctx := context.Background()
+	if _, err := app.Pause(ctx); err != nil {
+		t.Fatalf("Pause with a failing stream: %v", err)
+	}
+	if _, err := app.SetField(ctx, "full_self_prompting.honour_limits", "true"); err != nil {
+		t.Fatalf("SetField with a failing stream: %v", err)
+	}
+	if err := os.WriteFile(app.ConfigPath, []byte(
+		"[task_source_provider]\nprovider = \"sqlite\"\n\n[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := app.AddTask("otter", "", "first task"); err != nil {
+		t.Fatalf("AddTask with a failing stream: %v", err)
+	}
+}
+
+// Turning full self-prompting off is announced as fsp.off, never ALSO as a
+// config.changed naming the same key.
+func TestStreamFSPToggleIsItsOwnEvent(t *testing.T) {
+	app, _ := testApp(t)
+	log := withStream(t, app)
+	if err := os.WriteFile(app.ConfigPath, []byte("[full_self_prompting]\nenabled = true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.SetFullSelfPrompting(context.Background(), false); err != nil {
+		t.Fatal(err)
+	}
+	wantLines(t, streamLines(t, log, 0), "fsp.off by=operator")
+}

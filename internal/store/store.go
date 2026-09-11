@@ -1339,14 +1339,42 @@ func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domai
 // at or after since, newest first, at most limit of them. Unlike
 // AutoAcceptableEscalations it pushes NO eligibility filter down: a row with no
 // suggestion or no baseline is exactly one only a human can answer.
+//
+// Only the fields the orchestrator stream reads are selected (ID, AgentID,
+// SituationType, CreatedAt, and whether SigRaw and Suggestion are present):
+// it runs every sweep on the daemon's loop, and a full audit row carries the
+// pane excerpt and the LLM output.
 func (s *Store) EscalationsAwaitingAttention(ctx context.Context, since time.Time, limit int) ([]domain.AuditRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+auditCols+` FROM audit_log
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent_id, situation_type, created_at,
+		sig_raw != '', suggestion != '' FROM audit_log
 		WHERE node_id = ? AND status = 'escalated' AND created_at >= ?
 		ORDER BY created_at DESC, id DESC LIMIT ?`, s.self, unix(since), limit)
 	if err != nil {
 		return nil, err
 	}
-	return s.scanAudits(rows)
+	defer rows.Close()
+	var out []domain.AuditRecord
+	for rows.Next() {
+		var a domain.AuditRecord
+		var situation string
+		var created int64
+		var hasSig, hasSuggestion bool
+		if err := rows.Scan(&a.ID, &a.AgentID, &situation, &created, &hasSig, &hasSuggestion); err != nil {
+			return nil, err
+		}
+		a.NodeID, a.Status = s.self, "escalated"
+		a.SituationType = domain.SituationType(situation)
+		a.CreatedAt = fromUnix(created)
+		// Presence only: a placeholder the caller reads as "has one".
+		if hasSig {
+			a.SigRaw = "present"
+		}
+		if hasSuggestion {
+			a.Suggestion = "present"
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 // autoAcceptCandidateLimit bounds one sweep's candidate fetch. Each row can

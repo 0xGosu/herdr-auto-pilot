@@ -62,16 +62,12 @@ func (d *Daemon) emitChecklistDiff(ctx context.Context, locator, before, after s
 }
 
 // announcePendingEscalations puts each escalation that still needs a human on
-// the stream, once.
+// the stream, once. It runs right after the auto-accept pass that began at
+// passStart, and reads what that pass looked at (d.lastAutoAccept).
 //
 // WHEN is the whole design. At insert is too early: under full self-prompting
 // the row is about to be auto-accepted, and an orchestrator told about it would
-// race the daemon for the same pane. So a row is announced once the auto-accept
-// pass that began at passStart — the one that ran after the row became eligible
-// — has left it escalated. Eligibility is autoAcceptCutoffs, the same bound
-// the pass used, so the two can never disagree; a type auto-accept never takes
-// is announced after the first pass. Under full self-prompting that costs up to
-// one sweep (a minute) of latency, by design.
+// race the daemon for the same pane. See leftForAHuman for the rule.
 //
 // Auto-accepting and auto-accepted rows are not 'escalated', so they are never
 // announced. A row that is claimed and later reverted is not announced twice:
@@ -86,8 +82,6 @@ func (d *Daemon) announcePendingEscalations(ctx context.Context, passStart time.
 	if !ok {
 		return
 	}
-	cfg, _, _ := d.snapshot()
-	cutoffs := autoAcceptCutoffs(cfg, d.fspActive(ctx, cfg), passStart)
 	rows, err := lister.EscalationsAwaitingAttention(ctx, passStart.Add(-streamEscalationWindow), streamEscalationLimit)
 	if err != nil {
 		slog.Warn("orchestrator stream: listing pending escalations failed", "error", err)
@@ -100,26 +94,27 @@ func (d *Daemon) announcePendingEscalations(ctx context.Context, passStart time.
 	if d.streamAnnounced == nil {
 		d.streamAnnounced = make(map[int64]bool)
 	}
+	rep := d.lastAutoAccept
 	pending := make(map[int64]bool, len(rows))
 	for _, rec := range rows {
 		pending[rec.ID] = true
-		if d.streamAnnounced[rec.ID] {
+		if d.streamAnnounced[rec.ID] || !leftForAHuman(rec, rep, passStart) {
 			continue
 		}
-		bound := passStart
-		if c, ok := cutoffs[rec.SituationType]; ok {
-			bound = c
-		}
-		if rec.CreatedAt.After(bound) {
-			continue // auto-accept has not had its look yet
+		dedupe := fmt.Sprintf("escalation:%d", rec.ID)
+		// A read first: after a restart the in-memory set is empty, and an
+		// append its dedupe key drops would still take the write lock (and may
+		// consume a sequence number) for every pending row, every restart.
+		if seen, err := d.opt.Stream.Seen(ctx, dedupe); err == nil && seen {
+			d.streamAnnounced[rec.ID] = true
+			continue
 		}
 		agent := rec.AgentID
 		if n := names[rec.AgentID]; n != "" {
 			agent = n
 		}
 		ev := domain.StreamEvent{
-			At: d.opt.Clock.Now(), Kind: domain.StreamEscalation, Author: streamAuthor,
-			Dedupe: fmt.Sprintf("escalation:%d", rec.ID),
+			At: d.opt.Clock.Now(), Kind: domain.StreamEscalation, Author: streamAuthor, Dedupe: dedupe,
 			Fields: []domain.StreamField{
 				domain.StreamInt("id", rec.ID), domain.StreamStr("agent", agent),
 				domain.StreamStr("type", string(rec.SituationType)),
@@ -137,6 +132,29 @@ func (d *Daemon) announcePendingEscalations(ctx context.Context, passStart time.
 			delete(d.streamAnnounced, id)
 		}
 	}
+}
+
+// leftForAHuman reports whether auto-accept has had its look at a pending row
+// and left it — the condition for announcing it.
+//
+//   - A row auto-accept can NEVER take (its type does not auto-accept, or it
+//     has no suggestion or no baseline, which the candidate query filters out)
+//     only has to predate the pass: waiting out a timer for it would only
+//     delay the one party who can answer it.
+//   - A row it can take waits until it is old enough for the cutoff the pass
+//     used — immediately under full self-prompting, the configured threshold
+//     under timed auto-accept — AND the pass actually examined it without
+//     putting it off. A row past the candidate cap, or on an agent another row
+//     went first on, is not announced until a pass has really looked at it.
+func leftForAHuman(rec domain.AuditRecord, rep autoAcceptPassReport, passStart time.Time) bool {
+	cutoff, typed := rep.cutoffs[rec.SituationType]
+	if !typed || rec.SigRaw == "" || rec.Suggestion == "" {
+		return !rec.CreatedAt.After(passStart)
+	}
+	if rec.CreatedAt.After(cutoff) {
+		return false
+	}
+	return rep.ran && rep.examined[rec.ID] && !rep.deferred[rec.ID]
 }
 
 // maybePruneStream drops events past streamlog.Retention, once a day, off the

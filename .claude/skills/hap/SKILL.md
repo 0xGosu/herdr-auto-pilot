@@ -1201,8 +1201,10 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
   (database lists only) · `escalation` · `escalation.dismissed` · `correction` ·
   `pause.on|off` · `fsp.on|off` · `rule.streak|reset|deleted` · `daemon.started`.
 - **An escalation is announced once auto-accept has left it for a human** — up to
-  a minute after it was raised under full self-prompting. The stream never names a
-  row the daemon is about to answer itself.
+  a minute after it was raised under full self-prompting, or once its threshold
+  passed under timed auto-accept (a row with no suggestion: at the next sweep).
+  The stream never names a row the daemon is about to answer itself.
+- **Sequence numbers only increase** — never assume they are consecutive.
 - **Resuming:** without `--resume` the stream starts at the head. `--resume N`
   replays everything after N (the last seq you handled) first. Events are kept 7
   days; a cursor older than that prints `# gap missed=A..B`, a cursor above the

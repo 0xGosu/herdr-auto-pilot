@@ -614,6 +614,9 @@ type Daemon struct {
 	// The log's dedupe key is what holds across restarts; this is only the
 	// cheap first check. Pruned to the current pending set. Loop-owned.
 	streamAnnounced map[int64]bool
+	// lastAutoAccept is what the most recent auto-accept pass looked at, read
+	// by the announcement right after it. Loop-owned.
+	lastAutoAccept autoAcceptPassReport
 
 	// lastNodeUpsert throttles the nodes-row write to domain.NodeHeartbeat off
 	// the faster health-file beat. Zero means "never written", so a starting

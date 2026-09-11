@@ -149,14 +149,71 @@ func TestStreamPruneRunsOnceADay(t *testing.T) {
 	h.daemon.maybePruneStream(now)
 	waitFor(t, 2*time.Second, func() bool { return len(streamOf(t, log, domain.StreamPauseOn)) == 0 })
 
-	// Within the day the throttle holds, whatever the log contains.
-	if _, err := log.Append(ctx, domain.StreamEvent{Kind: domain.StreamPauseOn,
-		At: time.Now().Add(-2 * streamlog.Retention)}); err != nil {
+	// Within the day the throttle holds: the decision is synchronous, so the
+	// latch not moving proves no second prune was scheduled.
+	h.daemon.maybePruneStream(now.Add(time.Hour))
+	h.daemon.mu.Lock()
+	last := h.daemon.lastStreamPrune
+	h.daemon.mu.Unlock()
+	if !last.Equal(now) {
+		t.Fatalf("a second prune was scheduled within a day (latch moved to %v)", last)
+	}
+}
+
+// seedCandidate writes a pending escalation auto-accept CAN take: a suggestion
+// and a signature baseline.
+func seedCandidate(t *testing.T, h *harness, agent string, at time.Time) int64 {
+	t.Helper()
+	id, err := h.raw.AppendAudit(context.Background(), domain.AuditRecord{
+		AgentID: agent, AgentType: "claude", SituationType: domain.SituationApproval, Trigger: "t",
+		Action: domain.AuditActionEscalated, Status: "escalated", Suggestion: "respond: Yes", CreatedAt: at,
+	}.WithSignatureBaseline(domain.SignatureResult{
+		Signature: "sig-" + agent, Raw: "sig-" + agent, Salient: "permission:proceed | options:no;yes",
+		Verdict: domain.GuardOK, SalientChars: 500,
+	}))
+	if err != nil {
 		t.Fatal(err)
 	}
-	h.daemon.maybePruneStream(now.Add(time.Hour))
-	time.Sleep(50 * time.Millisecond)
-	if got := streamOf(t, log, domain.StreamPauseOn); len(got) != 1 {
-		t.Fatalf("the prune ran twice within a day: %v", got)
+	return id
+}
+
+// A row the auto-accept pass merely PUT OFF — another row on its agent went
+// first, its pane was busy — or never examined (past the candidate cap) is not
+// a row left for a human: auto-accept takes it on a later sweep, and
+// announcing it would set the orchestrator racing the daemon for the pane.
+func TestAnnounceWaitsForARowThePassPutOff(t *testing.T) {
+	h, log := newStreamHarness(t, "")
+	ctx := context.Background()
+	passStart := time.Now().Truncate(time.Second)
+	refused := seedCandidate(t, h, "p1", passStart.Add(-time.Minute))
+	putOff := seedCandidate(t, h, "p1", passStart.Add(-time.Minute))
+	unexamined := seedCandidate(t, h, "p2", passStart.Add(-time.Minute))
+	noSuggestion := seedStreamEscalation(t, h, "p3", passStart.Add(-time.Minute))
+
+	h.daemon.lastAutoAccept = autoAcceptPassReport{
+		ran:      true,
+		cutoffs:  map[domain.SituationType]time.Time{domain.SituationApproval: passStart},
+		examined: map[int64]bool{refused: true, putOff: true},
+		deferred: map[int64]bool{putOff: true},
+	}
+	h.daemon.announcePendingEscalations(ctx, passStart)
+
+	got := map[string]bool{}
+	for _, line := range streamOf(t, log, domain.StreamEscalation) {
+		got[strings.Fields(line)[1]] = true
+	}
+	for id, want := range map[int64]bool{refused: true, putOff: false, unexamined: false, noSuggestion: true} {
+		if got["id="+domain.StreamInt("", id).Value] != want {
+			t.Errorf("escalation %d announced = %v, want %v (all: %v)", id, !want, want, got)
+		}
+	}
+
+	// A pass that never reached its candidates (paused, say) examined nothing.
+	h.daemon.lastAutoAccept = autoAcceptPassReport{
+		cutoffs: map[domain.SituationType]time.Time{domain.SituationApproval: passStart},
+	}
+	h.daemon.announcePendingEscalations(ctx, passStart)
+	if n := len(streamOf(t, log, domain.StreamEscalation)); n != 2 {
+		t.Fatalf("a pass that did not run released its candidates: %d announced, want 2", n)
 	}
 }

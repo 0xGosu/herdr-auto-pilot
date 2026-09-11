@@ -685,8 +685,11 @@ func buildCommands() {
 				"  pause.on|off scope=…             fsp.on|off\n" +
 				"  rule.streak|reset|deleted sig=…  daemon.started version=…\n\n" +
 				"An escalation is announced once auto-accept has had its look at it and left it\n" +
-				"for a human — up to a minute after it was raised under full self-prompting —\n" +
-				"so the stream never names a row the daemon is about to answer itself.\n\n" +
+				"for a human — up to a minute after it was raised under full self-prompting, or\n" +
+				"once its threshold has passed under timed auto-accept — so the stream never\n" +
+				"names a row the daemon is about to answer itself. A row auto-accept can never\n" +
+				"take (no suggestion) is announced at the next sweep.\n\n" +
+				"Sequence numbers only ever increase; they are not guaranteed consecutive.\n\n" +
 				"The first line is always `# hap stream orchestrator head=H floor=F`. Without\n" +
 				"--resume the stream starts at the head and replays nothing. With --resume N it\n" +
 				"replays every event after N first. Events are kept for 7 days: a cursor older\n" +

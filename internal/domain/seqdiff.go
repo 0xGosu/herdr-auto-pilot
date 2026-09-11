@@ -152,22 +152,28 @@ type ChecklistChange struct {
 // task list: items created, deleted, edited or re-marked (EditChange), and
 // moved. It never reports an item that did not change.
 //
-// Items are aligned by TEXT, the same identity the reservation ledger uses. A
-// delete and insert of identical text become a move; what is left in the same
-// stretch pairs into an edit.
+// Alignment runs in four passes, each only over what the previous left:
+//
+//  1. the WHOLE item (text, mark and detail) — so of two items sharing a text,
+//     the one that is really still there is the one kept. Aligning on text
+//     alone matched a finished "[x] X" to the surviving "[ ] X" when the
+//     finished one was deleted, and reported a done task reopened;
+//  2. the same TEXT within one stretch between kept items — an item re-marked
+//     or given new detail in place;
+//  3. the same text anywhere — a move;
+//  4. position within one stretch — an item whose text was edited.
 func DiffChecklist(before, after []ChecklistItem) []ChecklistChange {
 	edits := DiffSequences(len(before), len(after), func(i, j int) bool {
-		return before[i].Text == after[j].Text
+		return sameChecklistItem(before[i], after[j])
 	})
+	edits = pairSameText(edits, before, after)
 	edits = pairMoves(edits, before, after)
 	edits = PairChanges(edits)
 	var out []ChecklistChange
 	for _, e := range edits {
 		switch e.Op {
 		case EditKeep:
-			if checklistItemChanged(before[e.Before], after[e.After]) {
-				out = append(out, ChecklistChange{Op: EditChange, Index: after[e.After].Index, Mark: after[e.After].Mark})
-			}
+			// Equal by construction: nothing to report.
 		case EditChange:
 			out = append(out, ChecklistChange{Op: EditChange, Index: after[e.After].Index, Mark: after[e.After].Mark})
 		case EditMove:
@@ -216,6 +222,44 @@ func pairMoves(edits []SequenceEdit, before, after []ChecklistItem) []SequenceEd
 	return out
 }
 
-func checklistItemChanged(a, b ChecklistItem) bool {
-	return a.Mark != b.Mark || strings.Join(a.Detail, "\n") != strings.Join(b.Detail, "\n")
+// pairSameText folds a delete and an insert of the same text inside one
+// stretch into a change: the item stayed where it was and only its mark or
+// detail moved.
+func pairSameText(edits []SequenceEdit, before, after []ChecklistItem) []SequenceEdit {
+	type key struct {
+		gap  int
+		text string
+	}
+	dels := map[key][]int{}
+	for k, e := range edits {
+		if e.Op == EditDelete {
+			kk := key{e.gap, before[e.Before].Text}
+			dels[kk] = append(dels[kk], k)
+		}
+	}
+	drop := map[int]bool{}
+	for k, e := range edits {
+		if e.Op != EditInsert {
+			continue
+		}
+		kk := key{e.gap, after[e.After].Text}
+		if len(dels[kk]) == 0 {
+			continue
+		}
+		d := dels[kk][0]
+		dels[kk] = dels[kk][1:]
+		edits[k] = SequenceEdit{Op: EditChange, Before: edits[d].Before, After: e.After, gap: e.gap}
+		drop[d] = true
+	}
+	out := edits[:0:0]
+	for k, e := range edits {
+		if !drop[k] {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func sameChecklistItem(a, b ChecklistItem) bool {
+	return a.Text == b.Text && a.Mark == b.Mark && strings.Join(a.Detail, "\n") == strings.Join(b.Detail, "\n")
 }

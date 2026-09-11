@@ -12,9 +12,12 @@
 //   - Every hap process on the machine can open a plain file, including a CLI
 //     under the turso engine, where only the daemon may open the store.
 //
-// The counter is SQLite's AUTOINCREMENT rowid: strictly increasing, never
-// reused even after a prune, and one namespace for every writer on the
-// machine because they all write the same file.
+// The counter is SQLite's AUTOINCREMENT rowid: strictly INCREASING, never
+// reused even after a prune, and one namespace for every writer on the machine
+// because they all write the same file. It is not guaranteed DENSE — an
+// append dropped by its dedupe key may consume a number — so a reader resumes
+// from the last seq it handled and never infers a lost event from a skipped
+// number; lost events are reported against the retained floor instead.
 //
 // Appending is best-effort BY CONTRACT (see ports.StreamLog): the change an
 // event describes has already been committed, so a failed append is logged by
@@ -24,6 +27,7 @@ package streamlog
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -54,14 +58,18 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_at ON events(at);
 `
 
+// errClosed is returned by every call on a closed Log.
+var errClosed = errors.New("stream log is closed")
+
 // Log is a lazily opened handle on the event log. Construction touches
 // nothing: every hap command builds one, and only the few that emit or read
 // events should pay for opening a database.
 type Log struct {
 	path string
 
-	mu sync.Mutex
-	db *sql.DB
+	mu     sync.Mutex
+	db     *sql.DB
+	closed bool
 }
 
 // New returns a handle on the log at path, opened on first use.
@@ -75,10 +83,14 @@ func (l *Log) Path() string { return l.path }
 
 // open opens and migrates the database once. A failure is NOT cached: a state
 // directory that was briefly unwritable must not disable the stream for the
-// rest of a long-lived process such as the daemon.
+// rest of a long-lived process such as the daemon. A closed Log stays closed —
+// a late append during shutdown must not quietly reopen the file.
 func (l *Log) open() (*sql.DB, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errClosed
+	}
 	if l.db != nil {
 		return l.db, nil
 	}
@@ -139,6 +151,8 @@ func (l *Log) Append(ctx context.Context, ev domain.StreamEvent) (int64, error) 
 }
 
 // Seen reports whether an event carrying the dedupe key is still in the log.
+// A read, so a caller re-examining state on a timer can skip the write an
+// already-recorded event would cost.
 func (l *Log) Seen(ctx context.Context, dedupe string) (bool, error) {
 	db, err := l.open()
 	if err != nil {
@@ -162,7 +176,7 @@ func (l *Log) Head(ctx context.Context) (int64, error) {
 	}
 	var head sql.NullInt64
 	err = db.QueryRowContext(ctx, `SELECT seq FROM sqlite_sequence WHERE name = 'events'`).Scan(&head)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
 	if err != nil {
@@ -224,10 +238,12 @@ func (l *Log) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	return res.RowsAffected()
 }
 
-// Close releases the database, if it was ever opened.
+// Close releases the database, if it was ever opened, and refuses every later
+// call.
 func (l *Log) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.closed = true
 	if l.db == nil {
 		return nil
 	}

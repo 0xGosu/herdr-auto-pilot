@@ -100,6 +100,22 @@ func TestDiffChecklist(t *testing.T) {
 			name: "create from empty", before: "", after: "# T\n- [ ] a\n- [ ] b\n",
 			want: []ChecklistChange{{Op: EditInsert, Index: 1, Mark: " "}, {Op: EditInsert, Index: 2, Mark: " "}},
 		},
+		{
+			// Aligning on text alone matched the done X to the surviving open
+			// one and reported a finished task reopened.
+			name: "delete the done one of two duplicates", before: "- [x] X\n- [ ] X\n", after: "- [ ] X\n",
+			want: []ChecklistChange{{Op: EditDelete, Index: 1}},
+		},
+		{
+			name: "mark the second of two duplicates", before: "- [ ] X\n- [ ] X\n", after: "- [ ] X\n- [x] X\n",
+			want: []ChecklistChange{{Op: EditChange, Index: 2, Mark: "x"}},
+		},
+		{
+			// A delete and an insert on opposite sides of a kept item are two
+			// events, never one edit.
+			name: "delete and insert across a kept item", before: "- [ ] a\n- [ ] b\n", after: "- [ ] b\n- [ ] c\n",
+			want: []ChecklistChange{{Op: EditDelete, Index: 1}, {Op: EditInsert, Index: 2, Mark: " "}},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -18,6 +18,9 @@ import (
 // callers, and a per-caller list of touched keys would be stale the day a new
 // caller is added.
 func FlattenKeys(cfg Config) (map[string]string, error) {
+	// A copy first: normalizing edits the slice in place, and cfg shares its
+	// backing array with the caller.
+	cfg.TaskSources = append([]TaskSource(nil), cfg.TaskSources...)
 	cfg.normalizeTaskSources()
 	var buf bytes.Buffer
 	if err := toml.NewEncoder(&buf).Encode(cfg); err != nil {
