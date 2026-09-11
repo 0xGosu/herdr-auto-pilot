@@ -457,12 +457,13 @@ func (d *Daemon) storeRerankVerdictLocked(key string, v []domain.RerankResult) {
 // and cannot have this shape: it is keyed on one agent, and a missing entry
 // there really does mean there is nothing to cancel.
 //
-// It is called on ANY reload and on RefreshKnowledge, unconditionally — never
-// gated on a section comparison the way reloadEmbedder's port swap is on
-// prev.Embedding != next.Embedding. Turning the judge off and on again, editing
-// its prompt, changing the threshold, or pulling rules learned on another
-// machine all change what the judge would answer, and a verdict that survived
-// any of them would keep answering the old question.
+// It is called on ANY reload unconditionally — never gated on a section
+// comparison the way reloadEmbedder's port swap is on prev.Embedding !=
+// next.Embedding. Turning the judge off and on again, editing its prompt, or
+// changing the threshold all change what the judge would answer, and a verdict
+// that survived any of them would keep answering the old question. A fleet
+// pull goes through invalidateRerankForKnowledge instead, which bumps whenever
+// the rule knowledge a listing is rendered from has moved.
 //
 // The two halves are one operation on purpose. Clearing only the cache leaves
 // the hole open in its most confusing form: a run started under the old regime
@@ -478,11 +479,66 @@ func (d *Daemon) storeRerankVerdictLocked(key string, v []domain.RerankResult) {
 func (d *Daemon) invalidateRerank() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.invalidateRerankLocked()
+}
+
+// invalidateRerankLocked is invalidateRerank's body; the caller holds mu.
+func (d *Daemon) invalidateRerankLocked() {
 	if len(d.rerankCache) > 0 {
 		d.rerankCache = map[string][]domain.RerankResult{}
 		d.rerankCacheOrder = nil
 	}
 	d.rerankGen++
+}
+
+// invalidateRerankForKnowledge is RefreshKnowledge's invalidation. It retires
+// every verdict only when the rule knowledge a candidate listing is rendered
+// from has moved since the last time it did: the candidate rows (emb, the
+// signature_embeddings digest) or the learned state the listing describes them
+// by (state, see ports.RuleStateFingerprinter). Under turso nearly every pull
+// reports a change, so bumping on each one retired almost every in-flight
+// judge run — the subprocess ran for nothing and the herd got the cosine
+// answer anyway. Either digest unknown ("") invalidates, which is the old
+// behaviour.
+//
+// This is NOT the "nothing to invalidate" fast path invalidateRerank rules out.
+// That one asks whether any verdict EXISTS, which a verdict in transit
+// defeats; this asks whether the QUESTION changed, and a verdict judged
+// against unmoved knowledge answers the question it was asked. The comparison
+// and the bump share one hold of mu, like commitRerankVerdict.
+//
+// A change this node made itself (a decision recorded here) is caught by the
+// next pull's digest just the same — the digest covers every node's rows — so
+// no source of change is lost relative to invalidating on every pull; only
+// pulls that moved nothing stop costing verdicts.
+func (d *Daemon) invalidateRerankForKnowledge(emb, state string) {
+	known := emb != "" && state != ""
+	digest := emb + "\x00" + state
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if known && d.rerankKnowledge == digest {
+		return
+	}
+	d.rerankKnowledge = ""
+	if known {
+		d.rerankKnowledge = digest
+	}
+	d.invalidateRerankLocked()
+}
+
+// ruleStateFingerprint digests the learned rule state a candidate listing
+// renders, or "" when the store cannot say — which invalidates.
+func (d *Daemon) ruleStateFingerprint(ctx context.Context) string {
+	rf, ok := d.opt.Store.(ports.RuleStateFingerprinter)
+	if !ok {
+		return ""
+	}
+	fp, err := rf.RuleStateFingerprint(ctx)
+	if err != nil {
+		slog.Debug("rule-state fingerprint unavailable; invalidating re-rank verdicts", "error", err)
+		return ""
+	}
+	return fp
 }
 
 // commitRerankVerdict is the LINEARIZATION POINT this feature's invalidation

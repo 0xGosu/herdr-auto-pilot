@@ -45,6 +45,10 @@ golangci-lint run --build-tags "vectors,cpu"
 - Golden classifier fixtures: `internal/classify/testdata/`; regenerate with
   `UPDATE_GOLDEN=1 go test ./internal/classify/` and review the diff.
 - Run the full suite before every commit that touches Go code.
+- Profiling (opt-in, any verb): `HAP_PROFILE_DIR=<dir> [HAP_PROFILE_SECONDS=60] hap daemon --restart` writes
+  ROLLING `<verb>-<pid>.cpu.pprof` / `.heap.pprof` windows (`internal/profiling`) — the files are always the latest
+  complete window, so an idle daemon hours in can be read with `go tool pprof -top bin/hap <file>`. The detached
+  daemon inherits the environment; nothing is written or listened on when the variable is unset.
 - Pipeline smoke test (fake herdr → real daemon → real LLM CLI):
   `go build -o /tmp/e2e ./e2e_harness && /tmp/e2e <short-dir> <hap-bin> <config-dir> <state-dir>`.
 
@@ -951,9 +955,16 @@ above it is listed for a one-shot CLI returning `[{"id": n, "score": s}]` by rel
   does mean nothing to cancel.
 - **The verdict cache keys on the RENDERED listing, never the candidate signatures** — the listing carries each
   rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what makes the judge say "reuse this", and all
-  of those move under an UNCHANGED signature set every time a decision is recorded. Cleared on ANY reload and
-  on `RefreshKnowledge`, unconditionally — never gated on a section compare, or turning the judge off and on
-  again resurrects its old answers.
+  of those move under an UNCHANGED signature set every time a decision is recorded. Cleared on ANY reload
+  unconditionally — never gated on a section compare, or turning the judge off and on again resurrects its old
+  answers.
+- **A fleet pull retires verdicts only when the listing's INPUTS moved** (`invalidateRerankForKnowledge`). Under
+  turso nearly every pull reports a change, and bumping on each one retired almost every in-flight judge run — the
+  subprocess ran for nothing. The digest must cover EVERYTHING the listing reads: the candidate rows
+  (`SignatureEmbeddingsFingerprint`) AND the learned state (`RuleStateFingerprint`: mode, decision floor, decision
+  count + max id). This is not the forbidden "nothing to invalidate" fast path — that asks whether a verdict
+  EXISTS, this asks whether the QUESTION changed — and the compare and the bump share one hold of `mu`. Either
+  digest unknown invalidates. A change made on THIS node is caught by the next pull's digest, as before.
 
 `match.VectorCandidates` exists for this and re-expresses `MatchVector` rather than duplicating it:
 `MatchVector`'s "return the first accepted candidate" is sound only because the list is in descending cosine —
@@ -1088,6 +1099,7 @@ where the behaviour could revert.
 | `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
 | `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
 | `internal/streamlog` | machine-local SQLite event log behind `hap stream orchestrator` (its own file, NOT a store table) |
+| `internal/profiling` | opt-in rolling CPU/heap profiles (`HAP_PROFILE_DIR`); files only, no listener |
 | `internal/updatecheck` | GitHub release check — one of exactly TWO `net/http` importers (NFR-007 allowlist) |
 | `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
 | `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |

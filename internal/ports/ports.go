@@ -139,6 +139,17 @@ type KnowledgeFingerprinter interface {
 	SignatureEmbeddingsFingerprint(ctx context.Context) (string, error)
 }
 
+// RuleStateFingerprinter is implemented by stores that can digest the learned
+// rule STATE a re-rank candidate listing renders (each rule's mode, decision
+// floor and decision history). With KnowledgeFingerprinter it lets the daemon
+// keep in-flight re-rank verdicts across a fleet pull that moved nothing a
+// listing reads. Optional, and separate so neither capability breaks a fake
+// implementing the other: absent — or on an error — every refresh invalidates,
+// as it always did.
+type RuleStateFingerprinter interface {
+	RuleStateFingerprint(ctx context.Context) (string, error)
+}
+
 // VisiblePaneReader is implemented by Herdr adapters that can read the pane's
 // current on-screen content (as opposed to ReadPane's consuming "recent"
 // delta). Used to recover a standing numbered menu when delivering an

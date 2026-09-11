@@ -41,6 +41,18 @@ func (s fingerprintingStore) SignatureEmbeddingsFingerprint(ctx context.Context)
 	return s.StorePort.(ports.KnowledgeFingerprinter).SignatureEmbeddingsFingerprint(ctx)
 }
 
+func (s fingerprintingStore) RuleStateFingerprint(ctx context.Context) (string, error) {
+	return s.StorePort.(ports.RuleStateFingerprinter).RuleStateFingerprint(ctx)
+}
+
+// embeddingsOnlyStore offers the rebuild digest but not the rule-state one:
+// the control for the verdict gate.
+type embeddingsOnlyStore struct{ *countingEmbeddingsStore }
+
+func (s embeddingsOnlyStore) SignatureEmbeddingsFingerprint(ctx context.Context) (string, error) {
+	return s.StorePort.(ports.KnowledgeFingerprinter).SignatureEmbeddingsFingerprint(ctx)
+}
+
 // latchedEmbedder is an embedder whose failure latch has tripped: a degraded
 // build is the best it will do until a reload.
 type latchedEmbedder struct{ *fakeEmbedder }
@@ -48,9 +60,22 @@ type latchedEmbedder struct{ *fakeEmbedder }
 func (latchedEmbedder) Degraded() bool { return true }
 
 // knowledgeHarness is semanticHarness over a counting store; fingerprint
-// selects whether the store offers the optional digest. It returns once the
+// selects whether the store offers both optional digests. It returns once the
 // startup build has published (semanticReady is set after publishKnowledge).
 func knowledgeHarness(t *testing.T, emb ports.EmbedderPort, fingerprint bool) (*Daemon, *countingEmbeddingsStore) {
+	t.Helper()
+	return knowledgeHarnessWith(t, emb, func(c *countingEmbeddingsStore) ports.StorePort {
+		if fingerprint {
+			return fingerprintingStore{c}
+		}
+		return c
+	})
+}
+
+// knowledgeHarnessWith is knowledgeHarness with the store wrapper chosen by
+// the caller, for the capabilities between "both digests" and "neither".
+func knowledgeHarnessWith(t *testing.T, emb ports.EmbedderPort,
+	wrap func(*countingEmbeddingsStore) ports.StorePort) (*Daemon, *countingEmbeddingsStore) {
 	t.Helper()
 	dir := t.TempDir()
 	raw, err := store.Open(filepath.Join(dir, "test.db"))
@@ -59,10 +84,7 @@ func knowledgeHarness(t *testing.T, emb ports.EmbedderPort, fingerprint bool) (*
 	}
 	t.Cleanup(func() { raw.Close() })
 	counting := &countingEmbeddingsStore{StorePort: raw}
-	var st ports.StorePort = counting
-	if fingerprint {
-		st = fingerprintingStore{counting}
-	}
+	st := wrap(counting)
 	d, err := New(Options{
 		ConfigPath:        filepath.Join(dir, "config.toml"),
 		ControlSocketPath: filepath.Join(testutil.SocketDir(t), "c.sock"),
@@ -136,8 +158,8 @@ func matchable(t *testing.T, d *Daemon, e domain.SignatureEmbedding) bool {
 
 // TestRefreshKnowledgeSkipsTheRebuildWhenNoRuleMoved is the CPU regression
 // guard: under turso nearly every pull reports a change, and rebuilding the
-// whole index on each one kept an idle node busy. Invalidation must still run
-// every time — the verdict cache keys on rule STATE the digest does not cover.
+// whole index on each one kept an idle node busy. Nothing moved, so the
+// re-rank verdicts survive too (see rerankknowledge_test.go).
 func TestRefreshKnowledgeSkipsTheRebuildWhenNoRuleMoved(t *testing.T) {
 	d, st := knowledgeHarness(t, &fakeEmbedder{}, true)
 	peerRule(t, st, "deploy")
@@ -154,8 +176,8 @@ func TestRefreshKnowledgeSkipsTheRebuildWhenNoRuleMoved(t *testing.T) {
 	if got := st.loads.Load(); got != loads {
 		t.Errorf("index loaded %d more time(s) on refreshes that changed no rule", got-loads)
 	}
-	if got := currentRerankGen(d); got != rr+3 {
-		t.Errorf("rerank generation = %d, want %d: invalidation must not be gated on the digest", got, rr+3)
+	if got := currentRerankGen(d); got != rr {
+		t.Errorf("rerank generation moved %d → %d on refreshes that changed no rule", rr, got)
 	}
 }
 

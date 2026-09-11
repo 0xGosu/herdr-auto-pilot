@@ -94,14 +94,33 @@ func (d *Daemon) rosterDemandLevel() rosterDemandLevel {
 			return rosterDemandLocal
 		}
 	}
-	// A read error is "nobody watching", as with the local registry: the
-	// event-driven path and the sweep still publish.
-	if d.opt.Store != nil && d.opt.Clock != nil {
-		if n, err := d.opt.Store.RemoteWatchers(context.Background(), d.opt.Clock.Now()); err == nil && n > 0 {
-			return rosterDemandRemote
-		}
+	if d.opt.Store != nil && d.opt.Clock != nil && d.remoteWatched(d.opt.Clock.Now()) {
+		return rosterDemandRemote
 	}
 	return rosterDemandNone
+}
+
+// remoteWatched reports whether another node's TUI watches the fleet, asking
+// the store at most once per remoteRosterInterval. The 2s roster tick asks on
+// the select loop, and with no local TUI — the common case — it used to run a
+// store query every tick for an answer that only paces a 15s publish: a remote
+// watcher is at most one interval late to be noticed, and its view arrives a
+// pull later anyway. A read error is "nobody watching", as with the local
+// registry: the event-driven path and the sweep still publish.
+func (d *Daemon) remoteWatched(now time.Time) bool {
+	d.mu.Lock()
+	if !d.rosterWatchersAt.IsZero() && now.Sub(d.rosterWatchersAt) < remoteRosterInterval {
+		watched := d.rosterWatched
+		d.mu.Unlock()
+		return watched
+	}
+	d.mu.Unlock()
+	n, err := d.opt.Store.RemoteWatchers(context.Background(), now)
+	watched := err == nil && n > 0
+	d.mu.Lock()
+	d.rosterWatchersAt, d.rosterWatched = now, watched
+	d.mu.Unlock()
+	return watched
 }
 
 // rosterShellOutTTLs returns the cwd and location TTLs for this pass.

@@ -658,6 +658,16 @@ func (s *failingStore) SignatureEmbeddingsFingerprint(ctx context.Context) (stri
 	return kf.SignatureEmbeddingsFingerprint(ctx)
 }
 
+// RuleStateFingerprint forwards ports.RuleStateFingerprinter likewise: without
+// it every refresh in the suite retires the in-flight re-rank verdicts.
+func (s *failingStore) RuleStateFingerprint(ctx context.Context) (string, error) {
+	rf, ok := s.StorePort.(ports.RuleStateFingerprinter)
+	if !ok {
+		return "", errors.New("wrapped store cannot fingerprint rule state")
+	}
+	return rf.RuleStateFingerprint(ctx)
+}
+
 // PruneAuditExcerpts, FreelistPages and Vacuum forward ports.RetentionPort for
 // the same reason. All three are needed together: the daemon asserts the
 // interface, not the methods.

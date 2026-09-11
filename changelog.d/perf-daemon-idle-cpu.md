@@ -1,0 +1,3 @@
+- Fixed the LLM re-rank judge's in-flight answers being thrown away on nearly every Turso pull: a pull now retires them only when it actually changed the rules, their learned state or their decision history, so under turso the judge's subprocess no longer mostly runs for nothing
+- Reduced the idle daemon's CPU further: the per-pull check for changed rules no longer reads every stored vector, and with no local TUI open the roster tick asks the store whether a remote TUI is watching at most once per 15s instead of every 2s
+- Added an opt-in profiling hook: set `HAP_PROFILE_DIR` (and optionally `HAP_PROFILE_SECONDS`, default 60) and any hap process writes rolling CPU and heap profiles there for `go tool pprof`; nothing is written or listened on when it is unset

@@ -486,20 +486,22 @@ func remapAllowed(s domain.Situation, sig domain.SignatureResult, hit match.Hit)
 // input — the embedder's health at build time decides which of them get
 // vectors — so initSemantic records a digest only for a build that was
 // complete, or whose embedder is down for good (see embedderPermanentlyDown).
-// The verdict invalidation is NOT gated: the cache keys on rule STATE
-// (signatures, decisions), which the digest does not cover.
+// The verdict invalidation has a gate of its own over a WIDER digest — the
+// listing also reads rule state (signatures, decisions) — see
+// invalidateRerankForKnowledge.
 func (d *Daemon) RefreshKnowledge() {
 	if d.matcher == nil {
 		return
 	}
-	// Rules learned on other machines have just arrived, so the candidate set a
-	// verdict was judged against no longer describes what the matcher would
-	// return — and a rule the refresh DELETED may be the one a verdict names.
-	// Drop them all, in flight included, rather than reason about which are
-	// still answerable: a re-rank is one subprocess, a wrong reuse is a wrong
-	// rule.
-	d.invalidateRerank()
-	if d.knowledgeUnchanged(d.knowledgeFingerprint(d.shutdownCtx)) {
+	emb := d.knowledgeFingerprint(d.shutdownCtx)
+	// Rules learned on other machines may have just arrived, so the candidate
+	// set a verdict was judged against may no longer describe what the matcher
+	// would return — and a rule the refresh DELETED may be the one a verdict
+	// names. When anything a listing reads moved, drop every verdict, in flight
+	// included, rather than reason about which are still answerable: a re-rank
+	// is one subprocess, a wrong reuse is a wrong rule.
+	d.invalidateRerankForKnowledge(emb, d.ruleStateFingerprint(d.shutdownCtx))
+	if d.knowledgeUnchanged(emb) {
 		return
 	}
 	gen := d.semanticGen.Add(1)
