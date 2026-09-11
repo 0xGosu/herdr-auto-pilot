@@ -1,2 +1,0 @@
-- Added real-agy integration cases, gated on `HAP_ITEST_AGY=1` (detection, a shell approval and a question answered through `hap confirm --send`, a task hand-out refused over a draft and delivered at an empty composer, and the permission-mode cycle), so agy's live screens and keys are checked the way claude's and codex's are
-- Fixed the real-agent mode integration cases, which were refused by the front end's roster check because their test app had no daemon behind it
