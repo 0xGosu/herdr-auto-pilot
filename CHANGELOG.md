@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.14
+
+- Cut the daemon's memory: its startup peak no longer climbs to ~130MB while the semantic index is rebuilt (the burst is collected tightly and handed back to the OS at once), and each of the Turso engine's pooled connections keeps a far smaller page cache
+- The embed worker hands back its start-up garbage once the model has loaded
+- `HAP_PROFILE_DIR` now also writes a `<verb>-<pid>.mem.txt` beside each heap profile, splitting the Go runtime's memory from the process's resident set
+- Cut the load the daemon puts on the herdr server: it now subscribes to agent-status events only for panes that host an agent, instead of every pane — with 13 panes open that was more than half of herdr's CPU
+
 ## 0.9.13
 
 - Cut what an open `hap tui` costs: it now re-reads its data only when something changed (a store change token, the config file, local checklist files) instead of every two seconds, and the Rules tab's last-used lookup no longer pulls every rule's full audit row
