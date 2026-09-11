@@ -155,3 +155,36 @@ func TestTwoHandlesShareOneCounter(t *testing.T) {
 		}
 	}
 }
+
+// A dedupe mark outlives the event it guarded — the prune is about replay, and
+// "already recorded" must hold for as long as the caller's subject is live —
+// and goes only when ForgetMarks is told it is no longer wanted.
+func TestMarksOutlivePruneUntilForgotten(t *testing.T) {
+	ctx := context.Background()
+	l := newLog(t)
+	for _, key := range []string{"escalation:1", "escalation:2", "other:1"} {
+		e := ev(domain.StreamEscalation)
+		e.Dedupe = key
+		e.At = time.Now().Add(-10 * 24 * time.Hour)
+		if _, err := l.Append(ctx, e); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := l.Prune(ctx, time.Now().Add(-Retention)); err != nil {
+		t.Fatal(err)
+	}
+	e := ev(domain.StreamEscalation)
+	e.Dedupe = "escalation:1"
+	if seq, err := l.Append(ctx, e); err != nil || seq != 0 {
+		t.Fatalf("re-append after its event was pruned = %d, %v; want dropped", seq, err)
+	}
+	n, err := l.ForgetMarks(ctx, "escalation:", func(key string) bool { return key == "escalation:1" })
+	if err != nil || n != 1 {
+		t.Fatalf("ForgetMarks = %d, %v; want 1", n, err)
+	}
+	for key, want := range map[string]bool{"escalation:1": true, "escalation:2": false, "other:1": true} {
+		if seen, err := l.Seen(ctx, key); err != nil || seen != want {
+			t.Errorf("Seen(%s) = %v, %v; want %v", key, seen, err, want)
+		}
+	}
+}

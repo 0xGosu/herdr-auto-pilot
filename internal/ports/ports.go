@@ -180,10 +180,13 @@ type EventPort interface {
 }
 
 // EscalationAttentionLister is the OPTIONAL store capability the daemon uses to
-// announce escalations on the orchestrator stream: this node's pending rows,
-// newest first, with no eligibility filter.
+// announce escalations on the orchestrator stream: this node's rows still
+// awaiting an answer ('escalated', plus the transient 'auto_accepting' so a
+// claim that reverts is still known), with no eligibility filter and no age
+// limit, in ascending id order after afterID — a keyset page, so a backlog of
+// any size is walked in full.
 type EscalationAttentionLister interface {
-	EscalationsAwaitingAttention(ctx context.Context, since time.Time, limit int) ([]domain.AuditRecord, error)
+	EscalationsAwaitingAttention(ctx context.Context, afterID int64, limit int) ([]domain.AuditRecord, error)
 }
 
 // StreamLog is the machine-local orchestrator event log behind
@@ -203,10 +206,12 @@ type StreamLog interface {
 	Floor(ctx context.Context) (int64, error)
 	// Since returns up to limit events after seq, oldest first.
 	Since(ctx context.Context, after int64, limit int) ([]domain.StreamEvent, error)
-	// Seen reports whether an event with this dedupe key is still retained.
+	// Seen reports whether this dedupe mark is set.
 	Seen(ctx context.Context, dedupe string) (bool, error)
-	// Prune deletes events recorded before cutoff.
+	// Prune deletes events recorded before cutoff; dedupe marks are kept.
 	Prune(ctx context.Context, cutoff time.Time) (int64, error)
+	// ForgetMarks removes the dedupe marks under prefix that keep rejects.
+	ForgetMarks(ctx context.Context, prefix string, keep func(key string) bool) (int64, error)
 }
 
 // NotifyPort surfaces escalations and critical failures to the operator.

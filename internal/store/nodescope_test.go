@@ -313,7 +313,7 @@ func TestOperationalReadsNeverSeeAnotherNodesRows(t *testing.T) {
 	if cands, _ := b.AutoAcceptableEscalations(ctx, map[domain.SituationType]time.Time{domain.SituationApproval: now}); len(cands) != 0 {
 		t.Errorf("B would auto-accept A's escalation: %+v", cands)
 	}
-	if pending, _ := b.EscalationsAwaitingAttention(ctx, now.Add(-24*time.Hour), 10); len(pending) != 0 {
+	if pending, _ := b.EscalationsAwaitingAttention(ctx, 0, 10); len(pending) != 0 {
 		t.Errorf("B would announce A's escalation on its orchestrator stream: %+v", pending)
 	}
 	if open, _ := b.HasOpenEscalation(ctx, "1"); open {

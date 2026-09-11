@@ -609,11 +609,9 @@ type Daemon struct {
 	// lastStreamPrune throttles the orchestrator event log's own retention to
 	// once a day, independently of the [logging] windows. Guarded by d.mu.
 	lastStreamPrune time.Time
-	// streamAnnounced remembers which escalations this process has already put
-	// on the orchestrator stream, so a pending row costs no write per sweep.
-	// The log's dedupe key is what holds across restarts; this is only the
-	// cheap first check. Pruned to the current pending set. Loop-owned.
-	streamAnnounced map[int64]bool
+	// stream is the orchestrator event log's writer queue and announcement
+	// pass, both off the loop (see streamState).
+	stream streamState
 	// lastAutoAccept is what the most recent auto-accept pass looked at, read
 	// by the announcement right after it. Loop-owned.
 	lastAutoAccept autoAcceptPassReport
@@ -1572,7 +1570,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				delivered := d.autoAcceptEscalations(ctx, agents)
 				// Right after the pass it depends on: what it left pending is
 				// what an orchestrator is told about.
-				d.announcePendingEscalations(ctx, passStart)
+				d.startAnnouncePass(passStart)
 				rest := withoutAgents(agents, delivered)
 				d.reconcileAttentionWith(ctx, rest)
 				d.autoSendIdleTasks(ctx, rest)

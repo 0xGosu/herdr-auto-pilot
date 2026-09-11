@@ -10,6 +10,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -23,26 +25,80 @@ import (
 // behalf.
 const streamAuthor = "daemon"
 
-// streamEscalationWindow bounds how far back the announcement pass looks. It
-// sits strictly INSIDE the log's retention: an escalation whose dedupe key has
-// been pruned must be too old to be looked at again, or it would be announced
-// a second time.
-const streamEscalationWindow = streamlog.Retention - 24*time.Hour
+// streamEscalationPage is one keyset page of the announcement pass's walk over
+// every pending escalation. A variable so tests can shrink it.
+var streamEscalationPage = 500
 
-// streamEscalationLimit caps one pass's fetch. Newest first, so a backlog
-// larger than the cap is the OLD end — rows an earlier pass already announced.
-const streamEscalationLimit = 500
+// streamQueueSize bounds the daemon's pending stream writes. Past it an event
+// is dropped with a warning: the stream is best-effort, the loop is not.
+const streamQueueSize = 1024
 
-// emitStream appends one daemon-authored event. Best-effort (ports.StreamLog):
-// the change is already committed, so a failure is logged and nothing else.
-// Detached from ctx's deadline and cancellation for the same reason.
-func (d *Daemon) emitStream(ctx context.Context, kind string, fields ...domain.StreamField) {
+// streamState is the daemon's side of the event log, kept off the select loop:
+// SQLite waits up to its busy timeout for another hap process holding the
+// write lock, and the loop serves every agent.
+type streamState struct {
+	once    sync.Once
+	queue   chan domain.StreamEvent
+	dropped atomic.Bool
+
+	mu sync.Mutex
+	// announcing is the one-pass-at-a-time latch for the announcement pass.
+	announcing bool
+	// announced remembers which escalations this process has already put on
+	// the stream, so a pending row costs one mark read per process, not one
+	// per sweep. Owned by the announcement pass (the latch serializes it).
+	announced map[int64]bool
+	// lastForget throttles the daily forgetting of marks for escalations that
+	// are no longer pending.
+	lastForget time.Time
+}
+
+// emitStream queues one daemon-authored event for the stream writer and
+// returns at once. Best-effort (ports.StreamLog): the change is already
+// committed, so a full queue drops the event with a warning.
+func (d *Daemon) emitStream(_ context.Context, kind string, fields ...domain.StreamField) {
 	if d.opt.Stream == nil {
 		return
 	}
+	d.stream.once.Do(func() {
+		d.stream.queue = make(chan domain.StreamEvent, streamQueueSize)
+		if !d.spawn(d.runStreamWriter) {
+			slog.Debug("orchestrator stream: daemon shutting down; not starting the writer")
+		}
+	})
 	ev := domain.StreamEvent{At: d.opt.Clock.Now(), Kind: kind, Author: streamAuthor, Fields: fields}
-	if _, err := d.opt.Stream.Append(context.WithoutCancel(ctx), ev); err != nil {
-		slog.Warn("could not record an orchestrator stream event", "kind", kind, "error", err)
+	select {
+	case d.stream.queue <- ev:
+		d.stream.dropped.Store(false)
+	default:
+		if !d.stream.dropped.Swap(true) {
+			slog.Warn("orchestrator stream: the writer is behind; dropping events until it catches up", "kind", kind)
+		}
+	}
+}
+
+// runStreamWriter appends queued events in order until shutdown, then drains
+// what is already queued.
+func (d *Daemon) runStreamWriter() {
+	write := func(ev domain.StreamEvent) {
+		if _, err := d.opt.Stream.Append(context.WithoutCancel(d.shutdownCtx), ev); err != nil {
+			slog.Warn("could not record an orchestrator stream event", "kind", ev.Kind, "error", err)
+		}
+	}
+	for {
+		select {
+		case ev := <-d.stream.queue:
+			write(ev)
+		case <-d.shutdownCtx.Done():
+			for {
+				select {
+				case ev := <-d.stream.queue:
+					write(ev)
+				default:
+					return
+				}
+			}
+		}
 	}
 }
 
@@ -61,18 +117,52 @@ func (d *Daemon) emitChecklistDiff(ctx context.Context, locator, before, after s
 	}
 }
 
+// startAnnouncePass runs announcePendingEscalations off the select loop, one
+// pass at a time, over what the auto-accept pass that began at passStart
+// looked at. Called on the loop right after that pass, which is what makes
+// the report copy safe: the next pass builds a new one.
+func (d *Daemon) startAnnouncePass(passStart time.Time) {
+	if d.opt.Stream == nil {
+		return
+	}
+	d.stream.mu.Lock()
+	if d.stream.announcing {
+		d.stream.mu.Unlock()
+		return
+	}
+	d.stream.announcing = true
+	d.stream.mu.Unlock()
+	rep := d.lastAutoAccept
+	release := func() {
+		d.stream.mu.Lock()
+		d.stream.announcing = false
+		d.stream.mu.Unlock()
+	}
+	if !d.spawn(func() {
+		defer release()
+		_ = logging.Guard("stream-announce", func() error {
+			d.announcePendingEscalations(d.shutdownCtx, rep, passStart)
+			return nil
+		})
+	}) {
+		release()
+	}
+}
+
 // announcePendingEscalations puts each escalation that still needs a human on
-// the stream, once. It runs right after the auto-accept pass that began at
-// passStart, and reads what that pass looked at (d.lastAutoAccept).
+// the stream, once, given what the auto-accept pass that began at passStart
+// looked at (rep).
 //
 // WHEN is the whole design. At insert is too early: under full self-prompting
 // the row is about to be auto-accepted, and an orchestrator told about it would
 // race the daemon for the same pane. See leftForAHuman for the rule.
 //
-// Auto-accepting and auto-accepted rows are not 'escalated', so they are never
-// announced. A row that is claimed and later reverted is not announced twice:
-// the log's dedupe key holds across restarts.
-func (d *Daemon) announcePendingEscalations(ctx context.Context, passStart time.Time) {
+// It walks EVERY pending row, oldest first, in keyset pages — no age window
+// and no newest-first cap, either of which leaves some pending row unannounced
+// forever. "Once" is the log's dedupe mark, which outlives the event it
+// guarded; marks are forgotten, daily, only for escalations that are no longer
+// pending, and only after a complete walk.
+func (d *Daemon) announcePendingEscalations(ctx context.Context, rep autoAcceptPassReport, passStart time.Time) {
 	if d.opt.Stream == nil {
 		return
 	}
@@ -82,55 +172,102 @@ func (d *Daemon) announcePendingEscalations(ctx context.Context, passStart time.
 	if !ok {
 		return
 	}
-	rows, err := lister.EscalationsAwaitingAttention(ctx, passStart.Add(-streamEscalationWindow), streamEscalationLimit)
-	if err != nil {
-		slog.Warn("orchestrator stream: listing pending escalations failed", "error", err)
-		return
-	}
 	names, err := d.opt.Store.AgentNames(ctx)
 	if err != nil {
 		names = nil // fall back to pane ids; naming is display only
 	}
-	if d.streamAnnounced == nil {
-		d.streamAnnounced = make(map[int64]bool)
+	d.stream.mu.Lock()
+	if d.stream.announced == nil {
+		d.stream.announced = make(map[int64]bool)
 	}
-	rep := d.lastAutoAccept
-	pending := make(map[int64]bool, len(rows))
-	for _, rec := range rows {
-		pending[rec.ID] = true
-		if d.streamAnnounced[rec.ID] || !leftForAHuman(rec, rep, passStart) {
-			continue
+	announced := d.stream.announced
+	d.stream.mu.Unlock()
+
+	pending := make(map[int64]bool)
+	for after := int64(0); ; {
+		rows, err := lister.EscalationsAwaitingAttention(ctx, after, streamEscalationPage)
+		if err != nil {
+			slog.Warn("orchestrator stream: listing pending escalations failed", "error", err)
+			return // an incomplete walk must not forget anything
 		}
-		dedupe := fmt.Sprintf("escalation:%d", rec.ID)
-		// A read first: after a restart the in-memory set is empty, and an
-		// append its dedupe key drops would still take the write lock (and may
-		// consume a sequence number) for every pending row, every restart.
-		if seen, err := d.opt.Stream.Seen(ctx, dedupe); err == nil && seen {
-			d.streamAnnounced[rec.ID] = true
-			continue
+		for _, rec := range rows {
+			after = rec.ID
+			pending[rec.ID] = true
+			if rec.Status != "escalated" || announced[rec.ID] || !leftForAHuman(rec, rep, passStart) {
+				continue
+			}
+			d.announceEscalation(ctx, rec, names, announced)
 		}
-		agent := rec.AgentID
-		if n := names[rec.AgentID]; n != "" {
-			agent = n
+		if len(rows) < streamEscalationPage {
+			break
 		}
-		ev := domain.StreamEvent{
-			At: d.opt.Clock.Now(), Kind: domain.StreamEscalation, Author: streamAuthor, Dedupe: dedupe,
-			Fields: []domain.StreamField{
-				domain.StreamInt("id", rec.ID), domain.StreamStr("agent", agent),
-				domain.StreamStr("type", string(rec.SituationType)),
-			},
-		}
-		if _, err := d.opt.Stream.Append(ctx, ev); err != nil {
-			// Not marked: the next sweep tries again.
-			slog.Warn("orchestrator stream: announcing an escalation failed", "audit", rec.ID, "error", err)
-			continue
-		}
-		d.streamAnnounced[rec.ID] = true
 	}
-	for id := range d.streamAnnounced {
+	for id := range announced {
 		if !pending[id] {
-			delete(d.streamAnnounced, id)
+			delete(announced, id)
 		}
+	}
+	d.maybeForgetEscalationMarks(ctx, pending)
+}
+
+func escalationMark(id int64) string { return fmt.Sprintf("%s%d", escalationMarkPrefix, id) }
+
+const escalationMarkPrefix = "escalation:"
+
+// announceEscalation writes one escalation event unless its mark says it was
+// already announced (by an earlier process, say).
+func (d *Daemon) announceEscalation(ctx context.Context, rec domain.AuditRecord, names map[string]string,
+	announced map[int64]bool) {
+	mark := escalationMark(rec.ID)
+	// A read first: after a restart the in-memory set is empty, and an append
+	// its mark drops would still take the write lock for every pending row.
+	if seen, err := d.opt.Stream.Seen(ctx, mark); err == nil && seen {
+		announced[rec.ID] = true
+		return
+	}
+	agent := rec.AgentID
+	if n := names[rec.AgentID]; n != "" {
+		agent = n
+	}
+	ev := domain.StreamEvent{
+		At: d.opt.Clock.Now(), Kind: domain.StreamEscalation, Author: streamAuthor, Dedupe: mark,
+		Fields: []domain.StreamField{
+			domain.StreamInt("id", rec.ID), domain.StreamStr("agent", agent),
+			domain.StreamStr("type", string(rec.SituationType)),
+		},
+	}
+	if _, err := d.opt.Stream.Append(ctx, ev); err != nil {
+		// Not marked: the next sweep tries again.
+		slog.Warn("orchestrator stream: announcing an escalation failed", "audit", rec.ID, "error", err)
+		return
+	}
+	announced[rec.ID] = true
+}
+
+// maybeForgetEscalationMarks drops, once a day, the marks of escalations that
+// are no longer pending — the only bound on the marks table. pending must be
+// the COMPLETE set: a mark forgotten for a live row announces it again.
+func (d *Daemon) maybeForgetEscalationMarks(ctx context.Context, pending map[int64]bool) {
+	now := d.opt.Clock.Now()
+	d.stream.mu.Lock()
+	due := d.stream.lastForget.IsZero() || now.Sub(d.stream.lastForget) >= retentionInterval
+	if due {
+		d.stream.lastForget = now
+	}
+	d.stream.mu.Unlock()
+	if !due {
+		return
+	}
+	keep := make(map[string]bool, len(pending))
+	for id := range pending {
+		keep[escalationMark(id)] = true
+	}
+	n, err := d.opt.Stream.ForgetMarks(ctx, escalationMarkPrefix, func(key string) bool { return keep[key] })
+	switch {
+	case err != nil:
+		slog.Warn("orchestrator stream: forgetting settled escalation marks failed", "error", err)
+	case n > 0:
+		slog.Info("orchestrator stream: forgot marks of settled escalations", "marks", n)
 	}
 }
 

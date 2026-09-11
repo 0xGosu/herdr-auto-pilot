@@ -1203,12 +1203,16 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
 - **An escalation is announced once auto-accept has left it for a human** — up to
   a minute after it was raised under full self-prompting, or once its threshold
   passed under timed auto-accept (a row with no suggestion: at the next sweep).
-  The stream never names a row the daemon is about to answer itself.
+  The stream never names a row the daemon is about to answer itself. Every
+  pending escalation is announced exactly once, however old it is and however
+  long the queue — a daemon that was down for a week announces the backlog when
+  it comes back.
 - **Sequence numbers only increase** — never assume they are consecutive.
 - **Resuming:** without `--resume` the stream starts at the head. `--resume N`
   replays everything after N (the last seq you handled) first. Events are kept 7
-  days; a cursor older than that prints `# gap missed=A..B`, a cursor above the
-  head prints `# reset …` — re-survey with the CLI in both cases.
+  days; events you had not reached when they were pruned — at resume or while
+  reading — print `# gap missed=A..B`, and a cursor above the head prints
+  `# reset …` — re-survey with the CLI in both cases.
 - **Per machine:** an action taken on another fleet node appears in that
   machine's stream; a hand edit to `config.toml` or a task file is not an event.
 

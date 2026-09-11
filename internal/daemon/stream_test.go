@@ -11,6 +11,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/streamlog"
+	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 )
 
 // The harness's store must expose the capability the announcement pass
@@ -76,7 +77,7 @@ func TestAnnouncePendingEscalationsOnceAfterThePass(t *testing.T) {
 		t.Fatalf("claim: %v %v", ok, err)
 	}
 
-	h.daemon.announcePendingEscalations(ctx, passStart)
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{}, passStart)
 	want := "escalation id=" + domain.StreamInt("", before).Value + " agent=otter type=approval by=daemon"
 	got := streamOf(t, log, domain.StreamEscalation)
 	if len(got) != 1 || got[0] != want {
@@ -84,10 +85,10 @@ func TestAnnouncePendingEscalationsOnceAfterThePass(t *testing.T) {
 	}
 
 	// Again, and again after "a restart" forgot what it announced: the log's
-	// dedupe key is what holds.
-	h.daemon.announcePendingEscalations(ctx, passStart)
-	h.daemon.streamAnnounced = nil
-	h.daemon.announcePendingEscalations(ctx, passStart)
+	// dedupe mark is what holds.
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{}, passStart)
+	h.daemon.stream.announced = nil
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{}, passStart)
 	if got := streamOf(t, log, domain.StreamEscalation); len(got) != 1 {
 		t.Fatalf("an escalation was announced more than once: %v", got)
 	}
@@ -107,7 +108,7 @@ func TestAnnounceSkipsAnAutoAcceptedEscalation(t *testing.T) {
 	if ok, err := h.raw.MarkAutoAccepted(ctx, accepted, true); err != nil || !ok {
 		t.Fatalf("mark auto-accepted: %v %v", ok, err)
 	}
-	h.daemon.announcePendingEscalations(ctx, passStart)
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{}, passStart)
 	if got := streamOf(t, log, domain.StreamEscalation); len(got) != 0 {
 		t.Fatalf("an auto-accepted escalation was announced: %v", got)
 	}
@@ -124,15 +125,20 @@ func TestDaemonTaskListWriteIsAnnounced(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	got := streamOf(t, log, domain.StreamTaskUpdated)
-	want := "task.updated list=" + path + " index=2 mark=- by=daemon"
-	if len(got) != 1 || got[0] != want {
+	// The list is named by its canonical locator (macOS temp dirs sit behind
+	// the /var -> /private/var symlink).
+	want := "task.updated list=" + tasklocator.Canonical(path) + " index=2 mark=- by=daemon"
+	waitFor(t, 2*time.Second, func() bool { return len(streamOf(t, log, domain.StreamTaskUpdated)) > 0 })
+	if got := streamOf(t, log, domain.StreamTaskUpdated); len(got) != 1 || got[0] != want {
 		t.Fatalf("announced %v, want [%s]", got, want)
 	}
-	// A write that changes nothing says nothing.
+	// A write that changes nothing says nothing. The marker event after it
+	// goes through the same queue, so once it lands the no-op had its chance.
 	if err := h.daemon.mutateTaskList(path, func(content string) (string, error) { return content, nil }); err != nil {
 		t.Fatal(err)
 	}
+	h.daemon.emitStream(context.Background(), domain.StreamPauseOn)
+	waitFor(t, 2*time.Second, func() bool { return len(streamOf(t, log, domain.StreamPauseOn)) == 1 })
 	if got := streamOf(t, log, domain.StreamTaskUpdated); len(got) != 1 {
 		t.Fatalf("a no-op write was announced: %v", got)
 	}
@@ -190,13 +196,12 @@ func TestAnnounceWaitsForARowThePassPutOff(t *testing.T) {
 	unexamined := seedCandidate(t, h, "p2", passStart.Add(-time.Minute))
 	noSuggestion := seedStreamEscalation(t, h, "p3", passStart.Add(-time.Minute))
 
-	h.daemon.lastAutoAccept = autoAcceptPassReport{
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{
 		ran:      true,
 		cutoffs:  map[domain.SituationType]time.Time{domain.SituationApproval: passStart},
 		examined: map[int64]bool{refused: true, putOff: true},
 		deferred: map[int64]bool{putOff: true},
-	}
-	h.daemon.announcePendingEscalations(ctx, passStart)
+	}, passStart)
 
 	got := map[string]bool{}
 	for _, line := range streamOf(t, log, domain.StreamEscalation) {
@@ -209,11 +214,95 @@ func TestAnnounceWaitsForARowThePassPutOff(t *testing.T) {
 	}
 
 	// A pass that never reached its candidates (paused, say) examined nothing.
-	h.daemon.lastAutoAccept = autoAcceptPassReport{
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{
 		cutoffs: map[domain.SituationType]time.Time{domain.SituationApproval: passStart},
-	}
-	h.daemon.announcePendingEscalations(ctx, passStart)
+	}, passStart)
 	if n := len(streamOf(t, log, domain.StreamEscalation)); n != 2 {
 		t.Fatalf("a pass that did not run released its candidates: %d announced, want 2", n)
+	}
+}
+
+// Every pending escalation is announced, at any age and however long the
+// backlog: an age window, or a newest-first cap applied before the dedupe,
+// leaves some pending row unannounced forever.
+func TestAnnounceWalksTheWholeBacklogAtAnyAge(t *testing.T) {
+	h, log := newStreamHarness(t, "")
+	ctx := context.Background()
+	prev := streamEscalationPage
+	streamEscalationPage = 2
+	t.Cleanup(func() { streamEscalationPage = prev })
+	passStart := time.Now().Truncate(time.Second)
+	seedStreamEscalation(t, h, "p0", passStart.Add(-40*24*time.Hour)) // outlived the event log's retention
+	for i := range 4 {
+		seedStreamEscalation(t, h, "p1", passStart.Add(-time.Duration(i+1)*time.Minute))
+	}
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{}, passStart)
+	if got := streamOf(t, log, domain.StreamEscalation); len(got) != 5 {
+		t.Fatalf("announced %d of 5 pending escalations: %v", len(got), got)
+	}
+}
+
+// A mark outlives the event it guarded (so a pruned event never re-announces
+// a still-pending row), and is forgotten only once its escalation is settled.
+func TestEscalationMarksOutliveTheEventAndGoWhenSettled(t *testing.T) {
+	h, log := newStreamHarness(t, "")
+	ctx := context.Background()
+	passStart := time.Now().Truncate(time.Second)
+	live := seedStreamEscalation(t, h, "p1", passStart.Add(-time.Minute))
+	settled := seedStreamEscalation(t, h, "p2", passStart.Add(-time.Minute))
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{}, passStart)
+	if _, err := log.Prune(ctx, time.Now().Add(time.Hour)); err != nil { // every event gone
+		t.Fatal(err)
+	}
+	if _, err := h.raw.ResolveEscalation(ctx, settled); err != nil {
+		t.Fatal(err)
+	}
+	h.daemon.stream.announced = nil // a restart
+	h.daemon.stream.lastForget = time.Time{}
+	h.daemon.announcePendingEscalations(ctx, autoAcceptPassReport{}, passStart)
+	if got := streamOf(t, log, domain.StreamEscalation); len(got) != 0 {
+		t.Fatalf("a pending escalation was announced again after its event aged out: %v", got)
+	}
+	if seen, _ := log.Seen(ctx, escalationMark(live)); !seen {
+		t.Error("the pending escalation's mark was forgotten")
+	}
+	if seen, _ := log.Seen(ctx, escalationMark(settled)); seen {
+		t.Error("the settled escalation's mark was kept forever")
+	}
+}
+
+// blockingStreamLog holds every append until released — a stream database
+// locked by another hap process.
+type blockingStreamLog struct {
+	*streamlog.Log
+	release chan struct{}
+}
+
+func (b blockingStreamLog) Append(ctx context.Context, ev domain.StreamEvent) (int64, error) {
+	<-b.release
+	return b.Log.Append(ctx, ev)
+}
+
+// The select loop never waits on the event log: an emit queues and returns,
+// and the announcement pass runs in the background.
+func TestStreamWritesNeverBlockTheLoop(t *testing.T) {
+	log := streamlog.InStateDir(t.TempDir())
+	t.Cleanup(func() { _ = log.Close() })
+	blocked := blockingStreamLog{Log: log, release: make(chan struct{})}
+	fl := &fakeLLM{}
+	h := newHarnessCore(t, "", nil, fl, fl, nil, func(o *Options) { o.Stream = blocked })
+	t.Cleanup(func() { close(blocked.release) })
+	seedStreamEscalation(t, h, "p1", time.Now().Add(-time.Minute))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.daemon.emitStream(context.Background(), domain.StreamPauseOn)
+		h.daemon.startAnnouncePass(time.Now())
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a stream write blocked its caller while the log was locked")
 	}
 }

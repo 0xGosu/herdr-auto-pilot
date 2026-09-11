@@ -196,3 +196,35 @@ func TestStreamRefusesBadArguments(t *testing.T) {
 		t.Error("a process with no event log must refuse rather than stream nothing forever")
 	}
 }
+
+// pruningLog prunes every event older than a day just before the first read —
+// the daemon's retention landing between the stream's floor check and its
+// first batch.
+type pruningLog struct {
+	*streamlog.Log
+	once sync.Once
+}
+
+func (p *pruningLog) Since(ctx context.Context, after int64, limit int) ([]domain.StreamEvent, error) {
+	p.once.Do(func() { _, _ = p.Prune(ctx, time.Now().Add(-24*time.Hour)) })
+	return p.Log.Since(ctx, after, limit)
+}
+
+func TestStreamOrchestratorReportsAPruneDuringTheRead(t *testing.T) {
+	app, log := streamApp(t)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	appendEvent(t, log, domain.StreamPauseOn, old)
+	appendEvent(t, log, domain.StreamPauseOff, old)
+	appendEvent(t, log, domain.StreamFSPOn, time.Now())
+	app.Stream = &pruningLog{Log: log}
+
+	out, _ := startStream(t, app, "--resume", "0")
+	waitForOutput(t, out, " fsp.on by=operator\n")
+	got := out.String()
+	if !strings.Contains(got, "# hap stream orchestrator head=3 floor=1\n") {
+		t.Fatalf("the floor was read after the prune; the case needs it read before:\n%s", got)
+	}
+	if !strings.Contains(got, "# gap missed=1..2 ") {
+		t.Fatalf("events pruned under the cursor mid-read were skipped silently:\n%s", got)
+	}
+}

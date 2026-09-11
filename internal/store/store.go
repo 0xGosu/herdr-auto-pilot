@@ -1335,20 +1335,22 @@ func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domai
 	return s.scanAudits(rows)
 }
 
-// EscalationsAwaitingAttention returns this node's pending escalations created
-// at or after since, newest first, at most limit of them. Unlike
-// AutoAcceptableEscalations it pushes NO eligibility filter down: a row with no
-// suggestion or no baseline is exactly one only a human can answer.
+// EscalationsAwaitingAttention returns up to limit of this node's escalations
+// still awaiting an answer, with id above afterID, in ascending id order — a
+// keyset page, so a caller walks a backlog of any size and any age in full.
+// Unlike AutoAcceptableEscalations it pushes NO eligibility filter down: a row
+// with no suggestion or no baseline is exactly one only a human can answer.
+// The transient 'auto_accepting' status is included (Status says which) so a
+// caller remembering what it announced does not forget a row mid-claim.
 //
 // Only the fields the orchestrator stream reads are selected (ID, AgentID,
-// SituationType, CreatedAt, and whether SigRaw and Suggestion are present):
-// it runs every sweep on the daemon's loop, and a full audit row carries the
-// pane excerpt and the LLM output.
-func (s *Store) EscalationsAwaitingAttention(ctx context.Context, since time.Time, limit int) ([]domain.AuditRecord, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, agent_id, situation_type, created_at,
+// Status, SituationType, CreatedAt, and whether SigRaw and Suggestion are
+// present): a full audit row carries the pane excerpt and the LLM output.
+func (s *Store) EscalationsAwaitingAttention(ctx context.Context, afterID int64, limit int) ([]domain.AuditRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, agent_id, status, situation_type, created_at,
 		sig_raw != '', suggestion != '' FROM audit_log
-		WHERE node_id = ? AND status = 'escalated' AND created_at >= ?
-		ORDER BY created_at DESC, id DESC LIMIT ?`, s.self, unix(since), limit)
+		WHERE node_id = ? AND status IN ('escalated', 'auto_accepting') AND id > ?
+		ORDER BY id LIMIT ?`, s.self, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -1359,10 +1361,10 @@ func (s *Store) EscalationsAwaitingAttention(ctx context.Context, since time.Tim
 		var situation string
 		var created int64
 		var hasSig, hasSuggestion bool
-		if err := rows.Scan(&a.ID, &a.AgentID, &situation, &created, &hasSig, &hasSuggestion); err != nil {
+		if err := rows.Scan(&a.ID, &a.AgentID, &a.Status, &situation, &created, &hasSig, &hasSuggestion); err != nil {
 			return nil, err
 		}
-		a.NodeID, a.Status = s.self, "escalated"
+		a.NodeID = s.self
 		a.SituationType = domain.SituationType(situation)
 		a.CreatedAt = fromUnix(created)
 		// Presence only: a placeholder the caller reads as "has one".

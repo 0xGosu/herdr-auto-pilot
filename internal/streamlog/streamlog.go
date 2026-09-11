@@ -14,10 +14,15 @@
 //
 // The counter is SQLite's AUTOINCREMENT rowid: strictly INCREASING, never
 // reused even after a prune, and one namespace for every writer on the machine
-// because they all write the same file. It is not guaranteed DENSE — an
-// append dropped by its dedupe key may consume a number — so a reader resumes
-// from the last seq it handled and never infers a lost event from a skipped
-// number; lost events are reported against the retained floor instead.
+// because they all write the same file. A reader resumes from the last seq it
+// handled and never infers a lost event from a skipped number; lost events are
+// reported against the retained floor instead.
+//
+// Dedupe keys are MARKS in a table of their own, not a column on the event:
+// an event ages out after Retention, but "this escalation was announced" must
+// hold for as long as the escalation stays pending — however long that is —
+// or pruning its event would announce it again. A mark is removed only by
+// ForgetMarks, which the daemon calls with the set still worth remembering.
 //
 // Appending is best-effort BY CONTRACT (see ports.StreamLog): the change an
 // event describes has already been committed, so a failed append is logged by
@@ -52,10 +57,13 @@ CREATE TABLE IF NOT EXISTS events (
 	at     INTEGER NOT NULL,
 	kind   TEXT    NOT NULL,
 	author TEXT    NOT NULL DEFAULT '',
-	fields TEXT    NOT NULL DEFAULT '',
-	dedupe TEXT UNIQUE
+	fields TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS events_at ON events(at);
+CREATE TABLE IF NOT EXISTS marks (
+	key TEXT PRIMARY KEY,
+	at  INTEGER NOT NULL
+);
 `
 
 // errClosed is returned by every call on a closed Log.
@@ -102,12 +110,32 @@ func (l *Log) open() (*sql.DB, error) {
 		return nil, fmt.Errorf("open stream log: %w", err)
 	}
 	db.SetMaxOpenConns(4)
-	if _, err := db.Exec(schema); err != nil {
+	if err := migrate(db); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate stream log: %w", err)
 	}
 	l.db = db
 	return db, nil
+}
+
+// migrate creates the schema, retrying a moment on SQLITE_BUSY. Two processes
+// opening a FRESH file at once race to switch it to WAL, and SQLite answers
+// the loser BUSY at once — without its busy handler — because waiting could
+// deadlock; the winner is done within milliseconds.
+func migrate(db *sql.DB) error {
+	var err error
+	for attempt := 1; attempt <= 5; attempt++ {
+		if _, err = db.Exec(schema); err == nil || !busy(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt) * 20 * time.Millisecond)
+	}
+	return err
+}
+
+func busy(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "SQLITE_BUSY") || strings.Contains(msg, "database is locked")
 }
 
 // dsn mirrors the store's sqlite settings where they matter to a
@@ -122,8 +150,9 @@ func dsn(path string) string {
 		"&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
 }
 
-// Append records ev and returns the sequence number it was given, or 0 when a
-// Dedupe key already present dropped it.
+// Append records ev and returns the sequence number it was given, or 0 when
+// ev.Dedupe names a mark already set. The mark and the event are written in
+// one transaction, so neither exists without the other.
 func (l *Log) Append(ctx context.Context, ev domain.StreamEvent) (int64, error) {
 	db, err := l.open()
 	if err != nil {
@@ -133,36 +162,91 @@ func (l *Log) Append(ctx context.Context, ev domain.StreamEvent) (int64, error) 
 	if at.IsZero() {
 		at = time.Now()
 	}
-	var dedupe any
-	if ev.Dedupe != "" {
-		dedupe = ev.Dedupe
-	}
-	res, err := db.ExecContext(ctx,
-		`INSERT INTO events (at, kind, author, fields, dedupe) VALUES (?, ?, ?, ?, ?)
-		 ON CONFLICT(dedupe) DO NOTHING`,
-		at.UnixMilli(), ev.Kind, ev.Author, domain.RenderStreamFields(ev.Fields), dedupe)
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, fmt.Errorf("append stream event: %w", err)
 	}
-	if n, err := res.RowsAffected(); err != nil || n == 0 {
+	defer func() { _ = tx.Rollback() }()
+	if ev.Dedupe != "" {
+		res, err := tx.ExecContext(ctx, `INSERT INTO marks (key, at) VALUES (?, ?) ON CONFLICT(key) DO NOTHING`,
+			ev.Dedupe, at.UnixMilli())
+		if err != nil {
+			return 0, fmt.Errorf("append stream event: %w", err)
+		}
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return 0, err
+		}
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO events (at, kind, author, fields) VALUES (?, ?, ?, ?)`,
+		at.UnixMilli(), ev.Kind, ev.Author, domain.RenderStreamFields(ev.Fields))
+	if err != nil {
+		return 0, fmt.Errorf("append stream event: %w", err)
+	}
+	seq, err := res.LastInsertId()
+	if err != nil {
 		return 0, err
 	}
-	return res.LastInsertId()
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("append stream event: %w", err)
+	}
+	return seq, nil
 }
 
-// Seen reports whether an event carrying the dedupe key is still in the log.
-// A read, so a caller re-examining state on a timer can skip the write an
-// already-recorded event would cost.
+// Seen reports whether the dedupe mark is set. A read, so a caller
+// re-examining state on a timer can skip the write lock an append would take.
 func (l *Log) Seen(ctx context.Context, dedupe string) (bool, error) {
 	db, err := l.open()
 	if err != nil {
 		return false, err
 	}
 	var n int
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE dedupe = ?`, dedupe).Scan(&n); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM marks WHERE key = ?`, dedupe).Scan(&n); err != nil {
 		return false, err
 	}
 	return n > 0, nil
+}
+
+// ForgetMarks removes every dedupe mark starting with prefix that keep does
+// not claim, and reports how many. The caller must have seen the WHOLE set
+// worth keeping: a mark forgotten for something still live lets it be
+// recorded a second time.
+func (l *Log) ForgetMarks(ctx context.Context, prefix string, keep func(key string) bool) (int64, error) {
+	db, err := l.open()
+	if err != nil {
+		return 0, err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := tx.QueryContext(ctx, `SELECT key FROM marks WHERE substr(key, 1, ?) = ?`, len(prefix), prefix)
+	if err != nil {
+		return 0, err
+	}
+	var drop []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		if !keep(key) {
+			drop = append(drop, key)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+	for _, key := range drop {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM marks WHERE key = ?`, key); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int64(len(drop)), nil
 }
 
 // Head is the highest sequence number ever assigned (0 for a fresh log). It
@@ -226,6 +310,7 @@ func (l *Log) Since(ctx context.Context, after int64, limit int) ([]domain.Strea
 }
 
 // Prune deletes every event recorded before cutoff and reports how many.
+// Dedupe marks are untouched (see ForgetMarks).
 func (l *Log) Prune(ctx context.Context, cutoff time.Time) (int64, error) {
 	db, err := l.open()
 	if err != nil {

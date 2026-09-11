@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 )
 
@@ -67,12 +68,23 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 			cursor = head
 		case cursor+1 < oldest:
 			fmt.Fprintf(out, "# gap missed=%d..%d (pruned before you resumed — re-survey with hap)\n", cursor+1, oldest-1)
+			cursor = oldest - 1
 		}
 	}
 
 	var lastErr string
 	for {
 		evs, err := app.Stream.Since(ctx, cursor, streamBatch)
+		if err == nil {
+			// Asked AFTER the read: a prune landing between the floor above
+			// (or the previous batch) and this read removes events the cursor
+			// had not reached, and they must be reported, never skipped.
+			if last, ok := prunedUnder(ctx, app, cursor, evs); ok {
+				fmt.Fprintf(out, "# gap missed=%d..%d (pruned while you were reading — re-survey with hap)\n",
+					cursor+1, last)
+				cursor = last
+			}
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -101,4 +113,28 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		case <-time.After(streamPollInterval):
 		}
 	}
+}
+
+// prunedUnder reports the last seq of events pruned beneath the cursor that
+// the reader never saw: everything from cursor+1 up to (not including) the
+// retained floor, and never past the first event the batch did return. ok is
+// false when nothing was lost — or when the floor could not be read, since a
+// failed read is not evidence of a gap.
+func prunedUnder(ctx context.Context, app *frontend.App, cursor int64, batch []domain.StreamEvent) (int64, bool) {
+	floor, err := app.Stream.Floor(ctx)
+	if err != nil {
+		return 0, false
+	}
+	if floor == 0 { // nothing retained: everything up to the head is gone
+		head, err := app.Stream.Head(ctx)
+		if err != nil {
+			return 0, false
+		}
+		floor = head + 1
+	}
+	last := floor - 1
+	if len(batch) > 0 && batch[0].Seq-1 < last {
+		last = batch[0].Seq - 1
+	}
+	return last, last > cursor
 }
