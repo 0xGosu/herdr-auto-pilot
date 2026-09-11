@@ -531,7 +531,7 @@ func sendTask(app *frontend.App, ctx context.Context,
 
 	return app.SendTaskForOperator(ctx,
 		domain.SendTaskPayload{Locator: locator, Index: index, TaskText: text},
-		paneID, agentType, agentName, hostFor(app))
+		paneID, agentType, agentName, hostFor(app), nil)
 }
 
 // confirmGeneratedTask runs an operator's confirm of a generated-task
@@ -548,7 +548,7 @@ func sendTask(app *frontend.App, ctx context.Context,
 // TestResolveFilesAGeneratedTaskConfirmUnderItsOwner and
 // TestALocalGeneratedTaskConfirmAlsoQueues.
 func confirmGeneratedTask(app *frontend.App, ctx context.Context, id int64, send bool) error {
-	return app.ConfirmGeneratedTaskForOperator(ctx, id, send, "operator", hostFor(app))
+	return app.ConfirmGeneratedTaskForOperator(ctx, id, send, "operator", hostFor(app), nil)
 }
 
 // hostFor builds that host over whatever herdr fake the test installed —

@@ -1246,6 +1246,11 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
 - Re-created when it disappears, at most 3 times an hour; never while paused,
   with the mode off, or after the mode stood down at a `[limits]` ceiling. hap
   never closes it — turning the mode off leaves it running.
+- **hap knows when the orchestrator is acting.** A `hap` command run inside its
+  pane is authored `orchestrator` (`by=orchestrator` on the stream): its
+  generated-task confirms and `hap task … send` go through the same never-auto
+  and irreversibility screen as hap's own unattended sends, and all its sends are
+  refused while the herd is paused. Your own commands are unaffected.
 
 ## disk usage and cleanup
 

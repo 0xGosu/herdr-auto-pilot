@@ -123,8 +123,11 @@ type Options struct {
 	//
 	// Optional. nil means the capability was never wired, and the action is
 	// refused with errActionUnsupported rather than silently reported done.
+	//
+	// screen is nil for an operator (their confirm is the gate) and the
+	// daemon's outbound screen for the orchestrator (an LLM's confirm is not).
 	ConfirmGeneratedTask func(ctx context.Context, auditID int64, send bool,
-		author string, host ports.TaskSendHost) error
+		author string, host ports.TaskSendHost, screen func(string) error) error
 	// SendTask hands one checklist item an operator picked to a live agent's
 	// pane, rendered through that source's own next-task template. It reaches
 	// this daemon as a send_task row, so an operator can hand out a task on any
@@ -137,8 +140,11 @@ type Options struct {
 	//
 	// Optional. nil means the capability was never wired, and the action is
 	// refused with errActionUnsupported rather than silently reported done.
+	//
+	// screen, when non-nil, is applied to the exact rendered prompt before it
+	// is sent — nil for an operator, the outbound screen for the orchestrator.
 	SendTask func(ctx context.Context, p domain.SendTaskPayload,
-		agentID, agentType, agentName string, host ports.TaskSendHost) error
+		agentID, agentType, agentName string, host ports.TaskSendHost, screen func(string) error) error
 	// DisableFSP switches full self-prompting off in config.toml and records
 	// the toggle in the automation history. Called when a [limits] ceiling is
 	// reached and full_self_prompting.honour_limits is set.

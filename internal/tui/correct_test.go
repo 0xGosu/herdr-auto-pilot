@@ -201,7 +201,7 @@ func standInConfirm(st *store.Store, a domain.AgentAction, app *frontend.App, fh
 			}
 		}
 	}
-	if err := app.ConfirmGeneratedTaskForOperator(ctx, p.AuditID, p.Send, a.Author, standInHost{fh}); err != nil {
+	if err := app.ConfirmGeneratedTaskForOperator(ctx, p.AuditID, p.Send, a.Author, standInHost{fh}, nil); err != nil {
 		st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed, err.Error(), "", time.Now())
 		return
 	}

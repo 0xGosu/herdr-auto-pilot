@@ -75,6 +75,7 @@ How to act:
 - Hand out or re-plan work through ` + "`{self} task`" + ` (add, edit, done, send). Prompt an agent directly with herdr only when the task list cannot express it.
 - While ` + "`pause.on`" + ` is in effect, do nothing but watch. After ` + "`fsp.off`" + `, stand by until the operator tells you otherwise.
 - Never type into your own pane, never act on an agent hap reports as disabled, and never approve destructive or irreversible work (deleting data, force-pushing, dropping databases, production deploys). When unsure, leave it for the operator and say so here.
+- hap knows these commands come from you: it screens what they would send with the same safety rules as its own unattended answers, and refuses them while the herd is paused. A refusal is final for that item — leave it for the operator; never retype it into the agent with herdr.
 
 When you are set up, report the herd's state in a few lines and ask the operator what the goals are.`
 
@@ -465,6 +466,16 @@ func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLau
 			abandon("starting it", errors.Join(startErr, err))
 			return domain.OrchestratorIdentity{}, false
 		}
+		if tr.PaneID != pane {
+			// Another session took the name between the lookup and the start
+			// (herdr keeps names unique, so ours was refused). Never record or
+			// brief it from here: the next pass finds it by name and adopts it
+			// the way it adopts any session hap did not start — unbriefed.
+			abandon("starting it", errors.Join(startErr, fmt.Errorf(
+				"the name %s was taken by another session (pane %s) during the start",
+				domain.OrchestratorAgentName, tr.PaneID)))
+			return domain.OrchestratorIdentity{}, false
+		}
 		if startErr != nil {
 			slog.Info("orchestrator: herdr reported a start error, but the session is up", "error", startErr)
 		}
@@ -691,4 +702,50 @@ func (d *Daemon) orchestratorSucceeded() {
 	d.orch.failures = 0
 	d.orch.retryAt = time.Time{}
 	d.orch.mu.Unlock()
+}
+
+// CallerIsOrchestrator reports whether a hap command running in herdr pane
+// paneID (its HERDR_PANE_ID) is running inside the orchestrator session, by
+// the identity the daemon records in stateDir. Any failure answers false:
+// the command then acts as the operator, exactly as before this existed.
+func CallerIsOrchestrator(stateDir, paneID string) bool {
+	if stateDir == "" || paneID == "" {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, orchestratorStateFile))
+	if err != nil {
+		return false
+	}
+	var id domain.OrchestratorIdentity
+	return json.Unmarshal(data, &id) == nil && id.Known() && id.PaneID == paneID
+}
+
+// actionScreen is the outbound screen a queued action's text must pass: none
+// for an operator — they saw the text, and their confirm is the gate — and
+// the daemon's own never-auto and irreversibility screen for the orchestrator,
+// an LLM whose text no human has seen.
+func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(string) error {
+	if a.Author != domain.OrchestratorAuthor {
+		return nil
+	}
+	return func(text string) error {
+		if err := d.screenOutbound(agentType, text); err != nil {
+			return fmt.Errorf("%w: %v", errOutboundRefused, err)
+		}
+		return nil
+	}
+}
+
+// refuseOrchestratorWhilePaused holds the orchestrator's actions to the kill
+// switch the daemon's own sends honour. An operator's are exempt: resolving
+// by hand while the herd is paused is what the pause is for. A read error
+// refuses (fail closed).
+func (d *Daemon) refuseOrchestratorWhilePaused(ctx context.Context, a domain.AgentAction) error {
+	if a.Author != domain.OrchestratorAuthor {
+		return nil
+	}
+	if d.orchestratorPaused(ctx) {
+		return errors.New("the herd is paused, so hap will not act for the orchestrator; resume it or act as the operator")
+	}
+	return nil
 }

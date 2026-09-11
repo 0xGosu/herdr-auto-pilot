@@ -28,6 +28,9 @@ func (d *Daemon) acceptGeneratedTaskAction(ctx context.Context, a domain.AgentAc
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)
 	}
+	if err := d.refuseOrchestratorWhilePaused(ctx, a); err != nil {
+		return "", err
+	}
 
 	audit, err := d.opt.Store.GetAudit(ctx, p.AuditID)
 	if err != nil {
@@ -86,7 +89,8 @@ func (d *Daemon) acceptGeneratedTaskAction(ctx context.Context, a domain.AgentAc
 	// order.
 	var inner error
 	disabled, err := d.opt.Store.WithAgentAutomation(ctx, audit.AgentID, func() {
-		inner = d.opt.ConfirmGeneratedTask(ctx, p.AuditID, p.Send, a.Author, d.taskSendHost(a.ID))
+		inner = d.opt.ConfirmGeneratedTask(ctx, p.AuditID, p.Send, a.Author, d.taskSendHost(a.ID),
+			d.actionScreen(a, audit.AgentType))
 	})
 	switch {
 	case err != nil:

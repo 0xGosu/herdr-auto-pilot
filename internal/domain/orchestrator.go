@@ -18,6 +18,11 @@ const (
 	// OrchestratorWorkspaceLabel labels the herdr workspace the session is
 	// created in, and is how an existing one is found again.
 	OrchestratorWorkspaceLabel = "hap-orchestrator"
+	// OrchestratorAuthor is the author a hap command carries when the
+	// orchestrator session runs it. Its actions are an LLM's, so the daemon
+	// screens them like its own unattended sends and refuses them while the
+	// herd is paused, where an operator's are neither.
+	OrchestratorAuthor = "orchestrator"
 	// OrchestratorAgentKind is the only agent kind supported so far.
 	OrchestratorAgentKind = "claude"
 )

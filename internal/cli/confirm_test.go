@@ -129,7 +129,7 @@ func standInConfirm(ctx context.Context, st *store.Store, a domain.AgentAction,
 			}
 		}
 	}
-	if err := app.ConfirmGeneratedTaskForOperator(ctx, p.AuditID, p.Send, a.Author, cliStandInHost{h}); err != nil {
+	if err := app.ConfirmGeneratedTaskForOperator(ctx, p.AuditID, p.Send, a.Author, cliStandInHost{h}, nil); err != nil {
 		st.FinishAgentAction(ctx, a.ID, domain.AgentActionFailed, err.Error(), "", time.Now())
 		return
 	}
@@ -367,7 +367,7 @@ func standInSendTask(ctx context.Context, st *store.Store, a domain.AgentAction,
 		fail("agent " + a.Target + " is no longer live — refresh and retry")
 		return
 	}
-	if err := app.SendTaskForOperator(ctx, p, agentID, agentType, a.Target, cliStandInHost{h}); err != nil {
+	if err := app.SendTaskForOperator(ctx, p, agentID, agentType, a.Target, cliStandInHost{h}, nil); err != nil {
 		fail(err.Error())
 		return
 	}

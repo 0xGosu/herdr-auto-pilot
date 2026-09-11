@@ -264,7 +264,11 @@ pane `1`), mints an `agent_names` row in a node-keyed table, writes a checklist,
   LOCATOR, not agent alone, or one source's item renders through another's template. `hap task send`
   is local-only; the TUI's Tasks tab can hand out a remote node's item.
 - The operator path is deliberately NOT screened (`screen` is nil): the daemon's own sends are screened
-  because no human saw the text; here one has, and their confirm has always been the gate.
+  because no human saw the text; here one has, and their confirm has always been the gate. **The one
+  exception is the orchestrator** (`domain.OrchestratorAuthor`, set by `cmd/hap` when HERDR_PANE_ID is the
+  orchestrator's pane): an LLM's confirm is not a human's, so its generated-task confirms and `task send`
+  get the daemon's `screenOutbound` (`daemon.actionScreen`) and all three executors refuse it while the herd
+  is paused (`refuseOrchestratorWhilePaused`). Keyed on the queued row's AUTHOR, so an operator is untouched.
 - **Test trap:** `internal/daemon` may not import `internal/frontend`, so its tests drive a FAKE seam
   and prove only the EXECUTOR's guards. The confirm's own behaviour is proved in `internal/frontend`;
   the TUI and CLI suites run a stand-in drain calling the REAL confirm, or their "the tasks file was

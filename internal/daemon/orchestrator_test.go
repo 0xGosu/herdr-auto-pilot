@@ -172,6 +172,13 @@ func newOrchHarness(t *testing.T, cfgTOML string, setup func(*orchLauncher)) (*h
 // config — what every step of a pass re-asks — and returns it, for tests that
 // drive ensureOrchestrator directly on a harness started with it off.
 func orchestratorModeOnIn(h *harness) config.Config {
+	// Hold the pass latch first: Run's own startup pass may still be on its
+	// way (the harness only waits for the control socket), and one arriving
+	// after the mode flips on would race the pass the test drives directly.
+	// ensureOrchestrator itself ignores the latch.
+	h.daemon.orch.mu.Lock()
+	h.daemon.orch.running = true
+	h.daemon.orch.mu.Unlock()
 	h.daemon.mu.Lock()
 	defer h.daemon.mu.Unlock()
 	h.daemon.cfg.FullSelfPrompting.Enabled = true

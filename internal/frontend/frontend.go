@@ -4417,9 +4417,12 @@ func (a *App) SendTaskToAgentOn(ctx context.Context, nodeID, agentName, locator 
 // instead of duplicating work in the agent.
 //
 // As an operator action it is exempt from the pause switch, matching
-// Resolve/Confirm.
+// Resolve/Confirm. screen is nil for an operator; for the orchestrator the
+// daemon passes its outbound screen, applied to the exact rendered prompt —
+// after the reservation, since the prompt folds the reserved item's detail, so
+// a refusal returns the item to [ ].
 func (a *App) SendTaskForOperator(ctx context.Context, p domain.SendTaskPayload,
-	agentID, agentType, agentName string, host ports.TaskSendHost) error {
+	agentID, agentType, agentName string, host ports.TaskSendHost, screen func(string) error) error {
 
 	if host == nil {
 		return fmt.Errorf("herdr unavailable — cannot send")
@@ -4473,6 +4476,16 @@ func (a *App) SendTaskForOperator(ctx context.Context, p domain.SendTaskPayload,
 		Template: template, AgentName: agentName, Cwd: cwd,
 		SourceIndex: sourceIndex,
 	}.Prompt()
+	if screen != nil {
+		if err := screen(prompt); err != nil {
+			if _, rerr := a.mutateTaskWithin(context.WithoutCancel(ctx), p.Locator,
+				releaseTask(p.Index, p.TaskText)); rerr != nil {
+				return fmt.Errorf("task #%d was not sent: %w (and it could not be returned to [ ]: %v)",
+					p.Index, err, rerr)
+			}
+			return fmt.Errorf("task #%d was not sent: %w", p.Index, err)
+		}
+	}
 	if f := a.deliverReserved(ctx, host, agentID, agentType, prompt, 0,
 		func(rc context.Context) error {
 			_, err := a.mutateTaskWithin(rc, p.Locator, releaseTask(p.Index, p.TaskText))
