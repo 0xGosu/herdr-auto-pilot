@@ -38,12 +38,22 @@ type Subscriber struct {
 	mu    sync.Mutex
 	panes map[string]paneInfo // monitored pane set (FR-001)
 	dirty chan struct{}       // signals a pane-set change to the status loop
+
+	// watched is the pane set the status stream last subscribed, each with
+	// the agent label it carried then ("" for a shell), and subscribed
+	// whether it ever has; both are owned by the status loop alone
+	// (runStatus), so they need no lock. See runStatus.
+	watched    map[string]string
+	subscribed bool
 }
 
 type paneInfo struct {
 	workspaceID string
 	tabID       string
 	agentLabel  string
+	// status is the agent status pane.list last reported, used to replay a
+	// newly watched agent's current state (see runStatus).
+	status string
 }
 
 // NewSubscriber creates a subscriber for the given Herdr socket path.
@@ -245,21 +255,59 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 // Only panes carrying a detected agent label are watched. A status
 // subscription is not free for herdr: measured on herdr 0.8.2, holding one for
 // each of 13 live panes (2 of them agents) was ~5.5 points of the server's CPU
-// — more than half its load with the daemon up — against ~2.7 for the two
+// — more than half its load with the daemon up — against ~2.8 for the two
 // agent panes alone, and a plain shell never reports an agent status to
 // watch. A shell that STARTS an agent is announced by pane.agent_detected,
-// which labels it and resubscribes (upsertPane); the one thing given up is a
-// status change landing in the milliseconds between that detection and the
-// resubscribe, which the minute sweep's reconcile covers.
+// which labels it and resubscribes (upsertPane).
+//
+// That resubscribe always comes too late for one event: herdr emits the
+// detection and the agent's first status change in the SAME update, so the
+// status is sent while the pane is still unwatched. It is not a race to win.
+// So a resubscribe that adds an agent pane — or finds a label on one it
+// watched as a shell, whose stream the label's own resubscribe tore down
+// mid-update — replays that pane's current status from the pane.list
+// snapshot it just took — once, and only on a resubscribe:
+// the first subscribe is the daemon starting, which its startup reconcile
+// already covers. A duplicate (the event did arrive) is harmless, since the
+// daemon coalesces captures per pane.
+//
+// The filter needs pane.list to REPORT agent labels (herdr 0.8.2 does). A
+// listing that carries none at all — a herdr that does not report them, or a
+// herd with no agent running — subscribes every pane, exactly as before:
+// filtering on labels that are never reported would leave an agent that was
+// already running when the daemon started with no status subscription at all.
 func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTransition) error {
-	allPanes, err := s.listPanes(ctx)
+	allPanes, labelled, err := s.listPanes(ctx)
 	if err != nil {
 		// Not wrapped with the method name: call()'s errors already carry it.
 		return err
 	}
-	paneIDs := s.agentPanes(allPanes)
+	paneIDs := allPanes
+	if labelled {
+		paneIDs = s.agentPanes(allPanes)
+	}
+	labels := s.labels(paneIDs)
+	var fresh []string
+	if s.subscribed {
+		for _, id := range paneIDs {
+			// New to the stream, or watched before only as a shell: either
+			// way the detection's status update was not seen as an agent's.
+			if prev, ok := s.watched[id]; labels[id] != "" && (!ok || prev == "") {
+				fresh = append(fresh, id)
+			}
+		}
+	}
+	s.watched = labels
+	s.subscribed = true
+	for _, tr := range s.replayStatus(fresh) {
+		select {
+		case out <- tr:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	if len(paneIDs) == 0 {
-		// Nothing to watch yet: wait for discovery to find panes.
+		// Nothing to watch yet: wait for discovery to find agent panes.
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -418,6 +466,41 @@ func (s *Subscriber) upsertPane(paneID, workspaceID, tabID, agentLabel string) {
 	}
 }
 
+// labels snapshots the agent label of each pane ("" for a shell).
+func (s *Subscriber) labels(ids []string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]string, len(ids))
+	for _, id := range ids {
+		label := s.panes[id].agentLabel
+		if domain.IsPlaceholderAgent(label, "") {
+			label = ""
+		}
+		out[id] = label
+	}
+	return out
+}
+
+// replayStatus builds a transition from pane.list's snapshot for each newly
+// watched pane that reported a real agent and status (see runStatus).
+func (s *Subscriber) replayStatus(ids []string) []domain.AgentTransition {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []domain.AgentTransition
+	for _, id := range ids {
+		info := s.panes[id]
+		if info.agentLabel == "" || domain.IsPlaceholderAgent("", info.status) {
+			continue
+		}
+		out = append(out, domain.AgentTransition{
+			AgentID: id, AgentType: info.agentLabel, PaneID: id,
+			TabID: info.tabID, WorkspaceID: info.workspaceID,
+			Status: info.status, At: time.Now(),
+		})
+	}
+	return out
+}
+
 // agentPanes keeps the panes that host a detected agent — the only ones the
 // status subscription watches (see runStatus).
 func (s *Subscriber) agentPanes(ids []string) []string {
@@ -533,20 +616,28 @@ func call(ctx context.Context, dial func(context.Context) (net.Conn, error),
 	return nil
 }
 
-// listPanes queries the live pane set over a short-lived connection.
-func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
+// listPanes queries the live pane set over a short-lived connection, and
+// reports whether the listing labelled any pane with its agent (see runStatus).
+func (s *Subscriber) listPanes(ctx context.Context) (ids []string, labelled bool, err error) {
 	var result struct {
 		Panes []struct {
 			PaneID      string `json:"pane_id"`
 			TabID       string `json:"tab_id"`
 			WorkspaceID string `json:"workspace_id"`
 			Agent       string `json:"agent"`
+			AgentStatus string `json:"agent_status"`
 		} `json:"panes"`
 	}
 	if err := call(ctx, s.Dial, "hap_pane_list", "pane.list", map[string]any{}, &result); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	ids := make([]string, 0, len(result.Panes))
+	for _, p := range result.Panes {
+		if !domain.IsPlaceholderAgent(p.Agent, "") {
+			labelled = true
+			break
+		}
+	}
+	ids = make([]string, 0, len(result.Panes))
 	s.mu.Lock()
 	live := map[string]bool{}
 	for _, p := range result.Panes {
@@ -559,12 +650,15 @@ func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
 		if p.TabID != "" {
 			info.tabID = p.TabID
 		}
-		// pane.list is the authoritative snapshot: a pane it reports with no
-		// agent has none now (the agent exited back to its shell), so the
-		// label is cleared rather than kept watching a plain shell.
+		info.status = p.AgentStatus
+		// A listing that labels agents is the authoritative snapshot: a pane
+		// it reports with no agent has none now (the agent exited back to its
+		// shell), so the label is cleared rather than kept watching a plain
+		// shell. One that labels nothing says nothing about agents, so the
+		// labels pane.agent_detected attached are kept.
 		if !domain.IsPlaceholderAgent(p.Agent, "") {
 			info.agentLabel = p.Agent
-		} else {
+		} else if labelled {
 			info.agentLabel = ""
 		}
 		s.panes[p.PaneID] = info
@@ -577,7 +671,7 @@ func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
 	}
 	s.mu.Unlock()
 	sort.Strings(ids)
-	return ids, nil
+	return ids, labelled, nil
 }
 
 func (s *Subscriber) agentLabel(paneID string) string {

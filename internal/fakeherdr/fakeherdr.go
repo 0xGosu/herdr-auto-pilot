@@ -48,6 +48,11 @@ type Server struct {
 	// agents is each pane's detected agent label, reported by pane.list the
 	// way real herdr reports it; a pane absent here is a plain shell.
 	agents map[string]string
+	// statuses is each agent pane's current status, reported by pane.list.
+	statuses map[string]string
+	// omitAgentLabels makes pane.list carry no agent field at all, like a
+	// herdr that does not report labels there (see SetPaneListLabels).
+	omitAgentLabels bool
 
 	// notifications records every notification.show request; notifyShown /
 	// notifyReason are the canned result, defaulting to a displayed toast.
@@ -72,6 +77,7 @@ func NewServer(dir string) (*Server, error) {
 		conns:        map[net.Conn]*clientConn{},
 		panes:        map[string]string{},
 		agents:       map[string]string{},
+		statuses:     map[string]string{},
 		notifyShown:  true,
 		notifyReason: "shown",
 	}
@@ -135,8 +141,12 @@ func (s *Server) serve(conn net.Conn) {
 			var panes []map[string]any
 			for paneID, wsID := range s.panes {
 				p := map[string]any{"pane_id": paneID, "workspace_id": wsID}
-				if label := s.agents[paneID]; label != "" {
+				if label := s.agents[paneID]; label != "" && !s.omitAgentLabels {
 					p["agent"] = label
+				}
+				p["agent_status"] = "unknown"
+				if st := s.statuses[paneID]; st != "" {
+					p["agent_status"] = st
 				}
 				panes = append(panes, p)
 			}
@@ -258,6 +268,15 @@ func (s *Server) AddAgentPane(paneID, workspaceID, agentLabel string) {
 	s.AddPane(paneID, workspaceID)
 }
 
+// SetPaneListLabels controls whether pane.list reports agent labels (the
+// default, as herdr 0.8.2 does). Off, labels still arrive through
+// pane.agent_detected, the way a herdr without them in pane.list behaves.
+func (s *Server) SetPaneListLabels(on bool) {
+	s.mu.Lock()
+	s.omitAgentLabels = !on
+	s.mu.Unlock()
+}
+
 // ClearAgent drops a pane's agent label, as when the agent exits back to its
 // shell: pane.list then reports the pane with no agent.
 func (s *Server) ClearAgent(paneID string) {
@@ -297,9 +316,21 @@ func (s *Server) PushAgentDetected(paneID, workspaceID, agentLabel string) {
 	}, "")
 }
 
+// PushAgentStarted is an agent starting in a pane the way herdr 0.8.2 reports
+// it: ONE state update that emits pane.agent_detected and, straight after, the
+// agent's first pane.agent_status_changed — before any subscriber can react to
+// the detection by subscribing the pane.
+func (s *Server) PushAgentStarted(paneID, workspaceID, agentLabel, status string) {
+	s.PushAgentDetected(paneID, workspaceID, agentLabel)
+	s.PushTransition(paneID, workspaceID, agentLabel, status)
+}
+
 // PushTransition pushes a pane.agent_status_changed event to subscribers
 // whose pane filter matches.
 func (s *Server) PushTransition(paneID, workspaceID, agentLabel, status string) {
+	s.mu.Lock()
+	s.statuses[paneID] = status
+	s.mu.Unlock()
 	s.broadcast("pane.agent_status_changed", map[string]any{
 		"pane_id": paneID, "workspace_id": workspaceID,
 		"agent": agentLabel, "agent_status": status,
@@ -332,6 +363,7 @@ func (s *Server) RemovePaneSilently(paneID string) {
 	s.mu.Lock()
 	delete(s.panes, paneID)
 	delete(s.agents, paneID)
+	delete(s.statuses, paneID)
 	s.mu.Unlock()
 }
 
