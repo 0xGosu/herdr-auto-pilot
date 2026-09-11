@@ -20,9 +20,9 @@ func TestSubscriberReceivesTransitions(t *testing.T) {
 	}
 	defer srv.Close()
 
-	// A pane already exists before the subscriber connects: discovered via
-	// the pane.created replay, then watched for status changes (FR-001).
-	srv.AddPane("w1:p1", "w1")
+	// An agent pane already exists before the subscriber connects: discovered
+	// via the pane.created replay, then watched for status changes (FR-001).
+	srv.AddAgentPane("w1:p1", "w1", "claude")
 
 	sub := NewSubscriber(srv.SocketPath)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -52,7 +52,7 @@ func TestSubscriberIgnoresDoublePlaceholderAgents(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.Close()
-	srv.AddPane("w1:p1", "w1")
+	srv.AddAgentPane("w1:p1", "w1", "claude")
 
 	sub := NewSubscriber(srv.SocketPath)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -177,7 +177,7 @@ func TestSubscriberReconnectsWithBackoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.Close()
-	srv.AddPane("w1:p2", "w1")
+	srv.AddAgentPane("w1:p2", "w1", "claude")
 
 	sub := NewSubscriber(srv.SocketPath)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -214,8 +214,8 @@ func TestSubscriberRecoversFromSilentlyVanishedPane(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer srv.Close()
-	srv.AddPane("w1:p1", "w1")
-	srv.AddPane("w1:p9", "w1")
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+	srv.AddAgentPane("w1:p9", "w1", "claude")
 
 	sub := NewSubscriber(srv.SocketPath)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -241,6 +241,232 @@ func TestSubscriberRecoversFromSilentlyVanishedPane(t *testing.T) {
 		}
 	}
 	t.Fatal("subscriber did not recover after a silently vanished pane")
+}
+
+// waitStatusSubs waits until the fake reports exactly want as the status
+// subscriptions held, returning the last observed set.
+func waitStatusSubs(t *testing.T, srv *fakeherdr.Server, want []string) []string {
+	t.Helper()
+	var got []string
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		got = srv.StatusSubscriptions()
+		if slices.Equal(got, want) {
+			return got
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return got
+}
+
+// TestSubscriberWatchesOnlyAgentPanes pins the herdr-side cost: a status
+// subscription is per pane and not free for the server (measured: holding one
+// for each of 13 panes was more than half of herdr's CPU with the daemon up),
+// and a plain shell never reports an agent status. The agent pane is the
+// control — without it the test passes for a subscriber that watches nothing.
+func TestSubscriberWatchesOnlyAgentPanes(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddPane("w1:sh", "w1")
+	srv.AddPane("w1:sh2", "w1")
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sub.Subscribe(ctx, make(chan domain.AgentTransition, 16))
+
+	if got := waitStatusSubs(t, srv, []string{"w1:p1"}); !slices.Equal(got, []string{"w1:p1"}) {
+		t.Fatalf("status subscriptions = %v, want only the agent pane [w1:p1]", got)
+	}
+}
+
+// TestSubscriberWatchesAPaneOnceAnAgentStartsInIt: a shell that starts an
+// agent is announced by pane.agent_detected, and from then on its status must
+// flow — the case watching only agent panes could otherwise lose for good.
+func TestSubscriberWatchesAPaneOnceAnAgentStartsInIt(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddPane("w1:sh", "w1")
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 64)
+	go sub.Subscribe(ctx, out)
+	if got := waitStatusSubs(t, srv, []string{"w1:p1"}); !slices.Equal(got, []string{"w1:p1"}) {
+		t.Fatalf("before: status subscriptions = %v, want [w1:p1]", got)
+	}
+	// Settled, not merely reached: a resubscribe still pending from the
+	// pane.created replays would otherwise pick the label up from pane.list
+	// on its own and hide a missing resubscribe signal.
+	time.Sleep(300 * time.Millisecond)
+	if got := srv.StatusSubscriptions(); !slices.Equal(got, []string{"w1:p1"}) {
+		t.Fatalf("before, settled: status subscriptions = %v, want [w1:p1]", got)
+	}
+
+	srv.PushAgentDetected("w1:sh", "w1", "claude")
+	if got := waitStatusSubs(t, srv, []string{"w1:p1", "w1:sh"}); !slices.Equal(got, []string{"w1:p1", "w1:sh"}) {
+		t.Fatalf("after the agent started: status subscriptions = %v, want [w1:p1 w1:sh]", got)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.PushTransition("w1:sh", "w1", "claude", "blocked")
+		select {
+		case tr := <-out:
+			if tr.PaneID == "w1:sh" && tr.Status == "blocked" {
+				return
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Fatal("the new agent's status never reached the subscriber")
+}
+
+// TestSubscriberStopsWatchingAPaneWhoseAgentExited: pane.list is the
+// authoritative snapshot, so a pane it reports with no agent (the agent quit
+// back to its shell) leaves the status subscription at the next resubscribe
+// rather than being watched as a plain shell forever.
+func TestSubscriberStopsWatchingAPaneWhoseAgentExited(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+	srv.AddAgentPane("w1:p2", "w1", "codex")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sub.Subscribe(ctx, make(chan domain.AgentTransition, 64))
+	if got := waitStatusSubs(t, srv, []string{"w1:p1", "w1:p2"}); !slices.Equal(got, []string{"w1:p1", "w1:p2"}) {
+		t.Fatalf("before: status subscriptions = %v", got)
+	}
+	srv.ClearAgent("w1:p2")
+	srv.AddPane("w1:new", "w1") // any pane-set change resubscribes
+	if got := waitStatusSubs(t, srv, []string{"w1:p1"}); !slices.Equal(got, []string{"w1:p1"}) {
+		t.Errorf("after the agent exited: status subscriptions = %v, want [w1:p1]", got)
+	}
+}
+
+// TestSubscriberWatchesEveryPaneWhenPaneListCarriesNoLabels is the
+// compatibility floor: a herdr whose pane.list reports no agent labels would
+// otherwise leave an agent already running at daemon start with no status
+// subscription (discovery labels it, and a label-trusting listing would clear
+// it again). With no labels in the listing every pane is watched, as before,
+// and the agent's status flows.
+func TestSubscriberWatchesEveryPaneWhenPaneListCarriesNoLabels(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.SetPaneListLabels(false)
+	srv.AddPane("w1:sh", "w1")
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 64)
+	go sub.Subscribe(ctx, out)
+	want := []string{"w1:p1", "w1:sh"}
+	if got := waitStatusSubs(t, srv, want); !slices.Equal(got, want) {
+		t.Fatalf("status subscriptions = %v, want every pane %v", got, want)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		srv.PushTransition("w1:p1", "w1", "claude", "idle")
+		select {
+		case tr := <-out:
+			if tr.PaneID == "w1:p1" && tr.Status == "idle" {
+				return
+			}
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	t.Fatal("the running agent's status never reached the subscriber")
+}
+
+// TestSubscriberDeliversANewAgentsFirstStatus: herdr sends an agent's
+// detection and its first status in ONE update, so the status is emitted
+// while the pane is still unwatched — not a race the resubscribe can win. The
+// resubscribe that adds the pane replays its current status from pane.list;
+// without that the new agent's first park waits for the minute sweep.
+func TestSubscriberDeliversANewAgentsFirstStatus(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddPane("w1:sh", "w1")
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 64)
+	go sub.Subscribe(ctx, out)
+	if got := waitStatusSubs(t, srv, []string{"w1:p1"}); !slices.Equal(got, []string{"w1:p1"}) {
+		t.Fatalf("before: status subscriptions = %v, want [w1:p1]", got)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	srv.PushAgentStarted("w1:sh", "w1", "claude", "idle") // pushed ONCE
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case tr := <-out:
+			if tr.PaneID == "w1:sh" && tr.Status == "idle" && tr.AgentType == "claude" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the new agent's first status was lost with its detection")
+		}
+	}
+}
+
+// TestSubscriberWithOnlyShellsStillSeesAnAgentStart covers the idle end of the
+// fallback: a herd with no agent yet labels nothing, so every pane is watched
+// and the first agent's status arrives directly.
+func TestSubscriberWithOnlyShellsStillSeesAnAgentStart(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddPane("w1:sh", "w1")
+	srv.AddPane("w1:sh2", "w1")
+
+	sub := NewSubscriber(srv.SocketPath)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 64)
+	go sub.Subscribe(ctx, out)
+	want := []string{"w1:sh", "w1:sh2"}
+	if got := waitStatusSubs(t, srv, want); !slices.Equal(got, want) {
+		t.Fatalf("status subscriptions = %v, want every pane %v", got, want)
+	}
+	srv.PushAgentStarted("w1:sh2", "w1", "codex", "blocked")
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case tr := <-out:
+			if tr.PaneID == "w1:sh2" && tr.Status == "blocked" {
+				return
+			}
+		case <-deadline:
+			t.Fatal("the first agent's status never arrived")
+		}
+	}
 }
 
 func TestCLIExecutor(t *testing.T) {

@@ -1089,6 +1089,18 @@ where the behaviour could revert.
   in case a build ships the caret binding, failing closed when the learned label matches no offered environment.
 - One `events.subscribe` per socket connection; status subscriptions require a concrete `pane_id`; existing
   panes are replayed as `pane_created`.
+- **A status subscription costs herdr CPU per pane, so only AGENT panes are watched** (`Subscriber.agentPanes`,
+  herdr 0.8.2): with 13 live panes (2 agents) the per-pane subscriptions were ~5.5 points of the server's CPU —
+  more than half its load with the daemon up — against ~2.8 for the agent panes alone, while the discovery stream
+  and hap's CLI calls were negligible. The label comes from `pane.list` (authoritative; an agent that exited
+  clears it) or `pane.agent_detected`, and a label newly attached to an existing pane resubscribes
+  (`upsertPane`) — too late for ONE event by construction: herdr emits the detection and the agent's first status
+  in the same update, so a resubscribe that ADDS an agent pane replays its status from the `pane.list` snapshot
+  (`replayStatus`; not on the first subscribe, which the startup reconcile covers). **A listing that labels NO pane falls back to watching every pane** (and keeps discovery's
+  labels) — `min_herdr_version` is 0.7.0 and a herdr not reporting labels in `pane.list` would otherwise leave
+  every agent running at daemon start unwatched; a herd with no agents takes the same path, harmlessly.
+  **Test trap:** `fakeherdr.AddPane` is a plain SHELL — a test pushing status must use
+  `AddAgentPane` (or `PushAgentDetected` first), exactly as real herdr only reports status for a detected agent.
 - Adding a pane makes the subscriber reconnect ("pane set changed", 1s backoff) — tests pushing transitions
   right after `AddPane` must wait past the resubscribe.
 - The herdr binary resolves via `HERDR_BIN_PATH` (fallback: `herdr` on PATH); the events socket via
