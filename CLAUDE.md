@@ -787,7 +787,10 @@ read and an earlier form is always somewhere above.
     question 2 can offer the same labels as question 1;
   - **a question's Write-in row is refused as a verdict** (`domain.ErrAgyNotAnswerable` →
     `deliver.ErrReplyWithheld`, which auto-accept maps to `errOutboundRefused` — without it the
-    refusal burns the attempt budget and DISMISSES the row).
+    refusal burns the attempt budget and DISMISSES the row);
+  - **every verified answer re-captures the pane** (`recaptureAfterAgyAnswer`, from the keyed-form
+    bodies AND `autoAcceptDeliver`): agy draws the next question IN PLACE with no status change,
+    so nothing else would ever look at it — the form stalled after question 1, silently.
 - **Anything else typed into agy needs a proven EMPTY composer** (`domain.AgyComposerReady`,
   `daemon.agyComposerRefusal`): herdr says idle under every agy modal, so a status check lets a
   hand-out land in a standing approval, a picker, the survey or the operator's draft. Asked by

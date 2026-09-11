@@ -608,6 +608,14 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 	case !sent:
 		return deliverErr
 	}
+	// agy draws a form's next question in place, with no status change for
+	// herdr to report, so the pane is captured again — the operator's --send
+	// and auto-accept both come through here (see recaptureAfterAgyAnswer).
+	if domain.AgyFormSituation(rec.SituationType, rec.AgentType) {
+		d.recaptureAfterAgyAnswer(ctx, domain.AgentTransition{
+			AgentID: rec.AgentID, PaneID: rec.AgentID, AgentType: rec.AgentType, Status: "idle",
+		})
+	}
 	return nil
 }
 

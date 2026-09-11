@@ -130,6 +130,56 @@ func TestAgyApprovalIsAnsweredWithTheDigitAlone(t *testing.T) {
 	}
 }
 
+// TestAgyQuestionFormIsCapturedAgainAfterEachAnswer: agy draws a form's next
+// question IN PLACE — herdr reports no status change for it — so after
+// answering question 1 the daemon must capture the pane again, or question 2
+// stalls with nothing escalated (observed live against agy 1.2.1).
+func TestAgyQuestionFormIsCapturedAgainAfterEachAnswer(t *testing.T) {
+	q1, q2 := agyScreen(t, "choice_agy_mcq_two"), agyScreen(t, "choice_agy_mcq_two_q2")
+	h := newHarness(t, "")
+	h.herdr.setKeyScript(q1, []string{"3"}, []string{q2})
+	h.seedAutonomousAgy(q1, domain.SituationChoice, "Blue")
+
+	h.pushAgy("agent-agy-q", "done")
+
+	if keys := waitForKeys(t, h, 1); !reflect.DeepEqual(keys, []string{"3"}) {
+		t.Fatalf("keys = %v, want exactly [3]", keys)
+	}
+	// Question 2 has no rule, so once it is captured it escalates as a choice
+	// of its own.
+	esc := waitForOneEscalation(t, h)
+	if esc.SituationType != domain.SituationChoice || !strings.Contains(esc.PaneExcerpt, "Question 2/2") {
+		t.Errorf("want question 2 escalated as its own choice, got %s: %.120q", esc.SituationType, esc.PaneExcerpt)
+	}
+}
+
+// The same through deliver.Deliver — the operator's --send and auto-accept.
+func TestAutoAcceptedAgyAnswerCapturesTheNextQuestion(t *testing.T) {
+	q1, q2 := agyScreen(t, "choice_agy_mcq_two"), agyScreen(t, "choice_agy_mcq_two_q2")
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setKeyScript(q1, []string{"3"}, []string{q2})
+	id := seedAgedAgyEscalation(t, h, q1, domain.SituationChoice, "respond: Blue")
+	// Live in herdr's listing too, or question 2's escalation is retired as
+	// agent_not_live the moment it is raised.
+	h.herdr.setAgents(agyLive)
+
+	h.daemon.autoAcceptEscalations(ctx, agyLive)
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(ctx)
+		for _, e := range pend {
+			if e.ID != id && strings.Contains(e.PaneExcerpt, "Question 2/2") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
 // TestAgyLLMPromotionAnswersWithTheDigitAlone is the LLM half: a confident
 // model answer naming an offered option is pressed as its digit alone.
 func TestAgyLLMPromotionAnswersWithTheDigitAlone(t *testing.T) {

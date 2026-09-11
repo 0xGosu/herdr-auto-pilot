@@ -680,9 +680,16 @@ What shipped, and where it deliberately departs from §4:
   as §5 verified. Live verification on a scratch agent is what confirms `send-keys <digit>`
   answers agy the same way.
 - **Questions stay one situation each.** No `MCQKind`, no answer series: `MCQAgyQuestions` was
-  removed. Each question classifies, decides and is answered on its own, and the next question
-  gets its own capture. §4.7's series protocol is unnecessary because agy renders later
-  questions' options only after the earlier ones are answered.
+  removed. Each question classifies, decides and is answered on its own. §4.7's series protocol
+  is unnecessary because agy renders later questions' options only after the earlier ones are
+  answered.
+- **Re-capture after every answer.** agy draws a form's next question in place, and herdr
+  reports no status change for it. Without a fresh capture the daemon never looked again, and
+  the form stalled after question 1 with nothing escalated (observed live).
+  - `daemon.recaptureAfterAgyAnswer` schedules a capture after every verified agy answer, from
+    the keyed-form bodies and from `autoAcceptDeliver` (the operator's `--send` and
+    auto-accept).
+  - An answer that set agy working cancels that capture through the working transition.
 - **Refusals.**
   - A reply naming no offered option escalates `unfamiliar_options` before any audit row claims
     an answer.

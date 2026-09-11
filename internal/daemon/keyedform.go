@@ -25,6 +25,9 @@ type keyedForm struct {
 	what   string // what is delivered, for logs and notifications
 	review string // what the operator should look at when it fails
 	send   func(ctx context.Context, chosen string) error
+	// after runs once the answer is verified delivered; nil for forms that
+	// need nothing more.
+	after func(ctx context.Context)
 }
 
 func (d *Daemon) remoteEnvForm(ks ports.KeystrokeSender, paneID string) keyedForm {
@@ -36,26 +39,48 @@ func (d *Daemon) remoteEnvForm(ks ports.KeystrokeSender, paneID string) keyedFor
 	}
 }
 
-// agyForm answers agy's standing approval or question (mcqdeliver.Agy). excerpt
-// is the capture the decision was made from: the deliverer refuses when the
-// live form is not that one (the next question of a form, another command).
-func (d *Daemon) agyForm(ks ports.KeystrokeSender, paneID, excerpt string) keyedForm {
+// agyForm answers agy's standing approval or question (mcqdeliver.Agy). The
+// situation's content is the capture the decision was made from: the deliverer
+// refuses when the live form is not that one (the next question of a form,
+// another command). Once answered, the pane is captured again
+// (recaptureAfterAgyAnswer).
+func (d *Daemon) agyForm(ks ports.KeystrokeSender, s domain.Situation, tr domain.AgentTransition) keyedForm {
 	return keyedForm{
 		guard: "agy-delivery", what: "agy answer", review: "the agy prompt",
 		send: func(ctx context.Context, chosen string) error {
 			return mcqdeliver.Agy(ctx, mcqdeliver.Config{
-				Keys: ks, Read: d.readVisible, PaneID: paneID,
+				Keys: ks, Read: d.readVisible, PaneID: s.PaneID,
 				ReadLines: d.opt.PaneReadLines, KeyDelay: sweepKeyDelay,
-			}, excerpt, chosen)
+			}, s.Content, chosen)
 		},
+		after: func(ctx context.Context) { d.recaptureAfterAgyAnswer(ctx, tr) },
 	}
+}
+
+// recaptureAfterAgyAnswer schedules a fresh capture of an agy pane whose form
+// hap just answered. agy draws the NEXT question of a form in place — no status
+// change, so no herdr event — and without this the daemon never looks again:
+// the form stalls after its first question with nothing escalated (observed
+// live, agy 1.2.1). When the answer set agy working instead, that transition
+// cancels the capture (handleTransition); when the form closed, the capture
+// classifies whatever agy parked on, exactly as a status event would have.
+func (d *Daemon) recaptureAfterAgyAnswer(ctx context.Context, tr domain.AgentTransition) {
+	switch tr.Status {
+	case "idle", "done", "blocked":
+	default:
+		tr.Status = "idle"
+	}
+	// Not an operator retry and not an idle-poll hand-out: those intents
+	// belonged to the capture that was just answered.
+	tr.RetryAuditID, tr.AutoIdleSend = 0, false
+	d.scheduleCapture(ctx, tr)
 }
 
 // deliverAgyForm answers an agy approval or question autonomously (act path).
 func (d *Daemon) deliverAgyForm(ctx context.Context, ks ports.KeystrokeSender,
 	s domain.Situation, sig domain.SignatureResult, dec domain.Decision,
 	tr domain.AgentTransition, now time.Time) {
-	d.deliverKeyedForm(ctx, d.agyForm(ks, s.PaneID, s.Content), s, sig, dec, tr, now)
+	d.deliverKeyedForm(ctx, d.agyForm(ks, s, tr), s, sig, dec, tr, now)
 }
 
 // deliverAgyFormLLM is the promotion-path twin of deliverAgyForm. Callers hold
@@ -63,7 +88,7 @@ func (d *Daemon) deliverAgyForm(ctx context.Context, ks ports.KeystrokeSender,
 func (d *Daemon) deliverAgyFormLLM(ctx context.Context, ks ports.KeystrokeSender,
 	s domain.Situation, sig domain.SignatureResult, tr domain.AgentTransition,
 	llmDec *domain.LLMDecision, confidence float64, llmConfidence *int, now time.Time) {
-	d.deliverKeyedFormLLM(ctx, d.agyForm(ks, s.PaneID, s.Content), s, sig, tr, llmDec, confidence, llmConfidence, now)
+	d.deliverKeyedFormLLM(ctx, d.agyForm(ks, s, tr), s, sig, tr, llmDec, confidence, llmConfidence, now)
 }
 
 // agyAnswerRefusalReason maps a domain.AgyAnswerKey refusal onto its escalation
@@ -164,6 +189,9 @@ func (d *Daemon) deliverKeyedForm(ctx context.Context, f keyedForm,
 					PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 					Signature: sig.Signature, Input: dec.Input, Excerpt: s.Content, SituationType: s.Type,
 				})
+				if f.after != nil {
+					f.after(ctx)
+				}
 			})
 			return nil
 		})
@@ -227,6 +255,9 @@ func (d *Daemon) deliverKeyedFormLLM(ctx context.Context, f keyedForm,
 						PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 						Signature: sig.Signature, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
 					})
+					if f.after != nil {
+						f.after(ctx)
+					}
 				})
 			if !executed {
 				d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
