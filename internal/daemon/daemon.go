@@ -1115,6 +1115,13 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	if !first && !prev.Agents.SyncClaudeSessionName && cfg.Agents.SyncClaudeSessionName {
 		d.startClaudeSessionNameSync()
 	}
+	// Turning the orchestrator on (the key, or the mode it rides on) starts it
+	// now rather than at the next sweep. `!first` for the reason above: Run
+	// drives its own startup pass. Called after the unlock — the pass takes
+	// d.mu itself.
+	if !first && !d.orchestratorModeOn(prev) {
+		d.startOrchestratorPass(nil)
+	}
 
 	d.reloadEmbedder(prev, cfg, first || forceEmbedder)
 	slog.Info("configuration loaded", "path", d.opt.ConfigPath)

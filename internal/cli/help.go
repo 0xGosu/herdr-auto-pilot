@@ -822,7 +822,7 @@ func buildCommands() {
 				"hap config fields",
 				"hap config path",
 				"hap config set <field> <value>",
-				"hap config set <llm command field> --preset <claude|codex>",
+				"hap config set <command field> --preset <claude|codex>",
 				"hap config set-threshold <minimum|idle|approval|choice|error> <value>",
 				"hap config env [list [<scope>]]",
 				"hap config env set <scope> <NAME> [--value V]",
@@ -834,7 +834,7 @@ func buildCommands() {
 			},
 			Flags: []FlagDoc{
 				{Name: "--value", Arg: "V", Desc: "config env set: the value; omit it and the value is read from stdin, which keeps a secret out of shell history and `ps`"},
-				{Name: "--preset", Arg: "NAME", Desc: "config set: install a built-in claude or codex recipe into an UNSET llm.command / llm.task_generate_command / llm.learn_from_user_command; refused once the field is configured"},
+				{Name: "--preset", Arg: "NAME", Desc: "config set: install a built-in recipe into an UNSET llm.command / llm.task_generate_command / llm.learn_from_user_command (claude or codex) or full_self_prompting.orchestrator_agent_command (claude only); refused once the field is configured"},
 			},
 			Details: "Every command that writes config.toml lives here — nothing else in hap does,\n" +
 				"so `hap config …` is the whole surface and the file never has to be opened by\n" +

@@ -260,6 +260,44 @@ func TestAFailingStreamNeverFailsTheCommand(t *testing.T) {
 	}
 }
 
+// The orchestrator keys round-trip through `config set` and render their
+// disabled/default states, and the command refuses a first word herdr cannot
+// start as claude.
+func TestOrchestratorConfigKeysRoundTrip(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := frontend.FieldValue(cfg, frontend.FSPOrchestratorCommandFieldKey); got != "(disabled)" {
+		t.Errorf("unset command renders %q", got)
+	}
+	if got := frontend.FieldValue(cfg, frontend.FSPOrchestratorPromptFieldKey); got != "(built-in brief)" {
+		t.Errorf("unset prompt renders %q", got)
+	}
+	if _, err := app.SetField(ctx, frontend.FSPOrchestratorCommandFieldKey, "claude --model opus"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.SetField(ctx, frontend.FSPOrchestratorPromptFieldKey, "Keep the herd moving; run {self} status."); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.SetField(ctx, frontend.FSPOrchestratorCommandFieldKey, "codex exec"); err == nil ||
+		!strings.Contains(err.Error(), "claude") {
+		t.Fatalf("a non-claude command was accepted (err %v)", err)
+	}
+	cfg, err = config.Load(app.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cfg.FullSelfPrompting.OrchestratorAgentCommand, " "); got != "claude --model opus" {
+		t.Errorf("stored command = %q (the refused write must not have replaced it)", got)
+	}
+	if got := frontend.FieldValue(cfg, frontend.FSPOrchestratorPromptFieldKey); got != "Keep the herd moving; run {self} status." {
+		t.Errorf("stored prompt renders %q — {self} must be kept for the daemon to expand", got)
+	}
+}
+
 // Turning full self-prompting off is announced as fsp.off, never ALSO as a
 // config.changed naming the same key.
 func TestStreamFSPToggleIsItsOwnEvent(t *testing.T) {

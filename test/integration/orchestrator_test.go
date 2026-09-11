@@ -6,10 +6,13 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 // closeWorkspacesLabelled closes every workspace carrying label — the cleanup
@@ -81,13 +84,22 @@ func TestRealAgentLauncherShapes(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("%d workspaces carry the label %q, want exactly one", n, label)
 	}
+
+	// A failed start closes the pane it opened; a wrong shape here would only
+	// log a warning, and the tab leak it exists to stop would come back.
+	if err := cli.ClosePane(ctx, second); err != nil {
+		t.Fatalf("closing pane %s: %v", second, err)
+	}
+	if info, err := cli.PaneInfo(ctx, second); err == nil {
+		t.Fatalf("pane %s still exists after ClosePane: %+v", second, info)
+	}
 }
 
 // TestRealOrchestratorAgentStart starts a real claude through the launcher and
 // finds it again by name — the round trip the daemon relies on to record the
-// session's pane and terminal. Nothing is prompted, so a started claude spends
-// nothing; gated on HAP_ITEST_CLAUDE all the same, like every case that runs
-// the agent.
+// session's pane and terminal — then checks the two things the brief depends on
+// that the unit suite can only fake: the fresh session reads as a proven-empty
+// composer, and a multi-line message lands. Spends a few tokens.
 func TestRealOrchestratorAgentStart(t *testing.T) {
 	requireHerdr(t)
 	if os.Getenv("HAP_ITEST_CLAUDE") != "1" {
@@ -108,5 +120,47 @@ func TestRealOrchestratorAgentStart(t *testing.T) {
 	}
 	if a.PaneID != pane || a.TerminalID == "" || a.AgentType != "claude" {
 		t.Fatalf("AgentByName = %+v; want pane %s, a terminal id and kind claude", a, pane)
+	}
+
+	// The daemon briefs only once the composer is PROVEN empty. A freshly
+	// started claude must read that way within a few seconds, or the brief is
+	// deferred forever and the operator gets one notification about it.
+	var screen string
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		screen, err = cli.ReadPaneVisible(ctx, pane, 80)
+		if err == nil {
+			if s, ok := domain.ClaudeSessionFromPane(screen); ok && s.ComposerEmpty {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a freshly started claude never showed a proven-empty composer (err %v); last screen:\n%s", err, screen)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	// The brief is multi-line, so it takes the paste route (`agent prompt`),
+	// which needs the agent interactively ready: it must land as ONE message.
+	// Spends a few tokens: claude answers it.
+	marker := "hap-itest-brief-" + strconv.FormatInt(time.Now().UnixNano()%1_000_000, 36)
+	brief := "This is a test of message delivery; reply with just the word ok.\n" +
+		"Marker: " + marker + "\nDo not run any tools."
+	if err := ports.SendToAgent(ctx, cli, pane, "claude", brief); err != nil {
+		t.Fatalf("sending a multi-line brief: %v", err)
+	}
+	// Not waitForPaneText: a fresh claude renders its transcript at the TOP of
+	// the pane, dozens of blank rows above the composer, so a 20-line read of
+	// a tall pane never reaches it.
+	deadline = time.Now().Add(paneTextTimeout)
+	for {
+		screen, err = cli.ReadPaneVisible(ctx, pane, 400)
+		if err == nil && strings.Contains(screen, marker) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the multi-line brief never appeared in pane %s (err %v); last screen:\n%s", pane, err, screen)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }

@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,8 +28,14 @@ type orchLauncher struct {
 	visible   string
 	created   []string
 	started   [][]string
+	closed    []string
 	lookups   int
 	failStart bool
+	// unsupported answers every lookup as a herdr without the verbs does.
+	unsupported bool
+	// onStart runs as StartAgent begins — the window a real start spends
+	// waiting for claude to become ready.
+	onStart func()
 }
 
 var (
@@ -40,6 +47,9 @@ func (l *orchLauncher) AgentByName(_ context.Context, name string) (domain.Agent
 	l.lmu.Lock()
 	defer l.lmu.Unlock()
 	l.lookups++
+	if l.unsupported {
+		return domain.AgentTransition{}, false, ports.ErrLaunchUnsupported
+	}
 	a, ok := l.named[name]
 	return a, ok, nil
 }
@@ -54,13 +64,21 @@ func (l *orchLauncher) NewPaneInWorkspace(_ context.Context, workspace, tab, cwd
 func (l *orchLauncher) StartAgent(_ context.Context, name, kind, pane string, args []string) error {
 	l.lmu.Lock()
 	l.started = append(l.started, append([]string{kind}, args...))
-	fail := l.failStart
+	fail, onStart, n := l.failStart, l.onStart, len(l.started)
 	l.lmu.Unlock()
+	if onStart != nil {
+		onStart()
+	}
 	if fail {
 		return errors.New("induced start failure")
 	}
+	// Each start is a new terminal, as a real one is.
+	term := "term_orch"
+	if n > 1 {
+		term = fmt.Sprintf("term_orch%d", n)
+	}
 	a := domain.AgentTransition{AgentID: pane, PaneID: pane, WorkspaceID: "wO", AgentType: kind,
-		Status: "idle", TerminalID: "term_orch"}
+		Status: "idle", TerminalID: term}
 	l.lmu.Lock()
 	l.named[name] = a
 	l.lmu.Unlock()
@@ -68,6 +86,36 @@ func (l *orchLauncher) StartAgent(_ context.Context, name, kind, pane string, ar
 	l.agents = append(l.agents, a)
 	l.mu.Unlock()
 	return nil
+}
+
+func (l *orchLauncher) ClosePane(_ context.Context, pane string) error {
+	l.lmu.Lock()
+	defer l.lmu.Unlock()
+	l.closed = append(l.closed, pane)
+	return nil
+}
+
+// kill makes the named session exit: herdr forgets the name and the agent.
+func (l *orchLauncher) kill(name string) {
+	l.lmu.Lock()
+	a := l.named[name]
+	delete(l.named, name)
+	l.lmu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	kept := l.agents[:0]
+	for _, b := range l.agents {
+		if b.PaneID != a.PaneID {
+			kept = append(kept, b)
+		}
+	}
+	l.agents = kept
+}
+
+func (l *orchLauncher) closedPanes() []string {
+	l.lmu.Lock()
+	defer l.lmu.Unlock()
+	return append([]string(nil), l.closed...)
 }
 
 func (l *orchLauncher) ReadPaneVisible(context.Context, string, int) (string, error) {
@@ -118,6 +166,17 @@ func newOrchHarness(t *testing.T, cfgTOML string, setup func(*orchLauncher)) (*h
 		o.ResolveSelf = func() (string, error) { return "/opt/hap/bin/hap", nil }
 	})
 	return h, l, state
+}
+
+// orchestratorModeOnIn turns the mode and the key on in the daemon's LIVE
+// config — what every step of a pass re-asks — and returns it, for tests that
+// drive ensureOrchestrator directly on a harness started with it off.
+func orchestratorModeOnIn(h *harness) config.Config {
+	h.daemon.mu.Lock()
+	defer h.daemon.mu.Unlock()
+	h.daemon.cfg.FullSelfPrompting.Enabled = true
+	h.daemon.cfg.FullSelfPrompting.OrchestratorAgentCommand = []string{"claude"}
+	return h.daemon.cfg
 }
 
 func waitOrchestratorIdle(t *testing.T, h *harness) {
@@ -235,6 +294,17 @@ func TestOrchestratorAdoptsAnExistingSessionWithoutBriefingIt(t *testing.T) {
 	}
 }
 
+// An operator's own brief replaces the built-in one, with {self} expanded — and
+// a SINGLE-line one is delivered too (herdr routes it as typed keys rather than
+// a paste, which the fake records the same way).
+func TestOrchestratorSendsTheConfiguredBrief(t *testing.T) {
+	h, _, _ := newOrchHarness(t, orchestratorOn+"orchestrator_agent_prompt = \"Run {self} status, then wait.\"\n", nil)
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
+	if got := h.herdr.sentInputs()[0]; got != "Run /opt/hap/bin/hap status, then wait." {
+		t.Fatalf("brief sent = %q", got)
+	}
+}
+
 // Every gate fails closed and creates nothing.
 func TestOrchestratorGatesRefuse(t *testing.T) {
 	on := config.Default()
@@ -254,8 +324,16 @@ func TestOrchestratorGatesRefuse(t *testing.T) {
 			}
 		}
 	})
+	t.Run("control: permitted", func(t *testing.T) {
+		h, l, _ := newOrchHarness(t, "", nil)
+		h.daemon.ensureOrchestrator(context.Background(), l, orchestratorModeOnIn(h), []domain.AgentTransition{})
+		if _, started, _ := l.snapshot(); len(started) != 1 {
+			t.Fatalf("starts = %d: the refusals below would pass on a pass that never runs", len(started))
+		}
+	})
 	t.Run("paused", func(t *testing.T) {
 		h, l, _ := newOrchHarness(t, "", nil)
+		on := orchestratorModeOnIn(h)
 		ctx := context.Background()
 		if _, err := h.raw.InsertKillEvent(ctx, domain.KillEvent{State: domain.KillStateActiveValue,
 			Scope: domain.KillScopeGlobal, Author: "operator", CreatedAt: time.Now()}); err != nil {
@@ -268,7 +346,7 @@ func TestOrchestratorGatesRefuse(t *testing.T) {
 	})
 	t.Run("not claude", func(t *testing.T) {
 		h, l, _ := newOrchHarness(t, "", nil)
-		bad := on
+		bad := orchestratorModeOnIn(h)
 		bad.FullSelfPrompting.OrchestratorAgentCommand = []string{"codex", "exec"}
 		h.daemon.ensureOrchestrator(context.Background(), l, bad, []domain.AgentTransition{})
 		if _, _, lookups := l.snapshot(); lookups != 0 {
@@ -334,6 +412,83 @@ func TestOrchestratorFailedStartBacksOff(t *testing.T) {
 	if h.daemon.orchestratorIdentity().Known() {
 		t.Fatal("a failed start recorded an identity")
 	}
+	if closed := l.closedPanes(); len(closed) != 1 || closed[0] != "wO:p1" {
+		t.Fatalf("closed panes = %q: a failed start must not leave its tab behind", closed)
+	}
+	if h.daemon.isOrchestrator(domain.AgentTransition{PaneID: "wO:p1"}) {
+		t.Fatal("the pane of a failed start is still ignored")
+	}
+}
+
+// A herdr without `agent get` stands the feature down quietly for the longest
+// backoff, and opens nothing.
+func TestOrchestratorUnsupportedHerdrStandsDown(t *testing.T) {
+	h, l, _ := newOrchHarness(t, "", func(l *orchLauncher) { l.unsupported = true })
+	h.daemon.ensureOrchestrator(context.Background(), l, orchestratorModeOnIn(h), []domain.AgentTransition{})
+	if created, _, _ := l.snapshot(); len(created) != 0 {
+		t.Fatalf("opened a pane on a herdr that cannot start agents: %q", created)
+	}
+	h.daemon.orch.mu.Lock()
+	retryAt := h.daemon.orch.retryAt
+	h.daemon.orch.mu.Unlock()
+	if time.Until(retryAt) < orchestratorBackoffMax-time.Minute {
+		t.Fatalf("retry at %v: want the longest backoff", retryAt)
+	}
+}
+
+// A session that keeps dying is re-created at most orchestratorMaxSpawnsPerHour
+// times an hour, through the real pass rather than the counter alone.
+func TestOrchestratorRespawnsAreCapped(t *testing.T) {
+	h, l, _ := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+	ctx := context.Background()
+	for range orchestratorMaxSpawnsPerHour + 2 {
+		h.daemon.ensureOrchestrator(ctx, l, cfg, nil)
+		l.kill(domain.OrchestratorAgentName)
+	}
+	if created, started, _ := l.snapshot(); len(started) != orchestratorMaxSpawnsPerHour ||
+		len(created) != orchestratorMaxSpawnsPerHour {
+		t.Fatalf("panes=%d starts=%d, want exactly %d of each", len(created), len(started), orchestratorMaxSpawnsPerHour)
+	}
+}
+
+// The mode turned off while `agent start` waited: the session is still
+// recorded (so it stays ignored) but nothing is typed into it. The new pane is
+// ignored from before the start returns.
+func TestOrchestratorModeOffDuringTheStartSendsNoBrief(t *testing.T) {
+	h, l, _ := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+	l.onStart = func() {
+		if !h.daemon.isOrchestrator(domain.AgentTransition{PaneID: "wO:p1"}) {
+			t.Error("the new pane was not ignored while its session started")
+		}
+		h.daemon.mu.Lock()
+		h.daemon.cfg.FullSelfPrompting.Enabled = false
+		h.daemon.mu.Unlock()
+	}
+	h.daemon.ensureOrchestrator(context.Background(), l, cfg, nil)
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Fatalf("briefed after the mode turned off: %q", got)
+	}
+	if id := h.daemon.orchestratorIdentity(); id.PaneID != "wO:p1" || id.TerminalID == "" || id.Briefed {
+		t.Fatalf("identity = %+v, want the started session recorded and unbriefed", id)
+	}
+}
+
+// Turning the key on by reload starts the orchestrator without waiting for a
+// sweep.
+func TestOrchestratorStartsOnTheReloadThatTurnsItOn(t *testing.T) {
+	h, l, _ := newOrchHarness(t, "", nil)
+	if err := os.WriteFile(h.cfgPath, []byte(orchestratorOn), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.daemon.reload(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		_, started, _ := l.snapshot()
+		return len(started) == 1
+	})
 }
 
 func TestOrchestratorSpawnRateCap(t *testing.T) {
@@ -380,6 +535,71 @@ func TestOrchestratorRecycledPaneIsReleased(t *testing.T) {
 	}
 	if disabled, _ := h.raw.AgentDisabled(ctx, "wO:p1"); disabled {
 		t.Error("the new tenant inherited the orchestrator's disable")
+	}
+}
+
+// The pane recycled while the daemon was DOWN: the new tenant carries the old
+// orchestrator's name and disable. The ensure pass must release them against
+// the old identity BEFORE recording a new one — afterwards nothing compares
+// that pane again, and an operator's agent stays disabled for good.
+func TestOrchestratorReleasesAPaneRecycledWhileTheDaemonWasDown(t *testing.T) {
+	h, l, _ := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+	ctx := context.Background()
+	h.daemon.setOrchestratorIdentity(domain.OrchestratorIdentity{PaneID: "wX:p3", TerminalID: "term_old"})
+	if err := h.raw.AssignAgentName(ctx, "wX:p3", domain.OrchestratorAgentName); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.SetAgentDisabled(ctx, "wX:p3", true); err != nil {
+		t.Fatal(err)
+	}
+	l.mu.Lock()
+	l.agents = append(l.agents, domain.AgentTransition{AgentID: "wX:p3", PaneID: "wX:p3",
+		TerminalID: "term_new", AgentType: "claude", Status: "idle"})
+	l.mu.Unlock()
+
+	h.daemon.ensureOrchestrator(ctx, l, cfg, nil)
+
+	names, _ := h.raw.AgentNames(ctx)
+	if names["wX:p3"] == domain.OrchestratorAgentName {
+		t.Error("the recycled pane kept the orchestrator's name")
+	}
+	if disabled, _ := h.raw.AgentDisabled(ctx, "wX:p3"); disabled {
+		t.Error("the recycled pane stayed disabled")
+	}
+	if names["wO:p1"] != domain.OrchestratorAgentName {
+		t.Errorf("the new orchestrator is named %q", names["wO:p1"])
+	}
+	if id := h.daemon.orchestratorIdentity(); id.PaneID != "wO:p1" {
+		t.Fatalf("identity = %+v", id)
+	}
+}
+
+// A LIVE agent the operator named "orchestrator" keeps the name — and the new
+// session is still disabled, though no ordinary event ever gave its pane a row.
+func TestOrchestratorIsDisabledWhenALiveAgentHoldsItsName(t *testing.T) {
+	h, l, _ := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+	ctx := context.Background()
+	if err := h.raw.AssignAgentName(ctx, "pZ", domain.OrchestratorAgentName); err != nil {
+		t.Fatal(err)
+	}
+	l.mu.Lock()
+	l.agents = append(l.agents, domain.AgentTransition{AgentID: "pZ", PaneID: "pZ",
+		TerminalID: "term_z", AgentType: "claude", Status: "idle"})
+	l.mu.Unlock()
+
+	h.daemon.ensureOrchestrator(ctx, l, cfg, nil)
+
+	names, _ := h.raw.AgentNames(ctx)
+	if names["pZ"] != domain.OrchestratorAgentName {
+		t.Errorf("the operator's agent lost its name: %q", names["pZ"])
+	}
+	if disabled, err := h.raw.AgentDisabled(ctx, "wO:p1"); err != nil || !disabled {
+		t.Fatalf("the orchestrator is not disabled: %v (%v)", disabled, err)
+	}
+	if disabled, _ := h.raw.AgentDisabled(ctx, "pZ"); disabled {
+		t.Error("the operator's agent was disabled")
 	}
 }
 

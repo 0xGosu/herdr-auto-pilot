@@ -2,6 +2,8 @@ package herdr
 
 import (
 	"context"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -108,5 +110,43 @@ func TestStartAgentDoesNotRetryOtherFailures(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("a non-busy failure was retried %d times", n)
+	}
+}
+
+// A success envelope with no pane is herdr reshaping its answer: reading it as
+// "no such agent" would start a duplicate every retry.
+func TestAgentByNameWithoutAPaneIsAnError(t *testing.T) {
+	cli, fake := launcherCLI(t)
+	if err := fake.SetAgentGet(`{"id":"cli:agent:get","result":{"agent":{}}}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := cli.AgentByName(context.Background(), "orchestrator"); err == nil || ok {
+		t.Fatalf("AgentByName = %v, %v; want an error", ok, err)
+	}
+}
+
+// A herdr that rejects the verbs (exit 2) says so distinctly, so the daemon
+// stands down once instead of warning on every backoff step.
+func TestLauncherReportsAnUnsupportedHerdr(t *testing.T) {
+	cli, fake := launcherCLI(t)
+	if err := os.WriteFile(fake.LegacyFlag, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, _, err := cli.AgentByName(ctx, "orchestrator"); !errors.Is(err, ports.ErrLaunchUnsupported) {
+		t.Errorf("AgentByName = %v, want ErrLaunchUnsupported", err)
+	}
+	if err := cli.StartAgent(ctx, "orchestrator", "claude", "w5:p1", nil); !errors.Is(err, ports.ErrLaunchUnsupported) {
+		t.Errorf("StartAgent = %v, want ErrLaunchUnsupported", err)
+	}
+}
+
+func TestClosePane(t *testing.T) {
+	cli, fake := launcherCLI(t)
+	if err := cli.ClosePane(context.Background(), "w5:p1"); err != nil {
+		t.Fatal(err)
+	}
+	if calls := fake.Calls(); len(calls) != 1 || calls[0] != "pane close w5:p1" {
+		t.Fatalf("calls = %q", calls)
 	}
 }

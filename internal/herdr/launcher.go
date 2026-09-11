@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 const (
@@ -47,6 +48,9 @@ func (c *CLI) AgentByName(ctx context.Context, name string) (domain.AgentTransit
 		if strings.Contains(err.Error(), "agent_not_found") || strings.Contains(out, "agent_not_found") {
 			return domain.AgentTransition{}, false, nil
 		}
+		if unsupportedSubcommand(err) {
+			return domain.AgentTransition{}, false, fmt.Errorf("%w: %v", ports.ErrLaunchUnsupported, err)
+		}
 		return domain.AgentTransition{}, false, err
 	}
 	var resp agentGetResponse
@@ -55,7 +59,10 @@ func (c *CLI) AgentByName(ctx context.Context, name string) (domain.AgentTransit
 	}
 	a := resp.Result.Agent
 	if a.PaneID == "" {
-		return domain.AgentTransition{}, false, nil
+		// A success with no pane is herdr reshaping its answer, not "no such
+		// agent": reading it as absence would start a duplicate that herdr's
+		// unique-name rule then refuses — one leaked pane per retry.
+		return domain.AgentTransition{}, false, fmt.Errorf("agent get %s: the response names no pane", name)
 	}
 	return domain.AgentTransition{
 		AgentID: a.PaneID, PaneID: a.PaneID, TabID: a.TabID, WorkspaceID: a.WorkspaceID,
@@ -120,6 +127,9 @@ func (c *CLI) StartAgent(ctx context.Context, name, kind, paneID string, args []
 		if err == nil {
 			return nil
 		}
+		if unsupportedSubcommand(err) {
+			return fmt.Errorf("%w: %v", ports.ErrLaunchUnsupported, err)
+		}
 		busy := strings.Contains(err.Error(), "agent_pane_busy") || strings.Contains(out, "agent_pane_busy")
 		if !busy || !time.Now().Before(deadline) {
 			return err
@@ -130,4 +140,10 @@ func (c *CLI) StartAgent(ctx context.Context, name, kind, paneID string, args []
 		case <-time.After(delay):
 		}
 	}
+}
+
+// ClosePane closes a pane (`pane close`).
+func (c *CLI) ClosePane(ctx context.Context, paneID string) error {
+	_, err := c.run(ctx, "pane", "close", paneID)
+	return err
 }

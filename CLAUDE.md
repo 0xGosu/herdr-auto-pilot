@@ -478,12 +478,23 @@ while the mode is on; it watches `hap stream orchestrator`.
 - **The identity is `<state>/orchestrator.json`, never `agent_names.terminal_id`** — that column is rewritten on
   a recycled pane and carries name + disable onto the new tenant. Loaded before the first event; a recycled pane
   (same pane, different terminal) releases identity, name and disable (`observeOrchestrator`).
+  - **The ensure pass observes FIRST, against the OLD identity.** A pane recycled while the daemon was down
+    still carries the old name + disable; once a new orchestrator is recorded nothing compares that pane again,
+    so an operator's agent stays disabled and its escalations are auto-dismissed as `agent_disabled`.
+  - A just-opened pane is filtered by pane id alone while it starts (`provisionalOrchestrator`) — **in memory
+    only**: persisted, a crash mid-start leaves an identity no recycled pane can contradict.
 - **Creation fails closed**: mode on, not stood down, kill switch clear (read error = paused), argv[0] = claude
-  (`domain.OrchestratorLaunch` — herdr starts by KIND), `ports.AgentLauncher` present. Off the loop, one pass at a
-  time, ≤3 spawns/hour, doubling backoff. A failed `agent start` re-probes `AgentByName` before counting as a
-  failure, so a readiness timeout never spawns a second session. An ADOPTED session is never briefed.
+  (`domain.OrchestratorLaunch` — herdr starts by KIND), `ports.AgentLauncher` present. "Mode on" is the operator's
+  switch, deliberately NOT `fspActive`'s preconditions. Off the loop, one pass at a time, ≤3 spawns/hour, doubling
+  backoff. A failed `agent start` re-probes `AgentByName` before counting as a failure, so a readiness timeout
+  never spawns a second session — and a real failure CLOSES the pane it opened, or every backoff step leaks a tab.
+  An ADOPTED session is never briefed.
+- **The mode is re-asked before each step that acts** (`orchestratorPermitted`: the start, the brief), from the
+  LIVE config — `agent start` alone may take two minutes.
 - **The brief never types into a modal**: it needs `ClaudeSessionFromPane` to prove an EMPTY composer, and is
-  delivered without `WithAgentAutomation` on purpose (the agent is disabled by design) but re-asks the kill switch.
+  delivered without `WithAgentAutomation` on purpose (the agent is disabled by design). A fresh claude renders its
+  transcript at the TOP of a tall pane, so a short read never sees a delivered brief (see
+  `TestRealOrchestratorAgentStart`).
 
 **Accepted limitation, not a bug:** a generated-task escalation is `idle`-typed, so its baseline salient is
 unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — the row waits for the operator.

@@ -314,8 +314,9 @@ type FakeCLI struct {
 	LogPath  string
 	PaneFile string
 	FailFlag string // when this file exists, every invocation fails
-	// LegacyFlag: when this file exists, `agent prompt` is rejected the way a
-	// pre-0.7.5 herdr rejects an unknown verb (exit 2 + usage banner).
+	// LegacyFlag: when this file exists, `agent prompt` (and `agent get` /
+	// `agent start`) is rejected the way a herdr without the verb rejects it
+	// (exit 2 + usage banner).
 	LegacyFlag string
 }
 
@@ -344,7 +345,7 @@ if [ -e %q ]; then
 fi
 if [ -e %q ]; then
   case "$1 $2" in
-    "agent prompt"|"pane send-text")
+    "agent prompt"|"pane send-text"|"agent get"|"agent start")
       echo "herdr $1 commands:" >&2
       exit 2
       ;;

@@ -16,10 +16,18 @@ package daemon
 //     the first event after a restart.
 //   - CREATING it fails closed: the mode must be on and not stood down, the
 //     kill switch clear (a read error counts as paused), the command must name
-//     claude, and herdr must offer the launch capability. It runs off the
-//     select loop — `agent start` waits up to two minutes for readiness — one
-//     pass at a time, at most orchestratorMaxSpawnsPerHour spawns an hour, with
-//     a doubling backoff after a failure. hap never closes the session.
+//     claude, and herdr must offer the launch capability. The mode and kill
+//     switch are re-asked before each step that acts (the start, the brief),
+//     because `agent start` alone may wait two minutes. It runs off the select
+//     loop, one pass at a time, at most orchestratorMaxSpawnsPerHour spawns an
+//     hour, with a doubling backoff after a failure. hap never closes a live
+//     session — only a pane it opened for a start that failed.
+//
+// "The mode is on" means the operator's switch (enabled, not stood down at a
+// ceiling), deliberately NOT fspActive's preconditions: a herd whose graduated
+// rules or llm.command lapsed is one where FSP answers LESS, which is when the
+// orchestrator is most useful, and the operator can turn it off with the same
+// key.
 
 import (
 	"context"
@@ -226,17 +234,24 @@ func orchestratorAlive(id domain.OrchestratorIdentity, agents []domain.AgentTran
 func (d *Daemon) observeOrchestrator(ctx context.Context, agents []domain.AgentTransition) {
 	id := d.orchestratorIdentity()
 	for _, a := range agents {
-		if id.RecycledBy(a) {
-			slog.Info("orchestrator: its pane now holds another agent; forgetting it", "pane", id.PaneID)
-			d.orch.mu.Lock()
-			if d.orch.id == id {
-				d.orch.id = domain.OrchestratorIdentity{}
-				d.saveOrchestratorLocked(d.orch.id)
-			}
-			d.orch.mu.Unlock()
-			d.releaseOrchestratorName(ctx, id.PaneID)
-			return
+		if !id.RecycledBy(a) {
+			continue
 		}
+		d.orch.mu.Lock()
+		// Compared on the session, not the whole struct: a brief pass may have
+		// advanced Briefed/BriefAttempts meanwhile, which changes nothing about
+		// which pane this is.
+		swapped := d.orch.id.PaneID == id.PaneID && d.orch.id.TerminalID == id.TerminalID
+		if swapped {
+			d.orch.id = domain.OrchestratorIdentity{}
+			d.saveOrchestratorLocked(d.orch.id)
+		}
+		d.orch.mu.Unlock()
+		if swapped {
+			slog.Info("orchestrator: its pane now holds another agent; forgetting it", "pane", id.PaneID)
+			d.releaseOrchestratorName(ctx, id.PaneID)
+		}
+		return
 	}
 }
 
@@ -264,20 +279,35 @@ func (d *Daemon) releaseOrchestratorName(ctx context.Context, paneID string) {
 	}
 }
 
-// startOrchestratorPass schedules one ensure pass when there is anything to
-// do. agents is a fresh listing the caller already holds, or nil to have the
-// pass list for itself (startup, a reload). Cheap and non-blocking: every
-// shell-out happens in the spawned pass.
-func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
-	cfg, _, _ := d.snapshot()
+// orchestratorModeOn reports whether cfg asks for an orchestrator right now:
+// the key set, and full self-prompting on and not stood down at its ceiling.
+func (d *Daemon) orchestratorModeOn(cfg config.Config) bool {
 	fsp := cfg.FullSelfPrompting
 	if !fsp.Enabled || !fsp.OrchestratorConfigured() {
-		return
+		return false
 	}
-	d.mu.Lock()
+	d.mu.RLock()
 	latched := d.fspCeilingLatched
-	d.mu.Unlock()
-	if latched {
+	d.mu.RUnlock()
+	return !latched
+}
+
+// orchestratorPermitted re-asks everything a pass must hold before it ACTS,
+// against the LIVE config rather than the one the pass started with: the
+// operator may have turned the mode off, or it may have stood down, during a
+// start that took minutes.
+func (d *Daemon) orchestratorPermitted(ctx context.Context) bool {
+	cfg, _, _ := d.snapshot()
+	return d.orchestratorModeOn(cfg) && !d.orchestratorPaused(ctx)
+}
+
+// startOrchestratorPass schedules one ensure pass when there is anything to
+// do. agents is a fresh listing the caller already holds, or nil to have the
+// pass list for itself (startup, a reload that turned it on). Cheap and
+// non-blocking: every shell-out happens in the spawned pass.
+func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
+	cfg, _, _ := d.snapshot()
+	if !d.orchestratorModeOn(cfg) {
 		return
 	}
 	launcher, ok := d.opt.Herdr.(ports.AgentLauncher)
@@ -336,7 +366,13 @@ func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLau
 		}
 		agents = listed
 	}
-	if d.orchestratorPaused(ctx) {
+	// Against the OLD identity, before anything can replace it: a pane recycled
+	// while the daemon was down still carries the previous orchestrator's name
+	// and disable (the terminal-id sync carries both onto the new tenant), and
+	// once a new orchestrator is recorded nothing compares that pane again — an
+	// operator's agent would stay disabled, its escalations auto-dismissed.
+	d.observeOrchestrator(ctx, agents)
+	if !d.orchestratorPermitted(ctx) {
 		return
 	}
 	argv := cfg.FullSelfPrompting.OrchestratorAgentCommand
@@ -371,6 +407,10 @@ func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLau
 	agents []domain.AgentTransition) (domain.OrchestratorIdentity, bool) {
 	now := d.opt.Clock.Now()
 	tr, found, err := launcher.AgentByName(ctx, domain.OrchestratorAgentName)
+	if errors.Is(err, ports.ErrLaunchUnsupported) {
+		d.orchestratorUnsupported(now, err)
+		return domain.OrchestratorIdentity{}, false
+	}
 	if err != nil {
 		d.orchestratorFailed(now, "looking it up", err)
 		return domain.OrchestratorIdentity{}, false
@@ -390,7 +430,30 @@ func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLau
 			d.orchestratorFailed(now, "opening its pane", err)
 			return domain.OrchestratorIdentity{}, false
 		}
+		// Ignored from its first event: the start takes seconds to minutes, and
+		// the new pane's agent_detected and status events arrive meanwhile.
+		d.provisionalOrchestrator(pane)
+		// abandon closes the pane this pass opened, so a start that keeps
+		// failing does not add a shell tab on every backoff step.
+		abandon := func(what string, err error) {
+			d.forgetProvisionalOrchestrator(pane)
+			if cerr := launcher.ClosePane(ctx, pane); cerr != nil {
+				slog.Warn("orchestrator: could not close the pane of a failed start", "pane", pane, "error", cerr)
+			}
+			if err != nil {
+				d.orchestratorFailed(now, what, err)
+			}
+		}
+		if !d.orchestratorPermitted(ctx) {
+			abandon("", nil)
+			return domain.OrchestratorIdentity{}, false
+		}
 		startErr := launcher.StartAgent(ctx, domain.OrchestratorAgentName, kind, pane, args)
+		if errors.Is(startErr, ports.ErrLaunchUnsupported) {
+			abandon("", nil)
+			d.orchestratorUnsupported(now, startErr)
+			return domain.OrchestratorIdentity{}, false
+		}
 		// A start that timed out waiting for readiness (a first-run prompt on
 		// screen, say) may still have started the session: ask rather than
 		// assume, so a timeout never causes a second one.
@@ -399,7 +462,7 @@ func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLau
 			if err == nil {
 				err = fmt.Errorf("no agent named %s after the start", domain.OrchestratorAgentName)
 			}
-			d.orchestratorFailed(now, "starting it", errors.Join(startErr, err))
+			abandon("starting it", errors.Join(startErr, err))
 			return domain.OrchestratorIdentity{}, false
 		}
 		if startErr != nil {
@@ -450,9 +513,19 @@ func (d *Daemon) claimOrchestratorName(ctx context.Context, paneID string, agent
 			d.releaseOrchestratorName(ctx, holder)
 		}
 		// UNIQUE(node_id, name) would refuse it anyway; skipping says why.
+		named := false
 		if !heldByALiveAgent {
 			if err := d.opt.Store.AssignAgentName(ctx, paneID, domain.OrchestratorAgentName); err != nil {
 				slog.Warn("orchestrator: could not name its pane", "pane", paneID, "error", err)
+			} else {
+				named = true
+			}
+		}
+		// The disable needs a row to land on, and the ingest filter kept the
+		// pane from ever getting one the ordinary way.
+		if !named {
+			if _, err := d.opt.Store.EnsureAgentName(ctx, paneID); err != nil {
+				slog.Warn("orchestrator: could not register its pane", "pane", paneID, "error", err)
 			}
 		}
 	}
@@ -468,8 +541,8 @@ func (d *Daemon) claimOrchestratorName(ctx context.Context, paneID string, agent
 // tells the operator once.
 //
 // Delivered WITHOUT WithAgentAutomation, deliberately — the agent is disabled
-// on purpose, and this is its own bootstrap. The kill switch is still re-asked
-// immediately before the send.
+// on purpose, and this is its own bootstrap. The mode and the kill switch are
+// still re-asked immediately before the send.
 func (d *Daemon) briefOrchestrator(ctx context.Context, id domain.OrchestratorIdentity, cfg config.Config) {
 	reader, ok := d.opt.Herdr.(ports.VisiblePaneReader)
 	if !ok {
@@ -484,7 +557,7 @@ func (d *Daemon) briefOrchestrator(ctx context.Context, id domain.OrchestratorId
 		d.noteOrchestratorWaiting(ctx)
 		return
 	}
-	if d.orchestratorPaused(ctx) {
+	if !d.orchestratorPermitted(ctx) {
 		return
 	}
 	err = ports.SendToAgent(ctx, d.opt.Herdr, id.PaneID, domain.OrchestratorAgentKind, d.orchestratorPrompt(cfg))
@@ -578,6 +651,39 @@ func (d *Daemon) orchestratorFailed(now time.Time, what string, err error) {
 	d.orch.retryAt = now.Add(delay)
 	d.orch.mu.Unlock()
 	slog.Warn("orchestrator: "+what+" failed; retrying later", "retry_in", delay.String(), "error", err)
+}
+
+// orchestratorUnsupported stands the feature down for as long as the backoff
+// allows, saying why once: a herdr without the verbs will not grow them.
+func (d *Daemon) orchestratorUnsupported(now time.Time, err error) {
+	d.orch.mu.Lock()
+	noted := d.orch.noLauncherNoted
+	d.orch.noLauncherNoted = true
+	d.orch.retryAt = now.Add(orchestratorBackoffMax)
+	d.orch.mu.Unlock()
+	if !noted {
+		slog.Warn("orchestrator: herdr cannot start one; upgrade herdr to use orchestrator_agent_command", "error", err)
+	}
+}
+
+// provisionalOrchestrator filters a just-opened pane by its pane id alone while
+// its session starts. In memory only: persisted, a crash mid-start would leave
+// an identity with no terminal id, which a recycled pane can never contradict.
+func (d *Daemon) provisionalOrchestrator(paneID string) {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	d.orch.id = domain.OrchestratorIdentity{PaneID: paneID}
+}
+
+// forgetProvisionalOrchestrator undoes provisionalOrchestrator after a failed
+// start, unless something else has been recorded since.
+func (d *Daemon) forgetProvisionalOrchestrator(paneID string) {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	if d.orch.id.PaneID == paneID && d.orch.id.TerminalID == "" {
+		d.orch.id = domain.OrchestratorIdentity{}
+		d.saveOrchestratorLocked(d.orch.id)
+	}
 }
 
 func (d *Daemon) orchestratorSucceeded() {
