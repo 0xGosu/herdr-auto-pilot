@@ -198,7 +198,7 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		// agy's question form is detected here rather than through
 		// ParseMCQForm on purpose: that parser routes a form into the
 		// multi-question sweep and the Claude/Codex deliverers, which would
-		// press arrow keys into an agy form (see domain.MCQAgyQuestions).
+		// press arrow keys into an agy form (see domain.AgyMCQForm).
 		if !matched && r.situation == domain.SituationChoice && agyChoice {
 			matched = true
 		}

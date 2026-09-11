@@ -2924,17 +2924,35 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		}
 	}
 
-	// agy's approvals and questions commit on the digit alone, so the send
-	// below (digit, then Enter) would answer agy's NEXT screen too. Until hap
-	// speaks agy's protocol the reply is withheld — ahead of the action-review
-	// dispatch as well, which would only end at the same gate. No Suggestion:
-	// confirming it would be refused in deliver.Deliver for the same reason.
-	if domain.AgyReplyWithheld(s.Type, s.AgentType) {
-		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonReplyWithheld,
-			Rationale:  "hap does not answer agy forms yet; answer it in the pane (decided: " + dec.Input + ")",
-			Confidence: dec.Confidence,
-		}, tr, now)
+	// agy's approvals and questions take KEYS — the digit alone commits — so the
+	// send below (digit, then Enter) would answer agy's NEXT screen too. They go
+	// to the verified keystroke deliverer, ahead of the action-review rewrite
+	// (a form's answer is an offered option, never adapted text). Without the
+	// keystroke capability this fails closed to escalation.
+	if domain.AgyFormSituation(s.Type, s.AgentType) {
+		ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
+		if !ok {
+			d.escalate(ctx, s, sig, domain.Decision{
+				Action: domain.ActionEscalate, Reason: domain.ReasonHerdrUnreachable,
+				Rationale:  "keystrokes unavailable; agy forms need verified keystrokes",
+				Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
+			}, tr, now)
+			return
+		}
+		// Refused before an audit row claims an automatic answer: a label the
+		// captured form does not offer (a rule learned on another render), or
+		// a question's free-text Write-in row. The deliverer re-checks both
+		// against the live pane.
+		if form, ok := domain.ParseAgyForm(s.Content); ok {
+			if _, err := domain.AgyAnswerKey(form, dec.Input); err != nil {
+				d.escalate(ctx, s, sig, domain.Decision{
+					Action: domain.ActionEscalate, Reason: agyAnswerRefusalReason(err),
+					Rationale: err.Error(), Confidence: dec.Confidence,
+				}, tr, now)
+				return
+			}
+		}
+		d.deliverAgyForm(ctx, ks, s, sig, dec, tr, now)
 		return
 	}
 
@@ -3201,6 +3219,17 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		if recycled, why := d.paneRecycled(ctx, s); recycled {
 			slog.Warn("pane was recycled since capture; abandoning the auto-send",
 				"agent", s.AgentID, "reason", why)
+			return abandon()
+		}
+	}
+
+	// agy only ever receives typed text at a proven EMPTY composer: herdr reports
+	// its modals idle, so a status-gated send could type a hand-out into a
+	// standing approval, a picker or the operator's draft. Nothing is attempted —
+	// the claim is released and a later capture decides again.
+	if domain.IsAgy(s.AgentType) {
+		if err := d.agyComposerRefusal(ctx, s.PaneID); err != nil {
+			slog.Info("agy composer not ready; not sending", "agent", s.AgentID, "reason", err)
 			return abandon()
 		}
 	}
@@ -4697,9 +4726,12 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	// still matches nothing must escalate: sent literally, its Enter commits the
 	// caret's option. It is also mapped to the option's DIGIT, like every other
 	// send path — a menu ignores the label text.
-	if domain.AgyReplyWithheld(current.Type, s.AgentType) {
+	// agy forms are answered by their keystroke deliverer from the act path and
+	// never reach the rewrite; refused here so a rewritten reply can never be
+	// typed into one with a trailing Enter should that ever change.
+	if domain.AgyFormSituation(current.Type, s.AgentType) {
 		escalateWith(domain.ReasonReplyWithheld,
-			"hap does not answer agy forms yet; answer it in the pane (decided: "+final+")")
+			"an agy form is answered by its keystroke deliverer, never a rewritten reply (decided: "+final+")")
 		return
 	}
 	if domain.UnmatchedMenuReply(current.Type, s.AgentType, pane, final) {
@@ -5163,9 +5195,37 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// keystroke would actually land on. There is already an option-set check for
 	// choice situations further up; this covers approvals and any drift between
 	// the consult snapshot and the live screen.
-	if domain.AgyReplyWithheld(s.Type, s.AgentType) {
-		reject(domain.ReasonReplyWithheld,
-			"hap does not answer agy forms yet; answer it in the pane (LLM suggested: "+llmDec.Action+")")
+	// agy's approvals and questions take keys (see act). The type that decides
+	// is current's — the visible re-read verified above — not the consult-time
+	// one: a digit must only be pressed into the form actually on screen.
+	if domain.AgyFormSituation(current.Type, s.AgentType) {
+		ks, ok := d.opt.Herdr.(ports.KeystrokeSender)
+		if !ok {
+			reject(domain.ReasonHerdrUnreachable,
+				"herdr adapter cannot send keystrokes; agy forms need them")
+			return
+		}
+		form, ok := domain.ParseAgyForm(pane)
+		if !ok {
+			reject(domain.ReasonLLMNoSubmit, "stale: no answerable agy form on screen")
+			return
+		}
+		if _, err := domain.AgyAnswerKey(form, llmDec.Action); err != nil {
+			reject(agyAnswerRefusalReason(err), "LLM answer: "+err.Error())
+			return
+		}
+		if !d.acquirePane(s.AgentID) {
+			reject(domain.ReasonPaneBusy,
+				"another pane interaction is in flight for this agent; not delivering concurrently")
+			return
+		}
+		d.deliverAgyFormLLM(ctx, ks, s, res.sig, tr, llmDec, computedConf, &llmConf, now)
+		return
+	}
+	// Any other LLM answer to agy is typed into its composer, so the composer
+	// must be proven empty on the same visible re-read (see AgyComposerReady).
+	if domain.IsAgy(s.AgentType) && !domain.AgyComposerReady(pane) {
+		reject(domain.ReasonLLMNoSubmit, "stale: agy's composer is not ready for a message")
 		return
 	}
 	if domain.UnmatchedMenuReply(s.Type, s.AgentType, pane, llmDec.Action) {

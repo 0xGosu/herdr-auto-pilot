@@ -3,54 +3,106 @@ package deliver_test
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
-// agyShellApprovalPane is agy 1.2.1's shell approval as it stands in a pane.
-const agyShellApprovalPane = "Requesting permission for:\n   go test ./...\n\nRun this command?\n" +
-	"> 1. Yes, run command\n" +
-	"  2. Yes, and always allow in this conversation for commands that start with 'go'\n" +
-	"  3. Yes, and always allow for commands that start with 'go' (Persist to settings.json)\n" +
-	"  4. No, cancel\n\n" +
-	"  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\n" +
-	"esc to cancel                                              Gemini 3.6 Flash · low\n"
+func agyFixture(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "classify", "testdata", "transcripts", name+".txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
 
-// TestDeliverWithholdsAgyForms: at an agy menu the digit alone commits, so the
-// generic send (digit, then Enter) would answer agy's NEXT screen as well.
-// Until hap speaks agy's protocol, every approval and choice reply is refused
-// before anything is typed — a label, a digit and an answer series alike.
-func TestDeliverWithholdsAgyForms(t *testing.T) {
-	for _, st := range []domain.SituationType{domain.SituationApproval, domain.SituationChoice} {
-		for _, outbound := range []string{"Yes, run command", "1", "3 1"} {
-			h := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: agyShellApprovalPane}}
-			err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
-				PaneID: "w1:p1", AgentType: "agy", SituationType: st,
-				PaneExcerpt: agyShellApprovalPane, Outbound: outbound,
-			})
-			if !errors.Is(err, deliver.ErrReplyWithheld) {
-				t.Errorf("%s %q: err = %v, want ErrReplyWithheld", st, outbound, err)
-			}
-			if len(h.inputs) != 0 || len(h.keys) != 0 {
-				t.Errorf("%s %q: nothing may reach the pane, got inputs=%v keys=%v", st, outbound, h.inputs, h.keys)
-			}
-		}
+// An agy approval is answered with the option's digit as a KEY and nothing
+// else — never the generic send, whose trailing Enter would answer agy's next
+// screen. The operator's --send and auto-accept both arrive here.
+func TestDeliverAnswersAgyFormsWithTheKeyAlone(t *testing.T) {
+	approval := agyFixture(t, "approval_agy_shell")
+	h := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: approval},
+		keyScript: []string{"1"}, keyScriptFrames: []string{agyFixture(t, "idle_agy_after_turn")}}
+	err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
+		PaneID: "w1:p1", AgentType: "agy", SituationType: domain.SituationApproval,
+		PaneExcerpt: approval, Outbound: "Yes, run command",
+	})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if want := []string{"1"}; !reflect.DeepEqual(h.keys, want) || len(h.inputs) != 0 {
+		t.Errorf("keys=%v inputs=%v, want keys %v and no submitted text", h.keys, h.inputs, want)
 	}
 }
 
-// Control: an agy error reply is free text typed into the composer — what agy
-// expects there — so it is delivered exactly as for any other agent.
-func TestDeliverStillSendsAgyErrorReplies(t *testing.T) {
-	h := &fakeHerdr{pane: "  ⎿  Interrupted · What should Antigravity CLI do instead?\n"}
+// A question's Write-in row asks for typed text: a verdict about the form, so it
+// is ErrReplyWithheld (auto-accept must not burn attempts on it), and nothing
+// is typed.
+func TestDeliverRefusesAnAgyWriteInAnswer(t *testing.T) {
+	mcq := agyFixture(t, "choice_agy_mcq")
+	h := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: mcq}}
 	err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
-		PaneID: "w1:p1", AgentType: "agy", SituationType: domain.SituationError, Outbound: "continue",
+		PaneID: "w1:p1", AgentType: "agy", SituationType: domain.SituationChoice,
+		PaneExcerpt: mcq, Outbound: "Write-in...",
 	})
-	if err != nil {
-		t.Fatalf("an error reply must be delivered: %v", err)
+	if !errors.Is(err, deliver.ErrReplyWithheld) {
+		t.Fatalf("err = %v, want ErrReplyWithheld", err)
 	}
-	if len(h.inputs) != 1 || h.inputs[0] != "continue" {
-		t.Errorf("inputs = %v, want [continue]", h.inputs)
+	if len(h.keys) != 0 || len(h.inputs) != 0 {
+		t.Errorf("nothing may reach the pane, got keys=%v inputs=%v", h.keys, h.inputs)
+	}
+}
+
+// There is no keystroke-less fallback for an agy form: every one needs a key
+// that is not followed by Enter, which a plain Send cannot type.
+func TestDeliverAgyFormNeedsKeystrokes(t *testing.T) {
+	approval := agyFixture(t, "approval_agy_shell")
+	h := &fakeHerdr{pane: approval}
+	err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
+		PaneID: "w1:p1", AgentType: "agy", SituationType: domain.SituationApproval,
+		PaneExcerpt: approval, Outbound: "1",
+	})
+	if err == nil {
+		t.Fatal("a keystroke-less adapter must refuse an agy form")
+	}
+	if len(h.inputs) != 0 {
+		t.Errorf("inputs = %v, want none", h.inputs)
+	}
+}
+
+// Free text for agy (an error reply, an idle hand-out) goes only into a proven
+// EMPTY composer; the operator's draft, a form or a picker refuses it.
+func TestDeliverAgyFreeTextNeedsAReadyComposer(t *testing.T) {
+	for _, tc := range []struct {
+		screen string
+		ready  bool
+	}{
+		{"idle_agy_after_turn", true},
+		{"idle_agy_mode_plan", true},
+		{"idle_agy_composer_draft", false},
+		{"idle_agy_model_picker", false},
+		{"approval_agy_shell", false},
+		{"working_agy_spinner", false},
+	} {
+		t.Run(tc.screen, func(t *testing.T) {
+			h := &fakeHerdr{pane: agyFixture(t, tc.screen)}
+			err := deliver.Deliver(context.Background(), fastCfg(h), deliver.Request{
+				PaneID: "w1:p1", AgentType: "agy", SituationType: domain.SituationError, Outbound: "continue",
+			})
+			if tc.ready {
+				if err != nil || !reflect.DeepEqual(h.inputs, []string{"continue"}) {
+					t.Fatalf("err=%v inputs=%v, want the reply delivered", err, h.inputs)
+				}
+				return
+			}
+			if err == nil || len(h.inputs) != 0 {
+				t.Fatalf("err=%v inputs=%v, want a refusal and nothing typed", err, h.inputs)
+			}
+		})
 	}
 }

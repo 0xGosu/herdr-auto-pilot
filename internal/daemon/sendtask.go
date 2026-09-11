@@ -130,6 +130,14 @@ func (d *Daemon) requireIdleForHandout(ctx context.Context, agentID, name string
 			return fmt.Errorf("agent %s is %s — a task can only be sent to a cleanly idle agent",
 				name, ag.Status)
 		}
+		// herdr reports agy's modals idle; only an empty composer on screen
+		// proves this one is waiting for a message.
+		if domain.IsAgy(ag.AgentType) {
+			if err := d.agyComposerRefusal(ctx, agentID); err != nil {
+				return fmt.Errorf("agent %s: %v — a task can only be sent to an agy waiting at an empty composer",
+					name, err)
+			}
+		}
 		return nil
 	}
 	return fmt.Errorf("agent %s is no longer live — refresh and retry", name)

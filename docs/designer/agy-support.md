@@ -654,3 +654,86 @@ What shipped, and where it deliberately departs from §4:
 - **Corpus.** `irreversible_corpus.txt` gained agy-rendered lines (the command between agy's
   anchors, and an "always allow" option carrying a force-push prefix). The existing seed
   patterns already match them, because agy prints commands verbatim.
+
+---
+
+## 10. Phase 3 as built (answering)
+
+- **The deliverer** is `mcqdeliver.Agy`, shared by every path that answers an agy form: the act
+  path and the LLM promotion (`daemon.deliverAgyForm` / `deliverAgyFormLLM`, which share their
+  audit-first bodies with Claude's remote-environment picker in `daemon/keyedform.go`), and
+  `deliver.Deliver` (the operator's `hap confirm/resolve --send` and auto-accept).
+  - `domain.ParseAgyForm` reduces the standing form to a kind (approval, question, trust,
+    review) plus options. `domain.AgyAnswerKey` maps the reply onto a key: the digit through
+    `MenuKeystrokeFrom` (the same label folding and unique-or-refuse prefix matching as every
+    menu), `y`/`n` for the review panel, and the row number for the trust prompt.
+  - It presses ONE key and re-reads up to four times. A form that is gone or replaced (the next
+    question, the next review item) is success. One still standing unchanged is an error, and
+    the key is never pressed again.
+  - The trust prompt walks the caret with `up`/`down`, verifying each move before it presses
+    Enter.
+  - **Stale guard:** when the decision's excerpt holds an agy form, the live form must be that
+    same form (`AgyForm.SameAs`: the same command, the same `Question i/N` and text, the same
+    review items). The trust prompt's caret is not part of the identity.
+- **Transport departure from §5.** Keys go through `ports.KeystrokeSender` (`pane send-keys`),
+  as the Claude and Codex deliverers do and as every test fake implements, not `pane send-text`
+  as §5 verified. Verified live below: `send-keys <digit>` answers agy exactly as `send-text`
+  did.
+- **Live verification (2026-09-11; agy 1.2.1, herdr 0.8.2, hap dev hot-swapped, full
+  self-prompting on).** On a scratch agent in a temp dir:
+  - **Shell approval:** the LLM chose "Yes, and always allow in this conversation…". The
+    promotion pressed its digit and agy ran `ls` with no stray key.
+  - **Two-question form:**
+    - Question 1 was auto-accepted through `deliver.Deliver` ("Red"), the same function the
+      operator's `--send` uses.
+    - The re-capture then saw question 2, and the LLM answered it ("Dog").
+    - The first run, before the re-capture existed, stalled on question 2. That stall is how
+      the gap was found.
+  - **`hap task … send`:** refused while a two-character draft stood in the composer (the task
+    stayed `[ ]`). After the draft was erased it was delivered as one multi-line message, and
+    agy answered.
+- **Found, not fixed (predates this change; reproduced on v0.9.16):** a static agy screen
+  standing when a daemon STARTS is re-driven but never captured. The trust prompt of an agent
+  launched before the daemon is one example; the startup resubscribe burst replays it. Its
+  parse and classification were checked live with this build (approval, `trust this folder`,
+  both rows). Its keys are covered by `mcqdeliver` tests on the recorded screen.
+- **Questions stay one situation each.** No `MCQKind`, no answer series: `MCQAgyQuestions` was
+  removed. Each question classifies, decides and is answered on its own. §4.7's series protocol
+  is unnecessary because agy renders later questions' options only after the earlier ones are
+  answered.
+- **Re-capture after every answer.** agy draws a form's next question in place, and herdr
+  reports no status change for it. Without a fresh capture the daemon never looked again, and
+  the form stalled after question 1 with nothing escalated (observed live).
+  - `daemon.recaptureAfterAgyAnswer` schedules a capture after every verified agy answer, from
+    the keyed-form bodies and from `autoAcceptDeliver` (the operator's `--send` and
+    auto-accept).
+  - An answer that set agy working cancels that capture through the working transition.
+- **Refusals.**
+  - A reply naming no offered option escalates `unfamiliar_options` before any audit row claims
+    an answer.
+  - The Write-in row is `domain.ErrAgyNotAnswerable`, which becomes `deliver.ErrReplyWithheld`,
+    escalated as `reply_withheld` and a verdict for auto-accept.
+  - An adapter without keystrokes escalates `herdr_unreachable`.
+  - A rewritten (action-review) reply is refused at an agy form.
+- **Composer proof (§4.1).** `domain.AgyComposerReady` requires the `? for shortcuts` status bar
+  directly under the composer sandwich, whose caret line is empty or a mode placeholder, and no
+  held screen (so no survey). Every path that types free text into agy asks it on a fresh
+  visible read:
+  - the idle poll and rule sends (`deliverAutonomousClaimed`, which releases the claim quietly
+    when it is not ready);
+  - LLM free-text answers;
+  - `deliver.Deliver`'s free-text branch;
+  - the generated-task `--send` (`refuseIfAgentBusy`, with the stale marker) and `send_task`
+    (`requireIdleForHandout`);
+  - the task-send host itself (`actionTaskSendHost.Send`, the last look before any hand-out).
+
+  This closes §8's generated-task gap.
+- **Multi-line prompts:** unchanged, and verified in phase 1. `herdr.CLI.submitText` routes
+  multi-line text through `agent prompt` (paste-aware, one message) and single-line text through
+  `send-text` plus `enter`. agy gets no retry Enters (`sendBehavior`), so `paneShowsStandingForm`
+  needs no agy forms.
+- **Not done here:**
+  - A never-auto seed for the trust prompt (§4.9). The seed list is scoped to major-risk remote
+    operations, and Claude's own trust prompt is not seeded. The trust prompt is answered when a
+    rule or the operator says so, like any approval.
+  - agy permission modes (phase 4).
