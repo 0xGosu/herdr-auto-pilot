@@ -8,6 +8,15 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.10
+
+- Added `full_self_prompting.orchestrator_agent_command` (bootstrap it with `hap config set full_self_prompting.orchestrator_agent_command --preset claude`): while full self-prompting is on, the daemon keeps an interactive claude session named `orchestrator` alive in its own `hap-orchestrator` herdr workspace, briefs it to watch `hap stream orchestrator` and keep the herd moving toward the goals you type into it, and ignores it completely. It is re-created if it disappears (at most 3 times an hour) and never closed by hap; `full_self_prompting.orchestrator_agent_prompt` replaces the built-in brief.
+- The orchestrator's row is highlighted on the TUI Agents tab.
+- Added `full_self_prompting.orchestrator_agent_cwd` to start the orchestrator in a directory of your choosing (it must already exist) instead of `<state>/orchestrator`.
+- The orchestrator's built-in brief schedules an hourly health check that restarts a stopped hap daemon and looks in on hung agents, and removes it while full self-prompting is off.
+- A failure to start the orchestrator (or a first-run claude prompt holding its brief) now shows as a TUI banner and in `hap status`, and the Config tab warns when `orchestrator_agent_cwd` does not exist.
+- Added `hap stream orchestrator [--resume N]`, a live one-line-per-event stream of what an orchestrating agent reacts to: config and task-source changes, task items, database task lists, escalations that auto-accept left for a human, dismissals and corrections, pause/resume, full self-prompting on/off, manual rule edits, and daemon restarts. Every line carries a resumable sequence number; events are kept for 7 days in a machine-local log.
+
 ## 0.9.9
 
 - Added `hap signatures search --screen`, which searches the captured pane instead of the rule's masked salient — the literal paths, commands and version numbers a salient replaces with `<path>`/`<num>` placeholders are findable again. It matches every term anywhere in the screen (quote a phrase to require it contiguous), reports how many screens it searched so an empty result tells you whether there was anything to search, and each result carries the text around its first hit.
