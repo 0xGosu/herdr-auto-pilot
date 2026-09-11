@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.21
+
+- Added real-agy integration cases, gated on `HAP_ITEST_AGY=1` (detection, a shell approval and a question answered through `hap confirm --send`, a task hand-out refused over a draft and delivered at an empty composer, and the permission-mode cycle), so agy's live screens and keys are checked the way claude's and codex's are
+- Fixed the real-agent mode integration cases, which were refused by the front end's roster check because their test app had no daemon behind it
+
 ## 0.9.20
 
 - `hap mode` and the `hap agents` MODE column now cover agy: its `default → acceptEdits → plan` cycle is read from agy's status bar and set with shift+tab (agy's own `accept-edits` spelling works too); hap presses into agy only at an empty composer, and a status bar with no model shows `-` rather than a guessed `default`
