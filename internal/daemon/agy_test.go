@@ -180,6 +180,32 @@ func TestAutoAcceptedAgyAnswerCapturesTheNextQuestion(t *testing.T) {
 	})
 }
 
+// The re-capture after an audit-row answer carries the live tenancy, so the
+// next capture matches a workspace-scoped task source and paneRecycled has a
+// terminal to compare; an unlisted agent keeps the bare transition.
+func TestAgyRecaptureTransitionCarriesTheLiveTenancy(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	rec := &domain.AuditRecord{AgentID: "pA", AgentType: domain.AgentTypeAgy}
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "pA", PaneID: "pA",
+		AgentType: domain.AgentTypeAgy, Status: "done",
+		TerminalID: "term-7", TabID: "w1:t2", WorkspaceID: "w1"}})
+
+	got := h.daemon.recaptureTransitionFor(ctx, rec)
+	want := domain.AgentTransition{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+		Status: "idle", TerminalID: "term-7", TabID: "w1:t2", WorkspaceID: "w1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("listed agent: got %+v, want %+v", got, want)
+	}
+
+	h.herdr.setAgents(nil)
+	got = h.daemon.recaptureTransitionFor(ctx, rec)
+	want.TerminalID, want.TabID, want.WorkspaceID = "", "", ""
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unlisted agent: got %+v, want %+v", got, want)
+	}
+}
+
 // TestAgyLLMPromotionAnswersWithTheDigitAlone is the LLM half: a confident
 // model answer naming an offered option is pressed as its digit alone.
 func TestAgyLLMPromotionAnswersWithTheDigitAlone(t *testing.T) {

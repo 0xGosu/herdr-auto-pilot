@@ -612,11 +612,24 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 	// herdr to report, so the pane is captured again — the operator's --send
 	// and auto-accept both come through here (see recaptureAfterAgyAnswer).
 	if domain.AgyFormSituation(rec.SituationType, rec.AgentType) {
-		d.recaptureAfterAgyAnswer(ctx, domain.AgentTransition{
-			AgentID: rec.AgentID, PaneID: rec.AgentID, AgentType: rec.AgentType, Status: "idle",
-		})
+		d.recaptureAfterAgyAnswer(ctx, d.recaptureTransitionFor(ctx, rec))
 	}
 	return nil
+}
+
+// recaptureTransitionFor builds the transition that re-captures an agy pane
+// answered from an audit row. The live listing supplies the tenancy the row
+// does not carry: the workspace a scoped task source matches on, and the
+// terminal paneRecycled compares. An unlisted agent keeps the bare transition,
+// whose empty terminal paneRecycled reads as unobserved.
+func (d *Daemon) recaptureTransitionFor(ctx context.Context, rec *domain.AuditRecord) domain.AgentTransition {
+	tr := domain.AgentTransition{
+		AgentID: rec.AgentID, PaneID: rec.AgentID, AgentType: rec.AgentType, Status: "idle",
+	}
+	if live, ok := d.liveAgentFor(ctx, rec.AgentID); ok {
+		tr.TerminalID, tr.TabID, tr.WorkspaceID = live.TerminalID, live.TabID, live.WorkspaceID
+	}
+	return tr
 }
 
 // autoAcceptDeliveryFailed applies the bounded-retry policy: revert the claim
