@@ -1,0 +1,24 @@
+> Use your shell tool to run exactly this command: ls -la /tmp/agyscratch.H2CE . Then reply with one line.
+
+● Bash(ls -la /tmp/agyscratch.H2CE) (ctrl+o to expand)
+
+  The directory /tmp/agyscratch.H2CE is empty, containing only the standard . and .. directory references.
+
+────────────────────────────────────────────────────────────
+> Ask me a multiple-choice question using your interactive question tool (the one that shows me selectable options): which fruit do I prefer — Apple, Banana or Cherry. Do nothing else
+  until I answer.
+
+? Which fruit do you prefer?
+
+Question
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Question 1/1: Which fruit do you prefer?
+
+> 1. Apple
+  2. Banana
+  3. Cherry
+  4. Write-in...
+
+  ↑/↓ Navigate · enter Select · esc Skip
+esc to cancel                                                                                                                                                       Gemini 3.6 Flash · low

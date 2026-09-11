@@ -1,0 +1,23 @@
+? Which fruit do you prefer?
+> Banana
+
+  Thank you! You selected Banana.
+
+────────────────────────────────────────────────────────────
+> Using your interactive question tool, ask me TWO multiple-choice questions in a single call: (1) favourite colour: Red, Green, Blue; (2) favourite pet: Cat, Dog. Do nothing else.
+
+? What is your favourite colour?
+> Blue
+? What is your favourite pet?
+> Cat
+
+  Thank you! You selected Blue as your favourite colour and Cat as your favourite pet.
+
+────────────────────────────────────────────────────────────
+> Write a 400-word essay about rivers, as plain text in your reply (no tools).
+
+  ⎿  Interrupted · What should Antigravity CLI do instead?
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                                                                     Gemini 3.6 Flash · low

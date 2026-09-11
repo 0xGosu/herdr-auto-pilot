@@ -1,0 +1,25 @@
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.6 Flash (Low)
+   ▄▀▀    ▀▀▄     /tmp/agyscratch.H2CE
+  ▄▀▀      ▀▀▄
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Switch Model
+
+  Gemini 3.8 Flash
+  Gemini 3.7 Flash
+> Gemini 3.6 Flash             (current)
+  Gemini 3.1 Pro
+  Claude Sonnet 4.6 (Thinking)
+  Claude Opus 4.6 (Thinking)
+  GPT-OSS 120B (Medium)
+
+  Effort  ◂        ◉──────────────○──────────────○        ▸
+                  low          medium          high
+            Faster responses, lighter reasoning — great for simpler tasks
+
+Keyboard: ↑/↓ Navigate  ←/→ Effort  enter Select  esc Go Back
+
+                                                                                                                                                                    Gemini 3.6 Flash · low

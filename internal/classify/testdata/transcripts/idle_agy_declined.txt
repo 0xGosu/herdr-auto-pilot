@@ -1,0 +1,13 @@
+● Bash(rm -rf /tmp/agyscratch.H2CE/hello.txt) (ctrl+o to expand)
+
+────────────────────────────────────────────────────────────
+> Use your shell tool to run exactly: rm -rf /tmp/agyscratch.H2CE/hello.txt
+● Bash(rm -rf /tmp/agyscratch.H2CE/hello.txt) (ctrl+o to expand)
+
+Command
+  ⎿  User declined the tool call
+
+────────────────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                       Gemini 3.6 Flash · low

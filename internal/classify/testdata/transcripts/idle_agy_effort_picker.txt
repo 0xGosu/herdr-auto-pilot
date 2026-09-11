@@ -1,0 +1,21 @@
+      ▄▀▀▄        Antigravity CLI 1.2.1
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.6 Flash (Low)
+   ▄▀▀    ▀▀▄     /tmp/agyscratch.H2CE
+  ▄▀▀      ▀▀▄
+
+> /model
+  ⎿  Exited /model command
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+Set Effort
+
+  ◂        ◉──────────────○──────────────○        ▸
+          low          medium          high
+    Faster responses, lighter reasoning — great for simpler tasks  (current)
+
+Keyboard: ←/→ Effort  enter Select  esc Go Back
+
+                                                                                                                                                                    Gemini 3.6 Flash · low
