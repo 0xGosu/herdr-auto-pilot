@@ -1569,6 +1569,16 @@ had ever looked at it. A match leaves the escalation for you. In practice it
 fires less often than you might expect — idle situations are compared by raw
 screen text, and hap leaves anything it cannot prove.
 
+### The orchestrator event stream
+
+`hap stream orchestrator` prints one line per change as it happens — config and
+task-source edits, task items, database task lists, escalations that auto-accept
+left for a human, dismissals and corrections, pause/resume, full self-prompting
+on/off, manual rule edits and daemon restarts — for an agent to watch and react
+to. Lines carry ids, not content, and a sequence number: `--resume N` replays
+everything after N (events are kept for 7 days) before following. See
+`hap help stream orchestrator`.
+
 ## Pause/kill switch & audit
 
 - `hap pause` / `hap resume` (TUI `p`/`r`, or Herdr plugin actions) toggle a

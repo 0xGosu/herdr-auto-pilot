@@ -345,6 +345,8 @@ func (a *App) PauseNode(ctx context.Context, nodeID string) (changed bool, err e
 	}); err != nil {
 		return false, err
 	}
+	a.emit(ctx, domain.StreamPauseOn, domain.StreamStr("scope", string(domain.KillScopeGlobal)),
+		domain.StreamStr("node", nodeID))
 	a.nudge(ctx, control.KindReload) // pushes sooner; the remote reads it on its pull
 	return true, nil
 }
@@ -367,6 +369,8 @@ func (a *App) ResumeNode(ctx context.Context, nodeID string) (changed bool, err 
 	}); err != nil {
 		return false, err
 	}
+	a.emit(ctx, domain.StreamPauseOff, domain.StreamStr("scope", string(domain.KillScopeGlobal)),
+		domain.StreamStr("node", nodeID))
 	a.nudge(ctx, control.KindReload)
 	return true, nil
 }

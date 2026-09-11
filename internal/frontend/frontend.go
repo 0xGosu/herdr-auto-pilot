@@ -113,6 +113,11 @@ type App struct {
 	// RemoteActionTimeout overrides how long a confirm waits for ANOTHER node's
 	// daemon to deliver (0 = DefaultRemoteActionTimeout). Tests shorten it.
 	RemoteActionTimeout time.Duration
+
+	// Stream is the machine-local orchestrator event log (`hap stream
+	// orchestrator`): the chokepoints below append to it after each change
+	// commits, and the stream command reads it. nil records nothing.
+	Stream ports.StreamLog
 }
 
 // nudge wakes the daemon so it re-reads what the caller just persisted. It
@@ -714,6 +719,7 @@ func (a *App) Pause(ctx context.Context) (changed bool, err error) {
 	}); err != nil {
 		return false, err
 	}
+	a.emit(ctx, domain.StreamPauseOn, domain.StreamStr("scope", string(domain.KillScopeGlobal)))
 	// The nudge is best-effort: the daemon reads the latest kill row every
 	// pipeline tick, so the pause takes effect regardless.
 	a.nudge(ctx, control.KindReload)
@@ -737,6 +743,7 @@ func (a *App) Resume(ctx context.Context) (changed bool, err error) {
 	}); err != nil {
 		return false, err
 	}
+	a.emit(ctx, domain.StreamPauseOff, domain.StreamStr("scope", string(domain.KillScopeGlobal)))
 	a.nudge(ctx, control.KindReload)
 	return true, nil
 }
@@ -816,11 +823,13 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// that. An escalation naming no agent has nowhere to deliver to.
 	willSend := send && action != domain.ActionNoop && audit.AgentID != ""
 	if !willSend {
-		if _, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
+		corrID, err := a.Store.InsertCorrection(ctx, domain.CorrectionRecord{
 			AuditID: auditID, CorrectedAction: action, Author: a.Author, Sent: false, CreatedAt: time.Now(),
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
+		a.emitCorrection(ctx, a.Author, corrID, audit, "false")
 		a.nudge(ctx, control.KindReload)
 		return nil
 	}
@@ -859,7 +868,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	// self-check; a sweep landing between two separate inserts would process
 	// the correction before its delivery existed, and the check could never
 	// arm for that row.
-	_, actionID, err := a.Store.InsertCorrectionWithDelivery(ctx,
+	corrID, actionID, err := a.Store.InsertCorrectionWithDelivery(ctx,
 		domain.CorrectionRecord{
 			AuditID: auditID, CorrectedAction: action, Author: a.Author, CreatedAt: time.Now(),
 		},
@@ -871,6 +880,7 @@ func (a *App) Resolve(ctx context.Context, auditID int64, action string, send bo
 	if err != nil {
 		return err
 	}
+	a.emitCorrection(ctx, a.Author, corrID, audit, "true")
 	a.nudge(ctx, control.KindWake)
 
 	// Wait for the daemon's verdict so the operator still learns on the spot
@@ -1076,6 +1086,7 @@ func (a *App) claimGeneratedTaskEscalation(ctx context.Context, audit *domain.Au
 		slog.Warn("recording generated-task confirmation correction failed", "audit", audit.ID, "error", corrErr)
 		return 0, nil
 	}
+	a.emitCorrection(ctx, author, corrID, audit, "")
 	return corrID, nil
 }
 
@@ -2179,6 +2190,7 @@ func (a *App) Dismiss(ctx context.Context, auditID int64) error {
 	if err := a.Store.DismissEscalation(ctx, auditID); err != nil {
 		return err
 	}
+	a.emit(ctx, domain.StreamEscalationDismissed, domain.StreamInt("id", auditID))
 	// Best-effort nudge: the dismissal is already committed, and callers
 	// batch-dismiss — a dead daemon must not read as a failed dismiss.
 	a.nudge(ctx, control.KindReload)
@@ -2341,6 +2353,7 @@ func (a *App) updateConfigReloadedThen(ctx context.Context, fn func(*config.Conf
 	if err != nil {
 		return false, err
 	}
+	before := a.snapshotConfig(cfg)
 	if err := fn(&cfg); err != nil {
 		return false, err
 	}
@@ -2350,6 +2363,9 @@ func (a *App) updateConfigReloadedThen(ctx context.Context, fn func(*config.Conf
 	if afterSave != nil {
 		afterSave()
 	}
+	// Under the lock, like afterSave, so two writers' events are ordered as
+	// their writes were.
+	a.emitConfigDiff(ctx, before, cfg)
 	return a.nudge(ctx, control.KindReload), nil
 }
 
@@ -4966,27 +4982,37 @@ func (a *App) AddTask(agent, path, text string) ([]domain.ChecklistItem, int, er
 // the one whose pane has closed, which is exactly the set TaskGroups resolves
 // a row's locator from.
 func (a *App) sourceForLocator(cfg config.Config, agent, locator string) (config.TaskSource, string, bool) {
+	i, name, ok := a.sourceIndexForLocator(cfg, agent, locator)
+	if !ok {
+		return config.TaskSource{}, "", false
+	}
+	return cfg.TaskSources[i], name, true
+}
+
+// sourceIndexForLocator is sourceForLocator reporting the source's POSITION in
+// cfg.TaskSources — the public `hap task <n>` selector — instead of the entry.
+func (a *App) sourceIndexForLocator(cfg config.Config, agent, locator string) (int, string, bool) {
 	if agent != "" {
 		// A derived list is named after the agent's NAME, whichever spelling
 		// the caller addressed it by (see taskListFor).
 		_, agent = a.agentSpellings(agent)
 	}
-	for _, src := range cfg.TaskSources {
+	for i, src := range cfg.TaskSources {
 		if a.sourceLocatorMatches(cfg, src, agent, locator) {
-			return src, agent, true
+			return i, agent, true
 		}
 	}
 	if agent != "" {
-		return config.TaskSource{}, "", false
+		return 0, "", false
 	}
 	for _, name := range a.agentNames() {
-		for _, src := range cfg.TaskSources {
+		for i, src := range cfg.TaskSources {
 			if a.sourceLocatorMatches(cfg, src, name, locator) {
-				return src, name, true
+				return i, name, true
 			}
 		}
 	}
-	return config.TaskSource{}, "", false
+	return 0, "", false
 }
 
 // creatableSource reports whether hap may CREATE the list this locator names.
@@ -5485,6 +5511,7 @@ func (a *App) DeleteSignature(ctx context.Context, prefix string) (string, int64
 	if err != nil {
 		return "", 0, err
 	}
+	a.emit(ctx, domain.StreamRuleDeleted, domain.StreamStr("sig", shortSignature(sig)))
 	a.nudge(ctx, control.KindReload)
 	return sig, decisions, nil
 }
@@ -5520,6 +5547,7 @@ func (a *App) ResetSignatureGraduation(ctx context.Context, prefix string) (stri
 	if err := a.Store.UpsertSignature(ctx, reset); err != nil {
 		return "", err
 	}
+	a.emit(ctx, domain.StreamRuleReset, domain.StreamStr("sig", shortSignature(sig)))
 	a.nudge(ctx, control.KindReload)
 	return sig, nil
 }
@@ -5650,6 +5678,10 @@ func (a *App) AdjustSignatureConfirmations(ctx context.Context, prefix string, d
 	if err := a.Store.UpsertSignature(ctx, adjusted); err != nil {
 		return out, err
 	}
+	a.emit(ctx, domain.StreamRuleStreak, domain.StreamStr("sig", shortSignature(sig)),
+		domain.StreamStr("delta", fmt.Sprintf("%+d", delta)),
+		domain.StreamInt("streak", int64(adjusted.ConsecutiveConfirmations)),
+		domain.StreamStr("mode", string(adjusted.Mode)))
 	a.nudge(ctx, control.KindReload)
 	return SignatureAdjustment{
 		Signature: sig, Confirmations: adjusted.ConsecutiveConfirmations,

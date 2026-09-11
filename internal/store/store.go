@@ -1335,6 +1335,20 @@ func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domai
 	return s.scanAudits(rows)
 }
 
+// EscalationsAwaitingAttention returns this node's pending escalations created
+// at or after since, newest first, at most limit of them. Unlike
+// AutoAcceptableEscalations it pushes NO eligibility filter down: a row with no
+// suggestion or no baseline is exactly one only a human can answer.
+func (s *Store) EscalationsAwaitingAttention(ctx context.Context, since time.Time, limit int) ([]domain.AuditRecord, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+auditCols+` FROM audit_log
+		WHERE node_id = ? AND status = 'escalated' AND created_at >= ?
+		ORDER BY created_at DESC, id DESC LIMIT ?`, s.self, unix(since), limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.scanAudits(rows)
+}
+
 // autoAcceptCandidateLimit bounds one sweep's candidate fetch. Each row can
 // carry a multi-KB pane excerpt and the pass runs on the daemon's select loop,
 // so the fetch is capped to keep that work constant no matter how large an

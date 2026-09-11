@@ -69,6 +69,33 @@ const autoAcceptAbsenceConfirmations = 2
 // would only incidentally catch the second — and only if its pane re-read
 // happened to land after the first delivery. One-per-agent makes that ordering
 // irrelevant rather than load-bearing.
+// autoAcceptCutoffs is the created_at bound, per situation type, under which a
+// pending escalation is old enough to auto-accept; a type absent from the map
+// never auto-accepts. Shared with the orchestrator stream, which must not
+// announce a row before auto-accept has had its look at it.
+func autoAcceptCutoffs(cfg config.Config, fsp bool, now time.Time) map[domain.SituationType]time.Time {
+	cutoffs := make(map[domain.SituationType]time.Time)
+	if fsp {
+		// Full self-prompting: zero wait for ALL five types — including idle
+		// and unclassifiable, whose timed auto-accept defaults are disabled.
+		// cutoff=now satisfies created_at <= cutoff for every pending row.
+		// A parallel builder rather than a change to AutoAcceptAfter: that
+		// accessor stays the source of truth for TIMED auto-accept, and
+		// full self-prompting works with escalations.auto_accept.enabled false. When
+		// both are on, these cutoffs strictly dominate.
+		for _, st := range config_AutoAcceptTypes() {
+			cutoffs[st] = now
+		}
+		return cutoffs
+	}
+	for _, st := range config_AutoAcceptTypes() {
+		if after, ok := cfg.AutoAcceptAfter(string(st)); ok {
+			cutoffs[st] = now.Add(-after)
+		}
+	}
+	return cutoffs
+}
+
 func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.AgentTransition) map[string]bool {
 	// Before anything else, and before every early return below: settle rows
 	// whose reply already landed but whose finalize did not stick. That is pure
@@ -84,29 +111,11 @@ func (d *Daemon) autoAcceptEscalations(ctx context.Context, agents []domain.Agen
 	cfg, _, _ := d.snapshot()
 	now := d.opt.Clock.Now()
 
-	cutoffs := make(map[domain.SituationType]time.Time)
 	fsp := d.fspActive(ctx, cfg)
+	cutoffs := autoAcceptCutoffs(cfg, fsp, now)
 	// One resolution for the whole pass, from the same snapshot fsp came from:
 	// every per-row gate below reads this rather than paying for fspActive again.
 	limitsInert := limitsInertFor(cfg, fsp)
-	if fsp {
-		// Full self-prompting: zero wait for ALL five types — including idle
-		// and unclassifiable, whose timed auto-accept defaults are disabled.
-		// cutoff=now satisfies created_at <= cutoff for every pending row.
-		// A parallel builder rather than a change to AutoAcceptAfter: that
-		// accessor stays the source of truth for TIMED auto-accept, and
-		// full self-prompting works with escalations.auto_accept.enabled false. When
-		// both are on, these cutoffs strictly dominate.
-		for _, st := range config_AutoAcceptTypes() {
-			cutoffs[st] = now
-		}
-	} else {
-		for _, st := range config_AutoAcceptTypes() {
-			if after, ok := cfg.AutoAcceptAfter(string(st)); ok {
-				cutoffs[st] = now.Add(-after)
-			}
-		}
-	}
 	if len(cutoffs) == 0 {
 		return nil // both features off, or every type disabled
 	}

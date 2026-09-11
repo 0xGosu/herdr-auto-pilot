@@ -51,8 +51,11 @@ type Options struct {
 	Store             ports.StorePort
 	Herdr             ports.HerdrPort
 	Events            ports.EventPort
-	Notify            ports.NotifyPort
-	LLM               ports.LLMPort
+	// Stream is the machine-local orchestrator event log (`hap stream
+	// orchestrator`). nil records nothing.
+	Stream ports.StreamLog
+	Notify ports.NotifyPort
+	LLM    ports.LLMPort
 	// LLMFactory, when set, rebuilds the LLM port from the freshly loaded
 	// config on every reload so llm.command/timeout edits apply live. It
 	// takes precedence over the static LLM field.
@@ -603,6 +606,15 @@ type Daemon struct {
 	// buy nothing. Guarded by d.mu.
 	lastRetentionSweep time.Time
 
+	// lastStreamPrune throttles the orchestrator event log's own retention to
+	// once a day, independently of the [logging] windows. Guarded by d.mu.
+	lastStreamPrune time.Time
+	// streamAnnounced remembers which escalations this process has already put
+	// on the orchestrator stream, so a pending row costs no write per sweep.
+	// The log's dedupe key is what holds across restarts; this is only the
+	// cheap first check. Pruned to the current pending set. Loop-owned.
+	streamAnnounced map[int64]bool
+
 	// lastNodeUpsert throttles the nodes-row write to domain.NodeHeartbeat off
 	// the faster health-file beat. Zero means "never written", so a starting
 	// daemon appears in the fleet on its first beat rather than a minute later.
@@ -898,15 +910,19 @@ func (d *Daemon) mutateTaskList(locator string, fn func(string) (string, error))
 	// it: Mutate read that content inside the lock, so there is no staleness
 	// after a write and no second round trip.
 	var written []byte
+	var before string
 	_, err = store.Mutate(ctx, locator, wait, func(content string) (string, error) {
 		out, mErr := fn(content)
 		if mErr == nil {
-			written = []byte(out)
+			before, written = content, []byte(out)
 		}
 		return out, mErr
 	})
 	if ports.TaskStoreRemote(store) {
 		d.noteTaskListWritten(locator, written, err)
+	}
+	if err == nil {
+		d.emitChecklistDiff(ctx, locator, before, string(written))
 	}
 	return err
 }
@@ -1456,6 +1472,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.processAgentActions(ctx)
 		return nil
 	})
+	// Tells an orchestrator that anything it held in memory about this daemon
+	// (in-flight captures, pending consults) is gone, so it re-surveys.
+	d.emitStream(ctx, domain.StreamDaemonStarted, domain.StreamStr("version", buildinfo.Version))
 	sweep := time.NewTicker(time.Minute)
 	defer sweep.Stop()
 
@@ -1511,6 +1530,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// Self-throttled to once a day and does its work on a
 				// background goroutine; the call itself is a clock compare.
 				d.maybeRunRetentionSweep(d.opt.Clock.Now())
+				d.maybePruneStream(d.opt.Clock.Now())
 				// Ahead of processCorrections: a delivered reply flips its
 				// correction's Sent flag, and processCorrections both READS
 				// that flag (to arm the unblock check) and marks the row
@@ -1545,7 +1565,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// the reply and an idle task hand-out microseconds apart,
 				// before its TUI had even repainted. The next sweep sees the
 				// settled state and proceeds normally.
+				passStart := d.opt.Clock.Now()
 				delivered := d.autoAcceptEscalations(ctx, agents)
+				// Right after the pass it depends on: what it left pending is
+				// what an orchestrator is told about.
+				d.announcePendingEscalations(ctx, passStart)
 				rest := withoutAgents(agents, delivered)
 				d.reconcileAttentionWith(ctx, rest)
 				d.autoSendIdleTasks(ctx, rest)

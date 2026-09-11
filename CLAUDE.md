@@ -1054,6 +1054,7 @@ where the behaviour could revert.
 | `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `sqlite` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |
 | `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
 | `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
+| `internal/streamlog` | machine-local SQLite event log behind `hap stream orchestrator` (its own file, NOT a store table) |
 | `internal/updatecheck` | GitHub release check — one of exactly TWO `net/http` importers (NFR-007 allowlist) |
 | `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
 | `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |

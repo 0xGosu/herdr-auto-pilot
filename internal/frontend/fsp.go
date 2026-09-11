@@ -132,9 +132,12 @@ func (a *App) AcceptGeneratedTaskAutomatically(ctx context.Context, auditID int6
 // mean "silently skipped on the most common path".
 func (a *App) recordFSPToggle(ctx context.Context, on bool) {
 	state := domain.KillStateFSPOff
+	kind := domain.StreamFSPOff
 	if on {
-		state = domain.KillStateFSPOn
+		state, kind = domain.KillStateFSPOn, domain.StreamFSPOn
 	}
+	// The mode has flipped whether or not the history row below lands.
+	a.emit(ctx, kind)
 	if _, err := a.Store.InsertKillEvent(context.WithoutCancel(ctx), domain.KillEvent{
 		State: state, Scope: domain.KillScopeFSP,
 		Author: a.Author, CreatedAt: time.Now(),

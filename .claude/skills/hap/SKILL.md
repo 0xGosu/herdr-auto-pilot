@@ -1181,6 +1181,35 @@ the only thing that had ever looked at it. A match leaves the escalation for
 you. In practice it fires less often than you might expect: idle situations are
 compared by raw screen text, and hap leaves anything it cannot prove.
 
+### the orchestrator event stream
+
+`hap stream orchestrator` prints one line per change, as it happens, until
+interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
+
+```
+# hap stream orchestrator head=1023 floor=12
+1024 2026-09-11T10:02:03Z escalation id=5812 agent=calm-pika type=approval by=daemon
+1025 2026-09-11T10:02:10Z task.updated list=db://n1/calm-pika.md source=2 index=3 mark=x by=operator
+1026 2026-09-11T10:03:05Z rule.streak sig=ab12cd34ef56 delta=+1 streak=3 mode=shadow by=operator
+```
+
+- **The payload is ids only** — fetch details with `hap escalations`, `hap audit`,
+  `hap task <source> list`, `hap signatures`, `hap config show`.
+- **Kinds:** `config.changed keys=…` (names, never values) ·
+  `task_source.added|removed|updated source=N` (a removed source carries its OLD
+  index — re-list) · `task.created|updated|deleted|moved` · `tasklist.created|deleted`
+  (database lists only) · `escalation` · `escalation.dismissed` · `correction` ·
+  `pause.on|off` · `fsp.on|off` · `rule.streak|reset|deleted` · `daemon.started`.
+- **An escalation is announced once auto-accept has left it for a human** — up to
+  a minute after it was raised under full self-prompting. The stream never names a
+  row the daemon is about to answer itself.
+- **Resuming:** without `--resume` the stream starts at the head. `--resume N`
+  replays everything after N (the last seq you handled) first. Events are kept 7
+  days; a cursor older than that prints `# gap missed=A..B`, a cursor above the
+  head prints `# reset …` — re-survey with the CLI in both cases.
+- **Per machine:** an action taken on another fleet node appears in that
+  machine's stream; a hand edit to `config.toml` or a task file is not an event.
+
 ## disk usage and cleanup
 
 `hap status` prints a `disk:` line. Three things grow in the state dir:
