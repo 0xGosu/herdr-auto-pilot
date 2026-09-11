@@ -375,3 +375,133 @@ func TestNextIDComesFromTheDaemonsAllocator(t *testing.T) {
 		t.Fatal("a missing socket must be an error, not an id")
 	}
 }
+
+// TestOnlyATransactionThatWroteReportsAWrite pins the push trigger to real
+// writes. Every commit used to count, so under turso a read-only transaction
+// — a roster publish that found nothing to change, a status snapshot — armed a
+// push to Turso Cloud. The writing half is the control: without it the test
+// passes for a Commit that never reports anything.
+func TestOnlyATransactionThatWroteReportsAWrite(t *testing.T) {
+	var writes atomic.Int32
+	e := NewExecutor(openBacking(t), func() { writes.Add(1) })
+	local, remote, _ := bridges(t, e)
+	for name, db := range map[string]*sql.DB{"local": local, "remote": remote} {
+		t.Run(name, func(t *testing.T) {
+			writes.Store(0)
+			tx, err := db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var n int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if got := writes.Load(); got != 0 {
+				t.Errorf("a read-only commit reported %d writes, want 0", got)
+			}
+
+			// A rolled-back write reports nothing either, and must not leak
+			// its flag into the next transaction on the same session.
+			tx, err = db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(`INSERT INTO t (txt) VALUES ('rolled back')`); err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			tx, err = db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if got := writes.Load(); got != 0 {
+				t.Errorf("rollback then an empty commit reported %d writes, want 0", got)
+			}
+
+			tx, err = db.Begin()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tx.Exec(`INSERT INTO t (txt) VALUES ('kept')`); err != nil {
+				t.Fatal(err)
+			}
+			if got := writes.Load(); got != 0 {
+				t.Errorf("an uncommitted write reported %d writes, want 0 before COMMIT", got)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			if got := writes.Load(); got != 1 {
+				t.Errorf("a writing commit reported %d writes, want 1", got)
+			}
+		})
+	}
+}
+
+// TestRevisionMovesOnEveryObservableChange pins the change token a front end
+// polls instead of re-reading its data: it moves on a committed write and on a
+// NoteChanged (a pull), holds still across reads and read-only transactions,
+// and reads the same over the in-process driver and the socket. A plain
+// sqlite handle is not a bridge and says so.
+func TestRevisionMovesOnEveryObservableChange(t *testing.T) {
+	e := NewExecutor(openBacking(t), nil)
+	local, remote, _ := bridges(t, e)
+	ctx := context.Background()
+	rev := func(db *sql.DB) string {
+		t.Helper()
+		r, err := Revision(ctx, db)
+		if err != nil {
+			t.Fatalf("revision: %v", err)
+		}
+		return r
+	}
+	start := rev(remote)
+	if got := rev(local); got != start {
+		t.Fatalf("in-process %q and socket %q disagree", got, start)
+	}
+	var n int
+	if err := remote.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := remote.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := rev(remote); got != start {
+		t.Errorf("reads moved the revision %q → %q", start, got)
+	}
+
+	if _, err := local.Exec(`INSERT INTO t (txt) VALUES ('a')`); err != nil {
+		t.Fatal(err)
+	}
+	afterWrite := rev(remote)
+	if afterWrite == start {
+		t.Errorf("a committed write left the revision at %q", start)
+	}
+	e.NoteChanged()
+	if got := rev(remote); got == afterWrite {
+		t.Errorf("a pull left the revision at %q", got)
+	}
+
+	// Another executor — a restarted daemon — never reads as "unchanged",
+	// even at the same count.
+	if other := NewExecutor(openBacking(t), nil); other.Revision() == NewExecutor(openBacking(t), nil).Revision() {
+		t.Errorf("two executors share a revision token %q", other.Revision())
+	}
+
+	plain := openBacking(t)
+	if _, err := Revision(ctx, plain); !errors.Is(err, ErrNoRevision) {
+		t.Errorf("a plain handle: %v, want ErrNoRevision", err)
+	}
+}

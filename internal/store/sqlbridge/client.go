@@ -175,6 +175,19 @@ func (s *remoteSession) roundTrip(ctx context.Context, req request) (response, e
 	return resp, nil
 }
 
+// Revision asks the daemon for its change token. A daemon predating the request
+// answers with a statement error, which leaves the connection usable.
+func (s *remoteSession) Revision(ctx context.Context) (string, error) {
+	resp, err := s.roundTrip(ctx, request{Kind: kindRev})
+	if err != nil {
+		return "", err
+	}
+	if resp.Rev == "" {
+		return "", ErrNoRevision
+	}
+	return resp.Rev, nil
+}
+
 func (s *remoteSession) transport(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return &transportError{err: ctx.Err()}

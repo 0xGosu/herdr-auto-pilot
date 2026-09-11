@@ -200,6 +200,8 @@ func (s *Server) handle(ctx context.Context, sess *Session, req request) respons
 			return fail(errors.New("sqlbridge: this daemon allocates no ids"))
 		}
 		return response{Kind: kindOK, LastID: strconv.FormatInt(s.opts.NextID(), 10)}
+	case kindRev:
+		return response{Kind: kindOK, Rev: s.e.Revision()}
 	default:
 		return fail(errors.New("sqlbridge: unknown request kind " + strconv.Quote(req.Kind)))
 	}

@@ -459,6 +459,15 @@ type Daemon struct {
 	// listing is a subprocess with a budget in seconds and the tick fires
 	// every two, so without it a slow herdr accumulates listings.
 	rosterTickRunning bool
+	// rosterTickEvery / rosterTickNextAt pace the LOCAL roster tick's backoff
+	// and rosterTickDigest is the last listing it compared against; see
+	// rosterTickMaxInterval. rosterTickLevel is the demand the previous tick
+	// saw, so a TUI that has just opened restarts from the fast tick. All
+	// guarded by mu.
+	rosterTickEvery  time.Duration
+	rosterTickNextAt time.Time
+	rosterTickDigest string
+	rosterTickLevel  rosterDemandLevel
 
 	// rosterLocationsAt is when the workspace and tab labels were last
 	// published (guarded by mu). They cost two herdr subprocesses and name

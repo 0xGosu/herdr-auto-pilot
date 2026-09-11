@@ -150,6 +150,14 @@ type RuleStateFingerprinter interface {
 	RuleStateFingerprint(ctx context.Context) (string, error)
 }
 
+// RevisionReporter is implemented by stores that can report an opaque change
+// token: equal tokens mean a read would return the same rows. The TUI polls it
+// and re-reads its data only when it moves. Optional: absent — or on an error —
+// the TUI re-reads on every tick, as it always did.
+type RevisionReporter interface {
+	Revision(ctx context.Context) (string, error)
+}
+
 // VisiblePaneReader is implemented by Herdr adapters that can read the pane's
 // current on-screen content (as opposed to ReadPane's consuming "recent"
 // delta). Used to recover a standing numbered menu when delivering an
@@ -956,6 +964,9 @@ type ReadStore interface {
 	// LatestAuditsForSignatures returns the newest audit row per signature
 	// (keyed by signature) for all signatures with audit history — one batched
 	// query replacing N LatestAuditForSignature calls in the Rules listing.
+	// Each record carries only ID, NodeID, Signature, Status, Action and
+	// CreatedAt: it runs for every rule on each TUI refresh, and the full rows
+	// (pane excerpts, LLM output) were most of that refresh's cost.
 	LatestAuditsForSignatures(ctx context.Context) (map[string]*domain.AuditRecord, error)
 	// ListSignatureEmbeddings returns every stored semantic identity row
 	// (all models), for rebuilding the in-memory match index.
