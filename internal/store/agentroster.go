@@ -23,7 +23,8 @@ const rosterColumns = `node_id, agent_id, pane_id, tab_id, workspace_id, agent_t
 const rosterSeqUnknown = 1 << 30
 
 // PublishRoster replaces the live roster with the agents herdr currently
-// reports, in ONE transaction, and stamps roster_meta.
+// reports, in ONE transaction, and stamps roster_meta — when a row changed or
+// the stamp is older than domain.RosterRestampAfter.
 //
 // Everything not in the set is marked gone rather than deleted, and an agent
 // whose terminal_id CHANGED is replaced rather than merged: herdr recycles
@@ -71,6 +72,9 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			return err
 		}
 
+		// changed records whether this publish wrote any roster row; only a
+		// publish that did, or a stamp gone stale, re-stamps roster_meta.
+		changed := false
 		live := make(map[string]bool, len(agents))
 		var recycled []any
 		recycledIDs := map[string]bool{}
@@ -92,6 +96,7 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 				append([]any{s.self}, recycled...)...); err != nil {
 				return err
 			}
+			changed = true
 		}
 		for i, a := range agents {
 			// An agent whose stored row already says exactly what this publish
@@ -112,6 +117,7 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 			if err := s.upsertRosterRow(ctx, tx, a, i, true); err != nil {
 				return err
 			}
+			changed = true
 		}
 		// Everything of ours not in the listing is marked gone, in one statement.
 		var absent []string
@@ -155,6 +161,27 @@ func (s *Store) PublishRoster(ctx context.Context, agents []domain.RosterAgent, 
 					terminal_id = excluded.terminal_id,
 					retired_at = excluded.retired_at`, tombstones...); err != nil {
 				return err
+			}
+			changed = true
+		}
+		// The stamp is the liveness proof (domain.RosterFresh) — and a write,
+		// which under turso arms a push. A publish that changed nothing leaves
+		// a recent stamp alone (domain.RosterRestampAfter), so a TUI's roster
+		// tick over a settled herd commits a read-only transaction.
+		if !changed {
+			var stampedAt int64
+			err := tx.QueryRowContext(ctx,
+				`SELECT published_at FROM roster_meta WHERE node_id = ?`, s.self).Scan(&stampedAt)
+			switch {
+			case errors.Is(err, sql.ErrNoRows):
+			case err != nil:
+				return err
+			default:
+				// An age below zero is a clock that stepped back: stamp, so
+				// the proof is re-based on the clock readers compare against.
+				if age := now.Sub(fromUnix(stampedAt)); stampedAt != 0 && age >= 0 && age < domain.RosterRestampAfter {
+					return nil
+				}
 			}
 		}
 		_, err = tx.ExecContext(ctx, `

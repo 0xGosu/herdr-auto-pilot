@@ -5263,7 +5263,10 @@ type SignatureRow struct {
 	// confirmation meant to prevent it: a reset rule has Decisions == 0 while
 	// still carrying history, and a long-lived rule outgrows any read window.
 	TotalDecisions int
-	LastAudit      *domain.AuditRecord
+	// LastAudit is the rule's newest audit row. From Signatures it is the
+	// listing subset (ports.StorePort.LatestAuditsForSignatures: id, status,
+	// action, time); SignatureDetail fills the whole row.
+	LastAudit *domain.AuditRecord
 	// PaneExcerpt is the pane snapshot the signature was first seen with
 	// (rule provenance); "" for rules learned before snapshots existed.
 	PaneExcerpt string

@@ -15,6 +15,7 @@ import (
 //	→ {"id":N,"k":"exec"|"query","q":"<sql>","a":[<value>…]}
 //	→ {"id":N,"k":"begin"|"commit"|"rollback"|"ping"}
 //	→ {"id":N,"k":"nextid"}                      ← {"id":N,"k":"ok","li":"<int64>"}
+//	→ {"id":N,"k":"rev"}                         ← {"id":N,"k":"ok","rv":"<token>"}
 //	← {"id":N,"k":"ok","li":"<int64>","ra":"<int64>"}
 //	← {"id":N,"k":"rows","c":["col"…],"r":[[<value>…]…]}
 //	← {"id":N,"k":"err","m":"<message>"}
@@ -37,6 +38,7 @@ type response struct {
 	Kind     string        `json:"k"`
 	LastID   string        `json:"li,omitempty"`
 	Affected string        `json:"ra,omitempty"`
+	Rev      string        `json:"rv,omitempty"`
 	Columns  []string      `json:"c,omitempty"`
 	Rows     [][]wireValue `json:"r,omitempty"`
 	Message  string        `json:"m,omitempty"`
@@ -56,9 +58,12 @@ const (
 	// processes on one machine from minting the same id in the same
 	// millisecond. The id rides in "li".
 	kindNextID = "nextid"
-	kindOK     = "ok"
-	kindRows   = "rows"
-	kindErr    = "err"
+	// kindRev asks for the executor's change token (Executor.Revision), so a
+	// front end can tell "nothing changed" without re-reading its data.
+	kindRev  = "rev"
+	kindOK   = "ok"
+	kindRows = "rows"
+	kindErr  = "err"
 )
 
 type wireValue struct {

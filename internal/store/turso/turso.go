@@ -167,7 +167,13 @@ func (d *DB) Pull() (changed bool, err error) {
 	defer d.ops.Done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
-	return d.sdb.Pull(context.Background())
+	changed, err = d.sdb.Pull(context.Background())
+	if changed {
+		// Before the gate opens: a reader that gets in next already sees
+		// the moved revision.
+		d.exec.NoteChanged()
+	}
+	return changed, err
 }
 
 // Push sends local changes to the remote.

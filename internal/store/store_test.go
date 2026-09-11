@@ -1556,7 +1556,8 @@ func TestLatestAuditForSignature(t *testing.T) {
 	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "old",
 		SituationType: domain.SituationApproval, Action: "1", CreatedAt: now.Add(-time.Minute)})
 	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "new",
-		SituationType: domain.SituationApproval, Action: "2", CreatedAt: now})
+		SituationType: domain.SituationApproval, Action: "2", CreatedAt: now,
+		Status: "auto", PaneExcerpt: "a whole pane of text", Rationale: "why", LLMOutput: "llm said"})
 	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:other", Trigger: "other",
 		SituationType: domain.SituationApproval, Action: "3", CreatedAt: now})
 	a, err := s.LatestAuditForSignature(ctx, "sig:x")
@@ -1585,7 +1586,8 @@ func TestLatestAuditsForSignatures(t *testing.T) {
 	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "old",
 		SituationType: domain.SituationApproval, Action: "1", CreatedAt: now.Add(-time.Minute)})
 	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:x", Trigger: "new",
-		SituationType: domain.SituationApproval, Action: "2", CreatedAt: now})
+		SituationType: domain.SituationApproval, Action: "2", CreatedAt: now,
+		Status: "auto", PaneExcerpt: "a whole pane of text", Rationale: "why", LLMOutput: "llm said"})
 	s.AppendAudit(ctx, domain.AuditRecord{Signature: "sig:other", Trigger: "other",
 		SituationType: domain.SituationApproval, Action: "3", CreatedAt: now})
 	// A signature-less row (e.g. an unclassifiable escalation) must not appear.
@@ -1599,11 +1601,22 @@ func TestLatestAuditsForSignatures(t *testing.T) {
 	if len(m) != 2 {
 		t.Fatalf("expected one row per non-empty signature (2), got %d: %v", len(m), m)
 	}
-	if m["sig:x"] == nil || m["sig:x"].Trigger != "new" {
+	if m["sig:x"] == nil || m["sig:x"].Action != "2" {
 		t.Errorf("sig:x should map to its NEWEST audit, got %+v", m["sig:x"])
 	}
-	if m["sig:other"] == nil || m["sig:other"].Trigger != "other" {
+	if m["sig:other"] == nil || m["sig:other"].Action != "3" {
 		t.Errorf("sig:other missing or wrong: %+v", m["sig:other"])
+	}
+	// A LISTING's subset only: the heavy columns are what made this query most
+	// of a TUI refresh's cost, so carrying them again must fail here.
+	if x := m["sig:x"]; x != nil {
+		if x.PaneExcerpt != "" || x.LLMOutput != "" || x.Rationale != "" {
+			t.Errorf("the listing carried heavy columns: excerpt=%q llm=%q rationale=%q",
+				x.PaneExcerpt, x.LLMOutput, x.Rationale)
+		}
+		if x.CreatedAt.Unix() != now.Unix() || x.Status != "auto" {
+			t.Errorf("the listing lost what it renders: created=%v status=%q", x.CreatedAt, x.Status)
+		}
 	}
 	if _, ok := m[""]; ok {
 		t.Errorf("signature-less rows must be excluded from the map")

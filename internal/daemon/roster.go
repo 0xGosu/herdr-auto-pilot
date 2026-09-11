@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -17,6 +18,17 @@ import (
 // what it used to see listing agents itself. It runs ONLY while a TUI is
 // registered — see rosterDemand.
 const rosterTickInterval = 2 * time.Second
+
+// rosterTickMaxInterval caps the local roster tick's backoff. A listing that
+// comes back unchanged doubles the wait before the next one (2s, 4s, 8s, then
+// this), and any change — in a listing, or an agent transition arriving as an
+// event — snaps it back to rosterTickInterval. Every tick is a herdr `agent
+// list` subprocess, and on a settled herd with a TUI open that was thirty a
+// minute answering "still the same". The events path already publishes every
+// status change the moment it happens; what only a listing sees — an agent
+// that vanished, a pane moved between tabs — reaches an open TUI at most this
+// late. Matches remoteRosterInterval: a remote watcher is paced the same way.
+const rosterTickMaxInterval = remoteRosterInterval
 
 // rosterCwdTTL is how long a published working directory is reused while
 // someone is watching.
@@ -151,17 +163,27 @@ func (d *Daemon) rosterShellOutTTLs() (cwd, locations time.Duration) {
 // refuses, or one shutdown race disables the tick for the life of the process.
 func (d *Daemon) startRosterTickPass(ctx context.Context) {
 	level := d.rosterDemandLevel()
-	if level == rosterDemandNone {
-		return
-	}
-	now := d.opt.Clock.Now()
 	d.mu.Lock()
-	if d.rosterTickRunning {
+	// A TUI that has just opened starts from the fast tick rather than
+	// inheriting a wait backed off before it was there. Recorded before ANY
+	// return below, or a tick that leaves early — nobody watching, a listing
+	// still running, a remote watcher's pacing — hides the transition.
+	if level == rosterDemandLocal && d.rosterTickLevel != rosterDemandLocal {
+		d.rosterTickEvery, d.rosterTickNextAt = 0, time.Time{}
+	}
+	d.rosterTickLevel = level
+	if level == rosterDemandNone || d.rosterTickRunning {
 		d.mu.Unlock()
 		return
 	}
+	now := d.opt.Clock.Now()
 	// A remote watcher gets a publish per sync interval, not per tick.
 	if level == rosterDemandRemote && !d.rosterRemoteAt.IsZero() && now.Sub(d.rosterRemoteAt) < remoteRosterInterval {
+		d.mu.Unlock()
+		return
+	}
+	// A local watcher is paced by the backoff (see rosterTickMaxInterval).
+	if level == rosterDemandLocal && now.Before(d.rosterTickNextAt) {
 		d.mu.Unlock()
 		return
 	}
@@ -180,12 +202,54 @@ func (d *Daemon) startRosterTickPass(ctx context.Context) {
 			slog.Debug("roster tick: listing agents failed", "error", err)
 			return
 		}
+		d.noteRosterTickListing(agents, d.opt.Clock.Now())
 		d.publishRoster(ctx, agents)
 	}) {
 		d.mu.Lock()
 		d.rosterTickRunning = false
 		d.mu.Unlock()
 	}
+}
+
+// noteRosterTickListing schedules the next local roster tick from this one's
+// listing: unchanged doubles the wait up to rosterTickMaxInterval, changed
+// snaps it back to rosterTickInterval.
+func (d *Daemon) noteRosterTickListing(agents []domain.AgentTransition, now time.Time) {
+	digest := rosterListingDigest(agents)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case digest != d.rosterTickDigest || d.rosterTickEvery == 0:
+		d.rosterTickEvery = rosterTickInterval
+	default:
+		d.rosterTickEvery = min(2*d.rosterTickEvery, rosterTickMaxInterval)
+	}
+	d.rosterTickDigest = digest
+	d.rosterTickNextAt = now.Add(d.rosterTickEvery)
+}
+
+// resetRosterTick returns the local roster tick to its fast cadence: an agent
+// transition means the herd is moving, and the next listing is the one most
+// likely to see something only a listing can.
+func (d *Daemon) resetRosterTick() {
+	d.mu.Lock()
+	d.rosterTickEvery, d.rosterTickNextAt = 0, time.Time{}
+	d.mu.Unlock()
+}
+
+// rosterListingDigest renders everything a publish stores from one listing, in
+// listing order (the order is published too).
+func rosterListingDigest(agents []domain.AgentTransition) string {
+	var b strings.Builder
+	for _, a := range agents {
+		b.WriteString(a.AgentID)
+		for _, f := range []string{a.PaneID, a.TabID, a.WorkspaceID, a.AgentType, a.Status, a.TerminalID} {
+			b.WriteByte(0)
+			b.WriteString(f)
+		}
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // publishRoster records the herd from a listing the caller already made.
@@ -447,6 +511,7 @@ func (d *Daemon) noteRosterTransition(ctx context.Context, tr domain.AgentTransi
 	if tr.Status == domain.AgentStatusDetected {
 		return
 	}
+	d.resetRosterTick()
 	if err := d.opt.Store.UpsertRosterAgent(ctx, domain.RosterAgentFrom(tr, d.opt.Clock.Now())); err != nil {
 		slog.Debug("roster: recording a transition failed", "agent", tr.AgentID, "error", err)
 	}

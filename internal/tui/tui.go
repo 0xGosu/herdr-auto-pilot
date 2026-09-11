@@ -94,7 +94,24 @@ type refreshMsg struct {
 	// updateDue is true when that cached result has aged out, so the tick
 	// handler knows to fire a background check.
 	updateDue bool
-	err       error
+	// changeKey is frontend.App.ChangeKey sampled BEFORE this refresh read
+	// anything, "" when the App cannot tell. Sampling first means a change
+	// landing mid-read costs one extra refresh, never a missed one.
+	changeKey string
+	// polledAt is the tick (or keypress) that asked for this refresh — what
+	// the backstop measures from, since the next tick is scheduled from the
+	// same moment. Stamping arrival instead made every other slow tick a
+	// probe: the next one lands 30s after the ask, under 30s after arrival.
+	polledAt time.Time
+	err      error
+}
+
+// probeMsg is a poll that found nothing changed (frontend.App.ChangeKey held
+// still), so none of the data was re-read: only what a poll reads besides it —
+// daemon health and the instance-limit sweep — comes back.
+type probeMsg struct {
+	health   frontend.DaemonHealth
+	tuiLimit frontend.TUILimitSweep
 }
 
 // updateCheckedMsg reports that a background release check finished; the
@@ -970,6 +987,12 @@ type Model struct {
 	// lastFingerprint is the previous refresh's activityFingerprint, the
 	// change signal lastActivity is driven from. Empty before the first one.
 	lastFingerprint string
+	// lastChangeKey is the change key the last successful refresh sampled
+	// ("" when there was none or the App cannot tell), and lastFullRefresh
+	// when it landed. A tick whose key still matches skips the re-read — see
+	// poll.
+	lastChangeKey   string
+	lastFullRefresh time.Time
 	// slowPoll records whether the LAST tick was scheduled at the slow
 	// interval, so a return to activity can refresh immediately instead of
 	// waiting out a long timer that is already in flight.
@@ -1733,7 +1756,10 @@ func (m Model) clockInterval(now time.Time) time.Duration {
 	return fastClockInterval
 }
 
-func (m Model) refresh() tea.Cmd {
+func (m Model) refresh() tea.Cmd { return m.refreshAt(time.Now()) }
+
+// refreshAt is refresh for a poll asked for at now.
+func (m Model) refreshAt(now time.Time) tea.Cmd {
 	app, ctx := m.app, m.ctx
 	// Only the agent whose detail overlay is OPEN needs its permission mode: it
 	// is the sole place the TUI renders one, and reading it costs a `herdr pane
@@ -1742,7 +1768,51 @@ func (m Model) refresh() tea.Cmd {
 	// the 2s tick meant N subprocesses every two seconds to paint a row that is
 	// usually not on screen.
 	modeFor := m.detailAgentID()
-	return func() tea.Msg { return refreshData(ctx, app, modeFor) }
+	groups := m.data.tasks
+	return func() tea.Msg {
+		key, ok := app.ChangeKey(ctx, groups)
+		msg := refreshData(ctx, app, modeFor)
+		if ok {
+			msg.changeKey = key
+		}
+		msg.polledAt = now
+		return msg
+	}
+}
+
+// refreshBackstop bounds how long a TUI trusts an unchanged change key. What a
+// refresh derives from the CLOCK rather than from stored data — roster
+// freshness, the update check's due time, the model file's presence — moves
+// with no write to key on, so it is re-read on this schedule. It matches the
+// idle poll, so a backed-off TUI re-reads on every tick exactly as before —
+// which holds because it is measured from when each refresh was ASKED for
+// (refreshMsg.polledAt), the same moment the next tick is timed from.
+const refreshBackstop = slowPollInterval
+
+// poll is the tick's refresh. It re-reads everything only when something may
+// have changed: the change key moved, the App cannot tell, the backstop is
+// due, or an agent detail is open — that overlay renders a permission mode
+// read from the PANE, which no key covers. Otherwise it is a probe: one change
+// token from the store and a few stats. Re-reading unconditionally every two
+// seconds was the TUI's whole idle cost, and serving it was most of the
+// daemon's while a TUI was open.
+func (m Model) poll(now time.Time) tea.Cmd {
+	if m.lastChangeKey == "" || m.detailAgentID() != "" || now.Sub(m.lastFullRefresh) >= refreshBackstop {
+		return m.refreshAt(now)
+	}
+	app, ctx, groups, last := m.app, m.ctx, m.data.tasks, m.lastChangeKey
+	return func() tea.Msg {
+		key, ok := app.ChangeKey(ctx, groups)
+		if ok && key == last {
+			return probeMsg{health: app.AssessDaemonHealth(), tuiLimit: enforceTUILimit(app)}
+		}
+		msg := refreshData(ctx, app)
+		if ok {
+			msg.changeKey = key
+		}
+		msg.polledAt = now
+		return msg
+	}
 }
 
 // detailAgentID returns the agent id an agents-tab detail overlay is currently
@@ -1772,18 +1842,7 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	// Daemon health is read from local state files (never errors), so assess it
 	// first — it stays meaningful even when GetStatus fails (e.g. daemon down).
 	msg.daemonHealth = app.AssessDaemonHealth()
-	// Keep only the newest few TUIs alive: every extra one re-runs this whole
-	// refresh on its own 2s tick. Throttled inside the App, and deliberately
-	// not allowed to fail the refresh — an unenforceable limit is a slow TUI,
-	// not a broken one.
-	if sweep, err := app.EnforceTUISessionLimit(); err != nil {
-		// Once per process: refreshData runs on a 2s tick, so a registry error
-		// that persists (an unwritable state dir, a stale lock) would otherwise
-		// write 43,200 identical lines a day into the daemon's log file.
-		logging.WarnOnce("tui-session-limit", "TUI instance limit not enforced", "error", err)
-	} else {
-		msg.tuiLimit = sweep
-	}
+	msg.tuiLimit = enforceTUILimit(app)
 	msg.status, msg.err = app.GetStatus(ctx)
 	if msg.err != nil {
 		return msg
@@ -1846,6 +1905,36 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 	msg.update = app.UpdateStatus(msg.cfg)
 	msg.updateDue = app.UpdateCheckDue(msg.cfg)
 	return msg
+}
+
+// enforceTUILimit keeps only the newest few TUIs alive: every extra one runs
+// its own poll. Throttled inside the App, and deliberately not allowed to fail
+// the poll — an unenforceable limit is a slow TUI, not a broken one.
+func enforceTUILimit(app *frontend.App) frontend.TUILimitSweep {
+	sweep, err := app.EnforceTUISessionLimit()
+	if err != nil {
+		// Once per process: this runs on a 2s tick, so a registry error that
+		// persists (an unwritable state dir, a stale lock) would otherwise
+		// write 43,200 identical lines a day into the daemon's log file.
+		logging.WarnOnce("tui-session-limit", "TUI instance limit not enforced", "error", err)
+	}
+	return sweep
+}
+
+// takeTUILimit records a sweep that closed older TUIs as the note to show, and
+// shows a pending one. Never over an error the operator is reading: a failed
+// action they just triggered is the one they need. It is held rather than
+// dropped, because no later sweep will re-report it — a peer already asked to
+// close is skipped for its whole grace, and gone after that — and a pane that
+// vanished with no explanation is the thing this note exists to prevent.
+func (m *Model) takeTUILimit(sweep frontend.TUILimitSweep) {
+	if len(sweep.Closed) > 0 {
+		m.pendingTUINote = closedTUINote(sweep)
+	}
+	if m.pendingTUINote != "" && (m.status == nil || !m.status.err) {
+		m.status = &statusNote{text: m.pendingTUINote, at: time.Now()}
+		m.pendingTUINote = ""
+	}
 }
 
 // closedTUINote explains a sweep that closed older TUIs, naming the setting to
@@ -2102,19 +2191,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Say so when this instance closed older ones: from the operator's side
 		// a pane they left open simply disappeared, and the reason (a limit they
 		// can raise) is only knowable from here.
-		// Never over an error the operator is reading: a failed action they
-		// just triggered is the one they need. It is held rather than dropped,
-		// because no later sweep will re-report it — a peer already asked to
-		// close is skipped for its whole grace, and gone after that — and a
-		// pane that vanished with no explanation is the thing this note exists
-		// to prevent.
-		if len(msg.tuiLimit.Closed) > 0 {
-			m.pendingTUINote = closedTUINote(msg.tuiLimit)
-		}
-		if m.pendingTUINote != "" && (m.status == nil || !m.status.err) {
-			m.status = &statusNote{text: m.pendingTUINote, at: time.Now()}
-			m.pendingTUINote = ""
-		}
+		m.takeTUILimit(msg.tuiLimit)
 		// A failed refresh returns before the update fields are filled, so
 		// carry the last known ones forward — the hint must not blink out of
 		// the header for every frame a store read happens to fail.
@@ -2126,6 +2203,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// keyboard. A failed refresh is not evidence of quiet either — it would
 		// otherwise let a broken store back the poll off — so it also refreshes
 		// the stamp without pretending to know the fingerprint.
+		if msg.err != nil {
+			m.lastChangeKey = ""
+		} else {
+			m.lastChangeKey, m.lastFullRefresh = msg.changeKey, msg.polledAt
+			if m.lastFullRefresh.IsZero() {
+				m.lastFullRefresh = time.Now()
+			}
+		}
 		if msg.err != nil {
 			m.lastActivity = time.Now()
 		} else if fp := activityFingerprint(msg); fp != m.lastFingerprint {
@@ -2270,10 +2355,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, msg.run
 	case openTaskSourceFieldMsg:
 		return m.openTaskSourceFieldPrompt(msg)
+	case probeMsg:
+		// Nothing changed, so nothing is re-derived and the idle clock is
+		// left alone: a probe that finds no change IS the quiet the backoff
+		// waits for.
+		m.data.daemonHealth = msg.health
+		m.takeTUILimit(msg.tuiLimit)
+		return m, nil
 	case tickMsg:
 		now := time.Now()
 		m.slowPoll = m.idle(now)
-		cmds := []tea.Cmd{m.refresh(), tick(m.refreshInterval(now))}
+		cmds := []tea.Cmd{m.poll(now), tick(m.refreshInterval(now))}
 		if m.updateCheckAllowed(time.Now()) {
 			m.updateChecking = true
 			m.lastUpdateCheck = time.Now()

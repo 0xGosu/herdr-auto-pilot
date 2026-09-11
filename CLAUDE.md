@@ -626,6 +626,16 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     cannot establish the lease fails closed rather than migrating blind.
   - `fleetRun` runs every sync op off the loop and waits for it OR shutdown; `turso.DB.Close` waits a
     bounded time and refuses to close underneath an in-flight op.
+  - **A front end polls a change token, not the data** (`Store.Revision` → `ports.RevisionReporter`,
+    `frontend.App.ChangeKey`, `tui.Model.poll`). Under turso it is the executor's counter
+    (`sqlbridge.Executor.Revision`, a `rev` request over a POOLED connection), bumped AFTER every committed
+    write and every pull that `changed` — so sampling it before a read can only cost an extra refresh, never
+    miss one — and prefixed with an epoch because a restarted daemon counts from zero. Under sqlite it is
+    the file's and WAL's size+mtime. The key adds config.toml and local checklist files; a **gist** source
+    answers "cannot tell" (no local trace), as does a store without the port, and both keep the old
+    re-read-every-tick behaviour. What a refresh derives from the CLOCK is re-read on `refreshBackstop`, and
+    an open agent detail always re-reads (its permission mode comes from the PANE). The unconditional 2s
+    re-read was the TUI's whole idle cost and serving it most of the daemon's while one was open.
   - Config never enters the database. Front ends draw ids from the daemon with NO local fallback: two
     processes minting locally in one millisecond collide, so an insert with no id fails with the reason
     (`failedID`).
@@ -640,7 +650,12 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     **recycled** id is never skipped — its row was DELETEd earlier in the same transaction, so `existing`
     describes a row that no longer exists, and the gate is on `recycledIDs` structurally rather than on the
     coincidence that `terminal_id` is in the compare set. Roster FRESHNESS is `roster_meta.published_at`
-    (`domain.RosterFresh`), never a per-row `seen_at`, which is why the stamp still happens every publish.
+    (`domain.RosterFresh`), never a per-row `seen_at` — and the stamp is itself a write, so a publish that
+    changed nothing re-stamps only once it is `domain.RosterRestampAfter` old, a constant bounded ABOVE by
+    the one-minute sweep so an unwatched herd's every sweep still stamps. A changed row stamps at once.
+  - **Only a transaction that WROTE reports a write** (`sqlbridge.Session.txWrote`) — COMMIT used to
+    report unconditionally, so every read-only transaction armed a push. Any successful Exec counts,
+    whatever it affected: DDL reports 0 rows and must still reach the other nodes.
   - **`domain.NodeHeartbeat` is a SEPARATE constant from `daemonhealth.HeartbeatInterval` — deliberately
     slower, but BOUNDED ABOVE by `daemon.actionStaleAfter`.** The file answers "is this daemon hung" and
     must be fast; the row answers "is this machine still out there", and no reader asks with more precision

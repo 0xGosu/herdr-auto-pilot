@@ -29,6 +29,41 @@ type freshnessChecker interface {
 	Fresh(ctx context.Context) bool
 }
 
+// revisioner is a backend that can report the executor's change token.
+type revisioner interface {
+	Revision(ctx context.Context) (string, error)
+}
+
+// ErrNoRevision: the handle cannot report a change token — it is not a bridge,
+// or the daemon behind it predates the request.
+var ErrNoRevision = errors.New("sqlbridge: this handle reports no revision")
+
+// Revision returns the change token (Executor.Revision) of the executor behind
+// db, over one of db's OWN pooled connections — no dial, no new server session.
+// ErrNoRevision when db is not a bridge handle.
+func Revision(ctx context.Context, db *sql.DB) (string, error) {
+	c, err := db.Conn(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer c.Close()
+	var rev string
+	err = c.Raw(func(dc any) error {
+		bc, ok := dc.(*conn)
+		if !ok {
+			return ErrNoRevision
+		}
+		r, ok := bc.b.(revisioner)
+		if !ok {
+			return ErrNoRevision
+		}
+		var err error
+		rev, err = r.Revision(ctx)
+		return bc.wrap(err)
+	})
+	return rev, err
+}
+
 // Connector is a driver.Connector whose connections run in-process through an
 // Executor — the daemon's own path to the gated database.
 type Connector struct{ e *Executor }

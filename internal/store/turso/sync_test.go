@@ -331,3 +331,43 @@ func TestSchemaLeaseIsExclusiveBetweenTwoNodes(t *testing.T) {
 		t.Fatalf("%d nodes believe they hold the schema lease, want exactly 1", owners)
 	}
 }
+
+// TestAPullThatBroughtRowsMovesTheRevision covers the one change a front end's
+// poll cannot see as a local write: rows another node pushed, arriving through
+// this node's pull. The TUI skips its re-read while the store's revision holds
+// still, so a pull that changed rows without moving it would leave another
+// machine's escalation off the screen until the backstop.
+func TestAPullThatBroughtRowsMovesTheRevision(t *testing.T) {
+	url := startLocalSyncServer(t)
+	a := openNode(t, url, "aaaaaaaaaaaaaaaa")
+	a.sync(t)
+	b := openNode(t, url, "bbbbbbbbbbbbbbbb")
+	b.sync(t)
+	ctx := context.Background()
+	before, err := b.st.Revision(ctx)
+	if err != nil {
+		t.Fatalf("revision: %v", err)
+	}
+	if _, err := a.st.AppendAudit(ctx, domain.AuditRecord{AgentID: "1", AgentType: "claude", Trigger: "t",
+		SituationType: domain.SituationApproval, Action: domain.AuditActionEscalated, Status: "escalated",
+		CreatedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.db.Push(); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := b.db.Pull()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("B's pull after A's push reported nothing new")
+	}
+	after, err := b.st.Revision(ctx)
+	if err != nil {
+		t.Fatalf("revision: %v", err)
+	}
+	if after == before {
+		t.Errorf("a pull that brought rows left the revision at %q", after)
+	}
+}

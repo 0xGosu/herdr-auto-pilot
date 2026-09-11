@@ -70,14 +70,82 @@ func TestRepublishingASettledHerdWritesNothing(t *testing.T) {
 		}
 	}
 
-	// roster_meta still stamps: it is the liveness proof (domain.RosterFresh),
-	// and skipping it would make a settled herd read as "no daemon publishing".
-	_, publishedAt, err := s.LiveRoster(ctx)
+	// Nor is roster_meta: a stamp this recent is still the liveness proof, and
+	// re-stamping it would be the one write left in a settled publish — under
+	// turso, a push to Turso Cloud every tick. TestASettledHerdIsRestamped
+	// covers the stamp ageing out.
+	if got := rosterStampedAt(t, s); !got.Equal(first.Truncate(time.Millisecond)) {
+		t.Errorf("roster_meta.published_at = %v, want it left at the first publish %v", got, first)
+	}
+}
+
+// rosterStampedAt reads this node's roster_meta stamp.
+func rosterStampedAt(t *testing.T, s *Store) time.Time {
+	t.Helper()
+	_, publishedAt, err := s.LiveRoster(context.Background())
 	if err != nil {
 		t.Fatalf("live roster: %v", err)
 	}
-	if !publishedAt.Equal(second.Truncate(time.Millisecond)) && publishedAt.Unix() != second.Unix() {
-		t.Errorf("roster_meta.published_at = %v, want the second publish at %v", publishedAt, second)
+	return publishedAt
+}
+
+// TestASettledHerdIsRestamped is the other half of leaving the stamp alone: a
+// settled herd must never read as "no daemon publishing". The stamp moves once
+// it is domain.RosterRestampAfter old, and immediately whenever a publish
+// changed something — a status, or an agent vanishing.
+func TestASettledHerdIsRestamped(t *testing.T) {
+	if domain.RosterRestampAfter*4 > domain.RosterStaleAfter {
+		t.Fatalf("RosterRestampAfter %v leaves too little margin under RosterStaleAfter %v",
+			domain.RosterRestampAfter, domain.RosterStaleAfter)
+	}
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	t0 := time.Now().Truncate(time.Millisecond)
+	agents := []domain.RosterAgent{
+		{AgentID: "pane-1", PaneID: "pane-1", TabID: "t1", WorkspaceID: "w1",
+			AgentType: "claude", Status: "idle", TerminalID: "term-1", SeenAt: t0},
+		{AgentID: "pane-2", PaneID: "pane-2", TabID: "t1", WorkspaceID: "w1",
+			AgentType: "codex", Status: "idle", TerminalID: "term-2", SeenAt: t0},
+	}
+	publish := func(at time.Time, herd []domain.RosterAgent) {
+		t.Helper()
+		if err := s.PublishRoster(ctx, herd, at); err != nil {
+			t.Fatalf("publish at %v: %v", at, err)
+		}
+	}
+	publish(t0, agents)
+
+	almost := t0.Add(domain.RosterRestampAfter - time.Second)
+	publish(almost, agents)
+	if got := rosterStampedAt(t, s); !got.Equal(t0) {
+		t.Fatalf("stamp moved to %v before it aged out; want %v", got, t0)
+	}
+
+	aged := t0.Add(domain.RosterRestampAfter)
+	publish(aged, agents)
+	if got := rosterStampedAt(t, s); !got.Equal(aged) {
+		t.Fatalf("stamp = %v once it aged out, want %v", got, aged)
+	}
+
+	moved := aged.Add(time.Second)
+	agents[0].Status = "working"
+	publish(moved, agents)
+	if got := rosterStampedAt(t, s); !got.Equal(moved) {
+		t.Errorf("stamp = %v after a status change, want %v", got, moved)
+	}
+
+	vanished := moved.Add(time.Second)
+	publish(vanished, agents[:1])
+	if got := rosterStampedAt(t, s); !got.Equal(vanished) {
+		t.Errorf("stamp = %v after an agent vanished, want %v", got, vanished)
+	}
+
+	// A clock that stepped back re-bases the proof rather than trusting a
+	// stamp from the future forever.
+	back := t0.Add(-time.Minute)
+	publish(back, agents[:1])
+	if got := rosterStampedAt(t, s); !got.Equal(back) {
+		t.Errorf("stamp = %v after the clock stepped back, want %v", got, back)
 	}
 }
 
@@ -209,5 +277,46 @@ func TestAReorderedHerdIsRepublished(t *testing.T) {
 	}
 	if len(live) != 2 || live[0].AgentID != "pane-2" {
 		t.Fatalf("herdr's order was not republished: %+v", live)
+	}
+}
+
+// TestRevisionMovesOnAWriteAndHoldsAcrossReads pins the change token the TUI
+// polls in place of a full re-read, in every store mode: the sqlite file stamp,
+// the socket, and the daemon's in-process executor. A settled roster publish is
+// the read-only case that matters most — the TUI's own roster tick used to move
+// it every two seconds.
+func TestRevisionMovesOnAWriteAndHoldsAcrossReads(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	agents := []domain.RosterAgent{{AgentID: "pane-1", PaneID: "pane-1", TabID: "t1",
+		WorkspaceID: "w1", AgentType: "claude", Status: "idle", TerminalID: "term-1", SeenAt: now}}
+	if err := s.PublishRoster(ctx, agents, now); err != nil {
+		t.Fatal(err)
+	}
+	rev := func() string {
+		t.Helper()
+		r, err := s.Revision(ctx)
+		if err != nil {
+			t.Fatalf("revision: %v", err)
+		}
+		return r
+	}
+	before := rev()
+	if _, _, err := s.LiveRoster(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PublishRoster(ctx, agents, now.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := rev(); got != before {
+		t.Errorf("reads and a settled publish moved the revision %q → %q", before, got)
+	}
+	agents[0].Status = "working"
+	if err := s.PublishRoster(ctx, agents, now.Add(4*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := rev(); got == before {
+		t.Errorf("a changed publish left the revision at %q", got)
 	}
 }

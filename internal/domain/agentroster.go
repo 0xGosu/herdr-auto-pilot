@@ -75,6 +75,17 @@ func RosterAgentFrom(tr AgentTransition, seenAt time.Time) RosterAgent {
 // looks authoritative.
 const RosterStaleAfter = 3 * time.Minute
 
+// RosterRestampAfter is how old roster_meta.published_at may grow before a
+// publish that changed NOTHING stamps it again.
+//
+// The stamp is the liveness proof RosterFresh reads, but it is also a write,
+// and every write arms a Turso push: stamped on every publish, a TUI's roster
+// tick sent a changeset to Turso Cloud for a herd where nothing had moved.
+// A publish that changed a row always stamps. Bounded ABOVE by the daemon's
+// one-minute sweep, so on an unwatched herd every sweep still stamps and the
+// stamp stays under two sweeps old — far inside RosterStaleAfter.
+const RosterRestampAfter = 30 * time.Second
+
 // RosterFresh reports whether a roster published at publishedAt can still be
 // trusted as of now. A zero publishedAt means no daemon has ever published,
 // which is UNKNOWN — never "no agents are running".

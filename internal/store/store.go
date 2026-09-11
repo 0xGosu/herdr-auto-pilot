@@ -33,6 +33,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
@@ -78,6 +79,9 @@ type Store struct {
 	// onWrite is called after every committed write (nil-safe). The daemon's
 	// sync loop uses it to debounce a push.
 	onWrite func()
+	// path is the sqlite file, when the store was opened from one; Revision
+	// stats it. Empty for a handle passed to OpenDB.
+	path string
 }
 
 // Options configures OpenDB.
@@ -204,12 +208,17 @@ func Open(path string) (*Store, error) {
 	// BEGIN under busy_timeout instead of failing mid-transaction, so extra
 	// connections cost queueing rather than errors.
 	db.SetMaxOpenConns(sqlitePoolSize)
-	return OpenDB(db, Options{
+	st, err := OpenDB(db, Options{
 		NodeID:       nodeID,
 		Engine:       EngineSQLite,
 		Migrate:      true,
 		AgentLockDir: filepath.Join(dir, "agent-automation-locks"),
 	})
+	if err != nil {
+		return nil, err
+	}
+	st.path = path
+	return st, nil
 }
 
 // sqlitePoolSize is the modernc connection pool for every sqlite-engine open
@@ -226,11 +235,16 @@ func OpenAs(path, nodeID string) (*Store, error) {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
 	db.SetMaxOpenConns(sqlitePoolSize)
-	return OpenDB(db, Options{
+	st, err := OpenDB(db, Options{
 		NodeID:       nodeID,
 		Engine:       EngineSQLite,
 		AgentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks-"+nodeID),
 	})
+	if err != nil {
+		return nil, err
+	}
+	st.path = path
+	return st, nil
 }
 
 // OpenDB wraps an already-open database handle. It is how the turso engine is
@@ -281,6 +295,40 @@ func (s *Store) MigrateWith(between func() error) error { return s.migrate(betwe
 // Ping reports whether the database answers — for a proxied store, whether the
 // daemon serving it is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
+// ErrNoRevision: this store cannot report a change token (see Revision).
+var ErrNoRevision = errors.New("store: no revision for this handle")
+
+// Revision returns an opaque token that changes whenever a read of this store
+// could return something different, so a front end can skip re-reading data
+// that has not moved. Under turso it is the daemon's executor counter
+// (sqlbridge.Executor.Revision) — over the socket for a front end, in-process
+// for the daemon. Under sqlite it is the database file's and its WAL's size
+// and modification time: every committing process appends to the WAL, and a
+// checkpoint rewrites the file. Reads touch neither (only -shm). ErrNoRevision
+// when neither applies; callers then re-read as they always did.
+func (s *Store) Revision(ctx context.Context) (string, error) {
+	rev, err := sqlbridge.Revision(ctx, s.db)
+	if !errors.Is(err, sqlbridge.ErrNoRevision) {
+		return rev, err
+	}
+	if s.path == "" {
+		return "", ErrNoRevision
+	}
+	var b strings.Builder
+	for _, p := range []string{s.path, s.path + "-wal"} {
+		fi, err := os.Stat(p)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			b.WriteString("-;")
+		case err != nil:
+			return "", err
+		default:
+			fmt.Fprintf(&b, "%d:%d;", fi.ModTime().UnixNano(), fi.Size())
+		}
+	}
+	return b.String(), nil
+}
 
 // noteWrite reports a committed write to the sync hook.
 func (s *Store) noteWrite() {
@@ -1776,22 +1824,31 @@ func (s *Store) LatestAuditForSignature(ctx context.Context, signature string) (
 // otherwise make on each ~2s refresh into one grouped query. The inner
 // MAX(id)-per-signature scan is index-served by idx_audit_signature.
 func (s *Store) LatestAuditsForSignatures(ctx context.Context) (map[string]*domain.AuditRecord, error) {
+	// A LISTING's columns only, never auditCols: the rest of a row — the pane
+	// excerpt, the LLM's output, the salient — is most of audit_log's bytes,
+	// and this runs for EVERY learned rule on each TUI refresh. Selecting the
+	// whole row moved ~30MB through the store proxy per refresh on a
+	// 787-rule store and was over half the TUI's CPU and most of the daemon's
+	// while a TUI was open. A view needing the full row reads it with
+	// LatestAuditForSignature, as the signature detail does.
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+auditCols+` FROM audit_log
+		`SELECT id, node_id, signature, status, action_or_escalation, created_at FROM audit_log
 		 WHERE id IN (SELECT MAX(id) FROM audit_log WHERE signature <> '' GROUP BY signature)`)
 	if err != nil {
 		return nil, err
 	}
-	audits, err := s.scanAudits(rows)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]*domain.AuditRecord, len(audits))
-	for i := range audits {
-		a := audits[i]
+	defer rows.Close()
+	out := map[string]*domain.AuditRecord{}
+	for rows.Next() {
+		var a domain.AuditRecord
+		var created int64
+		if err := rows.Scan(&a.ID, &a.NodeID, &a.Signature, &a.Status, &a.Action, &created); err != nil {
+			return nil, err
+		}
+		a.CreatedAt = fromUnix(created)
 		out[a.Signature] = &a
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // LatestKillEvent returns the newest GLOBAL kill event row, or nil (read every
