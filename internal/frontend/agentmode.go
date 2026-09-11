@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -488,9 +489,16 @@ func joinModes(modes []domain.AgentMode) string {
 
 // modeFillBudget bounds ONE FillAgentModes pass end to end, for the same reason
 // cwdFillBudget bounds FillAgentCwds: each read is its own subprocess with a 15s
-// CLI budget and they run in sequence. A displayed mode is a nicety — whatever
-// resolves in the budget is what shows.
+// CLI budget. A displayed mode is a nicety — whatever resolves in the budget is
+// what shows.
 const modeFillBudget = 3 * time.Second
+
+// modeFillParallel is how many of those pane reads run at once. They used to
+// run in sequence, so a one-shot `hap agents` waited for every agent's
+// `herdr pane read` subprocess back to back — most of its wall time on a herd
+// of a few agents. Bounded rather than one per agent so a large herd does not
+// fork a burst of herdr processes at the server all at once.
+const modeFillParallel = 4
 
 // FillAgentModes populates st.AgentModes for the agents in st.MonitoredAgents,
 // or for just the agent ids named in only.
@@ -522,27 +530,42 @@ func (a *App) FillAgentModes(ctx context.Context, st *Status, only ...string) {
 	ctx, cancel := context.WithTimeout(ctx, modeFillBudget)
 	defer cancel()
 
+	var (
+		mu    sync.Mutex
+		wg    sync.WaitGroup
+		slots = make(chan struct{}, modeFillParallel)
+	)
 	for _, agent := range st.MonitoredAgents {
-		if ctx.Err() != nil {
-			return // budget spent: keep whatever resolved
-		}
 		if wanted != nil && !wanted[agent.AgentID] {
 			continue
 		}
 		if domain.AgentModesFor(agent.AgentType) == nil {
 			continue
 		}
-		pane, err := a.readModePane(ctx, panePreferred(agent))
-		if err != nil {
-			continue
-		}
-		mode, ok := domain.AgentModeFromPane(agent.AgentType, pane)
-		if !ok {
-			continue
-		}
-		if st.AgentModes == nil {
-			st.AgentModes = map[string]domain.AgentMode{}
-		}
-		st.AgentModes[agent.AgentID] = mode
+		wg.Add(1)
+		go func(agent domain.AgentTransition) {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return // budget spent: keep whatever resolved
+			}
+			defer func() { <-slots }()
+			pane, err := a.readModePane(ctx, panePreferred(agent))
+			if err != nil {
+				return
+			}
+			mode, ok := domain.AgentModeFromPane(agent.AgentType, pane)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if st.AgentModes == nil {
+				st.AgentModes = map[string]domain.AgentMode{}
+			}
+			st.AgentModes[agent.AgentID] = mode
+		}(agent)
 	}
+	wg.Wait()
 }

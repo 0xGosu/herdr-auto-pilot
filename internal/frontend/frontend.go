@@ -243,8 +243,26 @@ type Status struct {
 	FleetNames map[domain.NodeAgent]string
 }
 
+// StatusOption narrows what GetStatus reads, for a caller that renders less.
+type StatusOption func(*statusOptions)
+
+type statusOptions struct {
+	skipStats bool
+}
+
+// WithoutAgentStats skips the per-agent lifetime counters (Status.StatsFor and
+// RemoteAgent.Stats). Only the TUI renders them, and they are the two most
+// expensive reads in a status snapshot — each aggregates the whole audit log
+// per agent, ~40ms of the daemon's time between them on a 787-rule store — so
+// the one-shot CLI verbs, which never show them, skip both.
+func WithoutAgentStats() StatusOption { return func(o *statusOptions) { o.skipStats = true } }
+
 // GetStatus returns the operator-facing status summary.
-func (a *App) GetStatus(ctx context.Context) (Status, error) {
+func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, error) {
+	var o statusOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	var st Status
 	kill, err := a.Store.LatestKillEvent(ctx)
 	if err != nil {
@@ -301,8 +319,10 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 		st.DisabledAgents = disabled
 	}
 	// Best-effort, like AgentNames: a stats-query error just leaves it nil.
-	if stats, err := a.Store.AgentStats(ctx); err == nil {
-		st.AgentStats = stats
+	if !o.skipStats {
+		if stats, err := a.Store.AgentStats(ctx); err == nil {
+			st.AgentStats = stats
+		}
 	}
 	// One config load serves both embedding summaries so they cannot
 	// disagree about a mid-edit config within a single status snapshot.
@@ -332,7 +352,7 @@ func (a *App) GetStatus(ctx context.Context) (Status, error) {
 			st.AgentNames[agent.AgentID] = name
 		}
 	}
-	a.fillFleet(ctx, &st)
+	a.fillFleet(ctx, &st, o)
 	return st, nil
 }
 
@@ -430,10 +450,12 @@ func (a *App) embeddingStatus(ctx context.Context, cfg config.Config) string {
 // by a different model than the currently configured one. Detection is by
 // model id, which is a digest of the model FILE (embedder.ModelIDFor) — so
 // two different models installed under the same name no longer read as one.
-// The id is resolved once per path per process, so replacing the model file IN
-// PLACE is still not detected until the next start or `[embedding]` reload (a
-// dims change is caught by the daemon's reconcile at its next index init; a
-// same-dims in-place swap silently mixes vector spaces).
+// The id is resolved once per path per process and persisted per machine
+// (embedder.SetModelIDCacheDir, keyed on the file's size, mtime, inode, device
+// and ctime), so replacing the model file IN PLACE is detected at the next
+// process start or `[embedding]` reload, never by a running process (a dims
+// change is caught by the daemon's reconcile at its next index init; a
+// same-dims in-place swap silently mixes vector spaces until then).
 //
 // ModelID must be resolved the SAME way the embedder resolves its own, or every
 // stored row reads stale forever and no re-embed can clear it — the permanent

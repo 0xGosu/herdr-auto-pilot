@@ -930,7 +930,7 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q (usage: hap status [--stderr])", fs.Arg(0))
 	}
-	st, err := app.GetStatus(ctx)
+	st, err := app.GetStatus(ctx, frontend.WithoutAgentStats())
 	if err != nil {
 		return err
 	}
@@ -1149,7 +1149,7 @@ func roundDuration(d time.Duration) string {
 }
 
 func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
-	st, err := app.GetStatus(ctx)
+	st, err := app.GetStatus(ctx, frontend.WithoutAgentStats())
 	if err != nil {
 		return err
 	}
@@ -1264,7 +1264,7 @@ func escalations(ctx context.Context, app *frontend.App, out io.Writer, args []s
 	// The status snapshot carries every node's names, so a row another machine
 	// raised is labelled name@node rather than mislabelled with a local agent
 	// that happens to share its pane id.
-	st, err := app.GetStatus(ctx)
+	st, err := app.GetStatus(ctx, frontend.WithoutAgentStats())
 	if err != nil {
 		return err
 	}
@@ -1455,7 +1455,7 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 	// The audit log is fleet-wide under a shared store, so each row names the
 	// machine it happened on — APPENDED, so every existing field keeps its
 	// position for the parsers reading this listing.
-	st, err := app.GetStatus(ctx)
+	st, err := app.GetStatus(ctx, frontend.WithoutAgentStats())
 	if err != nil {
 		return err
 	}
@@ -1597,7 +1597,7 @@ func killHistory(ctx context.Context, app *frontend.App, out io.Writer) error {
 	}
 	// Fleet-wide history: the node is appended so a pause landed on another
 	// machine (`hap pause --node`) reads as that machine's.
-	st, err := app.GetStatus(ctx)
+	st, err := app.GetStatus(ctx, frontend.WithoutAgentStats())
 	if err != nil {
 		return err
 	}
@@ -2038,7 +2038,7 @@ func splitAgentTypeFlag(args []string) (agentTypes string, rest []string, err er
 // refuses, and stays silent whenever the agent list could not be read — an
 // absent herdr must never read as "that type does not exist".
 func warnUnseenAgentTypes(ctx context.Context, app *frontend.App, out io.Writer, types []string) {
-	st, err := app.GetStatus(ctx)
+	st, err := app.GetStatus(ctx, frontend.WithoutAgentStats())
 	if err != nil || !st.AgentsKnown {
 		return
 	}
@@ -2914,7 +2914,7 @@ func taskSend(ctx context.Context, app *frontend.App, out io.Writer, agent, path
 	if it.Done {
 		return fmt.Errorf("task #%d is %q — only a pending [ ] task can be sent", idx, it.Mark)
 	}
-	status, err := app.GetStatus(ctx)
+	status, err := app.GetStatus(ctx, frontend.WithoutAgentStats())
 	if err != nil {
 		return err
 	}

@@ -3,8 +3,10 @@ package frontend_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -537,5 +539,95 @@ func TestSetAgentModeResolvesByShortName(t *testing.T) {
 	}
 	if chords, _ := fake.counts(); chords != 1 {
 		t.Errorf("delivered %d chords; want 1", chords)
+	}
+}
+
+// barrierHerdr blocks each pane read until `want` reads are in flight at
+// once (or the read's context ends), then renders like modeHerdr.
+type barrierHerdr struct {
+	*modeHerdr
+	want    int
+	arrived chan struct{}
+	release chan struct{}
+	// inFlight / maxInFlight record the most reads ever running at once.
+	inFlight, maxInFlight atomic.Int32
+}
+
+func (b *barrierHerdr) ReadPaneVisible(ctx context.Context, pane string, lines int) (string, error) {
+	n := b.inFlight.Add(1)
+	defer b.inFlight.Add(-1)
+	for {
+		m := b.maxInFlight.Load()
+		if n <= m || b.maxInFlight.CompareAndSwap(m, n) {
+			break
+		}
+	}
+	b.arrived <- struct{}{}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	return b.modeHerdr.ReadPaneVisible(ctx, pane, lines)
+}
+
+// TestFillAgentModesReadsPanesConcurrently: `hap agents` used to wait for each
+// agent's `herdr pane read` subprocess back to back. The barrier opens only
+// once all three reads are in flight together, so a sequential fill never gets
+// past the first read and resolves nothing inside the budget.
+func TestFillAgentModesReadsPanesConcurrently(t *testing.T) {
+	app, fake := claudeApp(t, domain.AgentModeAuto)
+	b := &barrierHerdr{modeHerdr: fake, want: 3, arrived: make(chan struct{}, 8), release: make(chan struct{})}
+	go func() {
+		for i := 0; i < b.want; i++ {
+			<-b.arrived
+		}
+		close(b.release)
+	}()
+	app.Herdr = b
+	st := frontend.Status{MonitoredAgents: []domain.AgentTransition{
+		{AgentID: "w1:p1", PaneID: "w1:p1", AgentType: "claude"},
+		{AgentID: "w1:p2", PaneID: "w1:p2", AgentType: "claude"},
+		{AgentID: "w1:p3", PaneID: "w1:p3", AgentType: "claude"},
+	}}
+	app.FillAgentModes(context.Background(), &st)
+	for _, id := range []string{"w1:p1", "w1:p2", "w1:p3"} {
+		if got := st.AgentMode(id); got != domain.AgentModeAuto {
+			t.Errorf("%s mode = %q, want %q — the reads did not run together", id, got, domain.AgentModeAuto)
+		}
+	}
+}
+
+// TestFillAgentModesCapsConcurrentReads: parallel, but bounded — each read is a
+// herdr subprocess, and a large herd must not fork one per agent at the server
+// at once. Six agents, a barrier that opens at four in flight: every mode still
+// resolves and no more than four reads ever overlap.
+func TestFillAgentModesCapsConcurrentReads(t *testing.T) {
+	app, fake := claudeApp(t, domain.AgentModeAuto)
+	b := &barrierHerdr{modeHerdr: fake, want: 4, arrived: make(chan struct{}, 16), release: make(chan struct{})}
+	go func() {
+		for i := 0; i < b.want; i++ {
+			<-b.arrived
+		}
+		close(b.release)
+		for range b.arrived { // later reads pass straight through
+		}
+	}()
+	defer close(b.arrived)
+	app.Herdr = b
+	var agents []domain.AgentTransition
+	for i := 1; i <= 6; i++ {
+		id := fmt.Sprintf("w1:p%d", i)
+		agents = append(agents, domain.AgentTransition{AgentID: id, PaneID: id, AgentType: "claude"})
+	}
+	st := frontend.Status{MonitoredAgents: agents}
+	app.FillAgentModes(context.Background(), &st)
+	for _, a := range agents {
+		if got := st.AgentMode(a.AgentID); got != domain.AgentModeAuto {
+			t.Errorf("%s mode = %q, want %q", a.AgentID, got, domain.AgentModeAuto)
+		}
+	}
+	if got := b.maxInFlight.Load(); got > 4 {
+		t.Errorf("%d pane reads ran at once; the cap is 4", got)
 	}
 }
