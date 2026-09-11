@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.17
+
+- Added a recorded corpus of Antigravity CLI (agy) screens and a design for supporting it; hap's handling of agy is unchanged for now (every agy screen still reads as idle)
+
 ## 0.9.16
 
 - Added `HAP_ACTOR=orchestrator`, which marks everything a hap command does as the orchestrator's rather than the operator's — for an orchestrating agent hap did not start itself. It gets the same never-auto screening and pause refusal as commands run in the orchestrator's own pane. That pane is always the orchestrator whatever the variable says, and any value other than `orchestrator` or `operator` fails the command
