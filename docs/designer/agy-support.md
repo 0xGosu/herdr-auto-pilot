@@ -677,8 +677,26 @@ What shipped, and where it deliberately departs from §4:
     review items). The trust prompt's caret is not part of the identity.
 - **Transport departure from §5.** Keys go through `ports.KeystrokeSender` (`pane send-keys`),
   as the Claude and Codex deliverers do and as every test fake implements, not `pane send-text`
-  as §5 verified. Live verification on a scratch agent is what confirms `send-keys <digit>`
-  answers agy the same way.
+  as §5 verified. Verified live below: `send-keys <digit>` answers agy exactly as `send-text`
+  did.
+- **Live verification (2026-09-11; agy 1.2.1, herdr 0.8.2, hap dev hot-swapped, full
+  self-prompting on).** On a scratch agent in a temp dir:
+  - **Shell approval:** the LLM chose "Yes, and always allow in this conversation…". The
+    promotion pressed its digit and agy ran `ls` with no stray key.
+  - **Two-question form:**
+    - Question 1 was auto-accepted through `deliver.Deliver` ("Red"), the same function the
+      operator's `--send` uses.
+    - The re-capture then saw question 2, and the LLM answered it ("Dog").
+    - The first run, before the re-capture existed, stalled on question 2. That stall is how
+      the gap was found.
+  - **`hap task … send`:** refused while a two-character draft stood in the composer (the task
+    stayed `[ ]`). After the draft was erased it was delivered as one multi-line message, and
+    agy answered.
+- **Found, not fixed (predates this change; reproduced on v0.9.16):** a static agy screen
+  standing when a daemon STARTS is re-driven but never captured. The trust prompt of an agent
+  launched before the daemon is one example; the startup resubscribe burst replays it. Its
+  parse and classification were checked live with this build (approval, `trust this folder`,
+  both rows). Its keys are covered by `mcqdeliver` tests on the recorded screen.
 - **Questions stay one situation each.** No `MCQKind`, no answer series: `MCQAgyQuestions` was
   removed. Each question classifies, decides and is answered on its own. §4.7's series protocol
   is unnecessary because agy renders later questions' options only after the earlier ones are
