@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.19
+
+- hap now answers agy's prompts itself — learned rules, LLM answers, auto-accept and `hap confirm/resolve --send` alike: a numbered approval or question gets the option's digit with no Enter, the trust-folder prompt gets its caret walked to the chosen row and confirmed, and the plan-artifact review panel gets `y`/`n`; every key is checked against a fresh read of the pane, and hap stops rather than press a key twice
+- A multi-question agy form is followed through question by question: after each answer hap looks at the pane again, so the next question is decided (or escalated to you) instead of stalling unseen
+- A reply meant for one agy question is never typed into the next one, even when the two offer the same labels, and a question's free-text "Write-in..." row is left to you
+- Task hand-outs, generated-task sends and free-text replies to agy wait until agy shows an empty composer, so a task can no longer land in a standing agy prompt, a picker or your half-typed draft
+
 ## 0.9.18
 
 - Added Antigravity CLI (`agy`) as a recognized agent: its approvals (shell commands, file access/creation, the trust-folder prompt, plan review), questions and errors now escalate as what they are instead of reading as an idle agent — which also stops an idle task hand-out from being typed into a standing agy prompt
