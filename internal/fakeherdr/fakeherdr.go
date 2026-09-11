@@ -259,8 +259,9 @@ func (s *Server) AddPane(paneID, workspaceID string) {
 }
 
 // AddAgentPane registers a pane that already hosts a detected agent — what
-// real herdr reports for a pane running claude or codex: pane.list carries
-// its label, so a subscriber watches its status from the first subscribe.
+// real herdr reports for a pane running claude, codex or agy: pane.list
+// carries its label (any string, verbatim), so a subscriber watches its status
+// from the first subscribe.
 func (s *Server) AddAgentPane(paneID, workspaceID, agentLabel string) {
 	s.mu.Lock()
 	s.agents[paneID] = agentLabel

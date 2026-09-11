@@ -5,11 +5,11 @@ import (
 	"strings"
 )
 
-// An agent's PERMISSION MODE — how much the agent asks before acting. Both
-// Claude Code and Codex expose it as a rotating toggle bound to Shift+Tab, and
-// neither reports it over any API: herdr's `agent list` and `pane get` carry no
-// mode field (verified against herdr 0.7.5), so the ONLY source of truth is the
-// mode indicator the agent paints in its own composer footer.
+// An agent's PERMISSION MODE — how much the agent asks before acting. Claude
+// Code, Codex and agy all expose it as a rotating toggle bound to Shift+Tab, and
+// none reports it over any API: herdr's `agent list` and `pane get` carry no
+// mode field (verified against herdr 0.7.5 and 0.8.2), so the ONLY source of
+// truth is the mode indicator the agent paints in its own composer footer.
 //
 // That makes every function here a pure parser over captured pane text, and it
 // makes the read a SAFETY CONTROL rather than a display convenience: setting the
@@ -23,7 +23,8 @@ import (
 //     suggest renders nothing), so a capture with no line is a capture that does
 //     not show the footer, not an agent in manual mode.
 //   - A keystroke is only ever pressed over a pane that positively shows its
-//     ordinary composer (ClaudeComposerReady / CodexComposerReady). Shift+Tab is
+//     ordinary composer (ClaudeComposerReady / CodexComposerReady /
+//     AgyComposerReady). Shift+Tab is
 //     REBOUND inside Claude's modals — a standing plan approval renders
 //     "shift+tab to approve with this feedback" — so pressing it at a form
 //     approves the form. Requiring positive composer evidence, rather than
@@ -49,13 +50,18 @@ const (
 	// of "auto mode on".
 	AgentModeBypass AgentMode = "bypassPermissions"
 
-	// Codex's two Shift+Tab modes. Codex names its unrestricted mode "Default"
-	// rather than "manual", and its footer shows NO segment for it.
+	// AgentModeDefault is the mode whose footer shows NO segment, for both
+	// agents that have one. The name is shared, the meaning is not: Codex's
+	// "Default" is its unrestricted mode (it has no "manual"), while agy's
+	// "default" is its MOST restrictive — it asks before edits and commands.
+	// Codex cycles default/plan; agy default/acceptEdits/plan, and agy's own
+	// spelling "accept-edits" parses to AgentModeAcceptEdits (ParseAgentMode).
 	AgentModeDefault AgentMode = "default"
 )
 
 // ShiftTab is the raw terminal encoding of the Shift+Tab chord (CSI Z), which
-// is what actually rotates the mode in both agents.
+// is what actually rotates the mode in every agent here (agy too, verified live
+// against agy 1.2.1 under herdr 0.8.2).
 //
 // It is a literal escape sequence rather than a herdr key NAME on purpose.
 // Verified live (2026-08-09, herdr 0.7.5): `herdr pane send-keys <pane>
@@ -72,13 +78,24 @@ const (
 const ShiftTab = "\x1b[Z"
 
 // Press ceilings for the rotate-until-target loop, one full extra cycle beyond
-// what each agent needs (Claude has 4 modes, Codex 2). The loop exits as soon as
-// the pane reports the target, so these only bound a pane that is not rotating —
-// an agent build whose cycle differs, or a chord that is not landing.
+// what each agent needs (Claude has 4 modes, Codex 2, agy 3). The loop exits as
+// soon as the pane reports the target, so these only bound a pane that is not
+// rotating — an agent build whose cycle differs, or a chord that is not landing.
 const (
 	ClaudeModePresses = 8
 	CodexModePresses  = 4
+	AgyModePresses    = 6
 )
+
+// modeAgentKind folds an agent type for the per-type switches below: agy
+// reaches herdr under more than one label (CanonicalAgentType), the others
+// only by name.
+func modeAgentKind(agentType string) string {
+	if IsAgy(agentType) {
+		return AgentTypeAgy
+	}
+	return strings.ToLower(strings.TrimSpace(agentType))
+}
 
 // AgentModesFor returns the modes settable for an agent type, in cycle order,
 // or nil when the type has no Shift+Tab mode toggle. Callers use it both to
@@ -92,11 +109,13 @@ const (
 // still be unreachable, which is why the caller detects a closed rotation rather
 // than trusting the list (see frontend.SetAgentMode).
 func AgentModesFor(agentType string) []AgentMode {
-	switch strings.ToLower(strings.TrimSpace(agentType)) {
+	switch modeAgentKind(agentType) {
 	case "claude":
 		return []AgentMode{AgentModeAcceptEdits, AgentModePlan, AgentModeAuto, AgentModeManual}
 	case "codex":
 		return []AgentMode{AgentModeDefault, AgentModePlan}
+	case AgentTypeAgy:
+		return []AgentMode{AgentModeDefault, AgentModeAcceptEdits, AgentModePlan}
 	default:
 		return nil
 	}
@@ -105,11 +124,13 @@ func AgentModesFor(agentType string) []AgentMode {
 // ModePressCap returns how many Shift+Tab presses may be spent rotating an
 // agent of this type to a target, or 0 when the type has no mode toggle.
 func ModePressCap(agentType string) int {
-	switch strings.ToLower(strings.TrimSpace(agentType)) {
+	switch modeAgentKind(agentType) {
 	case "claude":
 		return ClaudeModePresses
 	case "codex":
 		return CodexModePresses
+	case AgentTypeAgy:
+		return AgyModePresses
 	default:
 		return 0
 	}
@@ -310,14 +331,53 @@ func codexFooterLine(pane string) (string, bool) {
 	return "", false
 }
 
+// AgyAgentMode reports the permission mode agy is painting in the given pane
+// capture. ok=false means the capture does not show agy's composer status bar
+// with its model segment, which is UNKNOWN rather than any mode.
+//
+// agy prefixes the right-aligned half of its status bar with "accept-edits · "
+// or "plan · " and shows NO prefix in default mode (verified live, agy 1.2.1).
+// So, as with Codex, "default" is concluded only from a bar positively
+// recognized, and the bar only counts directly under the composer's bottom rule:
+// under a form, a picker or the slash popup the line above it is a key hint,
+// and those screens report unknown. The read is deliberately NOT gated on an
+// empty composer (AgyComposerReady) — it sends nothing, and a working agy or
+// one holding a draft still paints its mode. A bar with no model segment (agy
+// could not load a model) carries no mode either, so it is unknown too.
+//
+// One mode is invisible: --dangerously-skip-permissions paints no indicator of
+// its own and leaves the cycle's segments as they are, so such an agent reads
+// as whatever its cycle shows — "default" at launch. Callers MUST gate this on
+// the agent type being agy.
+func AgyAgentMode(pane string) (AgentMode, bool) {
+	lines := trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n"))
+	n := len(lines)
+	if n < 2 || !agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) {
+		return AgentModeUnknown, false
+	}
+	segment, ok := agyStatusBar(lines[n-1])
+	if !ok || segment == "" {
+		return AgentModeUnknown, false
+	}
+	switch {
+	case strings.HasPrefix(segment, "accept-edits · "):
+		return AgentModeAcceptEdits, true
+	case strings.HasPrefix(segment, "plan · "):
+		return AgentModePlan, true
+	}
+	return AgentModeDefault, true
+}
+
 // AgentModeFromPane dispatches to the right parser for an agent type. Types
 // with no mode toggle report unknown.
 func AgentModeFromPane(agentType, pane string) (AgentMode, bool) {
-	switch strings.ToLower(strings.TrimSpace(agentType)) {
+	switch modeAgentKind(agentType) {
 	case "claude":
 		return ClaudeAgentMode(pane)
 	case "codex":
 		return CodexAgentMode(pane)
+	case AgentTypeAgy:
+		return AgyAgentMode(pane)
 	default:
 		return AgentModeUnknown, false
 	}
@@ -407,12 +467,18 @@ func CodexComposerReady(pane string) bool {
 // pane. It fails CLOSED for every agent type with no known composer shape:
 // pressing an unrecognized chord into an unrecognized screen is the one
 // outcome this whole file exists to prevent.
+//
+// agy's gate is the stricter EMPTY-composer proof its deliveries use: herdr
+// reports every agy modal as idle, and a press over the survey or a draft is
+// not worth the difference.
 func ComposerReadyForMode(agentType, pane string) bool {
-	switch strings.ToLower(strings.TrimSpace(agentType)) {
+	switch modeAgentKind(agentType) {
 	case "claude":
 		return ClaudeComposerReady(pane)
 	case "codex":
 		return CodexComposerReady(pane)
+	case AgentTypeAgy:
+		return AgyComposerReady(pane)
 	default:
 		return false
 	}

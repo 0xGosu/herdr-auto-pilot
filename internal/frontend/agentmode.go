@@ -275,7 +275,7 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 	want, ok := domain.ParseAgentMode(agent.AgentType, modeName)
 	if !ok {
 		if modes := domain.AgentModesFor(agent.AgentType); modes != nil {
-			return ModeChange{}, fmt.Errorf("%q is not a mode for a %s agent (want one of %s)",
+			return ModeChange{}, fmt.Errorf("%q is not a mode %s offers (want one of %s)",
 				modeName, agent.AgentType, joinModes(modes))
 		}
 		return ModeChange{}, fmt.Errorf("%w: %q", ErrModeUnsupported, agent.AgentType)

@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -19,7 +20,9 @@ const SessionIDPlaceholder = "{session_id}"
 // flag name, because a wrong one is a hard argv error that fails every consult.
 //
 // codex is deliberately NOT here. It has no such flag — it MINTS a session id
-// and prints it, so hap reads it back with ExtractSessionID instead.
+// and prints it, so hap reads it back with ExtractSessionID instead. Neither is
+// agy: its --conversation takes the id of an EXISTING conversation to resume
+// and cannot name a new one, so it mints its own too.
 var sessionIDFlag = map[string]string{
 	"claude": "--session-id",
 }
@@ -69,14 +72,53 @@ func InjectSessionID(argv []string, sessionID string) []string {
 var codexSessionLine = regexp.MustCompile(
 	`(?im)^\s*session[ _-]?id\s*:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b`)
 
+// agyEnvelope is the one field hap reads from agy's print-mode JSON envelope:
+//
+//	{"conversation_id":"bf5cacf9-…","status":"SUCCESS","response":"PONG\n",…}
+//
+// agy prints it only under --output-format json (one envelope) or stream-json
+// (one per line); plain text output carries no id at all (verified live, agy
+// 1.2.1, 2026-09-11).
+type agyEnvelope struct {
+	ConversationID string `json:"conversation_id"`
+}
+
+// agyConversationID matches the UUID shape of an agy conversation id, which
+// also names its store file.
+var agyConversationID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// agySessionID returns the conversation id from the first output line that
+// DECODES as agy's JSON envelope. Decoding the whole line, rather than
+// searching for the key, is what keeps an id merely QUOTED in the response out:
+// inside the envelope the response is an escaped JSON string, so its text can
+// never be a top-level key.
+func agySessionID(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var env agyEnvelope
+		if json.Unmarshal([]byte(line), &env) != nil {
+			continue
+		}
+		if id := strings.ToLower(env.ConversationID); agyConversationID.MatchString(id) {
+			return id
+		}
+	}
+	return ""
+}
+
 // ExtractSessionID reads the session id a CLI reported in its own output, for
 // the CLIs that mint one rather than accept one.
 //
 // WHERE THE TRANSCRIPT LANDS DIFFERS PER CLI, and anything that later goes
-// looking for one must not assume claude's layout (verified live 2026-08-03):
+// looking for one must not assume claude's layout (verified live 2026-08-03,
+// agy 2026-09-11):
 //
 //	claude  <CLAUDE_CONFIG_DIR>/projects/<slugified-cwd>/<session-id>.jsonl
 //	codex   <CODEX_HOME>/sessions/<YYYY>/<MM>/<DD>/rollout-<ISO-ts>-<session-id>.jsonl
+//	agy     ~/.gemini/antigravity-cli/conversations/<session-id>.db
 //
 // So codex needs a suffix glob, not an exact filename. Its store is also the
 // larger of the two in practice (120 MB vs 24 MB on one live machine).
@@ -90,7 +132,11 @@ var codexSessionLine = regexp.MustCompile(
 // printing). An empty result means "unknown", never an error: the session id is
 // bookkeeping, and failing a consult over it would be absurd.
 func ExtractSessionID(argv0, output string) string {
-	if filepath.Base(argv0) != "codex" {
+	switch filepath.Base(argv0) {
+	case "codex":
+	case "agy":
+		return agySessionID(output)
+	default:
 		return ""
 	}
 	m := codexSessionLine.FindStringSubmatch(output)

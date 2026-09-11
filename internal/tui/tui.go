@@ -2119,7 +2119,7 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 	items = append(items, ruleItem{
 		kind:  "shortcut",
 		key:   "install-skill",
-		label: "Install hap agent skill for coding agents (Claude / Codex / others)",
+		label: "Install hap agent skill for coding agents (Claude / Codex / agy / others)",
 	})
 	return items
 }

@@ -39,8 +39,11 @@ func TestConfigSkillShortcutInstallsCheckedTargets(t *testing.T) {
 	if m.prompt == nil || !m.prompt.multi {
 		t.Fatalf("enter on the shortcut should open the multi-select, got %+v", m.prompt)
 	}
-	if len(m.prompt.options) != 3 {
-		t.Fatalf("expected the three install targets, got %v", m.prompt.options)
+	if len(m.prompt.options) != 4 {
+		t.Fatalf("expected the four install targets, got %v", m.prompt.options)
+	}
+	if !strings.Contains(strings.Join(m.prompt.options, "\n"), "~/.gemini/antigravity-cli/skills/hap") {
+		t.Fatalf("agy's global skills directory is not offered: %v", m.prompt.options)
 	}
 	if view := m.View(); !strings.Contains(view, "space: toggle") {
 		t.Fatalf("help line should advertise the toggle key:\n%s", view)

@@ -21,13 +21,14 @@ func TestHapSkillIsEmbedded(t *testing.T) {
 
 func TestInstallToWritesEverySelectedTarget(t *testing.T) {
 	home := t.TempDir()
-	written, err := InstallTo(home, []string{"claude", "codex", "agents"})
+	written, err := InstallTo(home, []string{"claude", "codex", "agy", "agents"})
 	if err != nil {
 		t.Fatalf("InstallTo: %v", err)
 	}
 	want := []string{
 		filepath.Join(home, ".claude", "skills", "hap", "SKILL.md"),
 		filepath.Join(home, ".codex", "skills", "hap", "SKILL.md"),
+		filepath.Join(home, ".gemini", "antigravity-cli", "skills", "hap", "SKILL.md"),
 		filepath.Join(home, ".agents", "skills", "hap", "SKILL.md"),
 	}
 	if len(written) != len(want) {
@@ -77,7 +78,7 @@ func TestInstallToRefusesAnUnknownTargetBeforeWriting(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), `unknown install target "cursor"`) {
 		t.Fatalf("expected an unknown-target error naming the valid set, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "claude, codex, agents") {
+	if !strings.Contains(err.Error(), "claude, codex, agy, agents") {
 		t.Errorf("error should list the valid targets, got %v", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(home, ".claude")); !os.IsNotExist(statErr) {

@@ -134,6 +134,48 @@ func TestExtractSessionIDOnlyForCodex(t *testing.T) {
 	}
 }
 
+// agyJSONOutput is agy's print-mode envelope, verbatim from a live
+// `agy -p … --output-format json` run (agy 1.2.1, 2026-09-11).
+const agyJSONOutput = `{"conversation_id":"bf5cacf9-ff49-41f5-86c1-334922f5a62d","status":"SUCCESS","response":"PONG\n","duration_seconds":2.629765096,"num_turns":1,"usage":{"input_tokens":6316,"output_tokens":21,"thinking_tokens":19,"cache_read_tokens":8133,"total_tokens":6337}}
+`
+
+// TestExtractSessionIDReadsAgyEnvelope: agy mints a conversation id and
+// reports it in its JSON envelope, and only there.
+func TestExtractSessionIDReadsAgyEnvelope(t *testing.T) {
+	const want = "bf5cacf9-ff49-41f5-86c1-334922f5a62d"
+	if got := ExtractSessionID("/root/.local/bin/agy", agyJSONOutput); got != want {
+		t.Errorf("json envelope: got %q, want %q", got, want)
+	}
+	// stream-json: one envelope per line, after unrelated output.
+	stream := "warming up\n" + `{"type":"init","conversation_id":"` + want + `"}` + "\n"
+	if got := ExtractSessionID("agy", stream); got != want {
+		t.Errorf("stream-json: got %q, want %q", got, want)
+	}
+	// The same output under another CLI's name is not scanned.
+	if got := ExtractSessionID("codex", agyJSONOutput); got != "" {
+		t.Errorf("codex must not read agy's envelope, got %q", got)
+	}
+}
+
+// TestExtractSessionIDIgnoresAnAgyIDThatIsNotTheEnvelopes: an id QUOTED in the
+// response is escaped inside the envelope, and plain-text output has no
+// envelope at all, so neither may be read as the conversation's id.
+func TestExtractSessionIDIgnoresAnAgyIDThatIsNotTheEnvelopes(t *testing.T) {
+	for name, out := range map[string]string{
+		"text mode prose":        `the conversation_id is "bf5cacf9-ff49-41f5-86c1-334922f5a62d"`,
+		"quoted in the response": `{"status":"SUCCESS","response":"{\"conversation_id\":\"bf5cacf9-ff49-41f5-86c1-334922f5a62d\"}"}`,
+		"not a uuid":             `{"conversation_id":"not-a-uuid"}`,
+		"broken json":            `{"conversation_id":"bf5cacf9-ff49-41f5-86c1-334922f5a62d"`,
+		"empty":                  "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := ExtractSessionID("agy", out); got != "" {
+				t.Errorf("must not extract from %q, got %q", out, got)
+			}
+		})
+	}
+}
+
 // TestExtractSessionIDIgnoresQuotedIDs is the reason the pattern is anchored to
 // the line start: the model's own prose routinely quotes ids back.
 func TestExtractSessionIDIgnoresQuotedIDs(t *testing.T) {

@@ -134,6 +134,117 @@ func renderCodex(m domain.AgentMode) string {
 	return "› Summarize recent commits\n\n" + footer + "\n"
 }
 
+// agyRule is the full-width rule agy draws around its composer.
+var agyRule = strings.Repeat("─", 60)
+
+// renderAgy paints agy's composer and status bar the way agy 1.2.1 does: the
+// mode placeholder on the empty caret line, and the mode prefix on the bar's
+// right-aligned segment — none for default.
+func renderAgy(m domain.AgentMode) string {
+	caret, prefix := ">", ""
+	switch m {
+	case domain.AgentModeAcceptEdits:
+		caret, prefix = "> Accept-edits mode: file edits auto-approved (shift+tab to cycle)", "accept-edits · "
+	case domain.AgentModePlan:
+		caret, prefix = "> Plan mode: research & plan only (shift+tab to cycle)", "plan · "
+	}
+	return "● PONG\n\n" + agyRule + "\n" + caret + "\n" + agyRule + "\n" +
+		"? for shortcuts" + strings.Repeat(" ", 40) + prefix + "Gemini 3.6 Flash · low\n"
+}
+
+func agyApp(t *testing.T, start domain.AgentMode) (*frontend.App, *modeHerdr) {
+	t.Helper()
+	app, st := testApp(t)
+	fake := &modeHerdr{
+		agents: []domain.AgentTransition{{AgentID: "w1:p4", PaneID: "w1:p4", AgentType: "agy", Status: "idle"}},
+		cycle:  []domain.AgentMode{domain.AgentModeDefault, domain.AgentModeAcceptEdits, domain.AgentModePlan},
+		render: renderAgy,
+	}
+	for i, m := range fake.cycle {
+		if m == start {
+			fake.at = i
+		}
+	}
+	app.Herdr = fake
+	seedRoster(t, st, fake.agents...)
+	return app, fake
+}
+
+// TestSetAgentModeRotatesAgy: agy's three-mode cycle, reached by agy's own
+// spelling of the middle mode, and the press count proving the loop stopped on
+// the pane's report.
+func TestSetAgentModeRotatesAgy(t *testing.T) {
+	tests := []struct {
+		from    domain.AgentMode
+		target  string
+		want    domain.AgentMode
+		presses int
+	}{
+		{domain.AgentModeDefault, "accept-edits", domain.AgentModeAcceptEdits, 1},
+		{domain.AgentModeDefault, "plan", domain.AgentModePlan, 2},
+		{domain.AgentModePlan, "default", domain.AgentModeDefault, 1},
+		{domain.AgentModeAcceptEdits, "default", domain.AgentModeDefault, 2},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.from)+"->"+tt.target, func(t *testing.T) {
+			app, fake := agyApp(t, tt.from)
+			change, err := app.SetAgentMode(context.Background(), "w1:p4", tt.target, fastModes)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if change.From != tt.from || change.Mode != tt.want || change.Presses != tt.presses {
+				t.Errorf("change = %s -> %s in %d presses; want %s -> %s in %d",
+					change.From, change.Mode, change.Presses, tt.from, tt.want, tt.presses)
+			}
+			if chords, _ := fake.counts(); chords != tt.presses {
+				t.Errorf("sent %d chords; want %d", chords, tt.presses)
+			}
+		})
+	}
+}
+
+// TestSetAgentModeRefusesAgyAtAFormOrADraft: herdr reports agy idle under
+// every modal, so the press gate is agy's empty-composer proof. An approval
+// covers the bar (unreadable, nothing sent); a draft still shows the mode,
+// but pressing into it is refused.
+func TestSetAgentModeRefusesAgyAtAFormOrADraft(t *testing.T) {
+	approval := "Run this command?\n> 1. Yes, run command\n  2. No, cancel\n\n" +
+		"  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\n" +
+		"esc to cancel" + strings.Repeat(" ", 40) + "Gemini 3.6 Flash · low\n"
+	draft := agyRule + "\n> half a thought\n" + agyRule + "\n" +
+		strings.Repeat(" ", 60) + "Gemini 3.6 Flash · low\n"
+	for name, tc := range map[string]struct {
+		pane string
+		err  error
+	}{
+		"approval": {approval, frontend.ErrModeUnreadable},
+		"draft":    {draft, frontend.ErrModeUnsafe},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, fake := agyApp(t, domain.AgentModeDefault)
+			fake.render = func(domain.AgentMode) string { return tc.pane }
+			_, err := app.SetAgentMode(context.Background(), "w1:p4", "plan", fastModes)
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("err = %v; want %v", err, tc.err)
+			}
+			if chords, _ := fake.counts(); chords != 0 {
+				t.Errorf("sent %d chords into a %s", chords, name)
+			}
+		})
+	}
+}
+
+// TestFillAgentModesReadsAgy: the `hap agents` MODE column and the TUI detail
+// both come from FillAgentModes, which skips every type with no toggle.
+func TestFillAgentModesReadsAgy(t *testing.T) {
+	app, fake := agyApp(t, domain.AgentModePlan)
+	st := frontend.Status{MonitoredAgents: fake.agents}
+	app.FillAgentModes(context.Background(), &st)
+	if got := st.AgentMode("w1:p4"); got != domain.AgentModePlan {
+		t.Errorf("AgentMode(w1:p4) = %q; want plan", got)
+	}
+}
+
 // fastModes keeps the settle wait short so tests do not sleep for real. The
 // values still exercise the poll loop (several polls per press).
 var fastModes = frontend.ModeOptions{SettleTimeout: 300 * time.Millisecond, PollInterval: time.Millisecond}

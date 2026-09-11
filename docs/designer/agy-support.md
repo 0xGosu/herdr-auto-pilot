@@ -736,4 +736,46 @@ What shipped, and where it deliberately departs from §4:
   - A never-auto seed for the trust prompt (§4.9). The seed list is scoped to major-risk remote
     operations, and Claude's own trust prompt is not seeded. The trust prompt is answered when a
     rule or the operator says so, like any approval.
-  - agy permission modes (phase 4).
+  - agy permission modes (phase 4, §11).
+
+## 11. Phase 4 as built (modes, session ids, the rest of the surface)
+
+- **Modes.** `domain.AgentModesFor("agy")` is `default, acceptEdits, plan` in cycle order. The
+  shared constants are reused, so `hap mode` prints `acceptEdits`, and `ParseAgentMode` folds
+  agy's own `accept-edits`. `AgyModePresses` is 6, one extra cycle as for the other agents.
+  Every per-type switch folds agy's aliases (`modeAgentKind`).
+  - **The read is `domain.AgyAgentMode`.** It uses the `accept-edits · ` / `plan · ` prefix on
+    the status bar's model segment, with no prefix meaning `default`. The bar counts only when
+    it is the last line and directly under the composer's bottom rule. agy paints the same bar,
+    prefix included, under every form, picker and popup, so those screens report unknown.
+  - A bar with no model segment (`error_agy_offline`) is unknown, never default.
+  - The read is not gated on an empty composer. A working agy (`working_agy_spinner` reads
+    `plan`) and one holding a draft still report their mode.
+  - **The press gate is `AgyComposerReady`** (`ComposerReadyForMode`), the same empty-composer
+    proof phase 3's deliveries use. A draft, a form or the survey refuses the set.
+  - `SetAgentMode`'s rotation detection and `restoreMode` apply unchanged.
+  - The whole corpus carries an explicit expectation (`TestAgyAgentModeOverEveryRecordedScreen`).
+- **`--dangerously-skip-permissions`**, checked live on agy 1.2.1: it paints no indicator of its
+  own. The cycle's prefixes still render under it (three presses went accept-edits, plan,
+  default), so reads and sets behave normally, and such an agent simply reads `default` at
+  launch. `hap help mode`, the README and the skill say so, and say that agy's `default` is its
+  most restrictive mode, while codex's is its least.
+- **Session id.** herdr still reports no `agent_session` for agy, and a live pane shows none, so
+  there is nothing per agent. agy prints `agy --conversation=<uuid>` only as it exits, when there
+  is no agent left to attach it to. For the LLM path, `agy -p … --output-format json` prints
+  `{"conversation_id":"<uuid>",…}`, verified live. `llm.ExtractSessionID("agy", …)` takes the id
+  from the first output line that decodes as that envelope, so an id quoted inside the escaped
+  `response` is never read. Plain text output carries none. Nothing is injected, because
+  `--conversation` resumes an existing id and cannot name a new one. The README does not
+  recommend JSON output for agy templates, because taskgen, rerank and learn-from-user read
+  stdout.
+- **Skill install.** `hap skill install agy` writes `~/.gemini/antigravity-cli/skills/hap/`. That
+  is the global directory agy's own `/skills` lists and loads, verified live with a probe
+  skill.
+  - `~/.gemini/config/skills`, named in agy's bundled migration guide, is not loaded.
+  - `~/.agents/skills` is read only per workspace.
+- **Display.** `hap agents`' MODE column and the TUI's agent detail both come from
+  `FillAgentModes`, which skips types with no toggle, so they show agy's mode with no
+  agy-specific code. The TUI's skill shortcut label names agy.
+- **fakeherdr.** It already carries any agent label verbatim (`AddAgentPane(pane, ws, "agy")`),
+  so only its comment changed.
