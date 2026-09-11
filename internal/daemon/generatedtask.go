@@ -130,6 +130,16 @@ func (d *Daemon) refuseIfAgentBusy(ctx context.Context, agentID string) error {
 				"or confirm without --send to queue the tasks to the agent's list",
 				domain.SuggestionStaleMarker, ag.Status)
 		}
+		// herdr reports agy's modals idle, so for agy "idle" is only proven by an
+		// empty composer on screen. Fails CLOSED, unlike the listing above: a
+		// pane that cannot be read is not evidence of a ready composer.
+		if domain.IsAgy(ag.AgentType) {
+			if err := d.agyComposerRefusal(ctx, agentID); err != nil {
+				return fmt.Errorf("agent is not waiting at an empty composer; %s (%v) — dismiss it, "+
+					"or confirm without --send to queue the tasks to the agent's list",
+					domain.SuggestionStaleMarker, err)
+			}
+		}
 		return nil
 	}
 	return nil
@@ -188,6 +198,14 @@ func (h *actionTaskSendHost) Cwd(ctx context.Context, paneID string) string {
 // not have reached the agent", which is false. A failure to mark happens before
 // anything is sent, so refusing here strands nothing.
 func (h *actionTaskSendHost) Send(ctx context.Context, paneID, agentType, prompt string) error {
+	// The last look before an agy hand-out, ahead of the side_effect mark
+	// because a refusal sends nothing: the earlier idle checks read herdr's
+	// status, which is idle under every agy modal.
+	if domain.IsAgy(agentType) {
+		if err := h.d.agyComposerRefusal(ctx, paneID); err != nil {
+			return fmt.Errorf("%v; nothing was sent", err)
+		}
+	}
 	if h.actionID != 0 {
 		if err := h.d.opt.Store.MarkAgentActionSideEffect(ctx, h.actionID, h.d.opt.Clock.Now()); err != nil {
 			return fmt.Errorf("recording the delivery attempt: %w", err)

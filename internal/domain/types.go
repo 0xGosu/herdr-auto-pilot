@@ -218,9 +218,11 @@ const (
 	// results always return to the operator as fresh escalations regardless of
 	// confidence; they never auto-act.
 	ReasonLLMRetry EscalateReason = "llm_retry"
-	// ReasonReplyWithheld: a reply was decided, but hap does not yet speak the
-	// agent's keystroke protocol for this screen, so nothing is sent (see
-	// AgyReplyWithheld). The operator answers in the pane.
+	// ReasonReplyWithheld: a reply was decided, but hap may not type it into
+	// this form — an agy question answered with its free-text Write-in row
+	// (ErrAgyNotAnswerable), or an agy form reached by a path that can only
+	// submit text. Rows from hap 0.9.18, which withheld every agy form reply,
+	// carry it too. The operator answers in the pane.
 	ReasonReplyWithheld EscalateReason = "reply_withheld"
 )
 

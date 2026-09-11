@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -253,7 +255,7 @@ func TestStripAgyChrome(t *testing.T) {
 	}
 }
 
-func TestAgyReplyWithheld(t *testing.T) {
+func TestAgyFormSituation(t *testing.T) {
 	for _, tc := range []struct {
 		st    SituationType
 		agent string
@@ -266,8 +268,104 @@ func TestAgyReplyWithheld(t *testing.T) {
 		{SituationApproval, "claude", false},
 		{SituationChoice, "codex", false},
 	} {
-		if got := AgyReplyWithheld(tc.st, tc.agent); got != tc.want {
-			t.Errorf("AgyReplyWithheld(%s, %s) = %v, want %v", tc.st, tc.agent, got, tc.want)
+		if got := AgyFormSituation(tc.st, tc.agent); got != tc.want {
+			t.Errorf("AgyFormSituation(%s, %s) = %v, want %v", tc.st, tc.agent, got, tc.want)
 		}
+	}
+}
+
+// The composer proof every agy hand-out path asks: ready means an EMPTY
+// composer at rest, and every other shape — however idle herdr calls it — is
+// not. (The recorded screens are run through it in internal/deliver.)
+func TestAgyComposerReady(t *testing.T) {
+	const rule = "────────────────────────────────────────"
+	const bar = "? for shortcuts                                         Gemini 3.6 Flash · low"
+	for name, tc := range map[string]struct {
+		pane string
+		want bool
+	}{
+		"empty composer":        {agyComposer, true},
+		"trailing blank lines":  {agyComposer + "\n\n", true},
+		"plan mode placeholder": {rule + "\n> Plan mode: research & plan only (shift+tab to cycle)\n" + rule + "\n" + bar, true},
+		"accept-edits placeholder": {rule + "\n> Accept-edits mode: file edits auto-approved (shift+tab to cycle)\n" + rule + "\n" + bar,
+			true},
+		// A draft drops the "? for shortcuts" token; the draft text alone is
+		// also refused, in case a build keeps the token.
+		"draft":             {rule + "\n> hello draft\n" + rule + "\n                                   Gemini 3.6 Flash · low", false},
+		"draft, token kept": {rule + "\n> hello draft\n" + rule + "\n" + bar, false},
+		"working turn":      {rule + "\n>\n" + rule + "\nesc to cancel                              Gemini 3.6 Flash · low", false},
+		// The feedback survey stands ABOVE a ready composer, and a digit typed
+		// while it does answers the survey.
+		"survey": {"How's the CLI experience so far? Help us improve:\n[1] Good  [2] Fine  [3] Bad  [0] Skip\n\n" +
+			agyComposer, false},
+		// A panel drawn below the composer pushes the status bar away from it.
+		"panel below the composer": {rule + "\n>\n" + rule + "\nAction required (1 left)\n› □ new plan.md\n\n" + bar, false},
+		"no composer":              {"  Some agent output\n\n" + bar, false},
+		"nothing":                  {"", false},
+	} {
+		if got := AgyComposerReady(tc.pane); got != tc.want {
+			t.Errorf("%s: AgyComposerReady = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestAgyAnswerKey(t *testing.T) {
+	approval := AgyForm{Kind: AgyFormApproval, Options: []NumberedOption{
+		{"1", "Yes, run command"}, {"2", "Yes, and always allow in this conversation"}, {"4", "No, cancel"}}}
+	question := AgyForm{Kind: AgyFormQuestion, WriteIn: "4", Options: []NumberedOption{
+		{"1", "Apple"}, {"2", "Banana"}, {"3", "Cherry"}}}
+	review := AgyForm{Kind: AgyFormReview}
+	for _, tc := range []struct {
+		form          AgyForm
+		reply, key    string
+		notAnswerable bool
+	}{
+		{form: approval, reply: "Yes, run command", key: "1"},
+		{form: approval, reply: "no, CANCEL", key: "4"},
+		{form: approval, reply: "4", key: "4"},
+		{form: approval, reply: "Yes, allow everything"}, // offered by no option
+		{form: approval, reply: "Yes"},                   // a prefix of two options
+		{form: question, reply: "Banana", key: "2"},
+		{form: question, reply: "Write-in...", notAnswerable: true},
+		{form: question, reply: "4", notAnswerable: true},
+		{form: review, reply: "Approve", key: "y"},
+		{form: review, reply: "n", key: "n"},
+		{form: review, reply: "shift+a"}, // approve ALL is never a reply
+	} {
+		key, err := AgyAnswerKey(tc.form, tc.reply)
+		switch {
+		case tc.notAnswerable:
+			if !errors.Is(err, ErrAgyNotAnswerable) {
+				t.Errorf("%s %q: err = %v, want ErrAgyNotAnswerable", tc.form.Kind, tc.reply, err)
+			}
+		case tc.key == "":
+			if err == nil {
+				t.Errorf("%s %q: key %q, want a refusal", tc.form.Kind, tc.reply, key)
+			}
+		case err != nil || key != tc.key:
+			t.Errorf("%s %q: key %q err %v, want %q", tc.form.Kind, tc.reply, key, err, tc.key)
+		}
+	}
+}
+
+// Moving the trust prompt's caret does not make it a different prompt — the
+// check a caret press relies on — while the next question of a form, even
+// with identical labels, is a different form.
+func TestAgyFormSameAs(t *testing.T) {
+	trust := "Do you trust the contents of this project?\n\n> Yes, I trust this folder\n  No, exit\n\n" +
+		"  ↑/↓ Navigate · enter Confirm\n"
+	moved := strings.Replace(trust, "> Yes, I trust this folder\n  No, exit", "  Yes, I trust this folder\n> No, exit", 1)
+	a, okA := ParseAgyForm(trust)
+	b, okB := ParseAgyForm(moved)
+	if !okA || !okB || a.Caret != 0 || b.Caret != 1 || !a.SameAs(b) {
+		t.Errorf("trust caret move: %+v %v / %+v %v, want the same prompt with the caret on rows 1 and 2", a, okA, b, okB)
+	}
+	q := func(i int) string {
+		return fmt.Sprintf("Question %d/2: Pick one\n\n> 1. Yes\n  2. No\n\n  ↑/↓ Navigate · enter Select · esc Skip\n", i)
+	}
+	q1, _ := ParseAgyForm(q(1))
+	q2, _ := ParseAgyForm(q(2))
+	if q1.Kind != AgyFormQuestion || q1.SameAs(q2) {
+		t.Errorf("question 1 and question 2 must be different forms: %+v / %+v", q1, q2)
 	}
 }

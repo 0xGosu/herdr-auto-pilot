@@ -606,77 +606,16 @@ func (d *Daemon) deliverSeriesLLM(ctx context.Context, ks ports.KeystrokeSender,
 }
 
 // deliverRemoteEnv answers Claude's standing "Select remote environment"
-// picker autonomously: audit-first (FR-024), then — off the main loop, the
-// verify-commit keystrokes take seconds — the adaptive mcqdeliver protocol.
-// The deliverer re-reads the live pane itself and fails closed when the
-// picker is gone or the learned label matches none of the offered
-// environments (its approval signature is global, so a rule learned on
-// another project's environment list can resolve here). Failures flip the
-// audit to escalated; a delivery is never retried blind. Note the
-// post-delivery unblock check may be a no-op for this shape — Herdr reports
-// the standing picker as idle — which is acceptable because the deliverer
-// already verified the picker left the screen.
+// picker autonomously through the shared keyed-form body (deliverKeyedForm):
+// audit-first, then the adaptive mcqdeliver protocol off the main loop. The
+// deliverer re-reads the live pane itself and fails closed when the picker is
+// gone or the learned label matches none of the offered environments (its
+// approval signature is global, so a rule learned on another project's
+// environment list can resolve here).
 func (d *Daemon) deliverRemoteEnv(ctx context.Context, ks ports.KeystrokeSender,
 	s domain.Situation, sig domain.SignatureResult, dec domain.Decision,
 	tr domain.AgentTransition, now time.Time) {
-
-	if !d.acquirePane(s.AgentID) {
-		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonPaneBusy, Rationale: "pane busy",
-			Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
-		}, tr, now)
-		return
-	}
-
-	d.spawn(func() {
-		defer d.releasePane(s.AgentID)
-		logging.Guard("remote-env-delivery", func() error {
-			d.withAgentAutomation(ctx, s, sig, tr, dec.Input, dec.Confidence, nil, "", "", now, func() {
-				auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-					AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
-					SituationType: s.Type, Action: domain.AuditActionAutoPrefix + dec.Input, Input: dec.Input,
-					Confidence: dec.Confidence, Rationale: dec.Rationale,
-					Status: "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
-				}.WithSignatureBaseline(sig))
-				if err != nil {
-					slog.Error("audit write failed; blocking autonomous action (FR-024)", "error", err)
-					d.notify(ctx, "Herd Auto Prompter: persistence failure",
-						"An automated action was blocked because its audit record could not be written.")
-					return
-				}
-				if err := d.sendRemoteEnvSelection(ctx, ks, s.PaneID, dec.Input); err != nil {
-					slog.Error("remote-env selection delivery failed", "pane", s.PaneID, "error", err)
-					d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-					d.notify(ctx, "Herd Auto Prompter: action delivery failed",
-						fmt.Sprintf("Agent %s: the remote environment selection could not be delivered (%v); please review the picker.", s.AgentID, err))
-					return
-				}
-				d.mu.Lock()
-				d.lastAutoSend[s.AgentID] = now
-				d.mu.Unlock()
-				if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
-					Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-					ChosenAction: dec.Input, Source: dec.Source, Confidence: dec.Confidence, CreatedAt: now,
-				}); err != nil {
-					slog.Error("decision record write failed", "error", err)
-				}
-				if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
-					updated := domain.RegisterAutoPrompt(*rate, now)
-					updated.AgentID = s.AgentID
-					if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
-						slog.Error("agent rate update failed", "error", err)
-					}
-				}
-				slog.Info("remote environment selection delivered",
-					"agent", s.AgentID, "confidence", dec.Confidence, "audit_id", auditID)
-				d.scheduleUnblockCheck(verifyunblock.Params{
-					PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
-					Signature: sig.Signature, Input: dec.Input, Excerpt: s.Content, SituationType: s.Type,
-				})
-			})
-			return nil
-		})
-	})
+	d.deliverKeyedForm(ctx, d.remoteEnvForm(ks, s.PaneID), s, sig, dec, tr, now)
 }
 
 // deliverRemoteEnvLLM is the promotion-path twin of deliverRemoteEnv (same
@@ -685,64 +624,7 @@ func (d *Daemon) deliverRemoteEnv(ctx context.Context, ks ports.KeystrokeSender,
 func (d *Daemon) deliverRemoteEnvLLM(ctx context.Context, ks ports.KeystrokeSender,
 	s domain.Situation, sig domain.SignatureResult, tr domain.AgentTransition,
 	llmDec *domain.LLMDecision, confidence float64, llmConfidence *int, now time.Time) {
-
-	d.spawn(func() {
-		defer d.releasePane(s.AgentID)
-		logging.Guard("remote-env-delivery-llm", func() error {
-			executed := d.withAgentAutomation(ctx, s, sig, tr, llmDec.Action,
-				confidence, llmConfidence, llmDec.CapturedOutput, llmDec.SessionID, now, func() {
-					auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-						AgentID: s.AgentID, AgentType: s.AgentType, Trigger: "llm-fallback",
-						SituationType: s.Type, Action: domain.AuditActionAutoPrefix + llmDec.Action, Input: llmDec.Action,
-						Confidence: confidence, LLMConfidence: llmConfidence,
-						Rationale: "LLM: " + llmDec.Rationale, LLMOutput: llmDec.CapturedOutput,
-						LLMSessionID: llmDec.SessionID,
-						Status:       "auto", PaneExcerpt: truncateExcerpt(s.Content), CreatedAt: now,
-					}.WithSignatureBaseline(sig))
-					if err != nil {
-						slog.Error("audit write failed; blocking LLM action (FR-024)", "error", err)
-						d.notify(ctx, "Herd Auto Prompter: persistence failure",
-							"An LLM-derived action was blocked because its audit record could not be written.")
-						return
-					}
-					if err := d.sendRemoteEnvSelection(ctx, ks, s.PaneID, llmDec.Action); err != nil {
-						slog.Error("LLM remote-env selection delivery failed", "pane", s.PaneID, "error", err)
-						d.opt.Store.UpdateAuditStatus(ctx, auditID, "escalated")
-						d.notify(ctx, "Herd Auto Prompter: action delivery failed", err.Error())
-						return
-					}
-					if err := d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "accepted"); err != nil {
-						slog.Error("llm decision status update failed", "error", err)
-					}
-					if _, err := d.opt.Store.RecordDecision(ctx, domain.DecisionRecord{
-						Signature: sig.Signature, SituationType: s.Type, AgentType: s.AgentType,
-						ChosenAction: llmDec.Action, Source: domain.SourceLLM, CreatedAt: now,
-					}); err != nil {
-						slog.Error("decision record write failed", "error", err)
-					}
-					d.ensureSignatureRow(ctx, sig.Signature, s.Type, s.AgentType, now)
-					if rate, err := d.opt.Store.GetAgentRate(ctx, s.AgentID); err == nil {
-						updated := domain.RegisterAutoPrompt(*rate, now)
-						updated.AgentID = s.AgentID
-						if err := d.opt.Store.UpdateAgentRate(ctx, updated); err != nil {
-							slog.Error("agent rate update failed", "error", err)
-						}
-					}
-					d.mu.Lock()
-					d.lastAutoSend[s.AgentID] = now
-					d.mu.Unlock()
-					slog.Info("LLM remote environment selection promoted and delivered", "agent", s.AgentID)
-					d.scheduleUnblockCheck(verifyunblock.Params{
-						PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
-						Signature: sig.Signature, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
-					})
-				})
-			if !executed {
-				d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
-			}
-			return nil
-		})
-	})
+	d.deliverKeyedFormLLM(ctx, d.remoteEnvForm(ks, s.PaneID), s, sig, tr, llmDec, confidence, llmConfidence, now)
 }
 
 // sendRemoteEnvSelection answers the standing remote-environment picker via

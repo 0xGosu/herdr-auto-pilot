@@ -186,24 +186,6 @@ func NumberedOptionLabels(opts []NumberedOption) []string {
 	return labels
 }
 
-// AgyReplyWithheld reports that no reply may be SENT to this agy situation:
-// hap recognizes agy's approvals and questions but does not yet speak their
-// keystroke protocol, and every send path would get it wrong.
-//
-// Every path that answers a menu types the option's digit and then presses
-// Enter (herdr.CLI.submitText). At an agy menu the digit alone COMMITS, so that
-// Enter lands on whatever screen comes next — on a two-question form it
-// commits option 1 of question 2 unseen; the trust prompt and the artifact
-// review take no digit at all, so the literal reply plus Enter commits the
-// caret's row. Until the agy deliverer exists, every send path refuses these
-// situations and they wait for the operator, who answers in the pane.
-//
-// Idle hand-outs and error replies are free text typed into the composer,
-// which is what agy expects there, so they are not withheld.
-func AgyReplyWithheld(sitType SituationType, agentType string) bool {
-	return IsAgy(agentType) && (sitType == SituationApproval || sitType == SituationChoice)
-}
-
 // ---------------------------------------------------------------------------
 // Approvals
 
@@ -448,13 +430,14 @@ func ParseAgyReview(pane string) (AgyReviewForm, bool) {
 // ---------------------------------------------------------------------------
 // Multiple-choice questions
 
-// MCQAgyQuestions is agy's multi-question protocol: ONE question on screen at a
-// time ("Question i/N: …"), a digit answers AND advances, and the last digit
-// submits — there is no Submit tab, and a later question's options are not
-// rendered until the earlier ones are answered, so no sweep can collect them.
-const MCQAgyQuestions MCQKind = "agy_questions"
-
-// AgyMCQForm is agy's live question form.
+// AgyMCQForm is agy's live question form. It shows ONE question at a time
+// ("Question i/N: …"): a digit answers AND advances, the last digit submits,
+// there is no Submit tab, and a later question's options are not rendered
+// until the earlier ones are answered — so no sweep can collect them, and each
+// question is classified, decided and answered as a situation of its own. It
+// deliberately carries no MCQKind: one would route the form into the
+// multi-question sweep and the Claude/Codex deliverers, which press arrow keys
+// into the pane.
 type AgyMCQForm struct {
 	Current  int    // 1-based index of the question on screen
 	Total    int    // N in "Question i/N"

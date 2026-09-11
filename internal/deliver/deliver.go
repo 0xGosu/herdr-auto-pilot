@@ -132,21 +132,14 @@ func (c Config) mcq(ks ports.KeystrokeSender, paneID string) mcqdeliver.Config {
 //
 // Callers gate on their own send policy — Deliver assumes the reply is meant
 // for the pane and never treats domain.ActionNoop specially.
-// ErrReplyWithheld marks a reply refused because hap does not yet speak the
-// agent's keystroke protocol for this screen (domain.AgyReplyWithheld). It is a
-// verdict about the form, not a delivery fault: a retry is refused the same
-// way, so callers must not spend a retry budget on it.
-var ErrReplyWithheld = errors.New("hap cannot answer this agent's form yet")
-
 func Deliver(ctx context.Context, c Config, req Request) error {
 	c = c.withDefaults()
-	// Before the read, and so before anything could be typed: hap does not yet
-	// answer agy's forms, and the generic send below (digit, then Enter) would
-	// commit agy's NEXT screen. See domain.AgyReplyWithheld.
-	if domain.AgyReplyWithheld(req.SituationType, req.AgentType) {
-		return fmt.Errorf("%w: agy %s forms are answered in the pane for now — hap would type the digit "+
-			"and then Enter, and agy commits on the digit alone; nothing was delivered",
-			ErrReplyWithheld, req.SituationType)
+	// agy's approvals and questions take KEYS (domain.AgyFormSituation): the
+	// generic send below types the digit and then Enter, and agy commits on the
+	// digit alone, so that Enter would answer agy's NEXT screen. They go to the
+	// verified keystroke deliverer, which reads the pane itself.
+	if domain.AgyFormSituation(req.SituationType, req.AgentType) {
+		return c.deliverAgy(ctx, req)
 	}
 	outbound := req.Outbound
 	// A numbered menu (Claude approvals/choices) only accepts the option's
@@ -160,6 +153,20 @@ func Deliver(ctx context.Context, c Config, req Request) error {
 	// "send the literal" for a plain reply). Pushing the read down per branch
 	// would issue up to three reads and change what each one observes.
 	pane, rerr := c.read()(ctx, req.PaneID, c.ReadLines)
+
+	// Any other reply to agy is free text typed into its composer, and only ever
+	// into a proven EMPTY one: herdr reports agy's modals idle, so nothing but
+	// the screen can tell a ready composer from a standing form, a picker, a
+	// working turn or the operator's draft.
+	if domain.IsAgy(req.AgentType) {
+		if rerr != nil {
+			return fmt.Errorf("the pane could not be read to prove agy's composer is ready: %w", rerr)
+		}
+		if !domain.AgyComposerReady(pane) {
+			return fmt.Errorf("agy's composer is not ready for a message (a form, a draft, a picker " +
+				"or a working turn is on screen); nothing was delivered")
+		}
+	}
 
 	// A per-tab answer series ("1 2 1", or "1 1,3 2" when a tab is multi-
 	// select) answers a multi-tab question form: one keystroke group per tab,
@@ -223,6 +230,27 @@ func Deliver(ctx context.Context, c Config, req Request) error {
 		return fmt.Errorf("sending to the agent failed: %w", err)
 	}
 	return nil
+}
+
+// ErrReplyWithheld marks a reply refused as a verdict about the agent's FORM
+// rather than a delivery fault — today, an agy question answered with its
+// free-text Write-in row (domain.ErrAgyNotAnswerable). A retry is refused the
+// same way, so callers must not spend a retry budget on it.
+var ErrReplyWithheld = errors.New("hap cannot answer this agent's form")
+
+// deliverAgy answers an agy approval or question with verified keystrokes
+// (mcqdeliver.Agy). There is no keystroke-less fallback: every agy form needs
+// a key that is not followed by Enter.
+func (c Config) deliverAgy(ctx context.Context, req Request) error {
+	ks, ok := c.Herdr.(ports.KeystrokeSender)
+	if !ok {
+		return fmt.Errorf("this herdr adapter cannot send keystrokes, which agy's forms need; nothing was delivered")
+	}
+	err := mcqdeliver.Agy(ctx, c.mcq(ks, req.PaneID), req.PaneExcerpt, req.Outbound)
+	if errors.Is(err, domain.ErrAgyNotAnswerable) {
+		return fmt.Errorf("%w: %v", ErrReplyWithheld, err)
+	}
+	return err
 }
 
 // deliverSeries answers a multi-tab question form. Every path returns, so

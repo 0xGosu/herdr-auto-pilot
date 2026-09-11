@@ -772,17 +772,34 @@ PARKED at idle/done** (`internal/domain/agy.go`, corpus and design in
 line at the true bottom of the capture — agy renders inline, so its whole transcript is in every
 read and an earlier form is always somewhere above.
 
-- **Replies to agy approvals and choices are WITHHELD** (`domain.AgyReplyWithheld`) on all four
-  send paths — `daemon.act` (ahead of the action-review dispatch), the action-review outcome, the
-  LLM promotion, and `deliver.Deliver` (which the operator's `--send` and auto-accept reach): every
-  path types the digit then Enter, and agy commits on the digit alone, so that Enter answers the
-  NEXT screen (on a two-question form, option 1 of question 2, unseen). A new send path must ask it
-  too. Auto-accept maps `deliver.ErrReplyWithheld` to `errOutboundRefused`, or the refusal burns
-  the attempt budget and dismisses the row. **Not covered:** a generated-task `--send`, whose busy
-  check reads herdr's status only — phase 3's composer-ready proof closes it.
-- **Never set `MCQKind`/`AnswerCount` on an agy situation, and keep `ParseMCQForm` false for agy**
-  until an agy series deliverer exists: `EffectiveAnswerCount() > 1` routes into `sweepFrames` and
-  `mcqdeliver.ClaudeTabs`, which press Right/Left into the pane BEFORE they refuse.
+- **A reply to an agy approval or question is KEYS, never submitted text**
+  (`domain.AgyFormSituation` → `mcqdeliver.Agy`). Every generic path types the reply and then
+  Enter, and agy commits on the digit alone, so that Enter answers the NEXT screen (on a
+  two-question form, option 1 of question 2, unseen). All four send paths route agy forms to the
+  keyed deliverer — `daemon.act` (ahead of the action-review rewrite), the LLM promotion (on the
+  RE-CLASSIFIED type), `deliver.Deliver` (the operator's `--send` and auto-accept) — and the
+  action-review outcome refuses one outright. A new send path must ask `AgyFormSituation` too. The
+  deliverer's rules are all load-bearing:
+  - **one key, then re-read; a key is never pressed twice** — a repeated digit answers whatever
+    the first one opened. Numbered forms get the digit, the review panel `y`/`n` (never `shift+a`),
+    the trust prompt arrows verified row by row and only then Enter;
+  - **the live form must be the DECIDED one** (`AgyForm.SameAs` against the decision's excerpt) —
+    question 2 can offer the same labels as question 1;
+  - **a question's Write-in row is refused as a verdict** (`domain.ErrAgyNotAnswerable` →
+    `deliver.ErrReplyWithheld`, which auto-accept maps to `errOutboundRefused` — without it the
+    refusal burns the attempt budget and DISMISSES the row).
+- **Anything else typed into agy needs a proven EMPTY composer** (`domain.AgyComposerReady`,
+  `daemon.agyComposerRefusal`): herdr says idle under every agy modal, so a status check lets a
+  hand-out land in a standing approval, a picker, the survey or the operator's draft. Asked by
+  `deliverAutonomousClaimed`, the LLM promotion, `deliver.Deliver`, `refuseIfAgentBusy` (with the
+  stale marker, so the TUI offers to queue instead), `requireIdleForHandout` and
+  `actionTaskSendHost.Send`. A new hand-out path must ask it too. **Test trap:** the daemon's
+  `fakeHerdr` has no `SendToAgent`, which is why the proof lives at the call sites and not in the
+  herdr adapter — there it would be invisible to every daemon test.
+- **Never set `MCQKind`/`AnswerCount` on an agy situation, and keep `ParseMCQForm` false for agy**:
+  each agy question is its own situation (the next one's options are not rendered until this one is
+  answered), and `EffectiveAnswerCount() > 1` routes into `sweepFrames` and `mcqdeliver.ClaudeTabs`,
+  which press Right/Left into the pane BEFORE they refuse.
 - Setup (sign-in, terms) and operator UI (pickers, panels, slash popup, the Tab-amend field, the
   survey) classify **unclassifiable**, ahead of every rule including the operator's — no consult,
   no suggestion, no keystroke. Enter on the terms screen flips the data-sharing consent.

@@ -140,7 +140,7 @@ func TestAgyFixturesClassify(t *testing.T) {
 			if s.MCQKind != "" || s.EffectiveAnswerCount() > 1 {
 				// A kind or a count routes the form into the multi-question
 				// sweep and the Claude/Codex deliverers, which press arrow keys
-				// (see domain.MCQAgyQuestions).
+				// (see domain.AgyMCQForm).
 				t.Errorf("%s @%s: MCQKind=%q AnswerCount=%d, want neither set", name, status, s.MCQKind, s.EffectiveAnswerCount())
 			}
 		}
