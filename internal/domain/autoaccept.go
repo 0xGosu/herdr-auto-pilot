@@ -30,6 +30,11 @@ var autoAcceptExcludedReasons = []EscalateReason{
 	// pause the guard sets, but that is a side effect of escalate(); this makes
 	// the exclusion explicit rather than incidental.)
 	ReasonRateLimited,
+	// reply_withheld: hap has no safe way to type into this agent's form yet
+	// (AgyReplyWithheld), so no answer can be delivered, however long it waits.
+	// deliver.Deliver refuses it anyway; excluding it keeps the row from being
+	// claimed at all.
+	ReasonReplyWithheld,
 }
 
 // EscalationReason extracts the machine-readable reason from an escalation's

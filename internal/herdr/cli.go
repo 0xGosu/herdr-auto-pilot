@@ -526,7 +526,7 @@ func (c *CLI) ListAgents(ctx context.Context) ([]domain.AgentTransition, error) 
 			AgentID:     a.PaneID,
 			PaneID:      a.PaneID,
 			TabID:       a.TabID,
-			AgentType:   a.Agent,
+			AgentType:   domain.CanonicalAgentType(a.Agent),
 			WorkspaceID: a.WorkspaceID,
 			Status:      a.AgentStatus,
 			TerminalID:  a.TerminalID,

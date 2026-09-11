@@ -17,6 +17,7 @@ package deliver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -131,8 +132,22 @@ func (c Config) mcq(ks ports.KeystrokeSender, paneID string) mcqdeliver.Config {
 //
 // Callers gate on their own send policy — Deliver assumes the reply is meant
 // for the pane and never treats domain.ActionNoop specially.
+// ErrReplyWithheld marks a reply refused because hap does not yet speak the
+// agent's keystroke protocol for this screen (domain.AgyReplyWithheld). It is a
+// verdict about the form, not a delivery fault: a retry is refused the same
+// way, so callers must not spend a retry budget on it.
+var ErrReplyWithheld = errors.New("hap cannot answer this agent's form yet")
+
 func Deliver(ctx context.Context, c Config, req Request) error {
 	c = c.withDefaults()
+	// Before the read, and so before anything could be typed: hap does not yet
+	// answer agy's forms, and the generic send below (digit, then Enter) would
+	// commit agy's NEXT screen. See domain.AgyReplyWithheld.
+	if domain.AgyReplyWithheld(req.SituationType, req.AgentType) {
+		return fmt.Errorf("%w: agy %s forms are answered in the pane for now — hap would type the digit "+
+			"and then Enter, and agy commits on the digit alone; nothing was delivered",
+			ErrReplyWithheld, req.SituationType)
+	}
 	outbound := req.Outbound
 	// A numbered menu (Claude approvals/choices) only accepts the option's
 	// digit, not the label. Re-read the pane's CURRENT screen so a menu still

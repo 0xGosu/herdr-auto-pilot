@@ -215,7 +215,7 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 			if domain.IsPlaceholderAgent(d.Agent, d.AgentStatus) {
 				return nil
 			}
-			s.upsertPane(d.PaneID, d.WorkspaceID, d.TabID, d.Agent)
+			s.upsertPane(d.PaneID, d.WorkspaceID, d.TabID, domain.CanonicalAgentType(d.Agent))
 			// Surface the discovery as a transition so the daemon can name
 			// the agent immediately — herdr replays agent_detected for
 			// existing panes on subscribe, so this also covers agents that
@@ -223,7 +223,7 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 			if d.Agent != "" {
 				tr := domain.AgentTransition{
 					AgentID:     d.PaneID,
-					AgentType:   d.Agent,
+					AgentType:   domain.CanonicalAgentType(d.Agent),
 					PaneID:      d.PaneID,
 					TabID:       s.tabID(d.PaneID),
 					WorkspaceID: d.WorkspaceID,
@@ -342,7 +342,7 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		if normalizeEventName(frame.Event, d.Type) != "pane.agent_status_changed" || d.PaneID == "" {
 			return nil
 		}
-		agentType := d.Agent
+		agentType := domain.CanonicalAgentType(d.Agent)
 		if agentType == "" {
 			agentType = s.agentLabel(d.PaneID)
 		}
@@ -657,7 +657,7 @@ func (s *Subscriber) listPanes(ctx context.Context) (ids []string, labelled bool
 		// shell. One that labels nothing says nothing about agents, so the
 		// labels pane.agent_detected attached are kept.
 		if !domain.IsPlaceholderAgent(p.Agent, "") {
-			info.agentLabel = p.Agent
+			info.agentLabel = domain.CanonicalAgentType(p.Agent)
 		} else if labelled {
 			info.agentLabel = ""
 		}

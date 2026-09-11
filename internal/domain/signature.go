@@ -460,6 +460,8 @@ func salientContent(s Situation, salientChars int) string {
 	// why this must stay gated on the agent type.
 	if strings.EqualFold(s.AgentType, "claude") {
 		content = StripClaudeChrome(content)
+	} else if IsAgy(s.AgentType) {
+		content = StripAgyChrome(content)
 	}
 	// Trailing salientChars characters (rune-aware, so a multibyte glyph is
 	// never split at the window boundary — matches the "chars" naming).

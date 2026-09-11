@@ -600,6 +600,11 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 		// The operator turned this agent off. Not a delivery fault and not a
 		// reason to retire the escalation — it simply waits.
 		return errAgentDisabled
+	case errors.Is(deliverErr, deliver.ErrReplyWithheld):
+		// A verdict about the agent's form, not a delivery fault: every
+		// retry would be refused the same way, so it must not burn the
+		// attempt budget and dismiss the row (autoAcceptDeliveryFailed).
+		return fmt.Errorf("%w: %v", errOutboundRefused, deliverErr)
 	case !sent:
 		return deliverErr
 	}

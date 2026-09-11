@@ -583,7 +583,74 @@ The following do **not** need an agy branch:
 - `Write-in...` free-text answers (§4.7).
 - The survey's exact render and lifetime (§4.12).
 - The **hand-out-into-modal** hazard (§1.2) is inferred from the code path, not exercised.
-  Phase 2's detection closes it either way.
+  Phase 2's detection closes it for the idle poll: the capture re-classifies as approval or
+  choice, and every hand-out branch requires the IDLE situation. A generated-task `--send` is
+  not covered, because `refuseIfAgentBusy` reads herdr's status only (which reads idle under an
+  agy modal). Phase 3's composer-ready proof closes that path.
 - `TestRealShiftTabKeyNameIsStillBroken` should now fail on herdr 0.8.2 (§1.6). Run
   `HAP_ITEST_CLAUDE=1` to confirm, then update the `CLAUDE.md` gotcha. Keep the CSI Z path
   for older herdr.
+
+---
+
+## 9. Phase 2 as built (domain + classify)
+
+What shipped, and where it deliberately departs from §4:
+
+- **Type and kind.** `domain.AgentTypeAgy` and `domain.CanonicalAgentType`. The latter folds
+  herdr's manifest aliases (`antigravity`, `antigravity-cli`) onto `agy` where herdr's labels
+  enter hap: `herdr.CLI.ListAgents` and the event subscriber. Every other label is untouched.
+  `domain.IsAgy` is the gate everywhere else.
+- **Parsers** (`internal/domain/agy.go`), each anchored to the bottom of the capture (only the
+  status bar and blank lines may follow the form's key-hint line):
+  - `ParseAgyApproval` — the shell and file prompts. Column-0 wraps are rejoined, so wide
+    and narrow renders share labels.
+  - `ParseAgyTrust`, `ParseAgyReview`, `ParseAgyMCQ` (Write-in excluded).
+  - `AgyErrorForm` — `interrupted`, `eligibility-check-failed`. Both must be the last
+    transcript item above a live composer.
+  - `AgyHeldForm` — setup and operator UI.
+- **Classification.**
+  - The approval and choice forms classify as parked at idle/done, like Codex's Plan approval,
+    and also when blocked. Working is excluded.
+  - Errors classify ungated, like claude/codex.
+  - `DefaultRules` gained the scoped agy error rule.
+  - **Departure from §4.10–4.12:** setup (sign-in, terms) and operator UI (pickers, panels,
+    the slash popup, the Tab-amend field, the survey) classify **unclassifiable**, not a new
+    `setup` situation. That outcome escalates with no LLM consult, no suggestion and no
+    keystroke. A new situation type would ripple through Decide, the store and every front
+    end for no safety gain. They are held ahead of every rule, the operator's included.
+- **Salients.**
+  - Approvals: `permission:<verb> | options:…`.
+    - Verbs: `run command: <cmd>`, `<verb> file (<target>; <reason>)`, `trust this folder`,
+      `review plan artifact`.
+    - The verb is stored UNMASKED: `IrreversibleScanContent` reads it raw, and masking hides
+      `of=/dev/sda`.
+  - Choices: `options:…`.
+  - Errors: `error:<kind>`.
+  - Idle: pane tail through `domain.StripAgyChrome`. It removes the launch line, the banner
+    (also a scrolled-in fragment of it), rules, the spinner, the artifact marker, the
+    `(ctrl+o to expand)` suffix, and the composer + status bar. A capture that is nothing but
+    chrome gets one fixed salient instead of an over-masked empty one, which would escalate
+    before the task source is ever consulted.
+- **Replies are withheld** (`domain.AgyReplyWithheld`, `deliver.ErrReplyWithheld`,
+  `domain.ReasonReplyWithheld`).
+  - **Why:** every send path types the digit and then Enter, and agy commits on the digit
+    alone.
+  - **Where it is refused:** all four send paths (`daemon.act` ahead of the action-review
+    dispatch, the action-review outcome, the LLM promotion, and `deliver.Deliver`), for agy
+    approvals and choices.
+  - **Auto-accept:** a `reply_withheld` escalation is excluded outright
+    (`autoAcceptExcludedReasons`). An agy form escalated for any other reason is claimed, and
+    the refusal is read as `errOutboundRefused`, so it never burns the attempt budget or
+    dismisses the row (`TestAutoAcceptLeavesAWithheldAgyReplyPending`).
+  - **What is not withheld:** idle hand-outs and error replies are free text into the
+    composer and still go.
+  - Phase 3 lifts the gate form by form as the agy deliverer lands.
+- **No `MCQKind` / `AnswerCount` for agy yet.** Either routes a form into the multi-question
+  sweep and the Claude/Codex deliverers, which press Right/Left into the pane before they
+  refuse. `domain.MCQAgyQuestions` is declared for phase 3 but never set, and
+  `domain.ParseMCQForm` still answers false for agy. The agy question form is matched at the
+  choice position directly.
+- **Corpus.** `irreversible_corpus.txt` gained agy-rendered lines (the command between agy's
+  anchors, and an "always allow" option carrying a force-push prefix). The existing seed
+  patterns already match them, because agy prints commands verbatim.

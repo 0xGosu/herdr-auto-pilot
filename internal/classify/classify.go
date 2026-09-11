@@ -68,6 +68,12 @@ func DefaultRules() []config.ClassifierRule {
 			Regex: nil,
 		},
 		{
+			// agy's interrupted turn and failed eligibility check, detected
+			// structurally via domain.AgyErrorForm at the error position.
+			AgentType: domain.AgentTypeAgy, Situation: "error",
+			Regex: nil,
+		},
+		{
 			AgentType: "*", Situation: "idle",
 			Regex: []string{
 				`(?i)(task|step|work) (is )?(complete|completed|done|finished)`,
@@ -138,6 +144,22 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 	if strings.EqualFold(agentType, "claude") {
 		_, claudeRemoteEnv = domain.ClaudeRemoteEnvForm(pane)
 	}
+	// herdr reports EVERY agy modal idle/done (docs/designer/agy-support.md),
+	// so agy's forms are recognized structurally, like the two above.
+	agyApproval, agyChoice := false, false
+	if domain.IsAgy(agentType) {
+		// First-run setup and operator UI (sign-in, terms, pickers, panels,
+		// the slash popup, the amend field, the survey): nothing hap may
+		// answer. Unclassifiable escalates with no LLM consult, no
+		// suggestion and no keystroke — the fail-safe outcome — ahead of
+		// every rule, operator rules included, because a rule matching
+		// text on these screens can only ever be wrong about them.
+		if _, held := domain.AgyHeldForm(pane); held {
+			return s
+		}
+		agyApproval = agyApprovalForm(pane)
+		_, agyChoice = domain.ParseAgyMCQ(pane)
+	}
 
 	// Approval and choice are normally BLOCKED situations (constitution
 	// taxonomy): their content rules are gated on herdr reporting the agent
@@ -170,6 +192,16 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		if !matched && r.situation == domain.SituationApproval && claudeRemoteEnv {
 			matched = true
 		}
+		if !matched && r.situation == domain.SituationApproval && agyApproval {
+			matched = true
+		}
+		// agy's question form is detected here rather than through
+		// ParseMCQForm on purpose: that parser routes a form into the
+		// multi-question sweep and the Claude/Codex deliverers, which would
+		// press arrow keys into an agy form (see domain.MCQAgyQuestions).
+		if !matched && r.situation == domain.SituationChoice && agyChoice {
+			matched = true
+		}
 		// Agent MCQ selection prompts render structurally, not as a plain
 		// numbered menu. Detect them at the choice rule's position so approval
 		// still wins and error is still evaluated after choice.
@@ -188,6 +220,9 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		if !matched && r.situation == domain.SituationError && strings.EqualFold(agentType, "codex") {
 			_, matched = domain.CodexErrorForm(pane)
 		}
+		if !matched && r.situation == domain.SituationError && domain.IsAgy(agentType) {
+			_, matched = domain.AgyErrorForm(pane)
+		}
 		if !matched {
 			continue
 		}
@@ -204,7 +239,13 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		// working stays excluded.
 		claudeRemoteEnvParked := r.situation == domain.SituationApproval && claudeRemoteEnv &&
 			(agentStatus == "idle" || agentStatus == "done")
-		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked && !codexPlanParked && !claudeRemoteEnvParked {
+		// Every agy form is parked at idle/done (verified live, agy 1.2.1 on
+		// herdr 0.8.2). Same statuses as above; working stays excluded.
+		agyParked := ((r.situation == domain.SituationApproval && agyApproval) ||
+			(r.situation == domain.SituationChoice && agyChoice)) &&
+			(agentStatus == "idle" || agentStatus == "done")
+		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked &&
+			!codexPlanParked && !claudeRemoteEnvParked && !agyParked {
 			continue
 		}
 		s.Type = r.situation
@@ -243,6 +284,10 @@ var errorLineRE = regexp.MustCompile(`(?im)^\s*(?:error|fatal|panic|exception)[:
 // enrich extracts salient decision content per situation type (feeds
 // signature generation, FR-003).
 func enrich(s *domain.Situation) {
+	if domain.IsAgy(s.AgentType) {
+		enrichAgy(s)
+		return
+	}
 	switch s.Type {
 	case domain.SituationChoice:
 		s.Options = append(s.Options, domain.OptionLabels(s.Content)...)
@@ -305,6 +350,55 @@ func enrich(s *domain.Situation) {
 		}
 		if strings.EqualFold(s.AgentType, "codex") && domain.CodexRateLimitForm(s.Content) {
 			s.Options = append(s.Options, domain.OptionLabels(domain.ExtractCodexRateLimitForm(s.Content))...)
+		}
+	}
+}
+
+// agyApprovalForm reports whether pane shows one of agy's parked approval
+// forms: a numbered permission prompt (not while its amend field is open —
+// that is the operator typing, and domain.AgyHeldForm holds it), the
+// trust-folder prompt, or the plan-artifact review panel.
+func agyApprovalForm(pane string) bool {
+	if f, ok := domain.ParseAgyApproval(pane); ok && !f.Amending {
+		return true
+	}
+	if _, ok := domain.ParseAgyTrust(pane); ok {
+		return true
+	}
+	_, ok := domain.ParseAgyReview(pane)
+	return ok
+}
+
+// enrichAgy fills an agy situation's salient fields from the agy form parsers
+// ONLY. The generic scrapes enrich uses for other agents are skipped on
+// purpose: agy renders inline, so a capture carries its whole transcript, and
+// OptionLabels over the pane would fold every numbered list agy ever printed
+// (and every earlier form still in the scrollback) into the option set.
+func enrichAgy(s *domain.Situation) {
+	switch s.Type {
+	case domain.SituationApproval:
+		if f, ok := domain.ParseAgyApproval(s.Content); ok {
+			// Unmasked on purpose: the salient is masked when the signature is
+			// computed, while domain.IrreversibleScanContent reads this field
+			// raw, and masking would hide a destructive target ("of=/dev/sda"
+			// becomes "of=<path>") from the never-auto screen.
+			s.PermissionVerb = f.PermissionVerb()
+			s.Options = append(s.Options, domain.NumberedOptionLabels(f.Options)...)
+		} else if f, ok := domain.ParseAgyTrust(s.Content); ok {
+			s.PermissionVerb = domain.PermissionVerbAgyTrust
+			s.Options = append(s.Options, f.Options...)
+		} else if _, ok := domain.ParseAgyReview(s.Content); ok {
+			// Stable across plan bodies and artifact names, like Codex's
+			// "implement this plan": equivalent reviews share one signature.
+			s.PermissionVerb = domain.PermissionVerbAgyReview
+		}
+	case domain.SituationChoice:
+		if f, ok := domain.ParseAgyMCQ(s.Content); ok {
+			s.Options = append(s.Options, domain.NumberedOptionLabels(f.Options)...)
+		}
+	case domain.SituationError:
+		if kind, ok := domain.AgyErrorForm(s.Content); ok {
+			s.ErrorSummary = kind
 		}
 	}
 }

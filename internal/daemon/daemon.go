@@ -2924,6 +2924,20 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		}
 	}
 
+	// agy's approvals and questions commit on the digit alone, so the send
+	// below (digit, then Enter) would answer agy's NEXT screen too. Until hap
+	// speaks agy's protocol the reply is withheld — ahead of the action-review
+	// dispatch as well, which would only end at the same gate. No Suggestion:
+	// confirming it would be refused in deliver.Deliver for the same reason.
+	if domain.AgyReplyWithheld(s.Type, s.AgentType) {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonReplyWithheld,
+			Rationale:  "hap does not answer agy forms yet; answer it in the pane (decided: " + dec.Input + ")",
+			Confidence: dec.Confidence,
+		}, tr, now)
+		return
+	}
+
 	// Numbered menus (Claude approvals/choices) accept the option's digit,
 	// not the label text; deliver the keystroke the menu expects. Free-text
 	// situations deliver the literal reply. s.Content is the classification
@@ -4683,6 +4697,11 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	// still matches nothing must escalate: sent literally, its Enter commits the
 	// caret's option. It is also mapped to the option's DIGIT, like every other
 	// send path — a menu ignores the label text.
+	if domain.AgyReplyWithheld(current.Type, s.AgentType) {
+		escalateWith(domain.ReasonReplyWithheld,
+			"hap does not answer agy forms yet; answer it in the pane (decided: "+final+")")
+		return
+	}
 	if domain.UnmatchedMenuReply(current.Type, s.AgentType, pane, final) {
 		escalateWith(domain.ReasonUnfamiliarOptions,
 			"rewritten reply matches none of the offered options: "+final)
@@ -5144,6 +5163,11 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// keystroke would actually land on. There is already an option-set check for
 	// choice situations further up; this covers approvals and any drift between
 	// the consult snapshot and the live screen.
+	if domain.AgyReplyWithheld(s.Type, s.AgentType) {
+		reject(domain.ReasonReplyWithheld,
+			"hap does not answer agy forms yet; answer it in the pane (LLM suggested: "+llmDec.Action+")")
+		return
+	}
 	if domain.UnmatchedMenuReply(s.Type, s.AgentType, pane, llmDec.Action) {
 		reject(domain.ReasonUnfamiliarOptions,
 			"LLM answer matches none of the offered options: "+llmDec.Action)

@@ -218,6 +218,10 @@ const (
 	// results always return to the operator as fresh escalations regardless of
 	// confidence; they never auto-act.
 	ReasonLLMRetry EscalateReason = "llm_retry"
+	// ReasonReplyWithheld: a reply was decided, but hap does not yet speak the
+	// agent's keystroke protocol for this screen, so nothing is sent (see
+	// AgyReplyWithheld). The operator answers in the pane.
+	ReasonReplyWithheld EscalateReason = "reply_withheld"
 )
 
 // Decision is the outcome of the pure decision core for one situation.

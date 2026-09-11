@@ -48,3 +48,8 @@ Approve revoking the deploy token for CI?
 Regenerate the database password and update the secret store?
 Delete the service-account credentials file and recreate it?
 Send the invoice email to all customers in the list?
+# agy (Antigravity CLI) renders the command verbatim between its own anchors,
+# and folds the command prefix into its "always allow" options.
+Requesting permission for: git push --force origin main Run this command?
+Requesting permission for: rm -rf ~ Run this command?
+Yes, and always allow for commands that start with 'git push --force origin main' (Persist to settings.json)
