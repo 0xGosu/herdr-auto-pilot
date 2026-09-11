@@ -175,7 +175,28 @@ type FullSelfPrompting struct {
 	// it is a materially larger grant than answering a question already on
 	// screen, and it stays opt-in separately from Enabled.
 	AcceptGeneratedTask bool `toml:"accept_generated_task"`
+	// OrchestratorAgentCommand, when set, has the daemon keep an interactive
+	// agent session named "orchestrator" alive while the mode is on: created
+	// in its own herdr workspace if none exists, ignored by every hap pass, and
+	// briefed to watch `hap stream orchestrator`. Empty (the default) is off.
+	//
+	// argv[0] names the agent KIND, not an executable: herdr starts an agent by
+	// kind and runs its own canonical binary, so only "claude" is accepted and
+	// only the words after it reach the agent (domain.OrchestratorLaunch).
+	OrchestratorAgentCommand []string `toml:"orchestrator_agent_command,omitempty"`
+	// OrchestratorAgentPrompt replaces the built-in brief the daemon sends the
+	// orchestrator once it is ready. {self} expands to this hap binary's path.
+	// Empty means the built-in brief.
+	OrchestratorAgentPrompt string `toml:"orchestrator_agent_prompt,omitempty"`
+	// OrchestratorAgentCwd is the orchestrator session's working directory: an
+	// absolute path, ~ and $VAR expanded, which must already exist. Empty
+	// means <state>/orchestrator, created on demand. Read when the session is
+	// CREATED, so changing it does not move a running one.
+	OrchestratorAgentCwd string `toml:"orchestrator_agent_cwd,omitempty"`
 }
+
+// OrchestratorConfigured reports whether an orchestrator command is set.
+func (f FullSelfPrompting) OrchestratorConfigured() bool { return len(f.OrchestratorAgentCommand) > 0 }
 
 // MinFSPGraduatedRules is how many graduated (autonomous) rules the
 // database must hold before full self-prompting mode may be enabled. A constant, not a

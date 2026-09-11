@@ -24,14 +24,15 @@ type sendTaskCall struct {
 	agentID   string
 	agentType string
 	agentName string
+	screen    func(string) error
 }
 
 func (s *sendTaskSeam) send(_ context.Context, p domain.SendTaskPayload,
-	agentID, agentType, agentName string, _ ports.TaskSendHost) error {
+	agentID, agentType, agentName string, _ ports.TaskSendHost, screen func(string) error) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.calls = append(s.calls, sendTaskCall{p, agentID, agentType, agentName})
+	s.calls = append(s.calls, sendTaskCall{p, agentID, agentType, agentName, screen})
 	return s.err
 }
 

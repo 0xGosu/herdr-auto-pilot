@@ -28,16 +28,18 @@ type confirmSeam struct {
 }
 
 type confirmCall struct {
-	auditID int64
-	send    bool
-	author  string
+	auditID  int64
+	send     bool
+	author   string
+	screened bool
+	screen   func(string) error
 }
 
 func (c *confirmSeam) confirm(ctx context.Context, auditID int64, send bool,
-	author string, host ports.TaskSendHost) error {
+	author string, host ports.TaskSendHost, screen func(string) error) error {
 
 	c.mu.Lock()
-	c.calls = append(c.calls, confirmCall{auditID, send, author})
+	c.calls = append(c.calls, confirmCall{auditID, send, author, screen != nil, screen})
 	fn, err := c.sendVia, c.err
 	c.mu.Unlock()
 	if fn != nil {

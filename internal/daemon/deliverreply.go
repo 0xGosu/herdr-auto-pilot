@@ -25,6 +25,9 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 	if p.Action == "" {
 		return "", errors.New("the queued reply carries no action")
 	}
+	if err := d.refuseOrchestratorWhilePaused(ctx, a); err != nil {
+		return "", err
+	}
 
 	audit, err := d.opt.Store.GetAudit(ctx, p.AuditID)
 	if err != nil {

@@ -115,6 +115,11 @@ type styles struct {
 	// answered. Faint only, no colour: it must read as "not yet actionable" in
 	// every theme, and a hue would compete with warn on the same row.
 	pending lipgloss.Style
+	// orchestrator marks the full-self-prompting orchestrator's row on the
+	// Agents tab: a special session hap ignores, which an operator must not
+	// mistake for one of the herd. It borrows the title role — bold and the
+	// most distinct hue in every theme — rather than adding a palette key.
+	orchestrator lipgloss.Style
 }
 
 func newStyles(p palette) styles {
@@ -123,19 +128,20 @@ func newStyles(p palette) styles {
 		help = help.Foreground(p.help)
 	}
 	return styles{
-		title:       lipgloss.NewStyle().Bold(true).Foreground(p.title),
-		version:     lipgloss.NewStyle().Foreground(p.section),
-		activeTab:   lipgloss.NewStyle().Bold(true).Underline(true),
-		inactiveTab: lipgloss.NewStyle().Faint(true),
-		paused:      lipgloss.NewStyle().Bold(true).Foreground(p.paused),
-		running:     lipgloss.NewStyle().Bold(true).Foreground(p.running),
-		selected:    lipgloss.NewStyle().Reverse(true),
-		section:     lipgloss.NewStyle().Bold(true).Foreground(p.section),
-		help:        help,
-		err:         lipgloss.NewStyle().Foreground(p.err),
-		ok:          lipgloss.NewStyle().Foreground(p.ok),
-		warn:        lipgloss.NewStyle().Bold(true).Foreground(p.warn),
-		pending:     lipgloss.NewStyle().Faint(true),
+		title:        lipgloss.NewStyle().Bold(true).Foreground(p.title),
+		version:      lipgloss.NewStyle().Foreground(p.section),
+		activeTab:    lipgloss.NewStyle().Bold(true).Underline(true),
+		inactiveTab:  lipgloss.NewStyle().Faint(true),
+		paused:       lipgloss.NewStyle().Bold(true).Foreground(p.paused),
+		running:      lipgloss.NewStyle().Bold(true).Foreground(p.running),
+		selected:     lipgloss.NewStyle().Reverse(true),
+		section:      lipgloss.NewStyle().Bold(true).Foreground(p.section),
+		help:         help,
+		err:          lipgloss.NewStyle().Foreground(p.err),
+		ok:           lipgloss.NewStyle().Foreground(p.ok),
+		warn:         lipgloss.NewStyle().Bold(true).Foreground(p.warn),
+		pending:      lipgloss.NewStyle().Faint(true),
+		orchestrator: lipgloss.NewStyle().Bold(true).Foreground(p.title),
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemon"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
@@ -294,6 +295,12 @@ func buildApp(paths config.Paths) (*frontend.App, func(), error) {
 			return daemonlock.Info(paths)
 		},
 		Stream: events,
+	}
+	// A command the orchestrator session runs is an LLM's, not the operator's:
+	// its author makes the daemon screen what it sends and refuse it while
+	// the herd is paused (daemon.actionScreen), and names it on the stream.
+	if daemon.CallerIsOrchestrator(paths.StateDir, os.Getenv("HERDR_PANE_ID")) {
+		app.Author = domain.OrchestratorAuthor
 	}
 	// Desktop notifications only exist when herdr launched us as a managed
 	// pane — it injects HERDR_ENV=1 and the control socket there. Outside

@@ -105,6 +105,17 @@ type DaemonHealth struct {
 	// FleetSyncDiagLines is the evidence behind it — the descriptor budget at
 	// the last failure, and whether an automatic recovery has been spent.
 	FleetSyncDiagLines []string
+	// OrchestratorFailing: the full-self-prompting orchestrator session could
+	// not be started (or adopted, or briefed) and the daemon is retrying.
+	// OrchestratorWaiting: it is up, but its brief is held by a claude prompt
+	// only the operator should answer. Both are WARNINGS: the herd is served
+	// either way, but without them the only trace was the daemon log.
+	OrchestratorFailing bool
+	OrchestratorWaiting bool
+	// OrchestratorError is the failure itself; OrchestratorLine the status
+	// page's full rendering (retry timing included).
+	OrchestratorError string
+	OrchestratorLine  string
 	// Reason explains a gave-up / auto-disabled latch.
 	Reason string
 	// StderrLog is the captured daemon stderr path (for hung/crashed post-mortem).
@@ -150,6 +161,12 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 			h.FleetSyncDiagLines = rec.FleetSync.DiagLines(now)
 			if rec.FleetSync != nil {
 				h.FleetSyncError = rec.FleetSync.LastError
+			}
+			if o := rec.Orchestrator; o != nil {
+				h.OrchestratorFailing = o.Failing()
+				h.OrchestratorWaiting = o.Waiting
+				h.OrchestratorError = o.LastError
+				h.OrchestratorLine = o.Line(now)
 			}
 		}
 	}
@@ -201,7 +218,8 @@ func (h DaemonHealth) Severity() DaemonSeverity {
 	case h.Hung || h.GaveUp || h.CrashLooping || h.BinaryReplaced || h.FleetSyncIsolated ||
 		(h.FleetSyncBootstrapping && h.FleetSyncFor >= daemonhealth.FleetSyncIsolatedAfter):
 		return DaemonError
-	case h.EmbeddingAutoDisabled || h.EmbedderDegraded || h.FleetSyncDegraded || (h.Running && h.VersionStale):
+	case h.EmbeddingAutoDisabled || h.EmbedderDegraded || h.FleetSyncDegraded || h.OrchestratorFailing ||
+		h.OrchestratorWaiting || (h.Running && h.VersionStale):
 		return DaemonWarn
 	default:
 		return DaemonOK
@@ -242,6 +260,11 @@ func (h DaemonHealth) Banner() string {
 		return "⚠ waiting for the shared database to bootstrap — this node is not monitoring yet"
 	case h.FleetSyncDegraded:
 		return "⚠ fleet sync failing — this machine may fall out of step with the other nodes"
+	case h.OrchestratorFailing:
+		return "⚠ orchestrator could not start — " + truncateHealthText(h.OrchestratorError, 160) +
+			" (retrying; hap status for details)"
+	case h.OrchestratorWaiting:
+		return "⚠ orchestrator is waiting on a claude prompt in workspace hap-orchestrator — answer it once and hap sends the brief"
 	case h.Running && h.VersionStale:
 		return "⚠ daemon is STALE (older binary) — run: hap daemon --ensure"
 	default:
@@ -282,4 +305,14 @@ func formatAge(d time.Duration) string {
 		d = 0
 	}
 	return d.Round(time.Second).String()
+}
+
+// truncateHealthText cuts s to at most n runes, marking the cut with "…", so
+// one banner line stays one line whatever herdr put in an error.
+func truncateHealthText(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n-1]) + "…"
 }

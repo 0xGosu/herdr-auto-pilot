@@ -30,6 +30,16 @@ const (
 	FSPAcceptGeneratedTaskFieldKey = "full_self_prompting.accept_generated_task"
 )
 
+// FSPOrchestratorCommandFieldKey and FSPOrchestratorPromptFieldKey configure
+// the orchestrator agent session the daemon keeps alive while the mode is on.
+// Free text, so read-only in the TUI like every argv template; the command
+// can be bootstrapped from a preset.
+const (
+	FSPOrchestratorCommandFieldKey = "full_self_prompting.orchestrator_agent_command"
+	FSPOrchestratorPromptFieldKey  = "full_self_prompting.orchestrator_agent_prompt"
+	FSPOrchestratorCwdFieldKey     = "full_self_prompting.orchestrator_agent_cwd"
+)
+
 // DeprecatedFSPFieldKey is the pre-move spelling. It is NOT registered — it may
 // never be offered for writing — but it still RESOLVES, because the config file
 // carrying the old table keeps loading and the two surfaces must not disagree.
@@ -231,13 +241,14 @@ func (a *App) fspBlockedReason(ctx context.Context, cfg config.Config) string {
 // so an unthreaded author would attribute every remote operator's decision to
 // the machine that executed it.
 //
-// screen is deliberately nil. The daemon's own sends are screened at decide
+// screen is nil for an operator. The daemon's own sends are screened at decide
 // time and an FSP acceptance is screened in the fork, because in both cases no
 // human ever saw the text; here one has, and their confirm has always been the
-// gate. Adding the screen would make a suggestion that trips a never-auto
-// pattern unconfirmable with no override.
+// gate — screening it would make a suggestion that trips a never-auto pattern
+// unconfirmable with no override. The daemon passes its screen only when the
+// ORCHESTRATOR confirmed: an LLM's confirm is not a human's.
 func (a *App) ConfirmGeneratedTaskForOperator(ctx context.Context, auditID int64, send bool,
-	author string, host ports.TaskSendHost) error {
+	author string, host ports.TaskSendHost, screen func(string) error) error {
 
 	audit, err := a.Store.GetAudit(ctx, auditID)
 	if err != nil {
@@ -253,6 +264,6 @@ func (a *App) ConfirmGeneratedTaskForOperator(ctx context.Context, auditID int64
 		return fmt.Errorf("audit record %d no longer carries a generated-task suggestion", auditID)
 	}
 	return a.acceptGeneratedTask(ctx, audit, generatedTaskConfirm{
-		send: send, author: author, host: host,
+		send: send, author: author, host: host, screen: screen,
 	})
 }

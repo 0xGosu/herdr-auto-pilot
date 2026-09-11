@@ -1579,6 +1579,18 @@ to. Lines carry ids, not content, and a sequence number: `--resume N` replays
 everything after N (events are kept for 7 days) before following. See
 `hap help stream orchestrator`.
 
+Set `full_self_prompting.orchestrator_agent_command` (`hap config set
+full_self_prompting.orchestrator_agent_command --preset claude`) and, while full
+self-prompting is on, the daemon keeps an interactive claude session named
+`orchestrator` alive in its own `hap-orchestrator` herdr workspace: briefed to
+watch that stream and unblock the herd toward the goals you type into it, and
+ignored by hap entirely (highlighted on the TUI Agents tab). It is re-created if
+it disappears — at most 3 times an hour — and never closed by hap. Its brief also
+has it schedule an hourly health check (Claude's `CronCreate`) that restarts a
+stopped hap daemon and looks in on hung agents, removed while the mode is off. It
+runs in `<state>/orchestrator` unless `full_self_prompting.orchestrator_agent_cwd`
+names another existing directory.
+
 ## Pause/kill switch & audit
 
 - `hap pause` / `hap resume` (TUI `p`/`r`, or Herdr plugin actions) toggle a

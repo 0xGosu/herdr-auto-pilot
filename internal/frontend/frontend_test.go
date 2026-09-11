@@ -531,7 +531,7 @@ func sendTask(app *frontend.App, ctx context.Context,
 
 	return app.SendTaskForOperator(ctx,
 		domain.SendTaskPayload{Locator: locator, Index: index, TaskText: text},
-		paneID, agentType, agentName, hostFor(app))
+		paneID, agentType, agentName, hostFor(app), nil)
 }
 
 // confirmGeneratedTask runs an operator's confirm of a generated-task
@@ -548,7 +548,7 @@ func sendTask(app *frontend.App, ctx context.Context,
 // TestResolveFilesAGeneratedTaskConfirmUnderItsOwner and
 // TestALocalGeneratedTaskConfirmAlsoQueues.
 func confirmGeneratedTask(app *frontend.App, ctx context.Context, id int64, send bool) error {
-	return app.ConfirmGeneratedTaskForOperator(ctx, id, send, "operator", hostFor(app))
+	return app.ConfirmGeneratedTaskForOperator(ctx, id, send, "operator", hostFor(app), nil)
 }
 
 // hostFor builds that host over whatever herdr fake the test installed —
@@ -2288,6 +2288,15 @@ func TestSetFieldValidatesAndPersists(t *testing.T) {
 		{"llm.auto_act_confidence_threshold", "-1", true},
 		{"llm.auto_act_confidence_threshold", "maybe", true},
 		{"llm.command", `claude -p "decide for me"`, false},
+		{"full_self_prompting.orchestrator_agent_command", "claude --model opus", false},
+		{"full_self_prompting.orchestrator_agent_command", "/usr/local/bin/claude", false},
+		{"full_self_prompting.orchestrator_agent_command", "codex exec", true},
+		{"full_self_prompting.orchestrator_agent_command", "", false},
+		{"full_self_prompting.orchestrator_agent_prompt", "Keep the herd moving.", false},
+		{"full_self_prompting.orchestrator_agent_cwd", "/srv/orchestrator", false},
+		{"full_self_prompting.orchestrator_agent_cwd", "~/orchestrator", false},
+		{"full_self_prompting.orchestrator_agent_cwd", "relative/dir", true},
+		{"full_self_prompting.orchestrator_agent_cwd", "", false},
 		{"llm.enable_rewrite_action", "true", false},
 		{"llm.enable_rewrite_action", "maybe", true},
 		{"llm.rewrite_action_fallback_template", "Act on: {original_text}", false},
@@ -2364,9 +2373,12 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"full_self_prompting.enabled": "false",
 		// "true" on purpose, unlike the switch above: neither of these is
 		// precondition-gated, so the accept path is exercised for real.
-		"full_self_prompting.honour_limits":         "true",
-		"full_self_prompting.accept_generated_task": "true",
-		"safety.disable_never_auto_seed_patterns":   "true",
+		"full_self_prompting.honour_limits":              "true",
+		"full_self_prompting.accept_generated_task":      "true",
+		"full_self_prompting.orchestrator_agent_command": "claude --model opus",
+		"full_self_prompting.orchestrator_agent_prompt":  "Keep the herd moving.",
+		"full_self_prompting.orchestrator_agent_cwd":     "/srv/orchestrator",
+		"safety.disable_never_auto_seed_patterns":        "true",
 		"llm.command":                          `claude -p "decide"`,
 		"llm.timeout_seconds":                  "60",
 		"llm.auto_act_confidence_threshold":    "70",
@@ -2540,6 +2552,9 @@ func TestPaneSalientCharsFieldDisplay(t *testing.T) {
 // else in the registry is editable, and unknown keys are never editable.
 func TestFieldTUIEditableClassification(t *testing.T) {
 	readOnly := map[string]bool{
+		"full_self_prompting.orchestrator_agent_command": true,
+		"full_self_prompting.orchestrator_agent_prompt":  true,
+		"full_self_prompting.orchestrator_agent_cwd":     true,
 		"llm.command":                          true,
 		"llm.rewrite_action_fallback_template": true,
 		"llm.task_generate_command":            true,
@@ -5124,8 +5139,10 @@ var configKeysExemptFromRegistry = map[string]string{
 	// FullSelfPrompting surfaces under both spellings. These two are reachable
 	// only by hand-editing the legacy table, which Load then migrates wholesale
 	// onto the canonical section — there is nothing to offer an operator here.
-	"escalations.full_self_prompting.honour_limits":         "deprecated alias for full_self_prompting.honour_limits",
-	"escalations.full_self_prompting.accept_generated_task": "deprecated alias for full_self_prompting.accept_generated_task",
+	"escalations.full_self_prompting.honour_limits":             "deprecated alias for full_self_prompting.honour_limits",
+	"escalations.full_self_prompting.accept_generated_task":     "deprecated alias for full_self_prompting.accept_generated_task",
+	"escalations.full_self_prompting.orchestrator_agent_prompt": "deprecated alias for full_self_prompting.orchestrator_agent_prompt",
+	"escalations.full_self_prompting.orchestrator_agent_cwd":    "deprecated alias for full_self_prompting.orchestrator_agent_cwd",
 }
 
 // tomlScalarKeys reports every key BurntSushi/toml would accept as a SCALAR

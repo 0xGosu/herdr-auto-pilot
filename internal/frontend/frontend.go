@@ -2401,6 +2401,9 @@ var ConfigFields = []ConfigFieldDef{
 	// renders all three under one "Full self-prompting" section.
 	{Key: FSPHonourLimitsFieldKey, TUIEditable: true},
 	{Key: FSPAcceptGeneratedTaskFieldKey, TUIEditable: true},
+	{Key: FSPOrchestratorCommandFieldKey},
+	{Key: FSPOrchestratorPromptFieldKey},
+	{Key: FSPOrchestratorCwdFieldKey},
 	{Key: "confidence_thresholds.minimum", TUIEditable: true},
 	{Key: "confidence_thresholds.idle", TUIEditable: true},
 	{Key: "confidence_thresholds.approval", TUIEditable: true},
@@ -2705,6 +2708,21 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.FormatBool(cfg.FullSelfPrompting.HonourLimits)
 	case FSPAcceptGeneratedTaskFieldKey:
 		return strconv.FormatBool(cfg.FullSelfPrompting.AcceptGeneratedTask)
+	case FSPOrchestratorCommandFieldKey:
+		if len(cfg.FullSelfPrompting.OrchestratorAgentCommand) == 0 {
+			return "(disabled)"
+		}
+		return JoinCommand(cfg.FullSelfPrompting.OrchestratorAgentCommand)
+	case FSPOrchestratorPromptFieldKey:
+		if cfg.FullSelfPrompting.OrchestratorAgentPrompt == "" {
+			return "(built-in brief)"
+		}
+		return cfg.FullSelfPrompting.OrchestratorAgentPrompt
+	case FSPOrchestratorCwdFieldKey:
+		if cfg.FullSelfPrompting.OrchestratorAgentCwd == "" {
+			return "(default: <state>/orchestrator)"
+		}
+		return cfg.FullSelfPrompting.OrchestratorAgentCwd
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -3026,6 +3044,32 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("%s must be true or false, got %q", FSPAcceptGeneratedTaskFieldKey, value)
 			}
 			cfg.FullSelfPrompting.AcceptGeneratedTask = v
+			return nil
+		case FSPOrchestratorCommandFieldKey:
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+			// Refused here, not only at spawn time: a wrong first word would
+			// otherwise be saved and then fail on every sweep, silently.
+			if len(argv) > 0 {
+				if _, _, err := domain.OrchestratorLaunch(argv); err != nil {
+					return fmt.Errorf("%s: %w", key, err)
+				}
+			}
+			cfg.FullSelfPrompting.OrchestratorAgentCommand = argv // empty disables it
+			return nil
+		case FSPOrchestratorPromptFieldKey:
+			cfg.FullSelfPrompting.OrchestratorAgentPrompt = value // empty restores the built-in brief
+			return nil
+		case FSPOrchestratorCwdFieldKey:
+			// Stored as typed (~ and $VAR expand at use, like every other path
+			// key), but it must be absolute once expanded: a relative path
+			// would resolve against whatever directory the daemon runs in.
+			if value != "" && !filepath.IsAbs(config.ExpandPath(value)) {
+				return fmt.Errorf("%s: %q is not an absolute path (~ and $VAR are fine)", key, value)
+			}
+			cfg.FullSelfPrompting.OrchestratorAgentCwd = value // empty restores <state>/orchestrator
 			return nil
 		case "escalations.auto_accept.approval":
 			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)
@@ -4388,9 +4432,12 @@ func (a *App) SendTaskToAgentOn(ctx context.Context, nodeID, agentName, locator 
 // instead of duplicating work in the agent.
 //
 // As an operator action it is exempt from the pause switch, matching
-// Resolve/Confirm.
+// Resolve/Confirm. screen is nil for an operator; for the orchestrator the
+// daemon passes its outbound screen, applied to the exact rendered prompt —
+// after the reservation, since the prompt folds the reserved item's detail, so
+// a refusal returns the item to [ ].
 func (a *App) SendTaskForOperator(ctx context.Context, p domain.SendTaskPayload,
-	agentID, agentType, agentName string, host ports.TaskSendHost) error {
+	agentID, agentType, agentName string, host ports.TaskSendHost, screen func(string) error) error {
 
 	if host == nil {
 		return fmt.Errorf("herdr unavailable — cannot send")
@@ -4444,6 +4491,16 @@ func (a *App) SendTaskForOperator(ctx context.Context, p domain.SendTaskPayload,
 		Template: template, AgentName: agentName, Cwd: cwd,
 		SourceIndex: sourceIndex,
 	}.Prompt()
+	if screen != nil {
+		if err := screen(prompt); err != nil {
+			if _, rerr := a.mutateTaskWithin(context.WithoutCancel(ctx), p.Locator,
+				releaseTask(p.Index, p.TaskText)); rerr != nil {
+				return fmt.Errorf("task #%d was not sent: %w (and it could not be returned to [ ]: %v)",
+					p.Index, err, rerr)
+			}
+			return fmt.Errorf("task #%d was not sent: %w", p.Index, err)
+		}
+	}
 	if f := a.deliverReserved(ctx, host, agentID, agentType, prompt, 0,
 		func(rc context.Context) error {
 			_, err := a.mutateTaskWithin(rc, p.Locator, releaseTask(p.Index, p.TaskText))

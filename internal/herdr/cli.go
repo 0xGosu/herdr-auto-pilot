@@ -51,6 +51,8 @@ type CLI struct {
 	Timeout time.Duration
 	// retryBaseDelay overrides submitRetryBaseDelay in tests (0 = default).
 	retryBaseDelay time.Duration
+	// startBusyDelay overrides agentStartBusyDelay in tests (0 = default).
+	startBusyDelay time.Duration
 
 	// sendShape caches which text-submission CLI shape this herdr supports
 	// (see submitText). Atomic: concurrent sends to different panes share it.
@@ -79,6 +81,12 @@ func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
+	return c.runFor(ctx, timeout, args...)
+}
+
+// runFor is run with an explicit deadline, for the one call (agent start)
+// that legitimately waits far longer than a control action.
+func (c *CLI) runFor(ctx context.Context, timeout time.Duration, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, c.BinPath, args...)

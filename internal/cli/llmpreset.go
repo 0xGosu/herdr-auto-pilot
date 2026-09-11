@@ -1,7 +1,8 @@
 package cli
 
-// `hap config set <llm command field> --preset claude|codex` — the CLI half of
-// the LLM command presets.
+// `hap config set <command field> --preset claude|codex` — the CLI half of
+// the command presets (the three [llm] templates, plus the orchestrator
+// command, which offers claude only).
 //
 // Three [llm] argv templates ship disabled (llm.command,
 // llm.task_generate_command, llm.learn_from_user_command). Turning one on by

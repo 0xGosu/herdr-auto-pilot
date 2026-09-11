@@ -123,8 +123,11 @@ type Options struct {
 	//
 	// Optional. nil means the capability was never wired, and the action is
 	// refused with errActionUnsupported rather than silently reported done.
+	//
+	// screen is nil for an operator (their confirm is the gate) and the
+	// daemon's outbound screen for the orchestrator (an LLM's confirm is not).
 	ConfirmGeneratedTask func(ctx context.Context, auditID int64, send bool,
-		author string, host ports.TaskSendHost) error
+		author string, host ports.TaskSendHost, screen func(string) error) error
 	// SendTask hands one checklist item an operator picked to a live agent's
 	// pane, rendered through that source's own next-task template. It reaches
 	// this daemon as a send_task row, so an operator can hand out a task on any
@@ -137,8 +140,11 @@ type Options struct {
 	//
 	// Optional. nil means the capability was never wired, and the action is
 	// refused with errActionUnsupported rather than silently reported done.
+	//
+	// screen, when non-nil, is applied to the exact rendered prompt before it
+	// is sent — nil for an operator, the outbound screen for the orchestrator.
 	SendTask func(ctx context.Context, p domain.SendTaskPayload,
-		agentID, agentType, agentName string, host ports.TaskSendHost) error
+		agentID, agentType, agentName string, host ports.TaskSendHost, screen func(string) error) error
 	// DisableFSP switches full self-prompting off in config.toml and records
 	// the toggle in the automation history. Called when a [limits] ceiling is
 	// reached and full_self_prompting.honour_limits is set.
@@ -615,6 +621,9 @@ type Daemon struct {
 	// lastAutoAccept is what the most recent auto-accept pass looked at, read
 	// by the announcement right after it. Loop-owned.
 	lastAutoAccept autoAcceptPassReport
+
+	// orch is the full-self-prompting orchestrator session (orchestrator.go).
+	orch orchestratorState
 
 	// lastNodeUpsert throttles the nodes-row write to domain.NodeHeartbeat off
 	// the faster health-file beat. Zero means "never written", so a starting
@@ -1112,6 +1121,13 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	if !first && !prev.Agents.SyncClaudeSessionName && cfg.Agents.SyncClaudeSessionName {
 		d.startClaudeSessionNameSync()
 	}
+	// Turning the orchestrator on (the key, or the mode it rides on) starts it
+	// now rather than at the next sweep. `!first` for the reason above: Run
+	// drives its own startup pass. Called after the unlock — the pass takes
+	// d.mu itself.
+	if !first && !d.orchestratorModeOn(prev) {
+		d.startOrchestratorPass(nil)
+	}
 
 	d.reloadEmbedder(prev, cfg, first || forceEmbedder)
 	slog.Info("configuration loaded", "path", d.opt.ConfigPath)
@@ -1209,6 +1225,7 @@ func (d *Daemon) writeHealth(startedAt time.Time) {
 		ExePath:        d.exePath,
 		BinaryReplaced: d.binaryReplaced.Load(),
 		FleetSync:      d.fleetHealth(),
+		Orchestrator:   d.orchestratorHealth(),
 	}
 	if err := daemonhealth.Write(d.opt.StateDir, h); err != nil {
 		slog.Debug("heartbeat write failed", "error", err)
@@ -1352,6 +1369,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Before the first health beat can publish a state this contradicts: a
 	// daemon started BY a sync recovery must not order another one.
 	d.adoptFleetRecoveryMarker()
+	// Before anything can process an event or reconcile a listing, so the
+	// orchestrator is ignored from the first one on.
+	d.loadOrchestrator()
 	d.writeHealth(startedAt)
 	// Through the throttle rather than around it: the first call always writes,
 	// and going this way ARMS the interval so the next health beat does not
@@ -1476,6 +1496,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Tells an orchestrator that anything it held in memory about this daemon
 	// (in-flight captures, pending consults) is gone, so it re-surveys.
 	d.emitStream(ctx, domain.StreamDaemonStarted, domain.StreamStr("version", buildinfo.Version))
+	// A daemon started with the orchestrator configured does not wait a minute
+	// for the first sweep to create it.
+	d.startOrchestratorPass(nil)
 	sweep := time.NewTicker(time.Minute)
 	defer sweep.Stop()
 
@@ -1554,6 +1577,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 				// only thing that can see an agent that VANISHED, which no
 				// per-agent event ever reports.
 				d.publishRoster(ctx, agents)
+				// The orchestrator is in the roster above and in NO pass below;
+				// this listing is also what tells whether it still exists.
+				d.observeOrchestrator(ctx, agents)
+				d.startOrchestratorPass(agents)
+				agents = d.withoutOrchestrator(agents)
 				// Ahead of the reconcile and the idle poll: an escalation
 				// accepted this tick no longer blocks its agent's
 				// hasOpenEscalation guard, so the same sweep can move it on.
@@ -1745,6 +1773,13 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 	// agent a front end is about to render differently, and every early exit
 	// below is a case where nothing else will publish it until the sweep.
 	d.noteRosterTransition(ctx, tr)
+
+	// The orchestrator is seen (the roster above shows it) but never named,
+	// captured, classified or audited: disabling alone would still do all
+	// three on every event.
+	if d.isOrchestrator(tr) {
+		return
+	}
 
 	// Auto-generate a short friendly name on first sight — for EVERY
 	// observed transition, including "detected" discovery events and
@@ -1953,6 +1988,9 @@ func (d *Daemon) reconcileAttentionPublishing(ctx context.Context, publish bool)
 // caller already has. The periodic sweep uses it so one `agent list` serves
 // both the reconcile and the auto-send-when-idle poll.
 func (d *Daemon) reconcileAttentionWith(ctx context.Context, agents []domain.AgentTransition) {
+	// Every caller's listing, including the startup reconcile's, which runs
+	// before the sweep's own filter ever does.
+	agents = d.withoutOrchestrator(agents)
 	// Before the parked-status filter: working agents must sync too, or a
 	// busy agent on a recycled pane id keeps the stale AGE until it parks.
 	d.syncTerminalIDs(ctx, agents)
@@ -2250,6 +2288,10 @@ func (d *Daemon) ignoreDuplicate(ctx context.Context, s domain.Situation,
 // delayedTr) and re-derives its inputs at fire time, so every gate — kill
 // switch, rate guard, retry ceiling — applies AFTER the delay.
 func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition) {
+	// Also here, for a delayed capture scheduled before the identity was known.
+	if d.isOrchestrator(tr) {
+		return
+	}
 	_, _, cls := d.snapshot()
 	now := d.opt.Clock.Now()
 	// Insert-if-absent; the transition handler already named the agent,

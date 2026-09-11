@@ -32,6 +32,9 @@ func (d *Daemon) sendTaskAction(ctx context.Context, a domain.AgentAction) (stri
 		return "", fmt.Errorf("%w: %q, so it cannot be run by this build. Upgrade with `hap daemon --ensure`",
 			errActionUnsupported, a.Kind)
 	}
+	if err := d.refuseOrchestratorWhilePaused(ctx, a); err != nil {
+		return "", err
+	}
 
 	// The operator's SPELLING of the agent, resolved here because agent_names
 	// is unique per NODE and a pane id repeats across machines — this is the
@@ -59,7 +62,8 @@ func (d *Daemon) sendTaskAction(ctx context.Context, a domain.AgentAction) (stri
 	// Inside the per-agent lifecycle barrier, like every other delivery.
 	var inner error
 	disabled, err := d.opt.Store.WithAgentAutomation(ctx, agent.AgentID, func() {
-		inner = d.opt.SendTask(ctx, p, agent.AgentID, agent.AgentType, name, d.taskSendHost(a.ID))
+		inner = d.opt.SendTask(ctx, p, agent.AgentID, agent.AgentType, name, d.taskSendHost(a.ID),
+			d.actionScreen(a, agent.AgentType))
 	})
 	switch {
 	case err != nil:
