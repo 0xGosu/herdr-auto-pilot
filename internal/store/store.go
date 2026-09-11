@@ -753,6 +753,52 @@ func (s *Store) ListSignatureEmbeddings(ctx context.Context) ([]domain.Signature
 	return out, rows.Err()
 }
 
+// SignatureEmbeddingsFingerprint digests every column of every row the
+// semantic index is built from, so the daemon can tell a fleet pull that moved
+// a rule apart from one that only moved bookkeeping (see
+// ports.KnowledgeFingerprinter). The vector BYTES are hashed too, not just
+// their length: the read costs a few milliseconds against a rebuild costing
+// hundreds, and "same length, different vector" is then never a question.
+//
+// Each field is length-prefixed so no two different rows can serialize to the
+// same bytes, and the order is by signature, the primary key, so the digest
+// does not depend on insertion order.
+func (s *Store) SignatureEmbeddingsFingerprint(ctx context.Context) (string, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT signature, situation_type, agent_type, model, dims, vector, salient, created_at
+		FROM signature_embeddings ORDER BY signature`)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	h := sha256.New()
+	var n [binary.MaxVarintLen64]byte
+	field := func(b []byte) {
+		h.Write(n[:binary.PutUvarint(n[:], uint64(len(b)))])
+		h.Write(b)
+	}
+	for rows.Next() {
+		var sig, st, agent, model, salient string
+		var dims, created int64
+		var blob []byte
+		if err := rows.Scan(&sig, &st, &agent, &model, &dims, &blob, &salient, &created); err != nil {
+			return "", err
+		}
+		field([]byte(sig))
+		field([]byte(st))
+		field([]byte(agent))
+		field([]byte(model))
+		field(binary.AppendVarint(nil, dims))
+		field(blob)
+		field([]byte(salient))
+		field(binary.AppendVarint(nil, created))
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
 // CountSignatureEmbeddings reports how many semantic identity rows exist.
 func (s *Store) CountSignatureEmbeddings(ctx context.Context) (int64, error) {
 	var n int64

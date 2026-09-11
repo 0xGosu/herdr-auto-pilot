@@ -148,6 +148,21 @@ func buildIndex(path string, dims int) (bleve.Index, error) {
 // abandoned index directory — a failed, superseded, or replaced build — is
 // removed, so the cache never leaks generations.
 func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
+	return m.rebuild(rows, dims, nil)
+}
+
+// RebuildPublished is Rebuild that also reports whether THIS call's index is
+// the one now live. A superseded build returns (false, nil), which Rebuild
+// cannot tell apart from success — and a caller recording what the live index
+// was built from must not vouch for rows it just threw away. It is true
+// alongside ErrCleanup, where the new index did publish.
+func (m *Matcher) RebuildPublished(rows []domain.SignatureEmbedding, dims int) (bool, error) {
+	var published bool
+	err := m.rebuild(rows, dims, &published)
+	return published, err
+}
+
+func (m *Matcher) rebuild(rows []domain.SignatureEmbedding, dims int, published *bool) error {
 	if !vectorSearchSupported {
 		// No KNN engine is linked (built without the `vectors` tag), so the
 		// index must be text-only. Force dims to 0: a positive dims would make
@@ -217,6 +232,9 @@ func (m *Matcher) Rebuild(rows []domain.SignatureEmbedding, dims int) error {
 	old, oldDir := m.idx, m.idxDir
 	m.idx, m.idxDir, m.dims = idx, dir, dims
 	m.mu.Unlock()
+	if published != nil {
+		*published = true
+	}
 	if old != nil {
 		if cleanupErr := m.cleanupIndex(old.Close, oldDir); cleanupErr != nil {
 			// The new index is live and published; only reclaiming the previous

@@ -1,0 +1,2 @@
+- Fixed the daemon rebuilding its whole semantic match index after every Turso pull, even when no learned rule had changed — on a fleet node that kept an idle daemon at ~20% CPU; it now rebuilds only when a rule is added, removed or re-embedded
+- Reduced `hap stream orchestrator`'s idle cost: a caught-up stream no longer re-reads the log's retained floor on every poll, and it polls every 2s instead of every 500ms after 30s without events (the first event restores the fast poll)
