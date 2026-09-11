@@ -125,9 +125,16 @@ func persistModelID(path string, facts modelIDEntry, id string) {
 		return
 	}
 	file := filepath.Join(modelIDDir, modelIDFile)
-	all := map[string]modelIDEntry{}
+	var all map[string]modelIDEntry
 	if data, err := os.ReadFile(file); err == nil {
-		_ = json.Unmarshal(data, &all)
+		// A corrupt file — or a literal `null`, which decodes cleanly into a
+		// nil map — is replaced, never written into.
+		if json.Unmarshal(data, &all) != nil {
+			all = nil
+		}
+	}
+	if all == nil {
+		all = map[string]modelIDEntry{}
 	}
 	facts.ID = id
 	all[path] = facts

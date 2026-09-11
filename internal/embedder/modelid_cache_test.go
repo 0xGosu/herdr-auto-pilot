@@ -124,24 +124,30 @@ func TestModelIDWithoutACacheDirHashesEveryProcess(t *testing.T) {
 }
 
 // TestAnUnreadableModelIDCacheOnlyCostsAHash: a corrupt cache file is ignored,
-// the id is computed, and the file is rewritten usable.
+// the id is computed, and the file is rewritten usable. `null` is the sharp
+// case: it decodes WITHOUT error into a nil map, and writing into that map
+// panicked in every process that asked for the model id.
 func TestAnUnreadableModelIDCacheOnlyCostsAHash(t *testing.T) {
-	state := t.TempDir()
-	model := filepath.Join(t.TempDir(), "m.gguf")
-	if err := os.WriteFile(model, []byte("bytes"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(state, modelIDFile), []byte("{not json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	hashed := freshProcess(t, state)
-	id := ModelIDFor(model)
-	if *hashed != 1 || id == "" {
-		t.Fatalf("corrupt cache: hashed %d, id %q", *hashed, id)
-	}
-	hashed = freshProcess(t, state)
-	if ModelIDFor(model) != id || *hashed != 0 {
-		t.Errorf("the cache was not rewritten usable (hashed %d)", *hashed)
+	for _, content := range []string{"{not json", "null", "[]", ""} {
+		t.Run(content, func(t *testing.T) {
+			state := t.TempDir()
+			model := filepath.Join(t.TempDir(), "m.gguf")
+			if err := os.WriteFile(model, []byte("bytes"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(state, modelIDFile), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			hashed := freshProcess(t, state)
+			id := ModelIDFor(model)
+			if *hashed != 1 || id == "" {
+				t.Fatalf("cache %q: hashed %d, id %q", content, *hashed, id)
+			}
+			hashed = freshProcess(t, state)
+			if ModelIDFor(model) != id || *hashed != 0 {
+				t.Errorf("cache %q was not rewritten usable (hashed %d)", content, *hashed)
+			}
+		})
 	}
 }
 
