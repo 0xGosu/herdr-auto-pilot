@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.11
+
+- Fixed the daemon rebuilding its whole semantic match index after every Turso pull, even when no learned rule had changed — on a fleet node that kept an idle daemon at ~20% CPU; it now rebuilds only when a rule is added, removed or re-embedded
+- Reduced `hap stream orchestrator`'s idle cost: a caught-up stream no longer re-reads the log's retained floor on every poll, and it polls every 2s instead of every 500ms after 30s without events (the first event restores the fast poll)
+
 ## 0.9.10
 
 - Added `full_self_prompting.orchestrator_agent_command` (bootstrap it with `hap config set full_self_prompting.orchestrator_agent_command --preset claude`): while full self-prompting is on, the daemon keeps an interactive claude session named `orchestrator` alive in its own `hap-orchestrator` herdr workspace, briefs it to watch `hap stream orchestrator` and keep the herd moving toward the goals you type into it, and ignores it completely. It is re-created if it disappears (at most 3 times an hour) and never closed by hap; `full_self_prompting.orchestrator_agent_prompt` replaces the built-in brief.
