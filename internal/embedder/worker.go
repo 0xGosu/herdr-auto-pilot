@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -120,6 +121,7 @@ func RunWorker(ctx context.Context, in io.Reader, out io.Writer) error {
 	bw := bufio.NewWriter(out)
 
 	requests := 0
+	freed := false
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -161,6 +163,15 @@ func RunWorker(ctx context.Context, in io.Reader, out io.Writer) error {
 		}
 		if err := bw.Flush(); err != nil {
 			return err
+		}
+		// The first successful embed is the model load. What the Go side
+		// allocated to get here — every package's init, the load itself —
+		// is garbage from now on; hand it back once rather than letting the
+		// runtime return it over the next minutes of a process that lives
+		// as long as the daemon.
+		if embErr == nil && !freed {
+			freed = true
+			debug.FreeOSMemory()
 		}
 	}
 }

@@ -28,6 +28,10 @@ func (d *Daemon) initSemantic(ctx context.Context, gen int64) {
 		return
 	}
 
+	// Loading every row and building a fresh index is the daemon's one large
+	// allocation burst; see tightGC.
+	defer tightGC()()
+
 	// Digest the rows BEFORE loading them: a rule landing between the two then
 	// costs one redundant rebuild on the next refresh, never a missed rule. (A
 	// Reconcile that rewrites rows below costs the same single extra rebuild.)

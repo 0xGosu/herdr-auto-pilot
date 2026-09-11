@@ -48,7 +48,10 @@ golangci-lint run --build-tags "vectors,cpu"
 - Profiling (opt-in, any verb): `HAP_PROFILE_DIR=<dir> [HAP_PROFILE_SECONDS=60] hap daemon --restart` writes
   ROLLING `<verb>-<pid>.cpu.pprof` / `.heap.pprof` windows (`internal/profiling`) — the files are always the latest
   complete window, so an idle daemon hours in can be read with `go tool pprof -top bin/hap <file>`. The detached
-  daemon inherits the environment; nothing is written or listened on when the variable is unset.
+  daemon inherits the environment; nothing is written or listened on when the variable is unset. Each window also
+  writes `<verb>-<pid>.mem.txt` (Go memory classes, plus `/proc/self/status` on Linux): the heap profile sees only LIVE Go
+  objects, a few MB of a resident set mostly made of file-backed pages, freed-but-unreturned Go heap and native
+  memory (Turso engine, FAISS, llama.cpp) — "go resident" is what to subtract from RssAnon to find the native part.
 - Pipeline smoke test (fake herdr → real daemon → real LLM CLI):
   `go build -o /tmp/e2e ./e2e_harness && /tmp/e2e <short-dir> <hap-bin> <config-dir> <state-dir>`.
 
@@ -618,7 +621,12 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   - The adapter gates the SDK (statements read-lock, Push/Pull/Checkpoint write-lock, transactions hold the
     lock, rows returned EAGERLY) over a FIXED pre-warmed pool, with sync ops on a background context —
     verified: unguarded they flood `database is locked`, and a Push cancelled mid-flight hangs the engine
-    for good.
+    for good. Every pooled connection gets `turso.PageCacheKiB` of page cache — at warm-up, and again whenever a
+    bridge session takes a connection (`sqlbridge.Executor.SetConnInit`), which is what reaches one database/sql
+    opened to replace a discarded one; a refusal is logged, never fatal. The engine default is
+    2000 KiB PER CONNECTION, kept for the daemon's life across the whole pool, duplicating the kernel's page
+    cache. The engine clamps anything under 200 pages up to 200 and reads it back as `200`, so the constant
+    sits at that floor.
   - **Schema DDL on a shared database is issued only by the SCHEMA LEASE holder**
     (`turso.PrepareSharedSchema` / `AcquireSchemaLease`), which must be RE-PROVEN between migration steps,
     failing closed with `ErrSchemaLeaseLost` — a background renewal alone is starved by a step's own write
@@ -843,6 +851,12 @@ collision changed it; an unnamed one is sent `/rename <hap name>`.
 
 ### Semantic matching
 
+- **A knowledge rebuild runs under `tightGC`** (`daemon/memory.go`) — loading every signature and building a
+  fresh index is the daemon's one large allocation burst (~40MB against a live heap of a few MB), and at the
+  default GC target it set the daemon's high-water mark and held ~80MB resident for its first minute. The
+  target is lowered only for the burst and the heap handed back at its end; a process-wide GOGC=25 was measured
+  at roughly double the idle daemon's CPU. It only ever LOWERS (an operator's tighter GOGC stays), overlapping
+  rebuilds nest, and GOGC=off is not touched at all.
 - **Semantic matching degrades, never blocks** — situations resolve via embedding + vector search over the
   MASKED salient (`daemon.resolveSignature`, `internal/match`, `internal/embedder`), falling back to
   normalized BM25, then exact hash. `SignatureResult.Raw` is the never-remapped content hash (the LLM drift

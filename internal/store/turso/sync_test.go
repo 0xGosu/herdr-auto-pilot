@@ -2,6 +2,7 @@ package turso_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"os"
@@ -60,6 +61,9 @@ func startLocalSyncServer(t *testing.T) string {
 	return ""
 }
 
+// testPoolConnections is openNode's pool size.
+const testPoolConnections = 4
+
 type node struct {
 	id  string
 	db  *turso.DB
@@ -74,7 +78,7 @@ func openNode(t *testing.T, url, id string) *node {
 	ctx := context.Background()
 	dir := t.TempDir()
 	db, err := turso.Open(ctx, turso.Options{Path: filepath.Join(dir, "hap.db"), RemoteURL: url,
-		AuthToken: os.Getenv("HAP_TURSO_TEST_TOKEN"), ClientName: "hap-" + id, Connections: 4})
+		AuthToken: os.Getenv("HAP_TURSO_TEST_TOKEN"), ClientName: "hap-" + id, Connections: testPoolConnections})
 	if err != nil {
 		t.Fatalf("%s: open: %v", id, err)
 	}
@@ -369,5 +373,40 @@ func TestAPullThatBroughtRowsMovesTheRevision(t *testing.T) {
 	}
 	if after == before {
 		t.Errorf("a pull that brought rows left the revision at %q", after)
+	}
+}
+
+// TestEveryPooledConnectionUsesTheSmallPageCache: the pool is warmed once and
+// kept for the daemon's life, so a connection that missed the pragma keeps the
+// engine's 2000 KiB default for good. Holding every connection at once is what
+// reaches each of them rather than whichever one the pool hands back first.
+func TestEveryPooledConnectionUsesTheSmallPageCache(t *testing.T) {
+	url := startLocalSyncServer(t)
+	n := openNode(t, url, "aaaaaaaaaaaaaaaa")
+	// The store's gated handle parks idle sessions on raw connections; hand
+	// them back so every pooled connection can be held below.
+	n.db.DB().SetMaxIdleConns(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	raw := n.db.Executor().DB()
+	var held []*sql.Conn
+	defer func() {
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	for i := 0; i < testPoolConnections; i++ {
+		c, err := raw.Conn(ctx)
+		if err != nil {
+			t.Fatalf("connection %d: %v", i, err)
+		}
+		held = append(held, c)
+		var kib int64
+		if err := c.QueryRowContext(ctx, "PRAGMA cache_size").Scan(&kib); err != nil {
+			t.Fatalf("connection %d: %v", i, err)
+		}
+		if kib != -turso.PageCacheKiB {
+			t.Errorf("connection %d: cache_size = %d, want %d", i, kib, -turso.PageCacheKiB)
+		}
 	}
 }
