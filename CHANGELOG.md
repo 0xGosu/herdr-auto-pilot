@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.16
+
+- Added `HAP_ACTOR=orchestrator`, which marks everything a hap command does as the orchestrator's rather than the operator's — for an orchestrating agent hap did not start itself. It gets the same never-auto screening and pause refusal as commands run in the orchestrator's own pane. That pane is always the orchestrator whatever the variable says, and any value other than `orchestrator` or `operator` fails the command
+- The audit log now records who settled each escalation: the TUI Audit tab has a BY column (`op`, `orch`, or `-` for hap's own rows and older ones), its detail view shows `Settled by`, and `hap audit` rows end with `by=`. Confirms, resolves, dismissals and prunes are all attributed, including ones the daemon carries out on the orchestrator's behalf
+
 ## 0.9.15
 
 - `hap status` and `hap agents` no longer hash the whole ~25 MB embedding model on every run: the model's id is remembered per machine and re-checked only when the file changes (tens of milliseconds on an idle machine, much more on a busy one)
