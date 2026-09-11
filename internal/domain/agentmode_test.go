@@ -1,6 +1,8 @@
 package domain
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -293,7 +295,7 @@ func TestCodexComposerReadyAcceptsTheRealComposer(t *testing.T) {
 // TestComposerReadyForModeFailsClosedOnUnknownAgents: an agent type with no
 // known composer shape must never be pressed into.
 func TestComposerReadyForModeFailsClosedOnUnknownAgents(t *testing.T) {
-	for _, agentType := range []string{"", "unknown", "gemini", "agy"} {
+	for _, agentType := range []string{"", "unknown", "gemini"} {
 		if ComposerReadyForMode(agentType, claudeComposer+"  ⏸ manual mode on\n") {
 			t.Errorf("ComposerReadyForMode(%q) accepted a pane for an agent with no known mode toggle", agentType)
 		}
@@ -324,6 +326,13 @@ func TestParseAgentModeAcceptsOnlyTheTypesOwnModes(t *testing.T) {
 		{"codex", "plan", AgentModePlan, true},
 		{"codex", "manual", AgentModeUnknown, false},
 		{"codex", "auto", AgentModeUnknown, false},
+		// agy's own spelling of its middle mode, and its aliases.
+		{"agy", "default", AgentModeDefault, true},
+		{"agy", "accept-edits", AgentModeAcceptEdits, true},
+		{"agy", "acceptEdits", AgentModeAcceptEdits, true},
+		{"antigravity", "plan", AgentModePlan, true},
+		{"agy", "auto", AgentModeUnknown, false},
+		{"agy", "manual", AgentModeUnknown, false},
 		// bypassPermissions is reportable but never settable: it is entered at
 		// launch, so the Shift+Tab cycle can never reach it and the loop would
 		// spend its whole ceiling trying.
@@ -344,7 +353,7 @@ func TestParseAgentModeAcceptsOnlyTheTypesOwnModes(t *testing.T) {
 // TestModePressCapCoversAFullCycle: the ceiling must exceed the cycle length,
 // or a target one step "behind" the current mode is unreachable.
 func TestModePressCapCoversAFullCycle(t *testing.T) {
-	for _, agentType := range []string{"claude", "codex"} {
+	for _, agentType := range []string{"claude", "codex", "agy", "antigravity-cli"} {
 		modes := AgentModesFor(agentType)
 		if cap := ModePressCap(agentType); cap < len(modes) {
 			t.Errorf("ModePressCap(%q) = %d with %d modes — a full rotation cannot complete", agentType, cap, len(modes))
@@ -352,6 +361,110 @@ func TestModePressCapCoversAFullCycle(t *testing.T) {
 	}
 	if ModePressCap("gemini") != 0 || AgentModesFor("gemini") != nil {
 		t.Error("an agent type with no mode toggle must offer no modes and no presses")
+	}
+}
+
+// TestAgyAgentModeOverEveryRecordedScreen runs agy's mode read and its press
+// gate over every recorded agy screen. Each fixture carries an explicit
+// expectation, so a new capture must be classified here before it passes.
+//
+// The cases that discriminate: offline (a status bar with no model segment)
+// and every form, picker and popup (a key hint above the bar, not the
+// composer's rule) are UNKNOWN, never "default"; a working agy and one holding
+// a draft still report their mode, because a read sends nothing; and neither
+// of those two may be pressed into.
+func TestAgyAgentModeOverEveryRecordedScreen(t *testing.T) {
+	unknown := AgentModeUnknown
+	want := map[string]struct {
+		mode  AgentMode
+		ready bool
+	}{
+		"idle_agy_fresh":             {AgentModeDefault, true},
+		"idle_agy_after_turn":        {AgentModeDefault, true},
+		"idle_agy_declined":          {AgentModeDefault, true},
+		"idle_agy_mode_accept_edits": {AgentModeAcceptEdits, true},
+		"idle_agy_mode_plan":         {AgentModePlan, true},
+		"error_agy_interrupted":      {AgentModeDefault, true},
+		"error_agy_model_warning":    {AgentModeDefault, true},
+		"idle_agy_composer_draft":    {AgentModeDefault, false},
+		"working_agy_spinner":        {AgentModePlan, false},
+		// A bar with no model segment carries no mode; the press gate may
+		// accept the composer, but SetAgentMode refuses on the unknown read
+		// before any press.
+		"error_agy_offline":            {unknown, true},
+		"approval_agy_artifact_review": {unknown, false},
+		"approval_agy_file_access":     {unknown, false},
+		"approval_agy_file_create":     {unknown, false},
+		"approval_agy_shell":           {unknown, false},
+		"approval_agy_shell_amend":     {unknown, false},
+		"approval_agy_shell_plan_mode": {unknown, false},
+		"approval_agy_shell_recent":    {unknown, false},
+		"approval_agy_shell_wide":      {unknown, false},
+		"approval_agy_shell_wrapped":   {unknown, false},
+		"approval_agy_trust_folder":    {unknown, false},
+		"choice_agy_mcq":               {unknown, false},
+		"choice_agy_mcq_two":           {unknown, false},
+		"choice_agy_mcq_two_q2":        {unknown, false},
+		"choice_agy_mcq_two_recent":    {unknown, false},
+		"idle_agy_effort_picker":       {unknown, false},
+		"idle_agy_model_picker":        {unknown, false},
+		"idle_agy_shortcuts_overlay":   {unknown, false},
+		"idle_agy_signin_method":       {unknown, false},
+		"idle_agy_signin_url":          {unknown, false},
+		"idle_agy_slash_popup":         {unknown, false},
+		"idle_agy_terms":               {unknown, false},
+	}
+	files, err := filepath.Glob(filepath.Join("..", "classify", "testdata", "transcripts", "*_agy_*.txt"))
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no agy fixtures found (%v)", err)
+	}
+	seen := map[string]bool{}
+	for _, f := range files {
+		name := strings.TrimSuffix(filepath.Base(f), ".txt")
+		seen[name] = true
+		t.Run(name, func(t *testing.T) {
+			w, ok := want[name]
+			if !ok {
+				t.Fatalf("no expectation for %s: classify it in this table", name)
+			}
+			b, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pane := string(b)
+			got, gotOK := AgentModeFromPane("agy", pane)
+			if got != w.mode || gotOK != (w.mode != unknown) {
+				t.Errorf("AgentModeFromPane = %q, %v; want %q", got, gotOK, w.mode)
+			}
+			if ready := ComposerReadyForMode("agy", pane); ready != w.ready {
+				t.Errorf("ComposerReadyForMode = %v; want %v", ready, w.ready)
+			}
+		})
+	}
+	for name := range want {
+		if !seen[name] {
+			t.Errorf("expectation for %s names no fixture", name)
+		}
+	}
+}
+
+// TestAgyAgentModeNeedsTheComposerRuleAboveTheBar: the status bar alone is not
+// enough — agy paints the same bar under every form and picker, where the mode
+// segment still renders, so a bar under anything but the composer's rule must
+// stay unknown. The alias must reach the same parser.
+func TestAgyAgentModeNeedsTheComposerRuleAboveTheBar(t *testing.T) {
+	bar := "? for shortcuts                                  plan · Gemini 3.6 Flash · low"
+	if got, ok := AgentModeFromPane("antigravity", agyComposer); !ok || got != AgentModeDefault {
+		t.Errorf("alias read = %q, %v; want default", got, ok)
+	}
+	if got, ok := AgyAgentMode("  ↑/↓ Navigate · enter Select\n" + bar + "\n"); ok {
+		t.Errorf("a bar under a key hint read as %q", got)
+	}
+	if got, ok := AgyAgentMode("────────────────────────────────────────\n" + bar + "\n\n"); !ok || got != AgentModePlan {
+		t.Errorf("bar under the rule = %q, %v; want plan", got, ok)
+	}
+	if _, ok := AgyAgentMode(""); ok {
+		t.Error("an empty capture reported a mode")
 	}
 }
 

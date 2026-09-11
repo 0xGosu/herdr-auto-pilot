@@ -81,20 +81,33 @@ var (
 // Callers only ever test the LAST non-empty line with this: the shapes are
 // distinctive at the bottom of the screen and nowhere else.
 func agyStatusBarLine(line string) bool {
+	_, ok := agyStatusBar(line)
+	return ok
+}
+
+// agyStatusBar is agyStatusBarLine that also returns the bar's right-aligned
+// model segment, "" when the bar carries none (no model loaded).
+func agyStatusBar(line string) (segment string, ok bool) {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
-		return false
+		return "", false
 	}
 	for _, left := range []string{"? for shortcuts", "esc to cancel"} {
-		if rest, ok := strings.CutPrefix(trimmed, left); ok {
+		if rest, found := strings.CutPrefix(trimmed, left); found {
 			rest = strings.TrimSpace(rest)
-			return rest == "" || agyModelSegmentRE.MatchString(rest)
+			if rest == "" {
+				return "", true
+			}
+			return rest, agyModelSegmentRE.MatchString(rest)
 		}
 	}
 	// No left token: only the right-aligned model segment, which starts after a
 	// terminal-width padding run.
 	loc := agyStatusPadRE.FindStringIndex(strings.TrimRight(line, " \t"))
-	return loc != nil && loc[0] == 0 && agyModelSegmentRE.MatchString(trimmed)
+	if loc != nil && loc[0] == 0 && agyModelSegmentRE.MatchString(trimmed) {
+		return trimmed, true
+	}
+	return "", false
 }
 
 // agyBody returns the capture's lines with trailing blank lines and agy's

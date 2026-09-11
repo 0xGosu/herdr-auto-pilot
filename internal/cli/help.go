@@ -188,13 +188,14 @@ func buildCommands() {
 			Aliases: []string{"--skill"},
 			Group:   groupCore,
 			Summary: "print the bundled hap agent skill document, or install it for coding agents",
-			Usage:   []string{"hap skill", "hap skill show", "hap --skill", "hap skill install <claude|codex|agents>..."},
+			Usage:   []string{"hap skill", "hap skill show", "hap --skill", "hap skill install <claude|codex|agy|agents>..."},
 			Details: "The SKILL.md that teaches a coding agent to drive hap ships inside the binary,\n" +
 				"so no repo checkout is needed. Without arguments (or with the explicit `show`)\n" +
 				"the document is printed to stdout. `install` writes it into the named agents'\n" +
 				"skill directories:\n" +
 				"  claude → ~/.claude/skills/hap/SKILL.md\n" +
 				"  codex  → ~/.codex/skills/hap/SKILL.md\n" +
+				"  agy    → ~/.gemini/antigravity-cli/skills/hap/SKILL.md\n" +
 				"  agents → ~/.agents/skills/hap/SKILL.md   (other tools sharing ~/.agents)\n" +
 				"The TUI's Config tab offers the same install as a quick shortcut.",
 			Examples: []string{"hap skill | less", "hap skill install claude codex"},
@@ -350,6 +351,7 @@ func buildCommands() {
 			Details: "With one argument it prints the mode alone, for scripts to capture:\n" +
 				"  claude: manual | acceptEdits | plan | auto\n" +
 				"  codex:  default | plan\n" +
+				"  agy:    default | acceptEdits | plan   (agy spells it accept-edits; both work)\n" +
 				"With two it presses shift+tab until the agent's own pane reports the mode you\n" +
 				"asked for — so it is idempotent: an agent already in that mode is left alone\n" +
 				"and no keystroke is sent.\n\n" +
@@ -359,7 +361,9 @@ func buildCommands() {
 				"fail with an explanation instead of pressing keys into a modal (inside one,\n" +
 				"shift+tab means \"approve\", not \"change mode\").\n\n" +
 				"Claude's launch-time bypass-permissions mode is reported but cannot be set —\n" +
-				"the shift+tab cycle does not pass through it.",
+				"the shift+tab cycle does not pass through it. agy's equivalent\n" +
+				"(--dangerously-skip-permissions) paints no indicator at all, so such an agy\n" +
+				"reports whatever its cycle shows, `default` at launch.",
 			Examples: []string{
 				"hap mode vivid-falcon",
 				"hap mode vivid-falcon plan --yes",

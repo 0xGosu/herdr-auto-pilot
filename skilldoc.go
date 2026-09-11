@@ -36,6 +36,11 @@ func Targets() []Target {
 	return []Target{
 		{Name: "claude", Label: "Claude", Dir: ".claude/skills"},
 		{Name: "codex", Label: "Codex", Dir: ".codex/skills"},
+		// agy's global skills directory, as its own `/skills` lists it
+		// (verified live, agy 1.2.1): "~/.gemini/config/skills" appears in
+		// agy's bundled migration guide but is NOT loaded, and ~/.agents is
+		// read only per workspace (<workspace>/.agents/skills).
+		{Name: "agy", Label: "Antigravity (agy)", Dir: ".gemini/antigravity-cli/skills"},
 		{Name: "agents", Label: "Others", Dir: ".agents/skills"},
 	}
 }

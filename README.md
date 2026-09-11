@@ -142,8 +142,9 @@ real ids filled in. Turn it off per invocation with `--no-hints`, per shell with
 these affect the help pages.
 
 `hap skill` prints the bundled agent skill document, and
-`hap skill install claude codex agents` writes it into those tools' skill
-directories — so a coding agent can drive hap without a repo checkout.
+`hap skill install claude codex agy agents` writes it into those tools' skill
+directories (agy's is `~/.gemini/antigravity-cli/skills`) — so a coding agent
+can drive hap without a repo checkout.
 
 Nearly everything the TUI does is also a CLI verb. The exceptions are two
 interactive-only conveniences: the `/usr/local/bin/hap` symlink shortcut and the
@@ -805,8 +806,11 @@ LLM-approved response may be sent.
 ### Permission modes
 
 The permission mode is what `shift+tab` cycles inside the agent's own TUI —
-`acceptEdits`, `plan`, `auto`, `manual` for claude; `default`, `plan` for codex.
-Other agent types have none.
+`acceptEdits`, `plan`, `auto`, `manual` for claude; `default`, `plan` for codex;
+`default`, `acceptEdits`, `plan` for agy (agy's own `accept-edits` spelling is
+accepted too). Other agent types have none. The shared names do not share a
+meaning: codex's `default` is its unrestricted mode, agy's is the one that asks
+before every edit and command.
 
 Setting works by pressing `shift+tab` and re-reading the pane until the agent
 itself reports the target, so it is **idempotent** (an agent already there gets
@@ -822,6 +826,13 @@ closed rotation, rotates the agent **back to where it started**, and names the
 cycle it observed. And an agent launched with `--dangerously-skip-permissions`
 reports `bypassPermissions`, which the cycle cannot leave, so hap refuses
 immediately.
+
+agy differs in two ways. Its `--dangerously-skip-permissions` paints no
+indicator at all, so such an agent reports whatever its cycle shows — `default`
+at launch — and hap cannot tell the two apart. And because herdr reports agy as
+idle under every prompt and picker, hap presses `shift+tab` into agy only at an
+EMPTY composer: a half-typed draft, a standing prompt or agy's survey refuses
+the set (reading the mode still works while agy is working or holds a draft).
 
 ## Never-auto patterns
 
@@ -1142,8 +1153,14 @@ the TUI's Audit tab.
 
 For `claude`, hap appends `--session-id {session_id}` automatically (writing
 `{session_id}` yourself turns that off, so it is never passed twice). `codex`
-mints its own and prints it in its startup banner, which hap reads back. For
-anything else nothing is added — hap does not guess a flag name.
+mints its own and prints it in its startup banner, which hap reads back. `agy`
+mints its own too and reports it as `conversation_id` only when the template
+already runs it with `--output-format json` (or `stream-json`); hap reads it
+back then, and it names `~/.gemini/antigravity-cli/conversations/<id>.db`. Plain
+text output carries no id, and switching an agy template to JSON output just for
+the id is not recommended: task generation, re-ranking and learn-from-user read
+the CLI's stdout and cannot see an answer wrapped in the envelope. For anything
+else nothing is added — hap does not guess a flag name.
 
 ### A separate environment per command
 

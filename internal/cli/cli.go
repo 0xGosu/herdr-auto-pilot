@@ -287,7 +287,7 @@ func modeNextSteps(out io.Writer, target string) {
 func modeReadError(r frontend.ModeReport, target string, err error) error {
 	switch {
 	case errors.Is(err, frontend.ErrModeUnsupported):
-		return fmt.Errorf("%s is a %q agent, which has no shift+tab mode toggle (claude and codex do)",
+		return fmt.Errorf("%s is a %q agent, which has no shift+tab mode toggle (claude, codex and agy do)",
 			r.Label(target), r.AgentType)
 	case errors.Is(err, frontend.ErrModeUnreadable):
 		return fmt.Errorf("could not read %s's mode: its pane is not showing the composer footer "+

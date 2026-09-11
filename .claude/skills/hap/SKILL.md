@@ -192,6 +192,7 @@ hap mode backend-dev plan --yes       # rotate the agent into plan mode
 |---|---|
 | `claude` | `acceptEdits`, `plan`, `auto`, `manual` |
 | `codex` | `default`, `plan` |
+| `agy` | `default`, `acceptEdits`, `plan` (agy's `accept-edits` works too) |
 
 Other agent types have no toggle and report `-`.
 
@@ -212,7 +213,12 @@ itself reports the target mode, so:
   closes, rotates the agent **back to where it started**, and names the cycle
   it observed.
 - **`bypassPermissions`** (`--dangerously-skip-permissions`) is reported but
-  cannot be set — the cycle does not pass through it.
+  cannot be set — the cycle does not pass through it. agy's flag of the same
+  name paints no indicator, so such an agy reports whatever its cycle shows
+  (`default` at launch). Don't read agy's `default` as "asks before acting".
+- **agy is only pressed at an empty composer** — herdr reports agy idle under
+  every prompt and picker, so a draft, a form or agy's survey refuses the set
+  (the read still works while agy is working or holds a draft).
 - `--yes` skips the y/N prompt and is **required** when not on a terminal.
 
 ## escalations
@@ -1368,6 +1374,7 @@ The skill ships **inside the binary**, so no checkout is needed:
 ```bash
 hap skill                            # print it
 hap skill install claude codex       # → ~/.claude/skills/hap/, ~/.codex/skills/hap/
+hap skill install agy                # → ~/.gemini/antigravity-cli/skills/hap/
 hap skill install agents             # → ~/.agents/skills/hap/ (tools sharing ~/.agents)
 ```
 

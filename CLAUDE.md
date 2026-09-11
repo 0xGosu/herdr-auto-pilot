@@ -23,7 +23,7 @@ Prefer these for how-to detail.
   hot-swap the daemon (`hap daemon --ensure`), live-test against a real agent.
 
 The hap skill also ships in the binary: `hap --skill` prints it,
-`hap skill install <claude|codex|agents>...` (or the TUI Config tab) installs it.
+`hap skill install <claude|codex|agy|agents>...` (or the TUI Config tab) installs it.
 
 ## Build, test, lint
 
@@ -810,6 +810,16 @@ read and an earlier form is always somewhere above.
   `IrreversibleScanContent` reads it raw alongside the 40-line pane tail, and `MaskVolatile` turns
   `of=/dev/sda` into `of=<path>` — the tail usually carries the raw command too, but a long
   wrapped command can push it out, and the verb is then the only raw copy.
+- **Modes (`default → acceptEdits → plan`) are read loosely and pressed strictly.** The READ
+  (`AgyAgentMode`) is not gated on an empty composer — a working agy or one holding a draft still
+  paints its mode, and `hap agents` should show it — but the PRESS gate (`ComposerReadyForMode`) is
+  `AgyComposerReady`. Two things the pane cannot say: `--dangerously-skip-permissions` paints no
+  indicator (such an agent reads `default` at launch), and a status bar with no model segment carries
+  no mode (UNKNOWN, never default). agy's `default` is its MOST restrictive mode, codex's its least.
+- **Session ids come from the print-mode JSON envelope only** (`llm.ExtractSessionID`): herdr reports
+  no `agent_session` for agy, and `--conversation` resumes an existing id rather than naming a new one,
+  so nothing is injected. The id is read from a line that DECODES as the envelope, never by searching
+  for the key, so an id quoted in the response (escaped inside the envelope) is never taken.
 
 ### Claude session-name sync
 
@@ -1104,7 +1114,9 @@ where the behaviour could revert.
   uniquely omits the cycle hint), so no line means the footer is not shown. **Matching is on the LABEL, never
   the glyph**: `accept edits on` and `auto mode on` both render `⏵⏵`. Codex is the mirror image — it appends a
   right-aligned `Plan mode` segment in Plan and nothing in Default, so "no segment" only means Default once the
-  footer itself is recognized.
+  footer itself is recognized. agy follows Codex (`domain.AgyAgentMode`): an `accept-edits · `/`plan · ` prefix on
+  the status bar's model segment, none for default — and the bar only counts DIRECTLY under the composer's rule,
+  because agy paints the same bar, mode prefix included, under every form and picker.
 - **The mode cycle is per-SESSION, not per-agent-type, so a set must detect a closed rotation** — verified live,
   a `--model haiku` Claude session offers three modes while a default-model session in the same build offers
   four, so `domain.AgentModesFor` is a SUPERSET, never a promise. `SetAgentMode` tracks the modes it has
