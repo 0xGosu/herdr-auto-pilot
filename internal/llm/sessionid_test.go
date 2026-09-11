@@ -162,11 +162,11 @@ func TestExtractSessionIDReadsAgyEnvelope(t *testing.T) {
 // envelope at all, so neither may be read as the conversation's id.
 func TestExtractSessionIDIgnoresAnAgyIDThatIsNotTheEnvelopes(t *testing.T) {
 	for name, out := range map[string]string{
-		"text mode prose": `the conversation_id is "bf5cacf9-ff49-41f5-86c1-334922f5a62d"`,
+		"text mode prose":        `the conversation_id is "bf5cacf9-ff49-41f5-86c1-334922f5a62d"`,
 		"quoted in the response": `{"status":"SUCCESS","response":"{\"conversation_id\":\"bf5cacf9-ff49-41f5-86c1-334922f5a62d\"}"}`,
-		"not a uuid":  `{"conversation_id":"not-a-uuid"}`,
-		"broken json": `{"conversation_id":"bf5cacf9-ff49-41f5-86c1-334922f5a62d"`,
-		"empty":       "",
+		"not a uuid":             `{"conversation_id":"not-a-uuid"}`,
+		"broken json":            `{"conversation_id":"bf5cacf9-ff49-41f5-86c1-334922f5a62d"`,
+		"empty":                  "",
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := ExtractSessionID("agy", out); got != "" {
