@@ -66,6 +66,15 @@ func (d *Daemon) deliverAgyFormLLM(ctx context.Context, ks ports.KeystrokeSender
 	d.deliverKeyedFormLLM(ctx, d.agyForm(ks, s.PaneID, s.Content), s, sig, tr, llmDec, confidence, llmConfidence, now)
 }
 
+// agyAnswerRefusalReason maps a domain.AgyAnswerKey refusal onto its escalation
+// reason: a Write-in row is withheld, anything else names no offered option.
+func agyAnswerRefusalReason(err error) domain.EscalateReason {
+	if errors.Is(err, domain.ErrAgyNotAnswerable) {
+		return domain.ReasonReplyWithheld
+	}
+	return domain.ReasonUnfamiliarOptions
+}
+
 // errAgyComposerNotReady is the refusal every agy hand-out path shares.
 var errAgyComposerNotReady = errors.New("agy's composer is not ready for a message " +
 	"(a form, a draft, a picker or a working turn is on screen)")

@@ -633,8 +633,8 @@ func AgyHeldForm(pane string) (kind string, ok bool) {
 	// The survey is transient and was seen standing above a ready composer, so
 	// it is looked for in the last few rows rather than as the final one.
 	for i := n - 1; i >= 0 && i >= n-6; i-- {
-		if agySurveySkipRE.MatchString(lines[i]) && i > 0 &&
-			(agySurveyRE.MatchString(lines[i-1]) || agySurveyRE.MatchString(lines[i])) {
+		if agySurveySkipRE.MatchString(lines[i]) &&
+			(agySurveyRE.MatchString(lines[i]) || (i > 0 && agySurveyRE.MatchString(lines[i-1]))) {
 			return AgyHeldSurvey, true
 		}
 	}

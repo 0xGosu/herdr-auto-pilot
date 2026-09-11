@@ -298,6 +298,9 @@ func TestAgyComposerReady(t *testing.T) {
 		// while it does answers the survey.
 		"survey": {"How's the CLI experience so far? Help us improve:\n[1] Good  [2] Fine  [3] Bad  [0] Skip\n\n" +
 			agyComposer, false},
+		// Rendered on one row, as the capture's very first line.
+		"survey on the first row": {"How's the CLI experience so far? Help us improve: [1] Good  [2] Fine  [3] Bad  [0] Skip\n" +
+			agyComposer, false},
 		// A panel drawn below the composer pushes the status bar away from it.
 		"panel below the composer": {rule + "\n>\n" + rule + "\nAction required (1 left)\n› □ new plan.md\n\n" + bar, false},
 		"no composer":              {"  Some agent output\n\n" + bar, false},

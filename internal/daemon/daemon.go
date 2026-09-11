@@ -8,7 +8,6 @@ package daemon
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -2946,12 +2945,8 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		// against the live pane.
 		if form, ok := domain.ParseAgyForm(s.Content); ok {
 			if _, err := domain.AgyAnswerKey(form, dec.Input); err != nil {
-				reason := domain.ReasonUnfamiliarOptions
-				if errors.Is(err, domain.ErrAgyNotAnswerable) {
-					reason = domain.ReasonReplyWithheld
-				}
 				d.escalate(ctx, s, sig, domain.Decision{
-					Action: domain.ActionEscalate, Reason: reason,
+					Action: domain.ActionEscalate, Reason: agyAnswerRefusalReason(err),
 					Rationale: err.Error(), Confidence: dec.Confidence,
 				}, tr, now)
 				return
@@ -5216,11 +5211,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			return
 		}
 		if _, err := domain.AgyAnswerKey(form, llmDec.Action); err != nil {
-			reason := domain.ReasonUnfamiliarOptions
-			if errors.Is(err, domain.ErrAgyNotAnswerable) {
-				reason = domain.ReasonReplyWithheld
-			}
-			reject(reason, "LLM answer: "+err.Error())
+			reject(agyAnswerRefusalReason(err), "LLM answer: "+err.Error())
 			return
 		}
 		if !d.acquirePane(s.AgentID) {
