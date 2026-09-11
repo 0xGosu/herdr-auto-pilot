@@ -114,7 +114,7 @@ func (st Status) RemoteNodes(now time.Time) (total, stale int) {
 
 // fillFleet adds the other nodes' view to a Status. Best effort throughout:
 // under the local engine there is one node and every fleet read is empty.
-func (a *App) fillFleet(ctx context.Context, st *Status) {
+func (a *App) fillFleet(ctx context.Context, st *Status, o statusOptions) {
 	st.NodeID = a.Store.NodeID()
 	now := a.now()
 	nodes, err := a.Store.ListNodes(ctx)
@@ -138,7 +138,10 @@ func (a *App) fillFleet(ctx context.Context, st *Status) {
 		st.FleetNames = names
 	}
 	disabled, _ := a.Store.DisabledAgentsAll(ctx)
-	stats, _ := a.Store.FleetAgentStats(ctx)
+	var stats map[domain.NodeAgent]domain.AgentStats
+	if !o.skipStats {
+		stats, _ = a.Store.FleetAgentStats(ctx)
+	}
 	roster, published, err := a.Store.FleetRoster(ctx)
 	if err != nil {
 		return

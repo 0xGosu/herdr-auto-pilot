@@ -881,6 +881,14 @@ collision changed it; an unnamed one is sent `/rename <hap name>`.
     Turso Cloud plus a permanent "N rules need re-compute" nag. Unreadable falls back to the base name, never
     `""` (an empty id compares unequal to every row, so drift could never clear) — and that fallback is NOT
     cached, or an install whose model arrives later keeps the legacy scheme for the process's life.
+  - **The id is hashed once per MACHINE, not per process** (`embedder.SetModelIDCacheDir`, `<state>/model-ids.json`,
+    set by every hap process in `cmd/hap`): streaming the ~25 MB model through SHA-256 cost every
+    `hap status` / `hap agents` ~50ms on an idle devbox and several hundred ms on a busy one. An entry is trusted
+    only while size, mtime, inode, device AND ctime match what was hashed — ctime is the one fact user space cannot
+    set, so a model rewritten in place with its mtime restored (`cp -p`, `touch -r`) is still re-hashed at the next
+    process start; an id is persisted only if the file's facts held still across the hash. The in-process cache
+    still holds for the process's life; `rm <state>/model-ids.json` forces a re-hash. Best-effort: an unreadable
+    cache just hashes.
   - **Anything comparing a stored row's model must resolve the id the SAME way** — `frontend.embeddingDrift`
     calls `embedder.ModelIDFor` rather than taking the base name; the two drifting apart is silent and
     permanent. `EmbeddingDrift.ModelName` is DISPLAY only; `ModelID` is the comparison key.

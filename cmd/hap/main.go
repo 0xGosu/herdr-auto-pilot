@@ -226,6 +226,10 @@ func run(verb string, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Every process that reports or matches embeddings needs the model's id;
+	// hashing the ~25 MB file once per machine instead of once per process is
+	// most of a one-shot `hap status`.
+	embedder.SetModelIDCacheDir(paths.StateDir)
 
 	switch verb {
 	case "daemon":
