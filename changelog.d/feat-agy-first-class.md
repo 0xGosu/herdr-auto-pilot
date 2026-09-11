@@ -1,3 +1,0 @@
-- Added Antigravity CLI (`agy`) as a recognized agent: its approvals (shell commands, file access/creation, the trust-folder prompt, plan review), questions and errors now escalate as what they are instead of reading as an idle agent — which also stops an idle task hand-out from being typed into a standing agy prompt
-- agy's banner, model line and status bar are left out of its screen signatures, so a model or effort switch no longer splits one situation into several rules
-- hap does not send replies to agy prompts yet (they escalate as `reply_withheld`; answer them in the pane), and sign-in, terms, pickers and panels escalate as unclassifiable rather than being answered
