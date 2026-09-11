@@ -505,3 +505,43 @@ func TestRevisionMovesOnEveryObservableChange(t *testing.T) {
 		t.Errorf("a plain handle: %v, want ErrNoRevision", err)
 	}
 }
+
+// TestConnInitRunsOnEverySessionAndNeverFailsIt: the per-connection setup is
+// what reaches a connection database/sql opens to replace a discarded one, so
+// it must run as each session takes its connection — and a setup that fails
+// is tuning lost, never a store refused.
+func TestConnInitRunsOnEverySessionAndNeverFailsIt(t *testing.T) {
+	ctx := context.Background()
+	e := NewExecutor(openBacking(t), nil)
+	var calls atomic.Int32
+	e.SetConnInit(func(ctx context.Context, c *sql.Conn) error {
+		calls.Add(1)
+		_, err := c.ExecContext(ctx, "PRAGMA cache_size = -800")
+		return err
+	})
+	for i := 0; i < 3; i++ {
+		s, err := e.Session(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, rows, err := s.Query(ctx, "PRAGMA cache_size", nil)
+		s.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 1 || rows[0][0] != int64(-800) {
+			t.Errorf("session %d: cache_size = %v, want -800", i, rows)
+		}
+	}
+	if got := calls.Load(); got != 3 {
+		t.Errorf("setup ran %d times for 3 sessions", got)
+	}
+
+	failing := NewExecutor(openBacking(t), nil)
+	failing.SetConnInit(func(context.Context, *sql.Conn) error { return errors.New("refused") })
+	s, err := failing.Session(ctx)
+	if err != nil {
+		t.Fatalf("a failed setup refused the session: %v", err)
+	}
+	s.Close()
+}

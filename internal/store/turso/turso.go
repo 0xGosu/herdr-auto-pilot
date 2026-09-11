@@ -21,6 +21,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -50,6 +51,25 @@ type Options struct {
 	Connections int
 	// OnWrite is reported after every committed write (the push debounce).
 	OnWrite func()
+}
+
+// PageCacheKiB is each pooled connection's page cache, in KiB (applied as
+// `PRAGMA cache_size = -PageCacheKiB` while the pool is warmed).
+//
+// The engine's default is 2000 KiB PER CONNECTION, and the pool holds
+// DefaultConnections of them for the life of the daemon, so a warm pool kept up
+// to ~24MB of pages — most of the daemon's native memory, for a database of
+// ~15MB that the kernel's page cache already holds. A miss costs a read from
+// that page cache, not the disk. 800 KiB is the ENGINE'S FLOOR: it clamps any
+// smaller setting to 200 pages (800 KiB at the 4 KiB page size — verified, and
+// it reads back as 200 rather than the value set), so asking for less changes
+// nothing but what the pragma reports.
+const PageCacheKiB = 800
+
+// setPageCache applies PageCacheKiB to one connection.
+func setPageCache(ctx context.Context, c *sql.Conn) error {
+	_, err := c.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = -%d", PageCacheKiB))
+	return err
 }
 
 // DefaultConnections covers the daemon's own two plus the socket server's
@@ -115,6 +135,13 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 	conns := make([]*sql.Conn, 0, n)
 	for i := 0; i < n; i++ {
 		c, err := raw.Conn(ctx)
+		if err == nil {
+			// Tuning, not a precondition: an engine that refuses the pragma
+			// keeps its default cache and the daemon still starts.
+			if perr := setPageCache(ctx, c); perr != nil && i == 0 {
+				slog.Warn("turso: page cache not reduced; keeping the engine default", "error", perr)
+			}
+		}
 		if err != nil {
 			for _, c := range conns {
 				c.Close()
@@ -128,6 +155,9 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 		c.Close() // back to the pool, which keeps them
 	}
 	exec := sqlbridge.NewExecutor(raw, opts.OnWrite)
+	// Warming covers the pool as opened; this covers any connection
+	// database/sql opens later to replace one it discarded.
+	exec.SetConnInit(setPageCache)
 	d := &DB{sdb: sdb, raw: raw, exec: exec}
 	// The daemon's own handle: two connections, like the local store's.
 	d.db = sqlbridge.OpenGated(exec, 2)

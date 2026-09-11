@@ -26,6 +26,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"log/slog"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -46,7 +47,18 @@ type Executor struct {
 	// restarted daemon counts from zero again. Together they are Revision.
 	rev   atomic.Uint64
 	epoch int64
+	// connInit, when set, runs on a session's connection as it is taken (see
+	// SetConnInit).
+	connInit func(ctx context.Context, c *sql.Conn) error
 }
+
+// SetConnInit sets a per-connection setup run on every session's connection
+// as the session takes it — the only moment every connection in use passes
+// through, including one database/sql opened to replace a discarded one (a
+// transaction whose context was cancelled before COMMIT closes its connection).
+// A failure is logged and the session carries on: setup is tuning, never a
+// reason to refuse the store. Call before any session is opened.
+func (e *Executor) SetConnInit(fn func(ctx context.Context, c *sql.Conn) error) { e.connInit = fn }
 
 // NewExecutor wraps db. onWrite may be nil.
 func NewExecutor(db *sql.DB, onWrite func()) *Executor {
@@ -102,6 +114,14 @@ func (e *Executor) Session(ctx context.Context) (*Session, error) {
 	conn, err := e.db.Conn(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if e.connInit != nil {
+		e.gate.RLock()
+		err := e.connInit(ctx, conn)
+		e.gate.RUnlock()
+		if err != nil {
+			slog.Warn("store: connection setup failed; continuing without it", "error", err)
+		}
 	}
 	return &Session{e: e, conn: conn}, nil
 }

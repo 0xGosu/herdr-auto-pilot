@@ -10,6 +10,13 @@
 // starts. The files on disk are therefore always the LATEST complete window,
 // and a process that exits finalizes the window it was in.
 //
+// Each heap snapshot gets a <name>-<pid>.mem.txt beside it: the Go runtime's
+// memory classes (runtime/metrics) and the process's own RSS lines. A heap
+// profile only sees live Go objects, and for hap those are a few MB of a
+// resident set several times larger — the rest is Go memory freed but not yet
+// returned to the OS, goroutine stacks, and the NATIVE side (llama.cpp, FAISS,
+// the Turso engine, malloc arenas). The file is what tells those apart.
+//
 //	HAP_PROFILE_DIR=/tmp/hap-prof hap daemon --restart
 //	go tool pprof -top /tmp/hap-prof/daemon-<pid>.cpu.pprof
 package profiling
@@ -20,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/metrics"
 	"runtime/pprof"
 	"strconv"
 	"strings"
@@ -144,6 +152,66 @@ func (p *profiler) finish() {
 	if err := writeHeap(p.base + ".heap.pprof"); err != nil {
 		slog.Warn("profiling: heap snapshot failed", "error", err)
 	}
+	if err := writeMem(p.base + ".mem.txt"); err != nil {
+		slog.Warn("profiling: memory summary failed", "error", err)
+	}
+}
+
+// memClasses are the runtime/metrics memory classes worth reading against the
+// RSS. They are the large ones, not a partition (the mcache/mspan metadata and
+// profiling buckets are left out), so the lines need not add up to total;
+// "go resident" below is computed from total and released alone.
+var memClasses = []string{
+	"/memory/classes/total:bytes",
+	"/memory/classes/heap/objects:bytes",
+	"/memory/classes/heap/unused:bytes",
+	"/memory/classes/heap/free:bytes",
+	"/memory/classes/heap/released:bytes",
+	"/memory/classes/heap/stacks:bytes",
+	"/memory/classes/os-stacks:bytes",
+	"/memory/classes/metadata/other:bytes",
+	"/memory/classes/other:bytes",
+	"/gc/heap/goal:bytes",
+}
+
+// writeMem writes the Go memory classes and the process's resident-set lines
+// (Linux; elsewhere only the Go half), renamed into place like writeHeap.
+// "Go resident" is total minus released: what the Go runtime holds that the OS
+// counts; whatever RSS is beyond it and beyond file-backed pages is native.
+func writeMem(path string) error {
+	samples := make([]metrics.Sample, len(memClasses))
+	for i, name := range memClasses {
+		samples[i].Name = name
+	}
+	metrics.Read(samples)
+	var b strings.Builder
+	var total, released uint64
+	for _, s := range samples {
+		if s.Value.Kind() != metrics.KindUint64 {
+			continue
+		}
+		v := s.Value.Uint64()
+		switch s.Name {
+		case "/memory/classes/total:bytes":
+			total = v
+		case "/memory/classes/heap/released:bytes":
+			released = v
+		}
+		fmt.Fprintf(&b, "%-40s %8d kB\n", s.Name, v/1024)
+	}
+	fmt.Fprintf(&b, "%-40s %8d kB\n", "go resident (total - released)", (total-released)/1024)
+	if status, err := os.ReadFile("/proc/self/status"); err == nil {
+		for _, line := range strings.Split(string(status), "\n") {
+			if strings.HasPrefix(line, "Vm") || strings.HasPrefix(line, "Rss") || strings.HasPrefix(line, "Threads") {
+				b.WriteString(line + "\n")
+			}
+		}
+	}
+	tmp := path + ".partial"
+	if err := os.WriteFile(tmp, []byte(b.String()), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // writeHeap snapshots the heap after a GC, so in-use figures describe what is

@@ -1,0 +1,3 @@
+- Cut the daemon's memory: its startup peak no longer climbs to ~130MB while the semantic index is rebuilt (the burst is collected tightly and handed back to the OS at once), and each of the Turso engine's pooled connections keeps a far smaller page cache
+- The embed worker hands back its start-up garbage once the model has loaded
+- `HAP_PROFILE_DIR` now also writes a `<verb>-<pid>.mem.txt` beside each heap profile, splitting the Go runtime's memory from the process's resident set
