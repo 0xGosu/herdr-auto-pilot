@@ -1,0 +1,1 @@
+- Cut the load the daemon puts on the herdr server: it now subscribes to agent-status events only for panes that host an agent, instead of every pane — with 13 panes open that was more than half of herdr's CPU

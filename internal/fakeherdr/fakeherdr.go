@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -44,6 +45,9 @@ type Server struct {
 	mu    sync.Mutex
 	conns map[net.Conn]*clientConn
 	panes map[string]string // paneID → workspaceID (replayed on subscribe)
+	// agents is each pane's detected agent label, reported by pane.list the
+	// way real herdr reports it; a pane absent here is a plain shell.
+	agents map[string]string
 
 	// notifications records every notification.show request; notifyShown /
 	// notifyReason are the canned result, defaulting to a displayed toast.
@@ -67,6 +71,7 @@ func NewServer(dir string) (*Server, error) {
 		SocketPath: path, ln: ln,
 		conns:        map[net.Conn]*clientConn{},
 		panes:        map[string]string{},
+		agents:       map[string]string{},
 		notifyShown:  true,
 		notifyReason: "shown",
 	}
@@ -129,7 +134,11 @@ func (s *Server) serve(conn net.Conn) {
 			s.mu.Lock()
 			var panes []map[string]any
 			for paneID, wsID := range s.panes {
-				panes = append(panes, map[string]any{"pane_id": paneID, "workspace_id": wsID})
+				p := map[string]any{"pane_id": paneID, "workspace_id": wsID}
+				if label := s.agents[paneID]; label != "" {
+					p["agent"] = label
+				}
+				panes = append(panes, p)
 			}
 			s.mu.Unlock()
 			resp, _ := json.Marshal(map[string]any{
@@ -239,12 +248,48 @@ func (s *Server) AddPane(paneID, workspaceID string) {
 	}, "")
 }
 
+// AddAgentPane registers a pane that already hosts a detected agent — what
+// real herdr reports for a pane running claude or codex: pane.list carries
+// its label, so a subscriber watches its status from the first subscribe.
+func (s *Server) AddAgentPane(paneID, workspaceID, agentLabel string) {
+	s.mu.Lock()
+	s.agents[paneID] = agentLabel
+	s.mu.Unlock()
+	s.AddPane(paneID, workspaceID)
+}
+
+// ClearAgent drops a pane's agent label, as when the agent exits back to its
+// shell: pane.list then reports the pane with no agent.
+func (s *Server) ClearAgent(paneID string) {
+	s.mu.Lock()
+	delete(s.agents, paneID)
+	s.mu.Unlock()
+}
+
+// StatusSubscriptions lists the panes live connections are subscribed to for
+// pane.agent_status_changed, sorted.
+func (s *Server) StatusSubscriptions() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []string
+	for _, cc := range s.conns {
+		for _, sub := range cc.subs {
+			if sub.Type == "pane.agent_status_changed" {
+				out = append(out, sub.PaneID)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // PushAgentDetected announces an agent label for a pane.
 func (s *Server) PushAgentDetected(paneID, workspaceID, agentLabel string) {
 	s.mu.Lock()
 	if _, ok := s.panes[paneID]; !ok {
 		s.panes[paneID] = workspaceID
 	}
+	s.agents[paneID] = agentLabel
 	s.mu.Unlock()
 	s.broadcast("pane.agent_detected", map[string]any{
 		"type": "pane_agent_detected", "pane_id": paneID,
@@ -286,6 +331,7 @@ func (s *Server) broadcast(eventType string, data map[string]any, paneID string)
 func (s *Server) RemovePaneSilently(paneID string) {
 	s.mu.Lock()
 	delete(s.panes, paneID)
+	delete(s.agents, paneID)
 	s.mu.Unlock()
 }
 

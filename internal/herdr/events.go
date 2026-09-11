@@ -235,18 +235,29 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 	})
 }
 
-// runStatus subscribes to pane.agent_status_changed for every live pane;
+// runStatus subscribes to pane.agent_status_changed for every live AGENT pane;
 // it returns (to be re-run by loop) whenever the pane set changes. The pane
 // set is fetched authoritatively via pane.list on every (re)subscribe —
 // discovery events only trigger the refresh — so a pane that exited during
 // a reconnect window can never wedge the subscription (herdr rejects
 // subscriptions naming dead panes).
+//
+// Only panes carrying a detected agent label are watched. A status
+// subscription is not free for herdr: measured on herdr 0.8.2, holding one for
+// each of 13 live panes (2 of them agents) was ~5.5 points of the server's CPU
+// — more than half its load with the daemon up — against ~2.7 for the two
+// agent panes alone, and a plain shell never reports an agent status to
+// watch. A shell that STARTS an agent is announced by pane.agent_detected,
+// which labels it and resubscribes (upsertPane); the one thing given up is a
+// status change landing in the milliseconds between that detection and the
+// resubscribe, which the minute sweep's reconcile covers.
 func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTransition) error {
-	paneIDs, err := s.listPanes(ctx)
+	allPanes, err := s.listPanes(ctx)
 	if err != nil {
 		// Not wrapped with the method name: call()'s errors already carry it.
 		return err
 	}
+	paneIDs := s.agentPanes(allPanes)
 	if len(paneIDs) == 0 {
 		// Nothing to watch yet: wait for discovery to find panes.
 		select {
@@ -396,12 +407,29 @@ func (s *Subscriber) upsertPane(paneID, workspaceID, tabID, agentLabel string) {
 	}
 	if agentLabel != "" && info.agentLabel != agentLabel {
 		info.agentLabel = agentLabel
+		// A pane that has just gained an agent joins the status
+		// subscription, which only watches agent panes (see runStatus).
+		changed = true
 	}
 	s.panes[paneID] = info
 	s.mu.Unlock()
 	if changed {
 		s.signalDirty()
 	}
+}
+
+// agentPanes keeps the panes that host a detected agent — the only ones the
+// status subscription watches (see runStatus).
+func (s *Subscriber) agentPanes(ids []string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if label := s.panes[id].agentLabel; label != "" && !domain.IsPlaceholderAgent(label, "") {
+			out = append(out, id)
+		}
+	}
+	return out
 }
 
 func (s *Subscriber) removePane(paneID string) {
@@ -531,8 +559,13 @@ func (s *Subscriber) listPanes(ctx context.Context) ([]string, error) {
 		if p.TabID != "" {
 			info.tabID = p.TabID
 		}
+		// pane.list is the authoritative snapshot: a pane it reports with no
+		// agent has none now (the agent exited back to its shell), so the
+		// label is cleared rather than kept watching a plain shell.
 		if !domain.IsPlaceholderAgent(p.Agent, "") {
 			info.agentLabel = p.Agent
+		} else {
+			info.agentLabel = ""
 		}
 		s.panes[p.PaneID] = info
 	}
