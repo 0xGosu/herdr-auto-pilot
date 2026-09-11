@@ -384,6 +384,8 @@ func driveMode(t *testing.T, app *frontend.App, target string, want domain.Agent
 
 // modeApp builds a real frontend.App over a throwaway store and the real herdr
 // CLI, so the integration cases exercise the same code path `hap mode` does.
+// Call it AFTER the agent under test has started: it publishes the live listing
+// once, and the roster stays fresh for domain.RosterStaleAfter.
 func modeApp(t *testing.T) *frontend.App {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "mode.db"))
@@ -391,5 +393,33 @@ func modeApp(t *testing.T) *frontend.App {
 		t.Fatalf("opening a scratch store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	return &frontend.App{Store: st, Herdr: herdr.NewCLI(), Author: "itest"}
+	cli := herdr.NewCLI()
+	publishLiveRoster(t, st, cli)
+	return &frontend.App{Store: st, Herdr: cli, Author: "itest"}
+}
+
+// publishLiveRoster stands in for the daemon's roster publish. A front end
+// resolves every target against the PUBLISHED roster and fails closed when
+// there is none (#386), so a front end over a store no daemon writes refuses
+// every agent — "no hap daemon has reported the running agents yet", which is
+// how TestRealClaudeModeCycle failed for as long as this helper published
+// nothing. It publishes herdr's own listing, as daemon.publishRoster does.
+func publishLiveRoster(t *testing.T, st *store.Store, cli *herdr.CLI) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	agents, err := cli.ListAgents(ctx)
+	if err != nil {
+		t.Fatalf("listing herdr's agents: %v", err)
+	}
+	now := time.Now()
+	rows := make([]domain.RosterAgent, 0, len(agents))
+	for _, tr := range agents {
+		if !domain.IsPlaceholderAgent(tr.AgentType, tr.Status) {
+			rows = append(rows, domain.RosterAgentFrom(tr, now))
+		}
+	}
+	if err := st.PublishRoster(ctx, rows, now); err != nil {
+		t.Fatalf("publishing the roster: %v", err)
+	}
 }

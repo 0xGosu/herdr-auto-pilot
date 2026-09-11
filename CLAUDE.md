@@ -58,13 +58,14 @@ golangci-lint run --build-tags "vectors,cpu"
 ## Local integration suite (real herdr + claude)
 
 `test/integration/` drives an **actual running herdr** (and, with `HAP_ITEST_CLAUDE=1` /
-`HAP_ITEST_CODEX=1`, a real agent CLI), gated by the `integration` build tag so
+`HAP_ITEST_CODEX=1` / `HAP_ITEST_AGY=1`, a real agent CLI), gated by the `integration` build tag so
 `go test ./...` and CI never run them. Each case **skips** (never fails) when its
 dependency is absent.
 
 ```sh
 go test -tags integration ./test/integration/ -v                    # from inside herdr, or set HERDR_BIN_PATH
 HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v -timeout 20m  # spends tokens
+HAP_ITEST_AGY=1 go test -tags integration ./test/integration/ -run TestRealAgy -v  # Gemini tokens
 go test -tags "integration vectors cpu" ./test/integration/ -v      # + the real-model semantic case
 ```
 
@@ -89,6 +90,13 @@ Three traps, each of which already cost a shipped regression:
   command to the shell, and the startup reconcile classifies an unpainted pane as empty,
   whose escalation then stops the injected transition re-capturing. A 1s sleep held in
   isolation and lost under full-suite load.
+
+- **On a working machine the OPERATOR's daemon watches the scratch panes too.** It answers agy forms
+  (under full self-prompting within seconds), so the agy cases `hap disable` their pane
+  (`quietOperatorDaemon`) — and it reads `--source recent`, the same consuming delta, which is why
+  the agy hand-out case goes through the operator path (visible reads only) rather than the idle poll.
+  A front end also needs a PUBLISHED roster to resolve any target (#386): `modeApp` publishes herdr's
+  listing (`publishLiveRoster`), which is what `TestRealClaudeModeCycle` lacked while it failed.
 
 Cases worth knowing beyond their names: `TestRealShiftTabKeyNameIsStillBroken` is a
 **tripwire** — it FAILS if herdr's `shift+tab` key name starts working, the signal to delete

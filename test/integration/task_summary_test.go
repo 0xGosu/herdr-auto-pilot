@@ -138,6 +138,11 @@ func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) *testDaemon {
 	events := newManualEvents()
 	llm := &capturingLLM{}
 	ctlPath := filepath.Join(testutil.SocketDir(t), "ctl.sock")
+	// The operator's task hand-out seam, wired the way cmd/hap wires it: the
+	// daemon executes a queued send_task through the FRONT END's checklist and
+	// render logic, handing it the pane access (ports.TaskSendHost). Without it
+	// every hand-out is refused as unsupported by this build.
+	fe := &frontend.App{Store: st, Author: "itest", ConfigPath: cfgPath, ControlPath: ctlPath}
 	d, err := daemon.New(daemon.Options{
 		ConfigPath:        cfgPath,
 		ControlSocketPath: ctlPath,
@@ -146,6 +151,7 @@ func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) *testDaemon {
 		Events:            events,
 		LLM:               llm,
 		StateDir:          dir,
+		SendTask:          fe.SendTaskForOperator,
 	})
 	if err != nil {
 		t.Fatal(err)

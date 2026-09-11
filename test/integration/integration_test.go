@@ -86,31 +86,40 @@ func tryHerdr(args ...string) {
 	_ = exec.CommandContext(ctx, herdrBin(), args...).Run()
 }
 
-// newScratchPane opens a throwaway tab and returns its pane id, closing it when
-// the test ends.
+// newScratchPane opens a throwaway WORKSPACE and returns its root pane id,
+// closing the workspace when the test ends.
 //
 // herdr 0.7.5 reshaped `agent start` to `--kind KIND --pane ID`: it now starts a
 // KNOWN agent kind in an EXISTING pane, and can no longer launch an arbitrary
 // command as a named agent (the old `agent start <name> --cwd D -- <argv>` exits
 // 2). So a pane is created first, and what runs in it is a separate step.
+//
+// A workspace of its own, never a tab: `tab create` without `--workspace` lands
+// in whichever workspace the UI has focused, so the suite's agents used to open
+// beside whatever the operator (or the orchestrator) was looking at. Every
+// input here names its pane explicitly, but a scratch agent has no business
+// sitting in someone else's workspace.
 func newScratchPane(t *testing.T, cwd, label string) string {
 	t.Helper()
-	out := runHerdr(t, "tab", "create", "--cwd", cwd, "--label", label, "--no-focus")
+	out := runHerdr(t, "workspace", "create", "--cwd", cwd, "--label", "hap-itest-"+label, "--no-focus")
 	var resp struct {
 		Result struct {
+			Workspace struct {
+				WorkspaceID string `json:"workspace_id"`
+			} `json:"workspace"`
 			RootPane struct {
 				PaneID string `json:"pane_id"`
 			} `json:"root_pane"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal([]byte(out), &resp); err != nil {
-		t.Fatalf("parse tab create output: %v (%s)", err, out)
+		t.Fatalf("parse workspace create output: %v (%s)", err, out)
 	}
-	pane := resp.Result.RootPane.PaneID
-	if pane == "" {
-		t.Fatalf("no pane id in tab create output: %s", out)
+	ws, pane := resp.Result.Workspace.WorkspaceID, resp.Result.RootPane.PaneID
+	if ws == "" || pane == "" {
+		t.Fatalf("no workspace or pane id in workspace create output: %s", out)
 	}
-	t.Cleanup(func() { tryHerdr("pane", "close", pane) })
+	t.Cleanup(func() { tryHerdr("workspace", "close", ws) })
 	return pane
 }
 
