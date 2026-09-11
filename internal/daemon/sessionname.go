@@ -312,6 +312,10 @@ func (d *Daemon) syncClaudeSessionNamesNow(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
+		// Never read, renamed or typed into: hap ignores the orchestrator.
+		if d.isOrchestrator(a) {
+			continue
+		}
 		// Re-resolved per agent, so an operator flipping the key back off
 		// stops the rest of the herd rather than only the next flip.
 		namer, ok := d.claudeSessionNamer(a.AgentType)

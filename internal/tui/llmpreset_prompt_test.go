@@ -36,7 +36,7 @@ func selectConfigField(t *testing.T, m Model, key string) Model {
 	t.Helper()
 	m.items = buildRuleItems(m.data.cfg)
 	for i, it := range m.items {
-		if it.kind == "field" && it.key == key {
+		if (it.kind == "field" || it.kind == "fsp") && it.key == key {
 			m.cursors[tabConfig] = i
 			return m
 		}
@@ -60,8 +60,10 @@ func TestUnsetLLMCommandOpensThePresetPicker(t *testing.T) {
 			if m.prompt == nil {
 				t.Fatalf("e on an unset %s opened no prompt (message: %q)", key, m.message)
 			}
-			if !reflect.DeepEqual(m.prompt.options, frontend.LLMPresetNames) {
-				t.Errorf("picker options = %v, want %v", m.prompt.options, frontend.LLMPresetNames)
+			// Only the CLIs that have a recipe for this key: the orchestrator
+			// has no codex preset, and offering one would only fail.
+			if want := frontend.LLMPresetNamesFor(key); !reflect.DeepEqual(m.prompt.options, want) || len(want) == 0 {
+				t.Errorf("picker options = %v, want %v", m.prompt.options, want)
 			}
 			if m.prompt.multi {
 				t.Error("the preset picker must be single-select")

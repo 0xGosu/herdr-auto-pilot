@@ -1,0 +1,588 @@
+package daemon
+
+// The full-self-prompting orchestrator: an interactive claude session named
+// "orchestrator" the daemon keeps alive while the mode is on
+// (full_self_prompting.orchestrator_agent_command), briefed to watch
+// `hap stream orchestrator` and keep the herd moving toward goals the operator
+// types into it.
+//
+// Two halves, and they fail in opposite directions:
+//
+//   - IGNORING it is unconditional once its identity is known. A disabled
+//     agent is still read, classified and audited on every event; the
+//     orchestrator must not be, so every ingest point returns early on
+//     isOrchestrator and every sweep pass runs over withoutOrchestrator. The
+//     identity lives in <state>/orchestrator.json so the filter is up before
+//     the first event after a restart.
+//   - CREATING it fails closed: the mode must be on and not stood down, the
+//     kill switch clear (a read error counts as paused), the command must name
+//     claude, and herdr must offer the launch capability. It runs off the
+//     select loop — `agent start` waits up to two minutes for readiness — one
+//     pass at a time, at most orchestratorMaxSpawnsPerHour spawns an hour, with
+//     a doubling backoff after a failure. hap never closes the session.
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+)
+
+const (
+	orchestratorStateFile        = "orchestrator.json"
+	orchestratorDirName          = "orchestrator"
+	orchestratorMaxSpawnsPerHour = 3
+	orchestratorBackoffMax       = 30 * time.Minute
+	// orchestratorBriefAttempts bounds SENDS of the brief that failed; a pass
+	// that found the composer not ready typed nothing and costs no attempt.
+	orchestratorBriefAttempts  = 3
+	orchestratorBriefReadLines = 80
+)
+
+// orchestratorBrief is the built-in brief (full_self_prompting.
+// orchestrator_agent_prompt replaces it). {self} is this hap binary, expanded
+// at send time: hap need not be on the session's PATH.
+const orchestratorBrief = `You are hap's herd orchestrator on this machine. hap (Herd Auto Prompter) watches every coding agent in this herdr session, answers their prompts from rules it has learned, and runs in full self-prompting mode, so anything it cannot answer itself is left for a human. Your job is to be that human's deputy: keep every agent in the herd unblocked and moving toward the goals the operator gives you in this conversation. hap ignores this session completely — nothing here is classified, answered or handed work.
+
+Start by learning your tools:
+1. Run ` + "`{self} --skill`" + ` and ` + "`herdr --skill`" + ` and read both: they document the hap CLI (status, escalations, tasks, rules, config) and herdr (workspaces, panes, agents, reading and prompting an agent).
+2. Run ` + "`{self} status`" + `, ` + "`{self} agents`" + ` and ` + "`{self} escalations`" + ` to survey the herd.
+3. Start the Monitor tool on ` + "`{self} stream orchestrator`" + `. It prints a ` + "`# … head=N`" + ` line, then one line per event: ` + "`<seq> <time> <kind> key=value … by=<author>`" + `. Remember the last seq you handled; if the monitor stops, restart it with ` + "`{self} stream orchestrator --resume <that seq>`" + `. A ` + "`# gap`" + ` or ` + "`# reset`" + ` line means events were lost: re-survey.
+
+Events carry ids only; fetch details with the CLI (` + "`{self} escalations`" + `, ` + "`{self} audit`" + `, ` + "`{self} task <source> list`" + `, ` + "`{self} signatures`" + `, ` + "`{self} config show`" + `). The kinds that need you most: ` + "`escalation`" + ` (an agent is waiting on something hap would not answer), ` + "`task.*`" + ` and ` + "`task_source.*`" + ` (work to hand out or re-plan), and ` + "`daemon.started`" + ` (re-survey).
+
+How to act:
+- Answer an escalation with ` + "`{self} confirm <id> --send`" + ` or ` + "`{self} resolve <id> --action TEXT --send`" + `, or drop it with ` + "`{self} dismiss <id>`" + `. Read the agent's screen first (herdr) — the answer must fit what is on screen now.
+- Hand out or re-plan work through ` + "`{self} task`" + ` (add, edit, done, send). Prompt an agent directly with herdr only when the task list cannot express it.
+- While ` + "`pause.on`" + ` is in effect, do nothing but watch. After ` + "`fsp.off`" + `, stand by until the operator tells you otherwise.
+- Never type into your own pane, never act on an agent hap reports as disabled, and never approve destructive or irreversible work (deleting data, force-pushing, dropping databases, production deploys). When unsure, leave it for the operator and say so here.
+
+When you are set up, report the herd's state in a few lines and ask the operator what the goals are.`
+
+// orchestratorState is the daemon's in-memory view of the orchestrator,
+// guarded by its own mutex: the ingest filter reads it on the select loop
+// while an ensure pass writes it from a goroutine.
+type orchestratorState struct {
+	mu sync.Mutex
+	id domain.OrchestratorIdentity
+	// running is the one-pass-at-a-time latch.
+	running bool
+	// spawns are the creation times within the last hour (the rate cap).
+	spawns []time.Time
+	// failures and retryAt are the doubling backoff after a failed pass.
+	failures int
+	retryAt  time.Time
+	// Once-only notices, so a condition that holds for hours logs once.
+	waitingNoted    bool
+	noLauncherNoted bool
+	badCommandNoted string
+}
+
+func (d *Daemon) orchestratorStatePath() string {
+	if d.opt.StateDir == "" {
+		return ""
+	}
+	return filepath.Join(d.opt.StateDir, orchestratorStateFile)
+}
+
+// loadOrchestrator restores the identity written by an earlier run. A missing
+// or unreadable file means no known orchestrator — the ensure pass then asks
+// herdr by name, so a lost file costs a lookup, never a duplicate session.
+func (d *Daemon) loadOrchestrator() {
+	path := d.orchestratorStatePath()
+	if path == "" {
+		return
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("orchestrator: could not read its identity file", "path", path, "error", err)
+		}
+		return
+	}
+	var id domain.OrchestratorIdentity
+	if err := json.Unmarshal(data, &id); err != nil {
+		slog.Warn("orchestrator: ignoring an unreadable identity file", "path", path, "error", err)
+		return
+	}
+	d.orch.mu.Lock()
+	d.orch.id = id
+	d.orch.mu.Unlock()
+}
+
+// saveOrchestratorLocked persists id (or removes the file for an unknown one).
+// Caller holds d.orch.mu, which orders two writers' files as their updates.
+func (d *Daemon) saveOrchestratorLocked(id domain.OrchestratorIdentity) {
+	path := d.orchestratorStatePath()
+	if path == "" {
+		return
+	}
+	if !id.Known() {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("orchestrator: could not remove its identity file", "error", err)
+		}
+		return
+	}
+	data, err := json.MarshalIndent(id, "", "  ")
+	if err == nil {
+		tmp := path + ".tmp"
+		if err = os.WriteFile(tmp, data, 0o600); err == nil {
+			err = os.Rename(tmp, path)
+		}
+	}
+	if err != nil {
+		// The in-memory identity still filters for this run; only a restart
+		// would forget it, and that falls back to the lookup by name.
+		slog.Warn("orchestrator: could not persist its identity", "error", err)
+	}
+}
+
+func (d *Daemon) orchestratorIdentity() domain.OrchestratorIdentity {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	return d.orch.id
+}
+
+// setOrchestratorIdentity installs a NEW identity and resets the once-per-
+// session notices.
+func (d *Daemon) setOrchestratorIdentity(id domain.OrchestratorIdentity) {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	d.orch.id = id
+	d.orch.waitingNoted = false
+	d.saveOrchestratorLocked(id)
+}
+
+// updateOrchestratorIfCurrent records progress (the brief) on id, unless the
+// identity was replaced or released while the caller worked.
+func (d *Daemon) updateOrchestratorIfCurrent(id domain.OrchestratorIdentity) {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	if d.orch.id.PaneID != id.PaneID || d.orch.id.TerminalID != id.TerminalID {
+		return
+	}
+	d.orch.id = id
+	d.saveOrchestratorLocked(id)
+}
+
+// isOrchestrator reports whether tr comes from the orchestrator session.
+func (d *Daemon) isOrchestrator(tr domain.AgentTransition) bool {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	return d.orch.id.Matches(tr)
+}
+
+// withoutOrchestrator drops the orchestrator from an agent listing, returning
+// the listing itself when it is not there.
+func (d *Daemon) withoutOrchestrator(agents []domain.AgentTransition) []domain.AgentTransition {
+	id := d.orchestratorIdentity()
+	if !id.Known() {
+		return agents
+	}
+	for i, a := range agents {
+		if !id.Matches(a) {
+			continue
+		}
+		out := make([]domain.AgentTransition, 0, len(agents)-1)
+		out = append(out, agents[:i]...)
+		for _, b := range agents[i+1:] {
+			if !id.Matches(b) {
+				out = append(out, b)
+			}
+		}
+		return out
+	}
+	return agents
+}
+
+// orchestratorAlive reports whether the identity's session is in the listing.
+func orchestratorAlive(id domain.OrchestratorIdentity, agents []domain.AgentTransition) bool {
+	if !id.Known() {
+		return false
+	}
+	for _, a := range agents {
+		if id.Matches(a) {
+			return true
+		}
+	}
+	return false
+}
+
+// observeOrchestrator releases the identity when the listing shows its pane
+// held by a DIFFERENT terminal: herdr recycled the pane id, and without the
+// release the new tenant would be ignored as the orchestrator forever — and
+// inherit its name and disable through SyncAgentTerminalID.
+func (d *Daemon) observeOrchestrator(ctx context.Context, agents []domain.AgentTransition) {
+	id := d.orchestratorIdentity()
+	for _, a := range agents {
+		if id.RecycledBy(a) {
+			slog.Info("orchestrator: its pane now holds another agent; forgetting it", "pane", id.PaneID)
+			d.orch.mu.Lock()
+			if d.orch.id == id {
+				d.orch.id = domain.OrchestratorIdentity{}
+				d.saveOrchestratorLocked(d.orch.id)
+			}
+			d.orch.mu.Unlock()
+			d.releaseOrchestratorName(ctx, id.PaneID)
+			return
+		}
+	}
+}
+
+// releaseOrchestratorName hands a pane that no longer holds the orchestrator
+// back to ordinary treatment: a generated name, and automation re-enabled —
+// both of which hap itself set when it claimed the pane.
+func (d *Daemon) releaseOrchestratorName(ctx context.Context, paneID string) {
+	names, err := d.opt.Store.AgentNames(ctx)
+	if err != nil || names[paneID] != domain.OrchestratorAgentName {
+		return
+	}
+	taken := func(n string) bool {
+		for _, v := range names {
+			if v == n {
+				return true
+			}
+		}
+		return false
+	}
+	if err := d.opt.Store.AssignAgentName(ctx, paneID, domain.GenerateAgentName(paneID, taken)); err != nil {
+		slog.Warn("orchestrator: could not rename a released pane", "pane", paneID, "error", err)
+	}
+	if err := d.opt.Store.SetAgentDisabled(ctx, paneID, false); err != nil {
+		slog.Warn("orchestrator: could not re-enable a released pane", "pane", paneID, "error", err)
+	}
+}
+
+// startOrchestratorPass schedules one ensure pass when there is anything to
+// do. agents is a fresh listing the caller already holds, or nil to have the
+// pass list for itself (startup, a reload). Cheap and non-blocking: every
+// shell-out happens in the spawned pass.
+func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
+	cfg, _, _ := d.snapshot()
+	fsp := cfg.FullSelfPrompting
+	if !fsp.Enabled || !fsp.OrchestratorConfigured() {
+		return
+	}
+	d.mu.Lock()
+	latched := d.fspCeilingLatched
+	d.mu.Unlock()
+	if latched {
+		return
+	}
+	launcher, ok := d.opt.Herdr.(ports.AgentLauncher)
+	if !ok {
+		d.orch.mu.Lock()
+		noted := d.orch.noLauncherNoted
+		d.orch.noLauncherNoted = true
+		d.orch.mu.Unlock()
+		if !noted {
+			slog.Warn("orchestrator: this herdr adapter cannot start agents; no orchestrator will run")
+		}
+		return
+	}
+	now := d.opt.Clock.Now()
+	d.orch.mu.Lock()
+	if d.orch.running {
+		d.orch.mu.Unlock()
+		return
+	}
+	id := d.orch.id
+	if agents != nil && orchestratorAlive(id, agents) && (id.Briefed || id.BriefAttempts >= orchestratorBriefAttempts) {
+		d.orch.mu.Unlock()
+		return // healthy: nothing to do
+	}
+	if now.Before(d.orch.retryAt) {
+		d.orch.mu.Unlock()
+		return
+	}
+	d.orch.running = true
+	d.orch.mu.Unlock()
+	release := func() {
+		d.orch.mu.Lock()
+		d.orch.running = false
+		d.orch.mu.Unlock()
+	}
+	if !d.spawn(func() {
+		defer release()
+		_ = logging.Guard("orchestrator", func() error {
+			d.ensureOrchestrator(d.shutdownCtx, launcher, cfg, agents)
+			return nil
+		})
+	}) {
+		release()
+	}
+}
+
+// ensureOrchestrator is one pass: make sure the session exists, then that it
+// has been briefed.
+func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLauncher, cfg config.Config,
+	agents []domain.AgentTransition) {
+	if agents == nil {
+		listed, err := d.opt.Herdr.ListAgents(ctx)
+		if err != nil {
+			slog.Warn("orchestrator: listing agents failed", "error", err)
+			return
+		}
+		agents = listed
+	}
+	if d.orchestratorPaused(ctx) {
+		return
+	}
+	argv := cfg.FullSelfPrompting.OrchestratorAgentCommand
+	kind, args, err := domain.OrchestratorLaunch(argv)
+	if err != nil {
+		d.orch.mu.Lock()
+		noted := d.orch.badCommandNoted == strings.Join(argv, "\x00")
+		d.orch.badCommandNoted = strings.Join(argv, "\x00")
+		d.orch.mu.Unlock()
+		if !noted {
+			slog.Warn("orchestrator: not starting one", "error", err)
+		}
+		return
+	}
+	id := d.orchestratorIdentity()
+	if !orchestratorAlive(id, agents) {
+		var ok bool
+		if id, ok = d.launchOrchestrator(ctx, launcher, kind, args, agents); !ok {
+			return
+		}
+	}
+	if !id.Briefed && id.BriefAttempts < orchestratorBriefAttempts {
+		d.briefOrchestrator(ctx, id, cfg)
+	}
+}
+
+// launchOrchestrator adopts the agent herdr already calls "orchestrator", or
+// creates one. An ADOPTED session is never briefed: hap did not start it, and
+// typing into a session somebody else started is exactly what the rest of this
+// daemon refuses to do without evidence.
+func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLauncher, kind string, args []string,
+	agents []domain.AgentTransition) (domain.OrchestratorIdentity, bool) {
+	now := d.opt.Clock.Now()
+	tr, found, err := launcher.AgentByName(ctx, domain.OrchestratorAgentName)
+	if err != nil {
+		d.orchestratorFailed(now, "looking it up", err)
+		return domain.OrchestratorIdentity{}, false
+	}
+	adopted := found
+	if !found {
+		if !d.orchestratorSpawnAllowed(now) {
+			return domain.OrchestratorIdentity{}, false
+		}
+		dir := filepath.Join(d.opt.StateDir, orchestratorDirName)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			d.orchestratorFailed(now, "creating its directory", err)
+			return domain.OrchestratorIdentity{}, false
+		}
+		pane, err := launcher.NewPaneInWorkspace(ctx, domain.OrchestratorWorkspaceLabel, domain.OrchestratorAgentName, dir)
+		if err != nil {
+			d.orchestratorFailed(now, "opening its pane", err)
+			return domain.OrchestratorIdentity{}, false
+		}
+		startErr := launcher.StartAgent(ctx, domain.OrchestratorAgentName, kind, pane, args)
+		// A start that timed out waiting for readiness (a first-run prompt on
+		// screen, say) may still have started the session: ask rather than
+		// assume, so a timeout never causes a second one.
+		tr, found, err = launcher.AgentByName(ctx, domain.OrchestratorAgentName)
+		if err != nil || !found {
+			if err == nil {
+				err = fmt.Errorf("no agent named %s after the start", domain.OrchestratorAgentName)
+			}
+			d.orchestratorFailed(now, "starting it", errors.Join(startErr, err))
+			return domain.OrchestratorIdentity{}, false
+		}
+		if startErr != nil {
+			slog.Info("orchestrator: herdr reported a start error, but the session is up", "error", startErr)
+		}
+	}
+	id := domain.OrchestratorIdentity{
+		PaneID: tr.PaneID, TerminalID: tr.TerminalID, WorkspaceID: tr.WorkspaceID,
+		StartedAt: now, Briefed: adopted,
+	}
+	d.setOrchestratorIdentity(id)
+	d.claimOrchestratorName(ctx, tr.PaneID, agents)
+	d.orchestratorSucceeded()
+	if adopted {
+		slog.Info("orchestrator: adopted the existing agent of that name; hap will not brief it", "pane", tr.PaneID)
+	} else {
+		slog.Info("orchestrator: started", "pane", tr.PaneID, "workspace", domain.OrchestratorWorkspaceLabel)
+	}
+	return id, true
+}
+
+// claimOrchestratorName gives the pane the hap name "orchestrator" and
+// disables automation on it — the operator-visible half of "ignored", which
+// every send gate also honours. The name is taken back from a row whose agent
+// is gone (a previous orchestrator), never from a LIVE agent an operator
+// chose to call that: the filter does not need the name, the operator's
+// choice stands.
+func (d *Daemon) claimOrchestratorName(ctx context.Context, paneID string, agents []domain.AgentTransition) {
+	names, err := d.opt.Store.AgentNames(ctx)
+	if err != nil {
+		slog.Warn("orchestrator: could not read agent names", "error", err)
+	} else {
+		live := make(map[string]bool, len(agents))
+		for _, a := range agents {
+			live[a.AgentID] = true
+		}
+		heldByALiveAgent := false
+		for holder, name := range names {
+			if name != domain.OrchestratorAgentName || holder == paneID {
+				continue
+			}
+			if live[holder] {
+				heldByALiveAgent = true
+				slog.Warn("orchestrator: a live agent already has the name orchestrator; leaving it be",
+					"agent", holder)
+				continue
+			}
+			d.releaseOrchestratorName(ctx, holder)
+		}
+		// UNIQUE(node_id, name) would refuse it anyway; skipping says why.
+		if !heldByALiveAgent {
+			if err := d.opt.Store.AssignAgentName(ctx, paneID, domain.OrchestratorAgentName); err != nil {
+				slog.Warn("orchestrator: could not name its pane", "pane", paneID, "error", err)
+			}
+		}
+	}
+	if err := d.opt.Store.SetAgentDisabled(ctx, paneID, true); err != nil {
+		// Not fatal: the ingest filter is what ignores the session.
+		slog.Warn("orchestrator: could not disable automation on its pane", "pane", paneID, "error", err)
+	}
+}
+
+// briefOrchestrator sends the brief once the session's composer is proven
+// ready and empty. The daemon never types into a claude modal: a first-run
+// prompt (trusting a new directory, say) defers the brief to a later pass and
+// tells the operator once.
+//
+// Delivered WITHOUT WithAgentAutomation, deliberately — the agent is disabled
+// on purpose, and this is its own bootstrap. The kill switch is still re-asked
+// immediately before the send.
+func (d *Daemon) briefOrchestrator(ctx context.Context, id domain.OrchestratorIdentity, cfg config.Config) {
+	reader, ok := d.opt.Herdr.(ports.VisiblePaneReader)
+	if !ok {
+		return
+	}
+	pane, err := reader.ReadPaneVisible(ctx, id.PaneID, orchestratorBriefReadLines)
+	if err != nil {
+		slog.Warn("orchestrator: reading its pane failed", "error", err)
+		return
+	}
+	if sess, ok := domain.ClaudeSessionFromPane(pane); !ok || !sess.ComposerEmpty {
+		d.noteOrchestratorWaiting(ctx)
+		return
+	}
+	if d.orchestratorPaused(ctx) {
+		return
+	}
+	err = ports.SendToAgent(ctx, d.opt.Herdr, id.PaneID, domain.OrchestratorAgentKind, d.orchestratorPrompt(cfg))
+	id.BriefAttempts++
+	if err != nil {
+		slog.Warn("orchestrator: sending the brief failed", "attempt", id.BriefAttempts, "error", err)
+	} else {
+		id.Briefed = true
+		slog.Info("orchestrator: briefed", "pane", id.PaneID)
+	}
+	d.updateOrchestratorIfCurrent(id)
+}
+
+// orchestratorPrompt renders the brief with {self} expanded at send time — the
+// binary running NOW, since an upgrade may have replaced the one the daemon
+// started as.
+func (d *Daemon) orchestratorPrompt(cfg config.Config) string {
+	text := cfg.FullSelfPrompting.OrchestratorAgentPrompt
+	if text == "" {
+		text = orchestratorBrief
+	}
+	self := "hap"
+	if d.opt.ResolveSelf != nil {
+		if p, err := d.opt.ResolveSelf(); err == nil && p != "" {
+			self = p
+		}
+	}
+	return strings.ReplaceAll(text, "{self}", self)
+}
+
+// noteOrchestratorWaiting tells the operator, once per session, that the
+// orchestrator is waiting on something only they should answer.
+func (d *Daemon) noteOrchestratorWaiting(ctx context.Context) {
+	d.orch.mu.Lock()
+	noted := d.orch.waitingNoted
+	d.orch.waitingNoted = true
+	d.orch.mu.Unlock()
+	if noted {
+		return
+	}
+	msg := "the orchestrator session is waiting on a claude prompt in workspace " +
+		domain.OrchestratorWorkspaceLabel + " — answer it once and hap sends the brief"
+	slog.Info("orchestrator: " + msg)
+	if d.opt.Notify != nil {
+		if err := d.opt.Notify.Notify(ctx, "hap orchestrator", msg); err != nil {
+			slog.Debug("orchestrator: notification failed", "error", err)
+		}
+	}
+}
+
+// orchestratorPaused reports whether the kill switch stands the pass down. A
+// read error counts as paused: this pass creates sessions and types into one.
+func (d *Daemon) orchestratorPaused(ctx context.Context) bool {
+	kill, err := d.opt.Store.LatestKillEvent(ctx)
+	if err != nil {
+		slog.Warn("orchestrator: kill-switch read failed; standing down this pass", "error", err)
+		return true
+	}
+	return domain.KillStateActive(kill)
+}
+
+// orchestratorSpawnAllowed enforces the rolling-hour cap and, when it allows a
+// spawn, counts it.
+func (d *Daemon) orchestratorSpawnAllowed(now time.Time) bool {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	kept := d.orch.spawns[:0]
+	for _, t := range d.orch.spawns {
+		if now.Sub(t) < time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	d.orch.spawns = kept
+	if len(kept) >= orchestratorMaxSpawnsPerHour {
+		d.orch.retryAt = kept[0].Add(time.Hour)
+		slog.Warn("orchestrator: started too often in the last hour; waiting before the next",
+			"spawns", len(kept), "retry_at", d.orch.retryAt.Format(time.RFC3339))
+		return false
+	}
+	d.orch.spawns = append(d.orch.spawns, now)
+	return true
+}
+
+func (d *Daemon) orchestratorFailed(now time.Time, what string, err error) {
+	d.orch.mu.Lock()
+	d.orch.failures++
+	delay := time.Minute << min(d.orch.failures-1, 5)
+	if delay > orchestratorBackoffMax {
+		delay = orchestratorBackoffMax
+	}
+	d.orch.retryAt = now.Add(delay)
+	d.orch.mu.Unlock()
+	slog.Warn("orchestrator: "+what+" failed; retrying later", "retry_in", delay.String(), "error", err)
+}
+
+func (d *Daemon) orchestratorSucceeded() {
+	d.orch.mu.Lock()
+	d.orch.failures = 0
+	d.orch.retryAt = time.Time{}
+	d.orch.mu.Unlock()
+}

@@ -287,12 +287,38 @@ var llmCommandPresets = map[string]map[string][]string{
 			llmRerankPrompt,
 		},
 	},
+	// The orchestrator is an INTERACTIVE session, so unlike the four above it
+	// takes no -p and carries no prompt: the daemon sends the brief through
+	// herdr once the session is ready. argv[0] is the agent kind herdr starts,
+	// so there is no codex recipe — claude is the only kind supported.
+	FSPOrchestratorCommandFieldKey: {
+		LLMPresetClaude: {
+			"claude",
+			"--model",
+			"opus",
+			"--permission-mode",
+			"auto",
+		},
+	},
 }
 
 // LLMPresetKeys lists every config key that offers presets, in registry
 // order, for help text and error messages.
 var LLMPresetKeys = []string{LLMCommandKey, LLMTaskGenerateCommandKey, LLMLearnFromUserCommandKey,
-	LLMRerankingCommandKey}
+	LLMRerankingCommandKey, FSPOrchestratorCommandFieldKey}
+
+// LLMPresetNamesFor lists, in display order, the presets that exist for key —
+// what a picker may offer, since not every key has a recipe for every CLI.
+func LLMPresetNamesFor(key string) []string {
+	byName := llmCommandPresets[key]
+	var out []string
+	for _, name := range LLMPresetNames {
+		if _, ok := byName[name]; ok {
+			out = append(out, name)
+		}
+	}
+	return out
+}
 
 // LLMPreset returns the recipe installed for key by preset, copied so a
 // caller can never mutate the shared table.
@@ -328,6 +354,8 @@ func llmCommandArgv(cfg *config.Config, key string) *[]string {
 		return &cfg.LLM.LearnFromUserCommand
 	case LLMRerankingCommandKey:
 		return &cfg.LLM.RerankingCommand
+	case FSPOrchestratorCommandFieldKey:
+		return &cfg.FullSelfPrompting.OrchestratorAgentCommand
 	default:
 		return nil
 	}
@@ -371,7 +399,7 @@ func (a *App) ApplyLLMPreset(ctx context.Context, key, preset string) (bool, err
 	}
 	recipe, ok := LLMPreset(key, preset)
 	if !ok {
-		return false, fmt.Errorf("unknown preset %q for %s (known presets: %s)", preset, key, strings.Join(LLMPresetNames, ", "))
+		return false, fmt.Errorf("unknown preset %q for %s (known presets: %s)", preset, key, strings.Join(LLMPresetNamesFor(key), ", "))
 	}
 	return a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
 		argv := llmCommandArgv(cfg, key)

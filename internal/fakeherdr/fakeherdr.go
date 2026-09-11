@@ -373,13 +373,49 @@ case "$1 $2" in
   "tab list")
     cat %q.tabs 2>/dev/null
     ;;
+  "agent get")
+    if [ -e %q.agentget ]; then
+      cat %q.agentget
+    else
+      echo '{"error":{"code":"agent_not_found","message":"agent target not found"},"id":"cli:agent:get"}' >&2
+      exit 1
+    fi
+    ;;
+  "workspace create"|"tab create")
+    cat %q.created 2>/dev/null
+    ;;
+  "agent start")
+    if [ -e %q.startbusy ]; then
+      rm -f %q.startbusy
+      echo '{"error":{"code":"agent_pane_busy","message":"pane is not at a shell prompt"}}' >&2
+      exit 1
+    fi
+    ;;
 esac
 exit 0
-`, f.LogPath, f.FailFlag, f.LegacyFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
+`, f.LogPath, f.FailFlag, f.LegacyFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile,
+		f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
 	if err := os.WriteFile(f.BinPath, []byte(script), 0o700); err != nil {
 		return nil, err
 	}
 	return f, nil
+}
+
+// SetAgentGet sets what `agent get` prints; with none set it answers
+// agent_not_found (exit 1), as herdr does for an unknown target.
+func (f *FakeCLI) SetAgentGet(content string) error {
+	return os.WriteFile(f.PaneFile+".agentget", []byte(content), 0o600)
+}
+
+// SetCreated sets what `workspace create` and `tab create` print.
+func (f *FakeCLI) SetCreated(content string) error {
+	return os.WriteFile(f.PaneFile+".created", []byte(content), 0o600)
+}
+
+// SetStartBusyOnce makes the next `agent start` fail with agent_pane_busy, the
+// refusal herdr gives while a new pane's shell is still spawning.
+func (f *FakeCLI) SetStartBusyOnce() error {
+	return os.WriteFile(f.PaneFile+".startbusy", nil, 0o600)
 }
 
 // SetPaneContent sets what `pane read` returns.

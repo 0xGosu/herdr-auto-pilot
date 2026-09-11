@@ -47,6 +47,10 @@ var configListsExemptFromCLI = map[string]string{
 	"safety.allowlist_patterns":      "deprecated alias for safety.never_auto_patterns — Load migrates it, and offering it for WRITING would teach the spelling we are retiring",
 	"safety.irreversible_indicators": "deprecated alias folded into the seed heuristic rules on Load",
 	"safety.indicator_rules":         "deprecated alias folded into safety.never_auto_rules on Load",
+	// The deprecated [escalations.full_self_prompting] table decodes into the
+	// same struct; Load migrates it wholesale onto the canonical section, whose
+	// key `hap config set` owns.
+	"escalations.full_self_prompting.orchestrator_agent_command": "deprecated alias for full_self_prompting.orchestrator_agent_command",
 }
 
 // TestEveryConfigListHasACLICommand is the structured-data twin of

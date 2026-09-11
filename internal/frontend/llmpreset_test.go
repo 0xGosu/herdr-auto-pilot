@@ -21,6 +21,9 @@ var presetKeys = map[string]func(config.Config) []string{
 	frontend.LLMTaskGenerateCommandKey:  func(c config.Config) []string { return c.LLM.GenerateTaskCommand },
 	frontend.LLMLearnFromUserCommandKey: func(c config.Config) []string { return c.LLM.LearnFromUserCommand },
 	frontend.LLMRerankingCommandKey:     func(c config.Config) []string { return c.LLM.RerankingCommand },
+	frontend.FSPOrchestratorCommandFieldKey: func(c config.Config) []string {
+		return c.FullSelfPrompting.OrchestratorAgentCommand
+	},
 }
 
 // TestLLMPresetSurvivesATOMLRoundTrip is the discriminating test for the whole
@@ -32,7 +35,8 @@ var presetKeys = map[string]func(config.Config) []string{
 // at all — see ApplyLLMPreset).
 func TestLLMPresetSurvivesATOMLRoundTrip(t *testing.T) {
 	for key, read := range presetKeys {
-		for _, preset := range frontend.LLMPresetNames {
+		// Every recipe the key HAS: the orchestrator has no codex one.
+		for _, preset := range frontend.LLMPresetNamesFor(key) {
 			t.Run(key+"/"+preset, func(t *testing.T) {
 				app, _ := testApp(t)
 				want, ok := frontend.LLMPreset(key, preset)
@@ -204,6 +208,12 @@ func TestEveryClaudePresetSurvivesTheArgvNormalizer(t *testing.T) {
 	for _, key := range frontend.LLMPresetKeys {
 		argv, ok := frontend.LLMPreset(key, frontend.LLMPresetClaude)
 		if !ok || len(argv) == 0 || argv[0] != "claude" {
+			continue
+		}
+		// The orchestrator is an INTERACTIVE session: it carries no -p and no
+		// prompt (the brief goes through herdr), and its argv is handed to
+		// `herdr agent start` rather than to the normalizer.
+		if key == frontend.FSPOrchestratorCommandFieldKey {
 			continue
 		}
 		checked++

@@ -30,6 +30,15 @@ const (
 	FSPAcceptGeneratedTaskFieldKey = "full_self_prompting.accept_generated_task"
 )
 
+// FSPOrchestratorCommandFieldKey and FSPOrchestratorPromptFieldKey configure
+// the orchestrator agent session the daemon keeps alive while the mode is on.
+// Free text, so read-only in the TUI like every argv template; the command
+// can be bootstrapped from a preset.
+const (
+	FSPOrchestratorCommandFieldKey = "full_self_prompting.orchestrator_agent_command"
+	FSPOrchestratorPromptFieldKey  = "full_self_prompting.orchestrator_agent_prompt"
+)
+
 // DeprecatedFSPFieldKey is the pre-move spelling. It is NOT registered — it may
 // never be offered for writing — but it still RESOLVES, because the config file
 // carrying the old table keeps loading and the two surfaces must not disagree.

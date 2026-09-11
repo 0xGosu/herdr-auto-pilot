@@ -2401,6 +2401,8 @@ var ConfigFields = []ConfigFieldDef{
 	// renders all three under one "Full self-prompting" section.
 	{Key: FSPHonourLimitsFieldKey, TUIEditable: true},
 	{Key: FSPAcceptGeneratedTaskFieldKey, TUIEditable: true},
+	{Key: FSPOrchestratorCommandFieldKey},
+	{Key: FSPOrchestratorPromptFieldKey},
 	{Key: "confidence_thresholds.minimum", TUIEditable: true},
 	{Key: "confidence_thresholds.idle", TUIEditable: true},
 	{Key: "confidence_thresholds.approval", TUIEditable: true},
@@ -2705,6 +2707,16 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.FormatBool(cfg.FullSelfPrompting.HonourLimits)
 	case FSPAcceptGeneratedTaskFieldKey:
 		return strconv.FormatBool(cfg.FullSelfPrompting.AcceptGeneratedTask)
+	case FSPOrchestratorCommandFieldKey:
+		if len(cfg.FullSelfPrompting.OrchestratorAgentCommand) == 0 {
+			return "(disabled)"
+		}
+		return JoinCommand(cfg.FullSelfPrompting.OrchestratorAgentCommand)
+	case FSPOrchestratorPromptFieldKey:
+		if cfg.FullSelfPrompting.OrchestratorAgentPrompt == "" {
+			return "(built-in brief)"
+		}
+		return cfg.FullSelfPrompting.OrchestratorAgentPrompt
 	case "llm.command":
 		if len(cfg.LLM.Command) == 0 {
 			return "(disabled)"
@@ -3026,6 +3038,23 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("%s must be true or false, got %q", FSPAcceptGeneratedTaskFieldKey, value)
 			}
 			cfg.FullSelfPrompting.AcceptGeneratedTask = v
+			return nil
+		case FSPOrchestratorCommandFieldKey:
+			argv, err := SplitCommand(value)
+			if err != nil {
+				return fmt.Errorf("%s: %w", key, err)
+			}
+			// Refused here, not only at spawn time: a wrong first word would
+			// otherwise be saved and then fail on every sweep, silently.
+			if len(argv) > 0 {
+				if _, _, err := domain.OrchestratorLaunch(argv); err != nil {
+					return fmt.Errorf("%s: %w", key, err)
+				}
+			}
+			cfg.FullSelfPrompting.OrchestratorAgentCommand = argv // empty disables it
+			return nil
+		case FSPOrchestratorPromptFieldKey:
+			cfg.FullSelfPrompting.OrchestratorAgentPrompt = value // empty restores the built-in brief
 			return nil
 		case "escalations.auto_accept.approval":
 			return setAutoAcceptThreshold(key, value, &cfg.Escalations.AutoAccept.Approval)

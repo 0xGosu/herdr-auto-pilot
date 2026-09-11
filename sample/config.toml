@@ -114,6 +114,21 @@ unclassifiable = "0"       # disabled: hap never understood the screen at all
 # and hands the first task over. Separate from `enabled` because it is
 # a materially larger grant than answering what is already on screen.
 #accept_generated_task = false
+#
+# Keep an ORCHESTRATOR agent alive while the mode is on: an interactive
+# claude session named "orchestrator", created in its own herdr workspace
+# (hap-orchestrator) when none exists, ignored by every hap pass, and
+# briefed to watch `hap stream orchestrator` and keep the herd moving
+# toward the goals you type into it. Re-created if it disappears (at most
+# 3 times an hour); never closed by hap. The first word names the agent
+# KIND (only "claude"), the rest are passed to it — no -p: the session is
+# interactive. Bootstrap it with
+#   hap config set full_self_prompting.orchestrator_agent_command --preset claude
+#orchestrator_agent_command = ["claude", "--model", "opus", "--permission-mode", "auto"]
+#
+# Replace the built-in brief sent to the orchestrator once it is ready;
+# {self} expands to this hap binary's path.
+#orchestrator_agent_prompt = ""
 
 # ── Operator LLM (consulted on unknown situations) ──────────────────
 # Omit this whole section to escalate unknown situations directly to you.

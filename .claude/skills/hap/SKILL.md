@@ -510,6 +510,8 @@ tab-separated stdout is unaffected.
 | `full_self_prompting.enabled` | false | answer every escalation carrying a proposed answer, immediately |
 | `full_self_prompting.honour_limits` | false | apply the `[limits]` ceilings to the mode, and switch it off when one is reached |
 | `full_self_prompting.accept_generated_task` | false | also act on an idle escalation whose suggestion is an LLM-generated task |
+| `full_self_prompting.orchestrator_agent_command` | (disabled) | keep an interactive `orchestrator` claude session alive while the mode is on (`--preset claude`) |
+| `full_self_prompting.orchestrator_agent_prompt` | (built-in brief) | replace the brief sent to the orchestrator; `{self}` = this hap binary |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic rule |
 | `llm.command` | (disabled) | argv for the consult CLI; this key alone gates the LLM fallback |
 | `llm.timeout_seconds` | 60 | timeout for one consult |
@@ -1215,6 +1217,35 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
   `# reset …` — re-survey with the CLI in both cases.
 - **Per machine:** an action taken on another fleet node appears in that
   machine's stream; a hand edit to `config.toml` or a task file is not an event.
+
+### the orchestrator agent
+
+With full self-prompting on, the daemon can keep a dedicated **interactive**
+claude session alive that watches this stream and keeps the herd moving toward
+goals you give it:
+
+```bash
+hap config set full_self_prompting.orchestrator_agent_command --preset claude
+# → ["claude", "--model", "opus", "--permission-mode", "auto"]
+```
+
+- It runs as the herdr agent **`orchestrator`** (also its hap name) in its own
+  **`hap-orchestrator`** workspace, cwd `<state>/orchestrator`. An existing agent
+  of that name is adopted, never duplicated — and never briefed.
+- Once its composer is ready the daemon sends it a brief (load `hap --skill` and
+  `herdr --skill`, run `Monitor` on `hap stream orchestrator`, how to act, what
+  never to do). Replace it with `full_self_prompting.orchestrator_agent_prompt`.
+  **Type your goals into that session.** If claude shows a first-run prompt
+  (trusting the new directory), answer it once — hap never types into a modal.
+- **hap ignores it completely**: no capture, classification, escalation, audit
+  row, task hand-out or rename. It is also marked disabled, and highlighted on
+  the TUI Agents tab.
+- The first word of the command names the agent **kind** (only `claude`); herdr
+  runs its own binary, so the words after it are all that reach the agent. No
+  `-p` — the session is interactive.
+- Re-created when it disappears, at most 3 times an hour; never while paused,
+  with the mode off, or after the mode stood down at a `[limits]` ceiling. hap
+  never closes it — turning the mode off leaves it running.
 
 ## disk usage and cleanup
 

@@ -1904,6 +1904,8 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 		frontend.FSPFieldKey,
 		frontend.FSPHonourLimitsFieldKey,
 		frontend.FSPAcceptGeneratedTaskFieldKey,
+		frontend.FSPOrchestratorCommandFieldKey,
+		frontend.FSPOrchestratorPromptFieldKey,
 	}
 	var items []ruleItem
 	for _, key := range fspKeys {
@@ -6556,7 +6558,7 @@ func (m Model) llmPresetPrompt(key string) (tea.Model, tea.Cmd) {
 	m.beginAction()
 	m.openPrompt(&prompt{
 		label:   fmt.Sprintf("%s is not configured — install a default recipe (↑/↓ then enter, esc to cancel)", key),
-		options: frontend.LLMPresetNames,
+		options: frontend.LLMPresetNamesFor(key),
 		onSubmit: func(preset string) tea.Cmd {
 			return func() tea.Msg {
 				reloaded, err := app.ApplyLLMPreset(ctx, key, preset)
@@ -7659,12 +7661,22 @@ func (m Model) renderAgents(b *strings.Builder) {
 			// Selected wins over faint: the cursor must be visible on a remote
 			// row, which is the whole point of the rows being reachable.
 			line = m.styles().selected.Render(line)
+		case isOrchestratorRow(r):
+			// Ahead of the remote dimming: whichever machine runs it, the
+			// orchestrator is never one of the herd.
+			line = m.styles().orchestrator.Render(line)
 		case r.remote():
 			line = m.styles().help.Render(line)
 		}
 		fmt.Fprintln(b, line)
 	}
 	m.renderMoreRows(b, len(agents)-end)
+}
+
+// isOrchestratorRow reports whether a row is the full-self-prompting
+// orchestrator, by the hap name the daemon reserves for it.
+func isOrchestratorRow(r agentRow) bool {
+	return !r.sep && r.Name == domain.OrchestratorAgentName
 }
 
 // agentRowStatus renders the STATUS column.
