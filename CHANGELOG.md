@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.13
+
+- Cut what an open `hap tui` costs: it now re-reads its data only when something changed (a store change token, the config file, local checklist files) instead of every two seconds, and the Rules tab's last-used lookup no longer pulls every rule's full audit row
+- The daemon's roster tick backs off (up to 15s) while the herd's listing is unchanged, and returns to 2s on any change or agent transition
+- A roster publish or read-only transaction that changed nothing no longer triggers a Turso push
+
 ## 0.9.12
 
 - Fixed the LLM re-rank judge's in-flight answers being thrown away on nearly every Turso pull: a pull now retires them only when it actually changed the rules, their learned state or their decision history, so under turso the judge's subprocess no longer mostly runs for nothing

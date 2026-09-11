@@ -1,3 +1,0 @@
-- Cut what an open `hap tui` costs: it now re-reads its data only when something changed (a store change token, the config file, local checklist files) instead of every two seconds, and the Rules tab's last-used lookup no longer pulls every rule's full audit row
-- The daemon's roster tick backs off (up to 15s) while the herd's listing is unchanged, and returns to 2s on any change or agent transition
-- A roster publish or read-only transaction that changed nothing no longer triggers a Turso push
