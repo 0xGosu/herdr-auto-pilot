@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -104,6 +106,98 @@ func TestSettlingAnEscalationNamesTheActor(t *testing.T) {
 	// Rows the prunes did not touch keep their names.
 	if _, actor := actorOf(resolved); actor != domain.OrchestratorAuthor {
 		t.Errorf("a prune rewrote a settled row's actor to %q", actor)
+	}
+}
+
+// TestAStoreOverAPreActorSchemaDegradesToUnattributed: a turso front end never
+// migrates — it reads the schema of the daemon it is connected to, and during
+// an upgrade handoff that daemon can still be the older build serving a schema
+// without audit_log.actor. Every audit read and every settle must keep working
+// there (unattributed), not fail with "no such column: actor". And once the
+// column appears the SAME handle attributes again: the negative answer is not
+// cached, so a TUI left open across the handoff recovers on its own.
+func TestAStoreOverAPreActorSchemaDegradesToUnattributed(t *testing.T) {
+	if proxyMode() || tursoMode() {
+		t.Skip("drives a raw sqlite file to reproduce the older daemon's schema")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "old.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nodeID := s.NodeID()
+	if _, err := s.db.ExecContext(ctx, `ALTER TABLE audit_log DROP COLUMN actor`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	db, err := sql.Open("sqlite", sqliteDSN(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Migrate: false, the way a front end opens the daemon's proxy.
+	old, err := OpenDB(db, Options{NodeID: nodeID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { old.Close() })
+
+	escalation := func() int64 {
+		t.Helper()
+		id, err := old.AppendAudit(ctx, domain.AuditRecord{
+			SituationType: domain.SituationApproval, Trigger: "t", Action: "escalated",
+			Status: "escalated", Actor: domain.OrchestratorAuthor, CreatedAt: time.Now().Add(-3 * time.Hour),
+		})
+		if err != nil {
+			t.Fatalf("AppendAudit on a pre-actor schema: %v", err)
+		}
+		return id
+	}
+	resolved, dismissed, updated := escalation(), escalation(), escalation()
+	if claimed, err := old.ResolveEscalationBy(ctx, resolved, domain.OrchestratorAuthor); err != nil || !claimed {
+		t.Fatalf("ResolveEscalationBy: %v %v", claimed, err)
+	}
+	if err := old.DismissEscalationBy(ctx, dismissed, domain.OrchestratorAuthor); err != nil {
+		t.Fatalf("DismissEscalationBy: %v", err)
+	}
+	if err := old.UpdateAuditStatusBy(ctx, updated, "resolved", domain.OrchestratorAuthor); err != nil {
+		t.Fatalf("UpdateAuditStatusBy: %v", err)
+	}
+	escalation()
+	if _, err := old.DismissEscalationsBeforeBy(ctx, time.Now(), domain.OrchestratorAuthor); err != nil {
+		t.Fatalf("DismissEscalationsBeforeBy: %v", err)
+	}
+	escalation()
+	if _, err := old.DismissEscalationsBeforeOnBy(ctx, time.Now(), nodeID, domain.OrchestratorAuthor); err != nil {
+		t.Fatalf("DismissEscalationsBeforeOnBy: %v", err)
+	}
+	recs, err := old.AuditLog(ctx, 10)
+	if err != nil || len(recs) != 5 {
+		t.Fatalf("AuditLog on a pre-actor schema: %d rows, %v", len(recs), err)
+	}
+	for _, r := range recs {
+		if r.Actor != "" {
+			t.Errorf("audit #%d reads actor %q from a schema with no such column", r.ID, r.Actor)
+		}
+	}
+	if rec, err := old.GetAudit(ctx, resolved); err != nil || rec == nil || rec.Status != "resolved" {
+		t.Fatalf("GetAudit on a pre-actor schema: %+v %v", rec, err)
+	}
+	if _, err := old.PendingEscalations(ctx); err != nil {
+		t.Fatalf("PendingEscalations on a pre-actor schema: %v", err)
+	}
+
+	// The new daemon takes over and migrates: the same handle attributes.
+	if _, err := old.db.ExecContext(ctx, `ALTER TABLE audit_log ADD COLUMN actor TEXT NOT NULL DEFAULT ''`); err != nil {
+		t.Fatal(err)
+	}
+	later := escalation()
+	if claimed, err := old.ResolveEscalationBy(ctx, later, domain.OrchestratorAuthor); err != nil || !claimed {
+		t.Fatalf("ResolveEscalationBy after the migration: %v %v", claimed, err)
+	}
+	if rec, err := old.GetAudit(ctx, later); err != nil || rec == nil || rec.Actor != domain.OrchestratorAuthor {
+		t.Errorf("after the column appears the settle must be attributed, got %+v %v", rec, err)
 	}
 }
 

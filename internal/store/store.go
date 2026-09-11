@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -82,6 +83,9 @@ type Store struct {
 	// path is the sqlite file, when the store was opened from one; Revision
 	// stats it. Empty for a handle passed to OpenDB.
 	path string
+	// actorColumn latches once audit_log.actor is known to exist (see
+	// auditActorColumn). Only a POSITIVE answer is cached.
+	actorColumn atomic.Bool
 }
 
 // Options configures OpenDB.
@@ -276,6 +280,7 @@ func OpenDB(db *sql.DB, opts Options) (*Store, error) {
 			db.Close()
 			return nil, err
 		}
+		s.actorColumn.Store(true)
 	}
 	return s, nil
 }
@@ -283,14 +288,20 @@ func OpenDB(db *sql.DB, opts Options) (*Store, error) {
 // Migrate applies the schema migration now. OpenDB runs it when Options.Migrate
 // is set; the turso daemon runs it here instead, AFTER its first pull and only
 // when it holds the schema lead (see turso.PrepareSharedSchema).
-func (s *Store) Migrate() error { return s.migrate(nil) }
+func (s *Store) Migrate() error { return s.MigrateWith(nil) }
 
 // MigrateWith is Migrate with a hook called BEFORE every step that issues DDL
 // or rewrites rows. Under a shared database the hook re-proves that this node
 // still holds the schema lease (turso.PrepareSharedSchema): each step is a
 // bounded transaction, so ownership is checked between them and a migration
 // whose lease lapsed stops before its next DDL rather than racing another node.
-func (s *Store) MigrateWith(between func() error) error { return s.migrate(between) }
+func (s *Store) MigrateWith(between func() error) error {
+	if err := s.migrate(between); err != nil {
+		return err
+	}
+	s.actorColumn.Store(true)
+	return nil
+}
 
 // Ping reports whether the database answers — for a proxied store, whether the
 // daemon serving it is reachable.
@@ -436,21 +447,38 @@ func (s *Store) RecordDecision(ctx context.Context, d domain.DecisionRecord) (in
 
 // AppendAudit appends an audit record (append-only, FR-020).
 func (s *Store) AppendAudit(ctx context.Context, a domain.AuditRecord) (int64, error) {
+	withActor := s.auditActorColumn(ctx)
 	var id int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx, `
+		args := []any{s.nextID(), s.self, a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
+			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
+			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
+			string(a.MatchMethod), a.MatchScore, a.EmbedError,
+			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars,
+			a.LLMSessionID, a.WhileFSPModeOn}
+		var res sql.Result
+		var err error
+		if withActor {
+			res, err = tx.ExecContext(ctx, `
 			INSERT INTO audit_log (id, node_id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
 					action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
 					corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
 					sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
 					while_fsp_mode_on, actor, created_at)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			s.nextID(), s.self, a.DecisionID, a.AgentID, a.AgentType, a.Signature, a.Trigger, string(a.SituationType),
-			a.Action, a.Input, a.Confidence, llmConfArg(a.LLMConfidence), a.Rationale, a.LLMOutput,
-			a.CorrectsAuditID, a.Status, a.Suggestion, a.PaneExcerpt,
-			string(a.MatchMethod), a.MatchScore, a.EmbedError,
-			a.SigRaw, a.SigSalient, string(a.SigVerdict), a.SigSalientChars,
-			a.LLMSessionID, a.WhileFSPModeOn, a.Actor, unix(a.CreatedAt))
+				append(args, a.Actor, unix(a.CreatedAt))...)
+		} else {
+			// A schema before audit_log.actor (auditActorColumn): the row is
+			// written unattributed rather than failing.
+			res, err = tx.ExecContext(ctx, `
+			INSERT INTO audit_log (id, node_id, decision_id, agent_id, agent_type, signature, trigger, situation_type,
+					action_or_escalation, input, confidence, llm_confidence, rationale, llm_output,
+					corrects_audit_id, status, suggestion, pane_excerpt, match_method, match_score, embed_error,
+					sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
+					while_fsp_mode_on, created_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				append(args, unix(a.CreatedAt))...)
+		}
 		if err != nil {
 			return err
 		}
@@ -468,9 +496,17 @@ func (s *Store) UpdateAuditStatus(ctx context.Context, auditID int64, status str
 
 // UpdateAuditStatusBy is UpdateAuditStatus naming who set the status
 // (ports.AuditActorWriter). The actor moves WITH the status, so a row returned
-// to "escalated" never keeps the name of whoever settled it before.
+// to "escalated" never keeps the name of whoever settled it before. Every *By
+// writer settles unattributed on a schema before the column
+// (auditActorColumn) rather than failing.
 func (s *Store) UpdateAuditStatusBy(ctx context.Context, auditID int64, status, actor string) error {
+	withActor := s.auditActorColumn(ctx)
 	return s.tx(ctx, func(tx *sql.Tx) error {
+		if !withActor {
+			_, err := tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = ? WHERE id = ?`, status, auditID)
+			return err
+		}
 		_, err := tx.ExecContext(ctx,
 			`UPDATE audit_log SET status = ?, actor = ? WHERE id = ?`, status, actor, auditID)
 		return err
@@ -1413,10 +1449,18 @@ func (s *Store) DismissEscalation(ctx context.Context, auditID int64) error {
 // DismissEscalationBy is DismissEscalation naming who dismissed it
 // (ports.AuditActorWriter), in the same guarded statement.
 func (s *Store) DismissEscalationBy(ctx context.Context, auditID int64, actor string) error {
+	withActor := s.auditActorColumn(ctx)
 	return s.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE id = ? AND status = 'escalated'`,
-			actor, auditID)
+		var res sql.Result
+		var err error
+		if withActor {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE id = ? AND status = 'escalated'`,
+				actor, auditID)
+		} else {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'dismissed' WHERE id = ? AND status = 'escalated'`, auditID)
+		}
 		if err != nil {
 			return err
 		}
@@ -1445,11 +1489,19 @@ func (s *Store) ResolveEscalation(ctx context.Context, auditID int64) (bool, err
 // (ports.AuditActorWriter). One statement, so the claim stays atomic and the
 // name can never land on a row another writer won.
 func (s *Store) ResolveEscalationBy(ctx context.Context, auditID int64, actor string) (bool, error) {
+	withActor := s.auditActorColumn(ctx)
 	var claimed bool
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'resolved', actor = ? WHERE id = ? AND status = 'escalated'`,
-			actor, auditID)
+		var res sql.Result
+		var err error
+		if withActor {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'resolved', actor = ? WHERE id = ? AND status = 'escalated'`,
+				actor, auditID)
+		} else {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'resolved' WHERE id = ? AND status = 'escalated'`, auditID)
+		}
 		if err != nil {
 			return err
 		}
@@ -1511,7 +1563,7 @@ func (s *Store) AutoAcceptableEscalations(ctx context.Context, cutoffs map[domai
 	// forever. The REASON exclusion deliberately stays in Go — LIKE-matching a
 	// free-text rationale fails open, which is the wrong direction for a safety
 	// exclusion.
-	q := `SELECT ` + auditCols + ` FROM audit_log WHERE node_id = ? AND status = 'escalated'
+	q := `SELECT ` + s.auditColumns(ctx) + ` FROM audit_log WHERE node_id = ? AND status = 'escalated'
 		AND sig_raw != '' AND suggestion != '' AND (` +
 		strings.Join(clauses, " OR ") + `) ORDER BY created_at ASC, id ASC LIMIT ?`
 	args = append([]any{s.self}, args...)
@@ -1731,11 +1783,19 @@ func (s *Store) DismissEscalationsBefore(ctx context.Context, cutoff time.Time) 
 // DismissEscalationsBeforeBy is DismissEscalationsBefore naming who pruned
 // (ports.AuditActorWriter).
 func (s *Store) DismissEscalationsBeforeBy(ctx context.Context, cutoff time.Time, actor string) (int64, error) {
+	withActor := s.auditActorColumn(ctx)
 	var dismissed int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE status = 'escalated' AND created_at < ?`,
-			actor, unix(cutoff))
+		var res sql.Result
+		var err error
+		if withActor {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE status = 'escalated' AND created_at < ?`,
+				actor, unix(cutoff))
+		} else {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'dismissed' WHERE status = 'escalated' AND created_at < ?`, unix(cutoff))
+		}
 		if err != nil {
 			return err
 		}
@@ -1759,11 +1819,20 @@ func (s *Store) DismissEscalationsBeforeOn(ctx context.Context, cutoff time.Time
 // DismissEscalationsBeforeOnBy is DismissEscalationsBeforeOn naming who pruned
 // (ports.AuditActorWriter).
 func (s *Store) DismissEscalationsBeforeOnBy(ctx context.Context, cutoff time.Time, nodeID, actor string) (int64, error) {
+	withActor := s.auditActorColumn(ctx)
 	var dismissed int64
 	err := s.tx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE node_id = ? AND status = 'escalated' AND created_at < ?`,
-			actor, nodeID, unix(cutoff))
+		var res sql.Result
+		var err error
+		if withActor {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'dismissed', actor = ? WHERE node_id = ? AND status = 'escalated' AND created_at < ?`,
+				actor, nodeID, unix(cutoff))
+		} else {
+			res, err = tx.ExecContext(ctx,
+				`UPDATE audit_log SET status = 'dismissed' WHERE node_id = ? AND status = 'escalated' AND created_at < ?`,
+				nodeID, unix(cutoff))
+		}
 		if err != nil {
 			return err
 		}
@@ -1840,7 +1909,7 @@ func (s *Store) ListSignatureSnapshots(ctx context.Context) ([]domain.SignatureS
 // (nil when none) — display context for list/detail views.
 func (s *Store) LatestAuditForSignature(ctx context.Context, signature string) (*domain.AuditRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+auditCols+` FROM audit_log WHERE signature = ? ORDER BY id DESC LIMIT 1`, signature)
+		`SELECT `+s.auditColumns(ctx)+` FROM audit_log WHERE signature = ? ORDER BY id DESC LIMIT 1`, signature)
 	if err != nil {
 		return nil, err
 	}
@@ -1982,6 +2051,50 @@ const auditCols = `id, node_id, decision_id, agent_id, agent_type, signature, tr
 	sig_raw, sig_salient, sig_verdict, sig_salient_chars, llm_session_id,
 	while_fsp_mode_on, actor, created_at`
 
+// auditColsNoActor is auditCols for a schema that predates audit_log.actor:
+// the same positions, with the column read as an empty string. Derived rather than
+// spelled out so the two lists cannot drift.
+var auditColsNoActor = strings.Replace(auditCols, " actor,", " '' AS actor,", 1)
+
+// auditColumns is the column list for this store's audit reads (see
+// auditActorColumn).
+func (s *Store) auditColumns(ctx context.Context) string {
+	if s.auditActorColumn(ctx) {
+		return auditCols
+	}
+	return auditColsNoActor
+}
+
+// auditActorColumn reports whether audit_log carries the actor column.
+//
+// Usually it does: every process that migrates adds it. But a front end under
+// turso never migrates — it reads the schema of the DAEMON it is connected to,
+// and during an upgrade handoff (a new binary on disk, the old daemon not yet
+// replaced) that daemon still serves the schema before the column. Naming the
+// column there fails every audit read and every escalation settle with "no
+// such column: actor", so instead the attribution degrades: reads see none and
+// the *By writers settle unattributed, both safe because the actor is
+// display-only.
+//
+// Only a positive answer is cached, so a front end that outlives the handoff
+// (a TUI left open) starts attributing as soon as the new daemon has
+// migrated. A failed probe answers false — the no-actor statements are valid
+// against either schema.
+func (s *Store) auditActorColumn(ctx context.Context) bool {
+	if s.actorColumn.Load() {
+		return true
+	}
+	has, err := s.hasColumn(ctx, "audit_log", "actor")
+	if err != nil {
+		slog.Debug("store: could not inspect audit_log; settling unattributed", "error", err)
+		return false
+	}
+	if has {
+		s.actorColumn.Store(true)
+	}
+	return has
+}
+
 // llmConfArg maps the optional LLM confidence to a SQL argument: nil stores
 // NULL (no LLM score), a value stores the 0-100 score.
 func llmConfArg(v *int) any {
@@ -1997,7 +2110,7 @@ func (s *Store) AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, 
 		limit = 100
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+auditCols+` FROM audit_log ORDER BY id DESC LIMIT ?`, limit)
+		`SELECT `+s.auditColumns(ctx)+` FROM audit_log ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -2007,7 +2120,7 @@ func (s *Store) AuditLog(ctx context.Context, limit int) ([]domain.AuditRecord, 
 // GetAudit returns one audit record by id, or nil.
 func (s *Store) GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+auditCols+` FROM audit_log WHERE id = ?`, id)
+		`SELECT `+s.auditColumns(ctx)+` FROM audit_log WHERE id = ?`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -2055,7 +2168,7 @@ func (s *Store) HasOpenEscalation(ctx context.Context, agentID string) (bool, er
 
 func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT `+auditCols+` FROM audit_log WHERE status = 'escalated' ORDER BY id DESC LIMIT 200`)
+		`SELECT `+s.auditColumns(ctx)+` FROM audit_log WHERE status = 'escalated' ORDER BY id DESC LIMIT 200`)
 	if err != nil {
 		return nil, err
 	}

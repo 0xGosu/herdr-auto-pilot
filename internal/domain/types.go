@@ -667,7 +667,10 @@ type AuditRecord struct {
 	// takes a row a front end settled. Empty on every row the daemon settles
 	// on its own (auto-sent, auto-dismissed), on an LLM retry (the queued
 	// request carries no author), and on rows predating the column — "not
-	// attributable", never a claim that the operator acted.
+	// attributable", never a claim that the operator acted. Also empty on a
+	// row settled while a turso front end was talking to a daemon whose schema
+	// predates the column (an upgrade handoff): the store degrades to
+	// unattributed writes there rather than failing the settle.
 	Actor     string
 	CreatedAt time.Time
 }

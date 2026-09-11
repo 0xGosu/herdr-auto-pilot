@@ -45,6 +45,7 @@ var explicitIDTables = map[string]bool{
 // here is a review event: the default for a new statement is to scope it.
 var nodeScopeExemptions = map[string]string{
 	"UpdateAuditStatusBy#1":          "by id: an operator surface resolves any node's escalation",
+	"UpdateAuditStatusBy#2":          "by id, attributed",
 	"EscalateAudit#1":                "by id",
 	"MarkCorrectionProcessed#1":      "by id",
 	"MarkCorrectionSent#1":           "by id",
@@ -53,7 +54,9 @@ var nodeScopeExemptions = map[string]string{
 	"UpdateLLMDecisionStatus#1":      "by id",
 	"auditNodeTx#1":                  "looks up a row's node so the caller can stamp it",
 	"DismissEscalationBy#1":          "by id: dismiss works on any node's escalation",
+	"DismissEscalationBy#2":          "by id, on a schema before audit_log.actor",
 	"ResolveEscalationBy#1":          "by id: resolve works on any node's escalation",
+	"ResolveEscalationBy#2":          "by id, on a schema before audit_log.actor",
 	"MarkAutoAccepted#1":             "by id, guarded on the daemon's own auto_accepting claim",
 	"DismissEscalationWithReason#1":  "by id",
 	"LatestAuditForSignature#1":      "knowledge view: a rule's latest sighting on any node",
@@ -64,6 +67,7 @@ var nodeScopeExemptions = map[string]string{
 	"CountPendingEscalations#1":      "fleet read: the unified pending count",
 	"PendingEscalations#1":           "fleet read: the unified queue, node_id per row",
 	"DismissEscalationsBeforeBy#1":   "fleet write: the operator prunes the unified queue they are looking at",
+	"DismissEscalationsBeforeBy#2":   "fleet write, on a schema before audit_log.actor",
 	"MarkLLMRetryProcessed#1":        "by id",
 	"RetireEscalationForRetry#1":     "by id",
 	"GetLLMRequest#1":                "by request_id",
