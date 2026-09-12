@@ -1327,6 +1327,11 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
   days; events you had not reached when they were pruned — at resume or while
   reading — print `# gap missed=A..B`, and a cursor above the head prints
   `# reset …` — re-survey with the CLI in both cases.
+- **Your own actions are not printed** — events `by=orchestrator` are
+  suppressed, so the stream carries only what you have not already done
+  yourself. They still take their sequence numbers, so `--resume` never replays
+  them and a run of them is not a `# gap`. `--include-self` prints them when you
+  are debugging what an emitter writes.
 - **Per machine:** an action taken on another fleet node appears in that
   machine's stream; a hand edit to `config.toml` or a task file is not an event.
 

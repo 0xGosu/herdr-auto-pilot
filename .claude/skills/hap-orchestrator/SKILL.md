@@ -56,7 +56,10 @@ cat /path/to/repo/AUTO.md      # section: "## Lessons for hap's auto-answer assi
 Then arm two things and keep them alive:
 
 - a persistent Monitor on `hap stream orchestrator --resume <last-seq>` —
-  `# gap` or `# reset` in its output means re-survey from scratch;
+  `# gap` or `# reset` in its output means re-survey from scratch. Your own
+  actions never come back at you: events `by=orchestrator` are suppressed
+  (`--include-self` if you ever need to see them), so anything the Monitor
+  reports is something else moved;
 - an hourly health-check cron: `hap status`, `hap agents`, restart a dead
   daemon with `hap daemon --ensure`, unblock anything stuck, report only if
   something needed action.

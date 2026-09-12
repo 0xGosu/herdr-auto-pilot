@@ -34,14 +34,25 @@ var streamGapRecheck = time.Minute
 // another read at once rather than a poll wait, so a long replay is not paced.
 const streamBatch = 500
 
-// streamOrchestrator is `hap stream orchestrator [--resume N]`.
+// streamOrchestrator is `hap stream orchestrator [--resume N] [--include-self]`.
 //
 // It reads the machine-local event log only (app.Stream), so it needs no
 // running daemon and never touches herdr.
+//
+// The stream's reader is normally the orchestrator itself, and its OWN actions
+// are in the log beside everyone else's — so without a filter every task it
+// marks done, every escalation it answers and every config key it sets comes
+// straight back at it as an event it must recognize and ignore. That is pure
+// noise on the one surface whose whole job is to say what the orchestrator has
+// not yet seen, so events it authored (domain.OrchestratorAuthor, the author a
+// hap command carries under HAP_ACTOR=orchestrator) are suppressed by default.
+// --include-self prints them, for debugging the emitters.
 func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: hap stream orchestrator [--resume N]"
+	const usage = "usage: hap stream orchestrator [--resume N] [--include-self]"
 	fs := flag.NewFlagSet("stream orchestrator", flag.ContinueOnError)
 	resume := fs.Int64("resume", 0, "replay every event after N, then keep following")
+	includeSelf := fs.Bool("include-self", false,
+		"also print the events the orchestrator itself authored (suppressed by default)")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -125,9 +136,22 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		} else {
 			lastErr = ""
 		}
+		// The cursor advances over a SUPPRESSED event exactly as it does over a
+		// printed one, so a self-authored event is never re-delivered on the
+		// next resume and never reads as a gap. Everything else in this loop is
+		// accounted on the RAW batch — prunedUnder's batch[0].Seq, settled,
+		// lastEventAt and the full-batch continue above — because each answers a
+		// question about the LOG, not about what was printed: counting only
+		// printed events would re-query the floor forever on a log the
+		// orchestrator alone wrote, and would end the no-wait replay mid-stream
+		// on a full batch it happened to author.
 		for _, ev := range evs {
-			if _, err := fmt.Fprintln(out, ev.Line()); err != nil {
-				return nil // the reader went away
+			if *includeSelf || ev.Author != domain.OrchestratorAuthor {
+				// Only a line actually written can prove the reader went away;
+				// a suppressed event is no evidence either way.
+				if _, err := fmt.Fprintln(out, ev.Line()); err != nil {
+					return nil // the reader went away
+				}
 			}
 			cursor = ev.Seq
 		}
