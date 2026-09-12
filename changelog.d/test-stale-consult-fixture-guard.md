@@ -1,1 +1,0 @@
-- Strengthened the stale-consult tests so the dismiss-versus-escalate split cannot regress unnoticed: the "situation changed" case now proves its two panes really are different situations before asserting on the outcome.

@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.34
+
+- Strengthened the stale-consult tests so the dismiss-versus-escalate split cannot regress unnoticed: the "situation changed" case now proves its two panes really are different situations before asserting on the outcome.
+
 ## 0.9.33
 
 - Fixed the timed auto-accept and full self-prompting sending an answer the `--action` rules refuse: the unattended path, the one that types with nobody watching, was the only send that never screened what it chose. A refused answer now waits for you instead, without counting as a failed delivery.
