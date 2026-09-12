@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.39
+
+- Added the real agy file-edit approval screen to the classifier corpus, so the idle-verdict suppression is proved against the recorded pane that caused the stall rather than a synthetic stand-in.
+
 ## 0.9.38
 
 - Fixed hap reporting an agy agent as idle while a prompt it does not recognise is on screen: agy must now show its composer to earn the idle verdict, so an unreadable modal escalates instead of being offered the next task. Previously such an agent could sit untouched behind a standing prompt while hap treated it as free — and a pane scored idle is exactly the one a hand-out gets typed into.
