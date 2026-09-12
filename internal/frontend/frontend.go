@@ -2446,6 +2446,7 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "escalations.auto_accept.idle", TUIEditable: true},
 	{Key: "escalations.auto_accept.unclassifiable", TUIEditable: true},
 	{Key: "safety.disable_never_auto_seed_patterns", TUIEditable: true},
+	{Key: "safety.enable_never_auto_action_seeds", TUIEditable: true},
 	{Key: "llm.command"}, // argv template
 	{Key: "llm.timeout_seconds", TUIEditable: true},
 	{Key: "llm.auto_act_confidence_threshold", TUIEditable: true},
@@ -2851,6 +2852,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return defaultedInt(cfg.Embedding.WarmTimeoutMs, embedder.DefaultWarmTimeoutMs)
 	case "safety.disable_never_auto_seed_patterns":
 		return strconv.FormatBool(cfg.Safety.DisableNeverAutoSeedPatterns)
+	case "safety.enable_never_auto_action_seeds":
+		return strconv.FormatBool(cfg.Safety.EnableNeverAutoActionSeeds)
 	case "tui.max_content_width":
 		if cfg.TUI.MaxContentWidth == 0 {
 			return "0 (full width)"
@@ -3316,6 +3319,13 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("safety.disable_never_auto_seed_patterns must be true or false, got %q", value)
 			}
 			cfg.Safety.DisableNeverAutoSeedPatterns = v
+			return nil
+		case "safety.enable_never_auto_action_seeds":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("safety.enable_never_auto_action_seeds must be true or false, got %q", value)
+			}
+			cfg.Safety.EnableNeverAutoActionSeeds = v
 			return nil
 		case "tui.max_content_width":
 			v, err := strconv.Atoi(value)

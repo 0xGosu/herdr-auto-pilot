@@ -24,6 +24,7 @@ import (
 var configListCommands = map[string]string{
 	"safety.never_auto_patterns":    "hap config rules add / hap config rules remove",
 	"safety.never_auto_rules":       "hap config rules add --agent-type / hap config rules remove-scoped",
+	"safety.never_auto_actions":     "hap config rules add --action / hap config rules remove-action",
 	"safety.disabled_seed_patterns": "hap config rules disable-seed / hap config rules enable-seed",
 	"task_sources":                  "hap config task-source add / set / remove",
 	"classifier":                    "hap config classifier add / remove",

@@ -357,6 +357,108 @@ type NeverAutoList struct {
 	rules []compiledNeverAutoRule
 }
 
+// SeedNeverAutoActionRules are the shipped rules for the ACTION side: menu
+// options that widen a one-off approval into a standing permission.
+//
+// They exist because answering such a row disarms every later safety control
+// rather than approving one command. Verified live on 2026-09-12: hap's LLM
+// chose agy's "Yes, and always allow in this conversation for commands that
+// start with X" at confidence 98-99 on nearly every approval. Once taken, every
+// later command matching that PREFIX runs with no prompt at all — so it never
+// reaches a pane, never reaches a classifier, and never reaches these rules. A
+// short prefix ("ln", "git", "pwd") therefore switches the safety net off for a
+// whole class of commands, silently and for the rest of the session.
+//
+// Kind is set EXPLICITLY on every rule. The action matcher shares its
+// compilation with NeverAutoList, whose heuristic half walks the same slice, so
+// a rule that arrived here with Kind unset could be defaulted into the
+// irreversibility heuristic and fire against action text it was never written
+// for.
+//
+// Off unless safety.enable_never_auto_action_seeds — see that key for why the
+// default is a sequencing decision, not a judgement about the risk.
+var SeedNeverAutoActionRules = []NeverAutoRule{
+	// agy and Claude both phrase the widening options as "and always allow" /
+	// "don't ask again". Anchored on the conjunction so a plain "Yes, run
+	// command" — the narrow answer these rules exist to leave available — can
+	// never match.
+	{Pattern: `(?i)\band\s+always\s+allow\b`, Kind: NeverAutoStrict, Source: NeverAutoSeed},
+	{Pattern: `(?i)\bdon'?t\s+ask\s+(me\s+)?again\b`, Kind: NeverAutoStrict, Source: NeverAutoSeed},
+	// The strongest of them: agy's option 3 writes the permission to
+	// settings.json, so it outlives the conversation entirely.
+	{Pattern: `(?i)\bpersist\s+to\s+settings\.json\b`, Kind: NeverAutoStrict, Source: NeverAutoSeed},
+	{Pattern: `(?i)\ballow\s+all\b|\byes\s+to\s+all\b`, Kind: NeverAutoStrict, Source: NeverAutoSeed},
+}
+
+// NeverAutoActionList refuses an ACTION hap is about to send. It is a distinct
+// type from NeverAutoList, not an alias, because it must expose Match and
+// NOTHING else: the underlying matcher also carries SuspectedIrreversible, and
+// an action rule reaching the irreversibility heuristic would escalate on text
+// it was never meant to judge.
+type NeverAutoActionList struct {
+	inner *NeverAutoList
+}
+
+// NewNeverAutoActionList compiles the operator's action rules, optionally with
+// the shipped seeds. disabledSeeds silences individual seed rules by pattern,
+// exactly as it does for the situation matcher.
+func NewNeverAutoActionList(seedEnabled bool, disabledSeeds []string, rules []NeverAutoRule) (*NeverAutoActionList, []error) {
+	var seeds []NeverAutoRule
+	if seedEnabled {
+		seeds = SeedNeverAutoActionRules
+	}
+	// Operator rules are forced to strict for the same reason the seeds declare
+	// it: nothing on this side may become heuristic.
+	operator := make([]NeverAutoRule, 0, len(rules))
+	for _, r := range rules {
+		r.Kind = NeverAutoStrict
+		if r.Source == "" {
+			r.Source = NeverAutoOperator
+		}
+		operator = append(operator, r)
+	}
+	inner, errs := NewNeverAutoList(false, disabledSeeds, nil, append(append([]NeverAutoRule(nil), seeds...), operator...))
+	// The seeds are passed as ordinary rules above (NewNeverAutoList's own seed
+	// set is the SITUATION one), so honour the operator's per-pattern disables
+	// here rather than relying on that path.
+	if seedEnabled && len(disabledSeeds) > 0 {
+		inner = filterDisabled(inner, disabledSeeds)
+	}
+	return &NeverAutoActionList{inner: inner}, errs
+}
+
+// filterDisabled drops compiled seed rules the operator has silenced by pattern.
+func filterDisabled(l *NeverAutoList, disabled []string) *NeverAutoList {
+	off := make(map[string]bool, len(disabled))
+	for _, p := range disabled {
+		off[p] = true
+	}
+	kept := make([]compiledNeverAutoRule, 0, len(l.rules))
+	for _, c := range l.rules {
+		if c.rule.Source == NeverAutoSeed && off[c.rule.Pattern] {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	return &NeverAutoList{rules: kept}
+}
+
+// Match reports whether the action hap is about to send is refused.
+func (l *NeverAutoActionList) Match(agentType, action string) (NeverAutoHit, bool) {
+	if l == nil || l.inner == nil {
+		return NeverAutoHit{}, false
+	}
+	return l.inner.Match(agentType, action)
+}
+
+// Rules returns the compiled action rules, for listing.
+func (l *NeverAutoActionList) Rules() []NeverAutoRule {
+	if l == nil || l.inner == nil {
+		return nil
+	}
+	return l.inner.Rules()
+}
+
 // NewNeverAutoList compiles strict and heuristic rules into one matcher while
 // preserving each rule's source, kind, and agent-type scope.
 // Invalid operator patterns are reported, not silently dropped.

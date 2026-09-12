@@ -763,6 +763,11 @@ func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(strin
 		if err := d.screenOutbound(agentType, text); err != nil {
 			return fmt.Errorf("%w: %v", errOutboundRefused, err)
 		}
+		// The action rules too: the orchestrator CHOOSES this text, so a
+		// widening menu option it picked is exactly what they exist to refuse.
+		if why := d.actionRefused(agentType, text); why != "" {
+			return fmt.Errorf("%w: matched never-auto action %s", errOutboundRefused, why)
+		}
 		return nil
 	}
 }

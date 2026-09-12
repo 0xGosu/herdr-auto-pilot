@@ -81,6 +81,53 @@ func (a *App) RemoveNeverAutoRule(ctx context.Context, index int, expected confi
 	})
 }
 
+// --- Never-auto ACTION rules ([[safety.never_auto_actions]]) --------------
+
+// AddNeverAutoActionRule appends a rule matched against the ANSWER hap is about
+// to send rather than the screen it is answering.
+//
+// Unlike AddNeverAutoRule an empty agentTypes list is ALLOWED and means every
+// agent: there is no flat companion list for this key to collide with, and
+// requiring a scope would make the common case ("never pick an always-allow
+// option, whoever is asking") the awkward one.
+func (a *App) AddNeverAutoActionRule(ctx context.Context, pattern string, agentTypes []string) error {
+	types, err := normalizeAgentTypes(agentTypes)
+	if err != nil {
+		return err
+	}
+	// Validated through the real matcher, so the CLI rejects exactly what the
+	// daemon would have skipped with a log line nobody reads.
+	if _, errs := domain.NewNeverAutoActionList(false, nil,
+		[]domain.NeverAutoRule{{Pattern: pattern, AgentTypes: types}}); len(errs) > 0 {
+		return fmt.Errorf("invalid pattern: %v", errs[0])
+	}
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		cfg.Safety.NeverAutoActionRules = append(cfg.Safety.NeverAutoActionRules,
+			config.NeverAutoRule{Pattern: pattern, AgentTypes: types})
+		return nil
+	})
+}
+
+// RemoveNeverAutoActionRule deletes action rule #index. As with the scoped
+// situation rules, the WHOLE entry the caller listed must still be there —
+// scope included — so a listing gone stale cannot silently drop a different
+// safety rule.
+func (a *App) RemoveNeverAutoActionRule(ctx context.Context, index int, expected config.NeverAutoRule) error {
+	return a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		if index < 0 || index >= len(cfg.Safety.NeverAutoActionRules) {
+			return fmt.Errorf("no never-auto action rule #%d", index)
+		}
+		got := cfg.Safety.NeverAutoActionRules[index]
+		if got.Pattern != expected.Pattern || !slices.Equal(got.AgentTypes, expected.AgentTypes) {
+			return fmt.Errorf("action rule #%d changed since it was listed (now agent_types=%s %q); re-list and retry",
+				index, strings.Join(got.AgentTypes, ","), got.Pattern)
+		}
+		cfg.Safety.NeverAutoActionRules = append(
+			cfg.Safety.NeverAutoActionRules[:index], cfg.Safety.NeverAutoActionRules[index+1:]...)
+		return nil
+	})
+}
+
 // --- Classifier rules ([[classifier]]) ------------------------------------
 
 // ClassifierSituations are the situation types an operator classifier rule may
