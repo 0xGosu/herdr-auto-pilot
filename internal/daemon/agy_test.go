@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -757,9 +758,12 @@ func TestAgyReviewApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
 			h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
 			h.herdr.failRead = tc.failRead
 
+			var mu sync.Mutex
 			var reqID string
 			h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+				mu.Lock()
 				reqID = req.RequestID
+				mu.Unlock()
 				return stageTaskReview(ctx, h, req, nil, "1", 90)
 			}
 
@@ -767,11 +771,13 @@ func TestAgyReviewApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
 			var callOrder []string
 			origMutate := h.daemon.opt.MutateTaskFile
 			h.daemon.opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {
-				mutations++
 				before := readTasks(t, path)
 				err := origMutate(path, fn)
 				after := readTasks(t, path)
+				mu.Lock()
+				mutations++
 				callOrder = append(callOrder, fmt.Sprintf("call %d: %q -> %q", mutations, strings.TrimSpace(before), strings.TrimSpace(after)))
+				mu.Unlock()
 				return err
 			}
 
@@ -795,23 +801,31 @@ func TestAgyReviewApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
 				agyAgent(), del, time.Now())
 
 			waitFor(t, 5*time.Second, func() bool {
-				if reqID == "" {
+				mu.Lock()
+				id := reqID
+				mu.Unlock()
+				if id == "" {
 					return false
 				}
-				dec, err := h.raw.LLMDecisionByRequest(ctx, reqID)
+				dec, err := h.raw.LLMDecisionByRequest(ctx, id)
 				return err == nil && dec != nil && dec.Status != "pending"
 			})
 
-			t.Logf("observed call order: %v", callOrder)
+			mu.Lock()
+			observedCallOrder := append([]string(nil), callOrder...)
+			observedMutations := mutations
+			mu.Unlock()
+
+			t.Logf("observed call order: %v", observedCallOrder)
 
 			if sent || len(h.herdr.sentInputs()) != 0 {
 				t.Fatalf("typed into a pane that is not at an empty composer: sent=%v inputs=%v",
 					sent, h.herdr.sentInputs())
 			}
-			if mutations != 0 {
+			if observedMutations != 0 {
 				t.Errorf("the task list was written %d times for a refusal that never got as far as "+
 					"a reservation — under a gist source that is a remote read-modify-write per sweep",
-					mutations)
+					observedMutations)
 			}
 			n, err := h.raw.TaskHandoutAttempts(ctx, canonicalTaskPath(taskFile), "1. run the suite")
 			if err != nil {
