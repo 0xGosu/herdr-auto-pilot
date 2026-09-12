@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.35
+
+- `hap status` now says when an agy agent is working outside the directory it was started in, and names the directory to relaunch it in — agy asks approval for every file outside its start directory, so a misplaced agent turns each file read into a round trip.
+- Added the shipped skill note that an agy agent must be started in the directory it will work in.
+
 ## 0.9.34
 
 - Strengthened the stale-consult tests so the dismiss-versus-escalate split cannot regress unnoticed: the "situation changed" case now proves its two panes really are different situations before asserting on the outcome.

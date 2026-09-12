@@ -1,2 +1,0 @@
-- `hap status` now says when an agy agent is working outside the directory it was started in, and names the directory to relaunch it in — agy asks approval for every file outside its start directory, so a misplaced agent turns each file read into a round trip.
-- Added the shipped skill note that an agy agent must be started in the directory it will work in.
