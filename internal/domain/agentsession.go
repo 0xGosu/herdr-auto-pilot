@@ -5,8 +5,8 @@ import (
 	"strings"
 )
 
-// A Claude CONVERSATION NAME — what `/rename` sets, and what Claude paints
-// right-aligned inside the rule above its composer:
+// ClaudeSession represents a Claude conversation name — what `/rename` sets,
+// and what Claude paints right-aligned inside the rule above its composer:
 //
 //	──────────────────────────────────────────── add-sweep-command-grid ─
 //	❯

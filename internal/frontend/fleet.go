@@ -280,10 +280,10 @@ func (a *App) requireLiveDaemonFor(ctx context.Context, nodeID string) error {
 	return fmt.Errorf("%w: node %s is unknown to this store", ErrDaemonUnavailable, nodeID)
 }
 
-// RemoteActionTimeout bounds how long a confirm waits for ANOTHER node's daemon
+// DefaultRemoteActionTimeout bounds how long a confirm waits for ANOTHER node's daemon
 // to deliver: the request travels on this node's next push and that node's
 // next pull, and the verdict comes back the same way, so two sync intervals
-// plus slack. Zero means DefaultRemoteActionTimeout.
+// plus slack.
 const DefaultRemoteActionTimeout = 45 * time.Second
 
 // awaitTimeoutFor is how long to wait for a queued action's verdict.

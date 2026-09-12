@@ -5,9 +5,9 @@ import (
 	"strings"
 )
 
-// An agent's PERMISSION MODE — how much the agent asks before acting. Claude
-// Code, Codex and agy all expose it as a rotating toggle bound to Shift+Tab, and
-// none reports it over any API: herdr's `agent list` and `pane get` carry no
+// AgentMode represents an agent's permission mode — how much the agent asks
+// before acting. Claude Code, Codex and agy all expose it as a rotating toggle
+// bound to Shift+Tab, and none reports it over any API: herdr's `agent list` and `pane get` carry no
 // mode field (verified against herdr 0.7.5 and 0.8.2), so the ONLY source of
 // truth is the mode indicator the agent paints in its own composer footer.
 //
