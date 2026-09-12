@@ -41,6 +41,7 @@ import (
 	"sync"
 	"time"
 
+	skilldoc "github.com/0xGosu/herdr-auto-pilot"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -68,7 +69,7 @@ const orchestratorBrief = `You are hap's herd orchestrator on this machine. hap 
 If the ` + "`hap`" + ` CLI is not on your PATH, use the binary at {self} in place of ` + "`hap`" + ` in every command below.
 
 Start by setting yourself up:
-1. Run ` + "`hap --skill`" + ` and ` + "`herdr --skill`" + ` and read both: they document the hap CLI (status, escalations, tasks, rules, config) and herdr (workspaces, panes, agents, reading and prompting an agent).
+1. Load the ` + "`hap-orchestrator`" + ` skill: hap has installed it, and the ` + "`hap`" + ` skill, into this working directory, so both are yours to re-read at any time — do that whenever your context is compacted and this brief is gone. ` + "`hap --skill`" + ` prints the hap one if the skill is somehow missing. Read ` + "`herdr --skill`" + ` too: it documents herdr (workspaces, panes, agents, reading and prompting an agent), which hap does not.
 2. Run ` + "`hap status`" + `, ` + "`hap agents`" + ` and ` + "`hap escalations`" + ` to survey the herd.
 3. Start the Monitor tool on ` + "`hap stream orchestrator`" + `. It prints a ` + "`# … head=N`" + ` line, then one line per event: ` + "`<seq> <time> <kind> key=value … by=<author>`" + `. Remember the last seq you handled; if the monitor stops, restart it with ` + "`hap stream orchestrator --resume <that seq>`" + `. A ` + "`# gap`" + ` or ` + "`# reset`" + ` line means events were lost: re-survey.
 4. Schedule an hourly health check with the CronCreate tool — a recurring job every hour whose prompt tells you to run ` + "`hap status`" + ` and ` + "`hap agents`" + ` and rescue what you find. Check CronList first so there is only ever one. It runs whether or not the stream said anything, because a stopped hap daemon and a hung agent are both silent: if ` + "`hap status`" + ` shows no running daemon, start it with ` + "`hap daemon --ensure`" + `; if an agent has sat working or blocked with no progress, read its screen with herdr and unblock it or tell the operator here.
@@ -108,6 +109,11 @@ type orchestratorState struct {
 	waitingNoted    bool
 	noLauncherNoted bool
 	badCommandNoted string
+	// skillsCwdNoted and skillsErrNoted are the skill bootstrap's own once-only
+	// notices: the pass runs every minute while a session is missing, and both
+	// conditions hold until an operator changes something.
+	skillsCwdNoted bool
+	skillsErrNoted string
 }
 
 func (d *Daemon) orchestratorStatePath() string {
@@ -403,6 +409,12 @@ func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLau
 		}
 		return
 	}
+	// Before the alive/launch branch on purpose: a session that already exists
+	// — adopted, or simply surviving a daemon restart — needs the skills just
+	// as much as one being created, and an UPGRADE reaches them no other way.
+	// Run's startup pass is what makes that free: it passes a nil listing, so
+	// startOrchestratorPass's "healthy, nothing to do" early-out cannot skip it.
+	d.bootstrapOrchestratorSkills(kind, cfg.FullSelfPrompting.OrchestratorAgentCwd)
 	id := d.orchestratorIdentity()
 	if !orchestratorAlive(id, agents) {
 		var ok bool
@@ -835,6 +847,71 @@ func (d *Daemon) orchestratorDir(cwd string) (string, error) {
 		return "", fmt.Errorf("orchestrator_agent_cwd: %w", err)
 	}
 	return config.ExpandPath(cwd), nil
+}
+
+// bootstrapOrchestratorSkills puts the bundled hap and hap-orchestrator skills
+// on disk in the orchestrator's working directory, so the session can recall
+// them at any time — including after an automatic compaction has dropped the
+// brief that told it to run `hap --skill`.
+//
+// It writes ONLY into the default <state>/orchestrator, the directory hap
+// creates and owns. An operator's orchestrator_agent_cwd gets nothing: that is
+// the same seam orchestratorDir already draws — hap does not create that
+// directory either — and here it also means an unattended write never lands in
+// somebody's repository, where a .claude/skills/hap/SKILL.md could overwrite a
+// project skill of their own and show up in their `git status`.
+//
+// The directory is created here, by the act of installing into it — this pass
+// runs whether or not a session is about to be started, so do not move the
+// MkdirAll back to the launch path: that is exactly what left an upgraded
+// binary's skills unreachable to a session nothing re-creates.
+//
+// Accepted limit: an ADOPTED session — one hap found by name rather than
+// started — runs in whatever directory the operator started it in, which hap
+// neither chose nor may write to, so its skills land in <state>/orchestrator
+// where that session will not look for them. Deliberate rather than fixed: the
+// alternative is writing into a directory an operator owns, which is the one
+// thing this refuses to do. `hap skill install` is their route.
+//
+// Never fatal: a herd with no skills on disk is worse off than one with them,
+// but far better off than one with no orchestrator. Failures are logged once
+// per distinct message and the pass carries on to the start and the brief.
+func (d *Daemon) bootstrapOrchestratorSkills(kind, cwd string) {
+	if cwd != "" {
+		d.orch.mu.Lock()
+		noted := d.orch.skillsCwdNoted
+		d.orch.skillsCwdNoted = true
+		d.orch.mu.Unlock()
+		if !noted {
+			slog.Info("orchestrator: orchestrator_agent_cwd is yours, not hap's, so the bundled skills are not "+
+				"written there; run `hap skill install` if you want them", "cwd", cwd)
+		}
+		return
+	}
+	if d.opt.StateDir == "" {
+		return
+	}
+	dir, err := d.orchestratorDir("")
+	var written []string
+	if err == nil {
+		written, err = skilldoc.InstallAgentSkills(dir, kind)
+	}
+	// Reported even alongside an error: a partial refresh is what landed.
+	if len(written) > 0 {
+		slog.Info("orchestrator: refreshed the skills in its working directory", "dir", dir, "files", len(written))
+	}
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	d.orch.mu.Lock()
+	noted := d.orch.skillsErrNoted == msg
+	d.orch.skillsErrNoted = msg
+	d.orch.mu.Unlock()
+	if !noted {
+		slog.Warn("orchestrator: could not install its skills; it will have to run `hap --skill` instead",
+			"error", err)
+	}
 }
 
 // orchestratorHealth is the orchestrator's trouble for the heartbeat, or nil

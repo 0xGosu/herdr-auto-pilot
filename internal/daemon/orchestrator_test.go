@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	skilldoc "github.com/0xGosu/herdr-auto-pilot"
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonhealth"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -285,7 +286,7 @@ func TestOrchestratorEventsAreIgnored(t *testing.T) {
 func TestOrchestratorAdoptsAnExistingSessionWithoutBriefingIt(t *testing.T) {
 	existing := domain.AgentTransition{AgentID: "wX:p9", PaneID: "wX:p9", AgentType: "claude",
 		Status: "idle", TerminalID: "term_x"}
-	h, l, _ := newOrchHarness(t, orchestratorOn, func(l *orchLauncher) {
+	h, l, state := newOrchHarness(t, orchestratorOn, func(l *orchLauncher) {
 		l.named[domain.OrchestratorAgentName] = existing
 		l.agents = append(l.agents, existing)
 	})
@@ -300,6 +301,14 @@ func TestOrchestratorAdoptsAnExistingSessionWithoutBriefingIt(t *testing.T) {
 	}
 	if id := h.daemon.orchestratorIdentity(); id.PaneID != "wX:p9" || id.TerminalID != "term_x" {
 		t.Fatalf("identity = %+v", id)
+	}
+	// The skills are still installed: the bootstrap runs before the alive/launch
+	// branch, so it does not depend on hap having started the session. They land
+	// in hap's own directory, which an adopted session may not be running in —
+	// the accepted limit named on bootstrapOrchestratorSkills.
+	if _, err := os.Stat(filepath.Join(state, orchestratorDirName, ".claude", "skills",
+		"hap", skilldoc.SkillFileName)); err != nil {
+		t.Errorf("an adopted session's pass installed no skills: %v", err)
 	}
 }
 
@@ -654,6 +663,9 @@ func TestOrchestratorBriefShape(t *testing.T) {
 		t.Fatalf("{self} appears %d times, want once", n)
 	}
 	for _, want := range []string{
+		// The skills are on disk in the session's cwd, which is what survives an
+		// automatic compaction; `hap --skill` stays named as the fallback.
+		"`hap-orchestrator`", "compacted",
 		"`hap --skill`", "`hap stream orchestrator`", "CronCreate", "CronList", "CronDelete",
 		"`hap daemon --ensure`", "`fsp.off`", "`fsp.on`",
 	} {
@@ -733,5 +745,91 @@ func TestOrchestratorTroubleReachesTheHeartbeat(t *testing.T) {
 	h.daemon.ensureOrchestrator(ctx, l, cfg, nil)
 	if o := h.daemon.orchestratorHealth(); o != nil {
 		t.Fatalf("a briefed orchestrator still reports %+v", o)
+	}
+}
+
+// The skills go on disk in the session's working directory, so the
+// orchestrator can recall them after an automatic compaction has dropped the
+// brief that told it to run `hap --skill`.
+func TestOrchestratorBootstrapsItsSkillsOnDisk(t *testing.T) {
+	h, _, state := newOrchHarness(t, orchestratorOn, nil)
+	waitFor(t, 5*time.Second, func() bool { return h.daemon.orchestratorIdentity().Briefed })
+	waitOrchestratorIdle(t, h)
+
+	base := filepath.Join(state, orchestratorDirName, ".claude", "skills")
+	hap := filepath.Join(base, "hap", skilldoc.SkillFileName)
+	got, err := os.ReadFile(hap)
+	if err != nil {
+		t.Fatalf("read %s: %v", hap, err)
+	}
+	if string(got) != skilldoc.HapSkill {
+		t.Errorf("%s is not the bundled hap skill", hap)
+	}
+	// The multi-file half: SKILL.md is useless without the references it links.
+	entries, err := os.ReadDir(filepath.Join(base, "hap-orchestrator"))
+	if err != nil {
+		t.Fatalf("read the orchestrator skill dir: %v", err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("the orchestrator skill installed as %d file(s); it is a tree", len(entries))
+	}
+	if _, err := os.Stat(filepath.Join(base, "hap-orchestrator", skilldoc.SkillFileName)); err != nil {
+		t.Errorf("no orchestrator SKILL.md: %v", err)
+	}
+}
+
+// The bootstrap sits BEFORE the alive/launch branch, so a session that already
+// exists — adopted, or surviving a restart — is brought up to date too. That is
+// how an upgraded binary's skills reach an orchestrator nothing re-creates.
+func TestOrchestratorRefreshesItsSkillsForALiveSession(t *testing.T) {
+	h, l, state := newOrchHarness(t, orchestratorOn, nil)
+	waitFor(t, 5*time.Second, func() bool { return h.daemon.orchestratorIdentity().Briefed })
+	waitOrchestratorIdle(t, h)
+
+	stale := filepath.Join(state, orchestratorDirName, ".claude", "skills",
+		"hap-orchestrator", skilldoc.SkillFileName)
+	if err := os.WriteFile(stale, []byte("an older release's skill"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	agents, _ := h.herdr.ListAgents(ctx)
+	cfg, _, _ := h.daemon.snapshot()
+	h.daemon.ensureOrchestrator(ctx, l, cfg, agents)
+
+	got, err := os.ReadFile(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) == "an older release's skill" {
+		t.Error("a live session's stale skill was left as it was")
+	}
+	// Nothing else happened: the session was healthy.
+	if _, started, _ := l.snapshot(); len(started) != 1 || len(h.herdr.sentInputs()) != 1 {
+		t.Errorf("the refresh pass restarted or re-briefed it: starts=%d sends=%d",
+			len(started), len(h.herdr.sentInputs()))
+	}
+}
+
+// An operator's orchestrator_agent_cwd is theirs, not hap's: an unattended
+// write there could overwrite a project skill of their own. hap writes nothing
+// and says so once, naming `hap skill install`.
+func TestOrchestratorWritesNoSkillsIntoAnOperatorsCwd(t *testing.T) {
+	h, l, state := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+	dir := t.TempDir()
+	cfg.FullSelfPrompting.OrchestratorAgentCwd = dir
+	h.daemon.ensureOrchestrator(context.Background(), l, cfg, nil)
+
+	if created, _, _ := l.snapshot(); len(created) != 1 {
+		t.Fatalf("the session was not started in %s: %q", dir, created)
+	}
+	for _, unwanted := range []string{".claude", ".agents"} {
+		if _, err := os.Stat(filepath.Join(dir, unwanted)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("hap wrote %s into the operator's working directory (stat err = %v)", unwanted, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(state, orchestratorDirName)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("hap fell back to its own directory instead of skipping (stat err = %v)", err)
 	}
 }

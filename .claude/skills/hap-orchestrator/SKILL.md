@@ -33,10 +33,14 @@ hap ignores the orchestrator's own pane. Operate through `hap`; reach for
 ## setup, once per session
 
 ```sh
-hap --skill && herdr --skill          # read both first
+herdr --skill                         # hap does not document herdr; read it first
 export HAP_NO_HINTS=1                 # `hap --no-hints <cmd>` is not a thing
 hap status && hap agents && hap escalations
 ```
+
+hap has installed this skill and the `hap` one into your working directory
+(`.claude/skills/`), so **re-read them whenever your context is compacted** and
+this setup is gone. `hap --skill` prints the hap document if it is missing.
 
 Read **`AUTO.md` in the root of every repo your agents work in**, if it exists.
 It is hap's own lessons file for that repo — written by

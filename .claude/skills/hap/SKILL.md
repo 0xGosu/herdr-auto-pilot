@@ -1345,8 +1345,12 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
   **`hap-orchestrator`** workspace, cwd `<state>/orchestrator` (or
   `full_self_prompting.orchestrator_agent_cwd`, which must already exist). An
   existing agent of that name is adopted, never duplicated — and never briefed.
-- Once its composer is ready the daemon sends it a brief (load `hap --skill` and
-  `herdr --skill`, run `Monitor` on `hap stream orchestrator`, schedule an hourly
+- hap installs **both skills into that working directory** —
+  `<state>/orchestrator/.claude/skills/{hap,hap-orchestrator}/` — refreshed on
+  upgrade, so the session can re-read them after its context is compacted. An
+  `orchestrator_agent_cwd` you chose is left alone; run `hap skill install` there.
+- Once its composer is ready the daemon sends it a brief (load the
+  `hap-orchestrator` skill, `herdr --skill`, run `Monitor` on `hap stream orchestrator`, schedule an hourly
   `CronCreate` health check of `hap status` / `hap agents` that restarts a stopped
   daemon with `hap daemon --ensure` — deleted on `fsp.off`, re-created on
   `fsp.on` — how to act, what never to do). Replace it with
@@ -1478,6 +1482,10 @@ hap skill install agents             # → ~/.agents/skills/hap/ (tools sharing 
 ```
 
 The TUI's Config tab offers the same install.
+
+The orchestrator session is set up for you: hap writes this skill **and**
+`hap-orchestrator` into `<state>/orchestrator/.claude/skills/` and refreshes them
+on upgrade — see [the orchestrator agent](#the-orchestrator-agent) above.
 
 ## troubleshooting
 
