@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.40
+
+- Added an `agy` (Antigravity CLI) option to the LLM command presets — `hap config set llm.task_generate_command --preset agy`, the same for `llm.learn_from_user_command` and `llm.reranking_command`, and the TUI Config tab's `e` picker — with two caveats worth reading first: the agy learn recipe runs under `--dangerously-skip-permissions`, wider than the claude recipe's `--permission-mode acceptEdits` because agy has no edits-only setting, and under agy the AUTO.md loop runs one way only, since the learn recipe writes lessons but the task-generation one cannot read them back. The generate and re-ranking recipes take no permission flag at all, and all three pass `--disable-slash-commands`.
+- Added the gaps to the help, the picker and the shipped reference rather than leaving them to be discovered: `llm.command` and the orchestrator command still offer claude and codex only, because the consult needs hap's MCP server and agy cannot be handed one on the command line, and herdr starts the orchestrator by agent kind, which is claude. `hap help config` and the `--preset` usage line now render the preset list from the registry, so they cannot name a stale set.
+- Added a drift guard over the recipes `sample/config.toml` documents: it strips the leading `# ` from every commented recipe and parses it, so all eleven presets are held byte-identical to the file operators actually read — previously only the two active claude ones were.
+
 ## 0.9.39
 
 - Added the real agy file-edit approval screen to the classifier corpus, so the idle-verdict suppression is proved against the recorded pane that caused the stall rather than a synthetic stand-in.
