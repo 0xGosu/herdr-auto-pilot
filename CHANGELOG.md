@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.37
+
+- Fixed `hap mode` failing to read or set an agy agent's permission mode while it had background work running: agy paints a task strip above its footer and adds a `N task(s)` suffix to the status bar, and neither was recognised — which put `acceptEdits` out of reach for exactly the agents that run background tasks.
+- The unreadable-mode error now says what was actually seen instead of asserting that an approval or form is up.
+
 ## 0.9.36
 
 - Fixed a task hand-out being refused for words in the task text on the ordinary rule path, the way it already was for the timed auto-accept: the never-auto ACTION rules describe menu options hap must never pick, so a checklist item that happens to contain one is work to do, not an option being chosen. Latent until you added a single `--action` rule or armed the shipped ones, then that item escalated on every attempt and could only ever be handed out by hand.
