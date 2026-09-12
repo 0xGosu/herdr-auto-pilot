@@ -73,6 +73,32 @@ type Safety struct {
 	// NeverAutoRules, then clears them so Save emits only canonical keys.
 	DeprecatedIrreversibleIndicators []string                  `toml:"irreversible_indicators"`
 	DeprecatedIndicatorRules         []DeprecatedIndicatorRule `toml:"indicator_rules"`
+	// NeverAutoActionRules are matched against the ANSWER hap is about to send,
+	// never against the screen it is answering. That distinction is the whole
+	// point of the key: every rule above matches SITUATION text, so a menu whose
+	// dangerous option is printed on every prompt cannot be guarded by one. An
+	// operator who wrote `(?i)persist to settings\.json` to avoid ever PICKING
+	// that option instead matched every agy approval, because agy prints that
+	// row each time — so hap escalated all of them and the agent could not
+	// progress (observed 2026-09-12; the rule was removed four minutes later).
+	//
+	// Same scoping as NeverAutoRules: empty (or "*") agent_types = every agent.
+	// There is deliberately no flat companion list — the split above exists only
+	// for backward compatibility, and it is what forced two index spaces and two
+	// removal verbs.
+	NeverAutoActionRules []NeverAutoRule `toml:"never_auto_actions"`
+	// EnableNeverAutoActionSeeds turns on the shipped action rules that refuse
+	// scope-WIDENING menu options ("always allow…", "Persist to settings.json").
+	//
+	// Off by default, and that is a sequencing decision rather than timidity:
+	// refusing an option only escalates, it does not pick a narrower one, so
+	// with these on and nothing else changed every approval whose best answer
+	// was a widening row becomes an escalation — and ReasonNeverAutoMatch is in
+	// autoAcceptExcludedReasons, making each one permanently operator-only. That
+	// is the same queue-blocking failure the flat rule caused, arriving by the
+	// action side instead. They become safe to enable together with a bias
+	// toward the narrowest satisfying option, which is where the default flips.
+	EnableNeverAutoActionSeeds bool `toml:"enable_never_auto_action_seeds"`
 }
 
 // NeverAutoRule is one operator-added never-auto regex, optionally scoped to

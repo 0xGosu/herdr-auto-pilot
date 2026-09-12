@@ -459,6 +459,10 @@ func TestSaveRoundTrip(t *testing.T) {
 	cfg.Safety.NeverAutoRules = []NeverAutoRule{{
 		Pattern: `(?i)compact\s+conversation`, AgentTypes: []string{"codex", "agy"},
 	}}
+	cfg.Safety.NeverAutoActionRules = []NeverAutoRule{{
+		Pattern: `(?i)always allow`, AgentTypes: []string{"agy"},
+	}}
+	cfg.Safety.EnableNeverAutoActionSeeds = true
 	cfg.TaskSources = []TaskSource{{Agent: "a1", Path: "/tmp/tasks.md", NextTaskTemplate: "Do {next_task_content} from {task_list_path}"}}
 	if err := Save(path, cfg); err != nil {
 		t.Fatal(err)
@@ -477,6 +481,17 @@ func TestSaveRoundTrip(t *testing.T) {
 	}
 	if got.TaskSources[0].NextTaskTemplate != "Do {next_task_content} from {task_list_path}" {
 		t.Errorf("next_task_template round trip mismatch: %+v", got.TaskSources[0])
+	}
+	// A safety key that Save drops is protection silently absent on the next
+	// load, and the Safety struct is dense enough with deprecated aliases that
+	// nothing else would notice.
+	if len(got.Safety.NeverAutoActionRules) != 1 ||
+		got.Safety.NeverAutoActionRules[0].Pattern != `(?i)always allow` ||
+		len(got.Safety.NeverAutoActionRules[0].AgentTypes) != 1 {
+		t.Errorf("never-auto action rule round trip mismatch: %+v", got.Safety.NeverAutoActionRules)
+	}
+	if !got.Safety.EnableNeverAutoActionSeeds {
+		t.Error("enable_never_auto_action_seeds did not survive the round trip")
 	}
 }
 

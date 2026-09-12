@@ -245,12 +245,17 @@ type Daemon struct {
 	// the beats between.
 	fleetRecoveryOrdered atomic.Bool
 
-	mu         sync.RWMutex
-	cfg        config.Config
-	neverAuto  *domain.NeverAutoList
-	classifier *classify.Classifier
-	llm        ports.LLMPort
-	embedder   ports.EmbedderPort
+	mu        sync.RWMutex
+	cfg       config.Config
+	neverAuto *domain.NeverAutoList
+	// neverAutoActions screens the ANSWER hap is about to send, never the screen
+	// it is answering. Kept apart from neverAuto because one list cannot serve
+	// both: a menu that prints its dangerous option on every prompt makes a
+	// situation-side rule fire every time (see config.Safety.NeverAutoActionRules).
+	neverAutoActions *domain.NeverAutoActionList
+	classifier       *classify.Classifier
+	llm              ports.LLMPort
+	embedder         ports.EmbedderPort
 
 	// matcher is the semantic match index; semanticReady gates resolution
 	// until the background initSemantic has populated it. semanticGen
@@ -1116,6 +1121,11 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	for _, e := range errs {
 		slog.Warn("never-auto pattern rejected", "error", e)
 	}
+	actions, actionErrs := domain.NewNeverAutoActionList(cfg.Safety.EnableNeverAutoActionSeeds,
+		cfg.Safety.DisabledSeedPatterns, neverAutoActionRules(cfg.Safety))
+	for _, e := range actionErrs {
+		slog.Warn("never-auto action pattern rejected", "error", e)
+	}
 	cls := classify.New(cfg.Classifier)
 
 	llmPort := d.opt.LLM
@@ -1132,6 +1142,7 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	d.configured = true
 	d.cfg = cfg
 	d.neverAuto = allow
+	d.neverAutoActions = actions
 	d.classifier = cls
 	d.llm = llmPort
 	d.stores = stores
@@ -1209,6 +1220,31 @@ func (d *Daemon) snapshot() (config.Config, *domain.NeverAutoList, *classify.Cla
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	return d.cfg, d.neverAuto, d.classifier
+}
+
+// actionRefused reports why the action hap is about to send is refused by the
+// ACTION rules, or "" when nothing matched.
+//
+// It is deliberately a separate accessor rather than a fourth return from
+// snapshot: every existing caller screens SITUATION text and must not acquire
+// an action screen by accident. The call sites that do want it are the ones
+// that hold a chosen answer — act, the action review, and the LLM promotion —
+// plus the orchestrator's actionScreen, whose "operator" is itself an LLM.
+//
+// Deliberately NOT applied where the outbound text is a generated TASK PROMPT
+// (tasklistreview, generatedTaskUnsafe): these rules describe menu options one
+// must never pick, and matching them against prose an agent is being asked to
+// do would refuse work for containing a phrase. Nor to an operator's own reply
+// in deliverreply — a human choosing to widen a permission is the human's call,
+// which is the same reasoning that leaves the operator path unscreened.
+func (d *Daemon) actionRefused(agentType, action string) string {
+	d.mu.RLock()
+	actions := d.neverAutoActions
+	d.mu.RUnlock()
+	if hit, matched := actions.Match(agentType, action); matched {
+		return hit.Diagnostic()
+	}
+	return ""
 }
 
 // embedderState reports the current semantic-matching health for the heartbeat
@@ -2922,6 +2958,14 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		}, tr, now)
 		return
 	}
+	if why := d.actionRefused(s.AgentType, dec.Input); why != "" {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonNeverAutoMatch,
+			Rationale:  "outbound action: " + why,
+			Confidence: dec.Confidence,
+		}, tr, now)
+		return
+	}
 
 	// Multi-tab MCQ forms are answered with a digit series, one keystroke
 	// per tab — never a single mapped label, never rewritten.
@@ -4418,6 +4462,10 @@ func (d *Daemon) startActionReview(ctx context.Context, s domain.Situation,
 			escalateFallback(domain.ReasonNeverAutoMatch, hit.Diagnostic())
 			return
 		}
+		if why := d.actionRefused(s.AgentType, outbound); why != "" {
+			escalateFallback(domain.ReasonNeverAutoMatch, why)
+			return
+		}
 		if hit, sus := allow.SuspectedIrreversible(s.AgentType, outbound); sus {
 			escalateFallback(domain.ReasonSuspectedIrrevers, hit.Diagnostic())
 			return
@@ -4673,6 +4721,9 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 		if hit, matched := allow.Match(s.AgentType, final); matched {
 			llmOutput = "discarded review: " + truncateRunes(final, 500)
 			degrade("output matched never-auto " + hit.Diagnostic())
+		} else if why := d.actionRefused(s.AgentType, final); why != "" {
+			llmOutput = "discarded review: " + truncateRunes(final, 500)
+			degrade("output matched never-auto action " + why)
 		} else if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
 			llmOutput = "discarded review: " + truncateRunes(final, 500)
 			degrade("output tripped irreversible " + hit.Diagnostic())
@@ -4716,6 +4767,10 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	}
 	if hit, matched := allow.Match(s.AgentType, final); matched {
 		escalateWith(domain.ReasonNeverAutoMatch, "action review: "+hit.Diagnostic())
+		return
+	}
+	if why := d.actionRefused(s.AgentType, final); why != "" {
+		escalateWith(domain.ReasonNeverAutoMatch, "action review action: "+why)
 		return
 	}
 	if hit, sus := allow.SuspectedIrreversible(s.AgentType, final); sus {
@@ -4976,6 +5031,10 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	if !isNoop {
 		if hit, matched := allow.Match(s.AgentType, llmDec.Action); matched {
 			reject(domain.ReasonNeverAutoMatch, "LLM action: "+hit.Diagnostic())
+			return
+		}
+		if why := d.actionRefused(s.AgentType, llmDec.Action); why != "" {
+			reject(domain.ReasonNeverAutoMatch, "LLM action: "+why)
 			return
 		}
 	}
@@ -6213,6 +6272,21 @@ func (d *Daemon) notify(ctx context.Context, title, body string) ports.NotifyRes
 func neverAutoRules(s config.Safety) []domain.NeverAutoRule {
 	rules := make([]domain.NeverAutoRule, 0, len(s.NeverAutoRules))
 	for _, r := range s.NeverAutoRules {
+		rules = append(rules, domain.NeverAutoRule{
+			Pattern: r.Pattern, AgentTypes: r.AgentTypes,
+			Kind: domain.NeverAutoStrict, Source: domain.NeverAutoOperator,
+		})
+	}
+	return rules
+}
+
+// neverAutoActionRules maps the operator's ACTION rules into the matcher. Kind
+// is pinned to strict here as well as in NewNeverAutoActionList: an action rule
+// must never reach the irreversibility heuristic, which judges different text
+// for a different purpose.
+func neverAutoActionRules(s config.Safety) []domain.NeverAutoRule {
+	rules := make([]domain.NeverAutoRule, 0, len(s.NeverAutoActionRules))
+	for _, r := range s.NeverAutoActionRules {
 		rules = append(rules, domain.NeverAutoRule{
 			Pattern: r.Pattern, AgentTypes: r.AgentTypes,
 			Kind: domain.NeverAutoStrict, Source: domain.NeverAutoOperator,

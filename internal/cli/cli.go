@@ -1917,7 +1917,36 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 			}
 			fmt.Fprintf(out, "operator scoped #%d\tagent_types=%s\t%s\n", i, scope, r.Pattern)
 		}
+		// The ACTION rules are listed under their own heading and their own
+		// index space: they answer a different question from everything above
+		// (what hap may SEND, not what it may act on), and `remove-action`
+		// addresses them.
+		if cfg.Safety.EnableNeverAutoActionSeeds {
+			fmt.Fprintln(out, "# shipped never-auto ACTION rules (refuse a scope-widening menu option)")
+			disabled := make(map[string]bool, len(cfg.Safety.DisabledSeedPatterns))
+			for _, p := range cfg.Safety.DisabledSeedPatterns {
+				disabled[p] = true
+			}
+			for _, r := range domain.SeedNeverAutoActionRules {
+				state := ""
+				if disabled[r.Pattern] {
+					state = " [disabled]"
+				}
+				fmt.Fprintf(out, "seed action %s\t%s%s\t%s\n", domain.SeedRuleID(r.Pattern), r.Kind, state, r.Pattern)
+			}
+		} else {
+			fmt.Fprintln(out, "# shipped never-auto ACTION rules are OFF (enable: hap config set safety.enable_never_auto_action_seeds true)")
+		}
+		for i, r := range cfg.Safety.NeverAutoActionRules {
+			scope := "*"
+			if len(r.AgentTypes) > 0 {
+				scope = strings.Join(r.AgentTypes, ",")
+			}
+			fmt.Fprintf(out, "operator action #%d\tagent_types=%s\t%s\n", i, scope, r.Pattern)
+		}
 		PrintNextSteps(out, []Hint{
+			{Cmd: "hap config rules add --action <regex>", Why: "refuse an ANSWER hap might send (e.g. an \"always allow\" menu option)"},
+			{Cmd: "hap config rules remove-action <index>", Why: "drop one of the action rules listed above"},
 			{Cmd: "hap config rules add <regex>", Why: "force a matching situation to always ask a human"},
 			{Cmd: "hap config rules remove <index>", Why: "drop one of the operator patterns listed above"},
 			{Cmd: "hap config rules remove-scoped <index>", Why: "drop one of the agent-scoped rules listed above"},
@@ -1930,6 +1959,8 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		return rulesAdd(ctx, app, out, args[1:])
 	case args[0] == "remove-scoped" && len(args) == 2:
 		return rulesRemoveScoped(ctx, app, out, args[1])
+	case args[0] == "remove-action" && len(args) == 2:
+		return rulesRemoveAction(ctx, app, out, args[1])
 	case args[0] == "disable-seed" && len(args) == 2:
 		return rulesSeedToggle(ctx, app, out, args[1], true)
 	case args[0] == "enable-seed" && len(args) == 2:
@@ -1954,7 +1985,7 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		PrintNextSteps(out, rulesEditedHints())
 		return nil
 	}
-	return fmt.Errorf("usage: hap config rules [list|add [--agent-type T] <regex>|remove <index>|remove-scoped <index>|disable-seed <id>|enable-seed <id>] (see: hap help config rules)")
+	return fmt.Errorf("usage: hap config rules [list|add [--action] [--agent-type T] <regex>|remove <index>|remove-scoped <index>|remove-action <index>|disable-seed <id>|enable-seed <id>] (see: hap help config rules)")
 }
 
 // rulesAdd appends an operator never-auto pattern. With --agent-type it lands
@@ -1964,14 +1995,36 @@ func rules(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 // The two lists are listed and removed separately (`remove` vs
 // `remove-scoped`) because each has its own index space.
 func rulesAdd(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	action, args := splitActionFlag(args)
 	agentTypes, rest, err := splitAgentTypeFlag(args)
 	if err != nil {
 		return err
 	}
 	if len(rest) != 1 {
-		return fmt.Errorf("usage: hap config rules add [--agent-type T[,T]] <regex> (see: hap help config rules)")
+		return fmt.Errorf("usage: hap config rules add [--action] [--agent-type T[,T]] <regex> (see: hap help config rules)")
 	}
 	pattern := rest[0]
+	// An ACTION rule matches what hap is about to SEND, not the screen it is
+	// answering, so it has one list and one index space whether or not it is
+	// scoped — unlike the situation rules above, whose flat/scoped split is a
+	// backward-compatibility artefact.
+	if action {
+		var types []string
+		if strings.TrimSpace(agentTypes) != "" {
+			types = strings.Split(agentTypes, ",")
+		}
+		if err := app.AddNeverAutoActionRule(ctx, pattern, types); err != nil {
+			return err
+		}
+		scope := "*"
+		if len(types) > 0 {
+			scope = strings.Join(types, ",")
+			warnUnseenAgentTypes(ctx, app, out, types)
+		}
+		fmt.Fprintf(out, "never-auto action rule added: agent_types=%s\t%s\n", scope, pattern)
+		PrintNextSteps(out, rulesEditedHints())
+		return nil
+	}
 	if strings.TrimSpace(agentTypes) == "" {
 		if err := app.AddNeverAutoPattern(ctx, pattern); err != nil {
 			return err
@@ -2075,6 +2128,53 @@ func rulesRemoveScoped(ctx context.Context, app *frontend.App, out io.Writer, ar
 		return err
 	}
 	fmt.Fprintf(out, "scoped never-auto rule #%d removed: agent_types=%s\t%s\n",
+		idx, strings.Join(expected.AgentTypes, ","), expected.Pattern)
+	PrintNextSteps(out, rulesEditedHints())
+	return nil
+}
+
+// splitActionFlag pulls a bare --action out of `rules add`'s arguments.
+//
+// Parsed by hand for the same reason splitAgentTypeFlag is: a never-auto
+// pattern is a REGEX and may legitimately begin with a dash, so the arguments
+// can never be handed to flag.Parse. The `--` terminator is preserved for
+// splitAgentTypeFlag, which runs next, so the pathological pattern that IS
+// "--action" is still addable as `rules add --action -- --action`.
+func splitActionFlag(args []string) (action bool, rest []string) {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--" {
+			return action, append(rest, args[i:]...)
+		}
+		if args[i] == "--action" || args[i] == "-action" {
+			action = true
+			continue
+		}
+		rest = append(rest, args[i])
+	}
+	return action, rest
+}
+
+// rulesRemoveAction deletes one never-auto ACTION rule by the index
+// `rules list` printed for it ("operator action #N"). Its own verb because the
+// action rules have their own index space — sharing `remove` would make
+// `rules remove 0` ambiguous between two different safety rules.
+func rulesRemoveAction(ctx context.Context, app *frontend.App, out io.Writer, arg string) error {
+	idx, err := strconv.Atoi(strings.TrimPrefix(arg, "#"))
+	if err != nil {
+		return fmt.Errorf("invalid action rule index %q (see: hap config rules list)", arg)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		return err
+	}
+	if idx < 0 || idx >= len(cfg.Safety.NeverAutoActionRules) {
+		return fmt.Errorf("no never-auto action rule #%d (see: hap config rules list)", idx)
+	}
+	expected := cfg.Safety.NeverAutoActionRules[idx]
+	if err := app.RemoveNeverAutoActionRule(ctx, idx, expected); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "never-auto action rule #%d removed: agent_types=%s\t%s\n",
 		idx, strings.Join(expected.AgentTypes, ","), expected.Pattern)
 	PrintNextSteps(out, rulesEditedHints())
 	return nil

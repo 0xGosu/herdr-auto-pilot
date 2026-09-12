@@ -902,14 +902,16 @@ func buildCommands() {
 			Summary:   "never-auto safety patterns (situations hap must never answer alone)",
 			Usage: []string{
 				"hap config rules [list]",
-				"hap config rules add [--agent-type T[,T]] <regex>",
+				"hap config rules add [--action] [--agent-type T[,T]] <regex>",
 				"hap config rules remove <index>",
 				"hap config rules remove-scoped <index>",
+				"hap config rules remove-action <index>",
 				"hap config rules disable-seed <id>",
 				"hap config rules enable-seed <id>",
 			},
 			Flags: []FlagDoc{
 				{Name: "--agent-type", Arg: "T", Desc: "add: limit the rule to these agent types (comma-separated, e.g. claude,codex) instead of every agent"},
+				{Name: "--action", Desc: "add: match the ANSWER hap is about to send instead of the situation on screen"},
 			},
 			Details: "`list` prints the shipped seed rules first, each with a stable `seed <id>` (a\n" +
 				"short hash of the pattern, strict or heuristic), then your operator patterns with\n" +
@@ -932,7 +934,21 @@ func buildCommands() {
 				"under \"operator scoped\" and have their own index space, which is why they are\n" +
 				"dropped with `remove-scoped` rather than `remove`. A scoped rule that names an\n" +
 				"agent type nothing reports is added with a note: it narrows a safety control, so\n" +
-				"a typo there fails toward hap answering rather than asking.\n" +
+				"a typo there fails toward hap answering rather than asking.\n\n" +
+				"`add --action` writes a rule of a different KIND: it is matched against the answer\n" +
+				"hap is about to SEND, not against the screen it is answering. Use it for a menu\n" +
+				"option that must never be chosen. Every rule above matches situation text, which\n" +
+				"cannot express that: on a menu whose dangerous row is printed every time — agy's\n" +
+				"\"(Persist to settings.json)\" is on every approval — a situation rule matches all\n" +
+				"of them and the agent stops making progress. Action rules are listed under\n" +
+				"\"operator action\" with their own index space, so they are dropped with\n" +
+				"`remove-action`. --agent-type scopes them the same way, and is optional here.\n\n" +
+				"hap also ships action rules for the scope-WIDENING options (\"and always allow\",\n" +
+				"\"Persist to settings.json\"), which pre-authorise a whole command prefix so later\n" +
+				"commands never raise a prompt at all. They are OFF unless you set\n" +
+				"safety.enable_never_auto_action_seeds=true: refusing an option only escalates, it\n" +
+				"does not pick a narrower one, so turning them on before hap prefers the narrowest\n" +
+				"option would turn most approvals into escalations.\n" +
 				"The pattern may start with a dash (`--force`, `-rf /`) and is taken literally —\n" +
 				"only `--agent-type` is read as a flag, in either position.",
 			Examples: []string{
