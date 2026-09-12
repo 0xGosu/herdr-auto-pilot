@@ -529,3 +529,79 @@ func TestDisableSeedRulePromptStatesItsAcceptKeys(t *testing.T) {
 		t.Errorf("consequence should come before the pattern: %q", m.confirm.label)
 	}
 }
+
+// anActionSeedRule returns a shipped ACTION rule, from the live list for the
+// same reason aSeedRule does.
+func anActionSeedRule(t *testing.T) domain.NeverAutoRule {
+	t.Helper()
+	if len(domain.SeedNeverAutoActionRules) == 0 {
+		t.Fatal("no shipped action seed rules")
+	}
+	return domain.SeedNeverAutoActionRules[len(domain.SeedNeverAutoActionRules)/2]
+}
+
+// The two sides of the seed set have SEPARATE master switches, and the affordance
+// has to settle which side a rule is on before reading either.
+//
+// safety.disable_never_auto_seed_patterns governs the SITUATION seeds;
+// the ACTION seeds compile from safety.enable_never_auto_action_seeds alone and
+// neither key touches the other's set. Reading the situation switch for an action
+// rule reports the opposite of the truth — an operator running with both keys set
+// pressed `b` on an escalation an action seed had just forced and was told "every
+// builtin rule is already off". Nothing was written, the rule stayed armed, and
+// the same escalation came back with the UI insisting it was disabled.
+//
+// The situation half is the control: with the same config, that rule really IS
+// already off, and the message must still say so.
+func TestTheSeedMasterSwitchesAreReadPerSide(t *testing.T) {
+	action, situation := anActionSeedRule(t), aSeedRule(t)
+	cfg := config.Default()
+	cfg.Safety.DisableNeverAutoSeedPatterns = true
+	cfg.Safety.EnableNeverAutoActionSeeds = true
+
+	m := escModelWith(t, cfg, []domain.AuditRecord{
+		seedRuleEscalation(1, action, domain.NeverAutoSeed),
+		seedRuleEscalation(2, situation, domain.NeverAutoSeed),
+	})
+
+	// Row 1: the ARMED action seed. `b` must offer to silence it.
+	upd, _ := m.Update(pressKeyMsg("b"))
+	withAction := upd.(Model)
+	if withAction.confirm == nil {
+		t.Fatalf("b on an armed action seed offered no prompt; message = %q — "+
+			"disable_never_auto_seed_patterns does not silence the action seeds, so reporting "+
+			"it as already off leaves the operator blocked by a rule they cannot reach",
+			withAction.message)
+	}
+
+	// Row 2, same config: the situation seed IS off wholesale, and must say so.
+	down, _ := m.Update(pressKeyMsg("j"))
+	m = down.(Model)
+	upd, cmd := m.Update(pressKeyMsg("b"))
+	withSituation := upd.(Model)
+	if cmd != nil || withSituation.confirm != nil {
+		t.Fatal("control: a SITUATION seed under disable_never_auto_seed_patterns must still " +
+			"report the master switch rather than prompt")
+	}
+	if !strings.Contains(withSituation.message, "disable_never_auto_seed_patterns") {
+		t.Errorf("control: should name the situation master switch, got %q", withSituation.message)
+	}
+}
+
+// An action seed whose own key is OFF is genuinely inactive, so the detail line
+// must annotate it that way — the mirror of the situation side's master switch.
+// Reachable on an OLD escalation raised while the key was still set, which is
+// what seedRuleStateSuffix exists for.
+func TestAnUnarmedActionSeedReadsAsInactive(t *testing.T) {
+	action := anActionSeedRule(t)
+	cfg := config.Default()
+	if cfg.Safety.EnableNeverAutoActionSeeds {
+		t.Fatal("fixture assumes the action seeds ship off")
+	}
+
+	m := escModelWith(t, cfg, []domain.AuditRecord{seedRuleEscalation(1, action, domain.NeverAutoSeed)})
+	m = press(t, m, "v")
+	if lines := strings.Join(m.detail.lines, "\n"); !strings.Contains(lines, "enable_never_auto_action_seeds") {
+		t.Errorf("detail should mark an unarmed action seed inactive and name its key:\n%s", lines)
+	}
+}

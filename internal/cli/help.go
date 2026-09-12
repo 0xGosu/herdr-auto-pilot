@@ -949,11 +949,14 @@ func buildCommands() {
 				"safety.enable_never_auto_action_seeds=true: refusing an option only escalates, it\n" +
 				"does not pick a narrower one, so turning them on before hap prefers the narrowest\n" +
 				"option would turn most approvals into escalations.\n" +
-				"The pattern may start with a dash (`--force`, `-rf /`) and is taken literally —\n" +
-				"only `--agent-type` is read as a flag, in either position.",
+				"The pattern may start with a dash (`--force`, `-rf /`) and is taken literally.\n" +
+				"`--agent-type` and `--action` are the only arguments read as flags, in either\n" +
+				"position; to add either of those two words as the literal pattern, put it after\n" +
+				"`--` (`hap config rules add --action -- --action`).",
 			Examples: []string{
 				"hap config rules list",
 				"hap config rules add '(?i)force[- ]push'",
+				"hap config rules add --action '(?i)always allow'",
 				"hap config rules add --agent-type codex '(?i)apply patch'",
 				"hap config rules remove 0",
 				"hap config rules remove-scoped 0",

@@ -7055,12 +7055,30 @@ func (m Model) showSelectedRule() (tea.Model, tea.Cmd) {
 // --- Builtin (seed) never-auto rules ---
 
 // seedRuleDisabled reports whether a shipped seed pattern is currently
-// silenced, and why. Two different switches can silence it: the per-rule
-// safety.disabled_seed_patterns list, and the wholesale
-// safety.disable_never_auto_seed_patterns. They need different messages —
-// re-enabling one rule does nothing while the master switch is on.
+// silenced, and why. Three switches can silence one, and they need different
+// messages — re-enabling a single rule does nothing while a master switch is
+// against it: the per-rule safety.disabled_seed_patterns list, which both sides
+// share, and one master switch PER SIDE.
+//
+// Which side the rule is on has to be settled before any master switch is
+// applied. The situation seeds are governed by
+// safety.disable_never_auto_seed_patterns and the ACTION seeds by
+// safety.enable_never_auto_action_seeds, and neither key touches the other's
+// set — so reading the situation switch for an action rule reports the opposite
+// of the truth. An operator running with disable_never_auto_seed_patterns = true
+// AND the action seeds armed was told "every builtin rule is already off" when
+// they pressed `b` on an escalation an action seed had just forced; nothing was
+// written, the rule stayed armed, and the same escalation came back.
 func (m Model) seedRuleDisabled(pattern string) (reason string, disabled bool) {
-	if m.data.cfg.Safety.DisableNeverAutoSeedPatterns {
+	if domain.IsActionSeedPattern(pattern) {
+		// The action seeds are opt-IN, so their master switch silences by being
+		// off — the mirror of the situation side, where it silences by being on.
+		// Reachable on an OLD escalation raised while the key was still set,
+		// which is what seedRuleStateSuffix exists to annotate.
+		if !m.data.cfg.Safety.EnableNeverAutoActionSeeds {
+			return "the builtin action rules are off (safety.enable_never_auto_action_seeds)", true
+		}
+	} else if m.data.cfg.Safety.DisableNeverAutoSeedPatterns {
 		return "every builtin rule is already off (safety.disable_never_auto_seed_patterns)", true
 	}
 	for _, p := range m.data.cfg.Safety.DisabledSeedPatterns {

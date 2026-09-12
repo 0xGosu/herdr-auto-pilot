@@ -168,12 +168,33 @@ func SeedRuleID(pattern string) string {
 	return fmt.Sprintf("%x", sum[:4]) // 8 hex chars — collision-safe for ~90 rules
 }
 
-// SeedRuleByID resolves a SeedRuleID back to its shipped rule. The bool is
-// false for an unknown id (e.g. a stale id whose pattern no longer ships),
-// which the callers surface as a "no such seed rule" error rather than acting
-// on the wrong one.
+// AllSeedRules returns every shipped seed rule an operator can address by id:
+// the SITUATION rules (SeedNeverAutoRules) followed by the ACTION ones
+// (SeedNeverAutoActionRules).
+//
+// It is the registry for identity — resolving an id, validating a pattern about
+// to be written to safety.disabled_seed_patterns, attributing an escalation —
+// and deliberately NOT the set anything compiles from. The two sides must never
+// share a matcher: the situation list also carries the irreversibility
+// heuristic, and an action rule reaching it would judge a chosen menu option
+// against indicators written for pane content (see NeverAutoActionList).
+//
+// Both sides read the same safety.disabled_seed_patterns, so an action seed was
+// always silenceable in principle — what was missing was any command able to
+// write the entry, because every resolver searched the situation set alone.
+func AllSeedRules() []NeverAutoRule {
+	situation := SeedNeverAutoRules()
+	rules := make([]NeverAutoRule, 0, len(situation)+len(SeedNeverAutoActionRules))
+	rules = append(rules, situation...)
+	return append(rules, SeedNeverAutoActionRules...)
+}
+
+// SeedRuleByID resolves a SeedRuleID back to its shipped rule, on either side.
+// The bool is false for an unknown id (e.g. a stale id whose pattern no longer
+// ships), which the callers surface as a "no such seed rule" error rather than
+// acting on the wrong one.
 func SeedRuleByID(id string) (NeverAutoRule, bool) {
-	for _, r := range SeedNeverAutoRules() {
+	for _, r := range AllSeedRules() {
 		if SeedRuleID(r.Pattern) == id {
 			return r, true
 		}
@@ -182,10 +203,30 @@ func SeedRuleByID(id string) (NeverAutoRule, bool) {
 }
 
 // IsSeedPattern reports whether pattern is the exact text of a shipped seed
-// rule. It guards the disable/enable path so only a real seed rule can be
-// recorded in safety.disabled_seed_patterns.
+// rule, on either side. It guards the disable/enable path so only a real seed
+// rule can be recorded in safety.disabled_seed_patterns.
 func IsSeedPattern(pattern string) bool {
-	for _, r := range SeedNeverAutoRules() {
+	for _, r := range AllSeedRules() {
+		if r.Pattern == pattern {
+			return true
+		}
+	}
+	return false
+}
+
+// IsActionSeedPattern reports whether pattern is a shipped ACTION seed rather
+// than a situation one.
+//
+// The two sides share safety.disabled_seed_patterns but NOT their master
+// switch: the situation seeds are governed by
+// safety.disable_never_auto_seed_patterns, the action seeds by
+// safety.enable_never_auto_action_seeds, and neither key touches the other's
+// set. So anything that reports whether a seed rule is currently in force has
+// to know which side it is on first — see tui.seedRuleDisabled, where applying
+// the wrong master switch told the operator a rule was already off while it was
+// still armed.
+func IsActionSeedPattern(pattern string) bool {
+	for _, r := range SeedNeverAutoActionRules {
 		if r.Pattern == pattern {
 			return true
 		}
@@ -225,7 +266,12 @@ func SeedRuleForRationale(rationale string) (NeverAutoRule, bool) {
 	if !ok || source != string(NeverAutoSeed) {
 		return NeverAutoRule{}, false
 	}
-	for _, r := range SeedNeverAutoRules() {
+	// Both sides: an escalation forced by an ACTION seed carries the same
+	// [never_auto_match] reason and the same diagnostic shape, so searching the
+	// situation set alone left those rows with no "silence this builtin rule"
+	// hint at all — the one case where the operator most needs it, since the
+	// rule refused an answer rather than a screen.
+	for _, r := range AllSeedRules() {
 		if r.Pattern == pattern {
 			return r, true
 		}

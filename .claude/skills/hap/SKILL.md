@@ -500,6 +500,7 @@ at `hap help config <topic>`:
 | `[[capture_delay]]` | `hap config capture-delay set / remove / list` |
 | `safety.never_auto_patterns` | `hap config rules add / remove` |
 | `[[safety.never_auto_rules]]` | `hap config rules add --agent-type` / `remove-scoped` |
+| `[[safety.never_auto_actions]]` | `hap config rules add --action` / `remove-action` |
 | `safety.disabled_seed_patterns` | `hap config rules disable-seed / enable-seed` |
 | `[llm.*_env]` | `hap config env set / unset / list` (values read from stdin) |
 
@@ -534,6 +535,7 @@ tab-separated stdout is unaffected.
 | `full_self_prompting.orchestrator_agent_prompt` | (built-in brief) | replace the brief sent to the orchestrator; `{self}` = this hap binary |
 | `full_self_prompting.orchestrator_agent_cwd` | `<state>/orchestrator` | the orchestrator's working directory: absolute (`~`/`$VAR` expand), must exist; read at creation |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic rule |
+| `safety.enable_never_auto_action_seeds` | false | arm the shipped ACTION rules — the scope-widening menu options ("and always allow", "Persist to settings.json") |
 | `llm.command` | (disabled) | argv for the consult CLI; this key alone gates the LLM fallback |
 | `llm.timeout_seconds` | 60 | timeout for one consult |
 | `llm.auto_act_confidence_threshold` | 85 | min LLM self-reported score (0-100) to auto-act; below it (or no score) escalates as `[llm_low_confidence]`. Set >100 (e.g. 999) to never auto-act |
@@ -680,15 +682,53 @@ hap config rules remove <index>
 hap config rules add --agent-type codex,agy '(?i)compact\s+the\s+conversation'
 hap config rules remove-scoped <index>   # scoped rules have their own index space
 
+hap config rules add --action '(?i)and always allow'
+hap config rules remove-action <index>   # action rules have their own index space
+
 hap config rules disable-seed <id>       # silence ONE shipped rule that over-escalates
 hap config rules enable-seed <id>
 ```
 
+There are **two kinds of rule, and picking the wrong one breaks the agent**:
+
+- an ordinary rule matches the **situation** — the pane text hap is deciding
+  about. Use it to force a human decision on a kind of prompt.
+- `--action` matches the **answer hap is about to send**. Use it to stop hap
+  ever *choosing* a particular option.
+
+To keep hap off a dangerous menu row, it must be an `--action` rule. Written as
+an ordinary rule the pattern matches the screen — and a row like agy's
+`(Persist to settings.json)` is printed on *every* approval, so the rule fires
+on all of them, escalates every prompt, and the agent stops making progress.
+Action rules are listed under their own heading with their own index space, and
+dropped with `remove-action`.
+
+hap also ships action rules for the scope-widening options ("and always allow",
+"don't ask again", "Persist to settings.json", "allow all"). They matter because
+such a row pre-authorises a whole command prefix — later commands then never
+raise a prompt at all, so they never reach a pane, a classifier, or any of these
+rules.
+
+They are **off** unless you set `safety.enable_never_auto_action_seeds = true`,
+because they are the *hard* half of that guard: refusing an option only
+escalates it, it does not answer the prompt, so on an agent that is offered one
+of these rows every time they turn approvals into escalations. For agy, hap
+already substitutes the narrowest option that still grants the request, which
+answers the prompt and keeps the agent moving; arm these when you want a refusal
+even where no narrower option exists.
+
+They screen hap's **own unattended sends only** — the timed auto-accept and full
+self-prompting. Your own confirmed answer is never refused by them: picking a
+widening option deliberately is your call. Neither is a task hand-out, whose
+text is work to do rather than an option being picked.
+
 A seed rule's `id` is a short hash of its pattern, so it names the same rule
-across upgrades (and is rejected if that pattern no longer ships). One seed rule
-is a single regex that may cover several phrasings — disabling it silences all
-of them, not just the phrase you saw. To drop the whole shipped set instead, set
-`safety.disable_never_auto_seed_patterns = true`.
+across upgrades (and is rejected if that pattern no longer ships). `disable-seed`
+takes the id of a shipped rule of *either* kind, exactly as `rules list` prints
+it. One seed rule is a single regex that may cover several phrasings — disabling
+it silences all of them, not just the phrase you saw. To drop the whole shipped
+situation set instead, set `safety.disable_never_auto_seed_patterns = true`; the
+action seeds are governed by their own key above.
 
 Prompts that look destructive but match no explicit pattern are caught by a
 **suspected-irreversible heuristic**. It requires corroboration — a destructive
@@ -1118,11 +1158,19 @@ unparseable; the whole section is then ignored, so a typo can never start
 sending on your behalf.
 
 Before anything is delivered: the kill switch is off and the agent is neither
-paused nor disabled; the agent still exists and is parked; and the pane still
-shows **the same situation**, re-read and re-classified against the signature on
-the audit row. If any of that cannot be *evaluated* (an unreadable pane, an
-unreachable herdr), nothing happens and the escalation waits — only a check that
-ran and came back negative retires one.
+paused nor disabled; the agent still exists and is parked; the pane still shows
+**the same situation**, re-read and re-classified against the signature on the
+audit row; and the answer itself passes the `--action` rules. If any of that
+cannot be *evaluated* (an unreadable pane, an unreachable herdr), nothing
+happens and the escalation waits — only a check that ran and came back negative
+retires one.
+
+The action screen matters most here, because this is the one path that types an
+answer with nobody watching. Skipping an escalation because it was *raised* by a
+never-auto rule (below) is not the same check: a row escalated for an ordinary
+reason — low LLM confidence, an ungraduated signature — can still carry a
+scope-widening option as its suggestion. A refusal leaves the escalation
+pending for you; it never counts as a failed delivery.
 
 `idle` and `unclassifiable` ship disabled because their signatures fall back to
 raw screen text, which cannot be compared confidently enough to deliver or
