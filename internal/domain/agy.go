@@ -177,6 +177,34 @@ func agyDropBackgroundStrip(lines []string) []string {
 	return append(out, lines[n-1])
 }
 
+// AgyComposerVisible reports that agy's composer is STRUCTURALLY on screen: the
+// status bar at the bottom, and the rule/input/rule sandwich above it.
+//
+// It answers a different question from AgyComposerReady, and the difference is
+// the whole point. Ready additionally proves the input line is EMPTY, because
+// it gates typing. This one only asks whether the composer is visible at all,
+// so it stays true while the operator holds a half-typed draft — an agent with
+// a draft is genuinely parked, and treating it as unreadable would escalate
+// every draft an operator leaves behind.
+//
+// What it is for: herdr reports every agy modal as idle/done, so on an agy pane
+// "idle" is not evidence that anything is free. A modal hap does not recognise
+// covers the composer and reads exactly like a parked agent — which is how an
+// agent sat for ten minutes behind an edit-approval prompt while hap raised an
+// IDLE escalation offering it the next task. Absence of the composer is the one
+// piece of positive evidence available without recognising the modal itself,
+// and it holds for modals nobody has met yet.
+func AgyComposerVisible(pane string) bool {
+	lines := agyDropBackgroundStrip(
+		trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")))
+	n := len(lines)
+	if n < 4 || !agyStatusBarLine(lines[n-1]) {
+		return false
+	}
+	return agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) &&
+		agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-4]))
+}
+
 func agyBody(pane string) []string {
 	lines := strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")
 	lines = trimTrailingBlank(lines)
