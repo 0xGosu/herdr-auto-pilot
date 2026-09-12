@@ -1,0 +1,1 @@
+- Fixed a stale LLM consult escalating a prompt that had already left the screen: when the pane is proven back at rest the outcome is now recorded as dismissed instead of queued for the operator, while a situation that genuinely changed into something else still escalates.

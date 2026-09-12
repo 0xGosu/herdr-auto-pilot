@@ -390,6 +390,50 @@ func SignatureHeldStill(prev, fresh SignatureResult, jitterPct int) bool {
 	return SimilarWithin(prev.Salient, fresh.Salient, jitterPct)
 }
 
+// ConsultTargetGone answers the other half of the post-consult staleness
+// question SignatureHeldStill opens: once the pane has NOT held still, is the
+// prompt the consult was about simply GONE, or has it become something else?
+//
+// The two outcomes are not interchangeable. A consult takes up to the LLM
+// timeout, and by the time it returns the screen is in one of three states: the
+// same situation (the answer is still deliverable), a genuinely different one
+// (the operator should be asked about it), or nothing at all — the human
+// answered the prompt by hand, the agent moved on, the command finished. Only
+// the middle case deserves an escalation. Raising the third fills the queue with
+// prompts that no longer exist on any screen, and an operator who opens two of
+// those stops opening the rest.
+//
+// "Gone" is deliberately the NARROW answer, because the failure it must never
+// produce is dismissing a prompt that is still standing:
+//
+//   - The re-read must classify as idle. SituationUnclassifiable is Classify's
+//     DEFAULT, so reading "we could not make sense of this" as "nothing is
+//     there" would auto-dismiss precisely the screens hap understands least.
+//   - On agy it must ALSO prove an empty composer, and that half is what makes
+//     this safe at all. herdr reports every agy modal as idle/done, so on agy
+//     "idle" says nothing about whether a form is on screen; AgyComposerReady is
+//     what separates a quiescent pane from a standing approval the classifier
+//     did not recognize. Without it this would answer "gone" for exactly the
+//     population it was written for — every ghost observed in practice was agy.
+//
+// Reach, which is narrower than it looks: Classify only returns SituationIdle
+// for an idle/done agent, and the caller re-classifies against the situation's
+// ORIGINAL status. herdr reports a claude or codex modal as blocked, so a
+// vanished prompt there re-reads as unclassifiable and still escalates — this
+// answers false for them by construction. That is the safe direction, and agy,
+// whose modals are all parked at idle/done, is where the ghosts actually are.
+//
+// Callers must have already established that the situation did NOT hold still.
+func ConsultTargetGone(agentType string, current Situation, pane string) bool {
+	if current.Type != SituationIdle {
+		return false
+	}
+	if IsAgy(agentType) {
+		return AgyComposerReady(pane)
+	}
+	return true
+}
+
 // splitOptionSet is NormalizedOptionSet's inverse: it splits the encoding on
 // unescaped ";" back into a set of unescaped labels, dropping empty entries.
 func splitOptionSet(s string) map[string]bool {

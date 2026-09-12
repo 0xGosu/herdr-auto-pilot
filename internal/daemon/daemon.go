@@ -3699,12 +3699,33 @@ func (d *Daemon) episodeNoticeSuppressed(agentID string, reason domain.EscalateR
 
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
+	d.escalateWith(ctx, s, sig, dec, tr, now, "")
+}
+
+// escalateWith is escalate with an optional FORCED auto-dismissal reason: the
+// caller has already established that this situation must be RECORDED but never
+// put in front of the operator (see domain.ConsultTargetGone).
+//
+// It is a parameter on the one chokepoint rather than a sibling that writes its
+// own dismissed row, because escalate owns work a twin would silently skip —
+// dropping the auto-task claim, the pending-escalation dedup, the
+// noop-vs-pending latch and the notify — and a local twin of a shared path is
+// the shape that passes every test while losing one of those.
+//
+// The agent-liveness reason wins when both apply: "this agent is gone" is the
+// more fundamental fact about the row, and it is what the existing operator
+// surfaces already explain.
+func (d *Daemon) escalateWith(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
+	dec domain.Decision, tr domain.AgentTransition, now time.Time, forced string) {
 	// The episode ended without an autonomous send, so an auto-send pairing for
 	// this agent is spent: the operator owns the situation now, and holding the
 	// claim would withhold a still-pending task from every other agent until
 	// its TTL. The file was never touched, so nothing is stranded.
 	d.dropAutoTaskClaim(s.AgentID)
 	autoDismissReason := d.escalationAutoDismissReason(ctx, s.AgentID)
+	if autoDismissReason == "" {
+		autoDismissReason = forced
+	}
 
 	// Dedup: if this normalized situation is already awaiting the user in the
 	// pending-escalation queue, re-raising it would just be a duplicate ask.
@@ -3778,7 +3799,10 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 			slog.Error("audit write failed for auto-dismissed escalation", "error", err)
 			return
 		}
-		slog.Info("escalation auto-dismissed: agent unavailable",
+		// The reason field carries WHY; the message must not name one cause,
+		// since a forced dismissal here is about the SITUATION being gone
+		// rather than the agent being unavailable.
+		slog.Info("escalation auto-dismissed",
 			"agent", s.AgentID, "situation", s.Type, "reason", autoDismissReason)
 		return
 	}
@@ -5029,7 +5053,10 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	if isNoop {
 		llmDec.OptionID = ""
 	}
-	reject := func(reason domain.EscalateReason, why string) {
+	// rejectAs marks the consult's decision rejected and raises the outcome.
+	// `forced` is normally empty; when set, the row is RECORDED as dismissed
+	// instead of queued for the operator (see escalateWith).
+	rejectAs := func(reason domain.EscalateReason, why string, forced string) {
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
 		suggested := llmDec.Action
 		if isNoop {
@@ -5063,11 +5090,14 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			score := llmDec.ConfidentScore
 			llmConf = &score
 		}
-		d.escalate(ctx, s, res.sig, domain.Decision{
+		d.escalateWith(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: reason, Rationale: why,
 			LLMConfidence: llmConf,
 			Suggestion:    "LLM suggested: " + suggested,
-		}.WithLLMSession(res.request.SessionID), tr, now)
+		}.WithLLMSession(res.request.SessionID), tr, now, forced)
+	}
+	reject := func(reason domain.EscalateReason, why string) {
+		rejectAs(reason, why, "")
 	}
 
 	// Re-gate: kill switch, never-auto patterns, heuristic, rate — the LLM can never
@@ -5292,6 +5322,20 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	current := cls.Classify(s.AgentType, s.Status, pane)
 	current.AgentID, current.PaneID, current.WorkspaceID = s.AgentID, s.PaneID, s.WorkspaceID
 	current.Status = s.Status
+	// A situation that did not hold still has two shapes, and only one of them
+	// is the operator's business: the prompt CHANGED into something else (ask
+	// them), or it is simply GONE — answered by hand, or the agent moved on
+	// while the consult ran (record it and move on). Escalating the second is
+	// how the queue fills with prompts that exist on no screen, and an operator
+	// who opens two of those stops opening the rest.
+	staleReject := func(why string) {
+		if domain.ConsultTargetGone(s.AgentType, current, pane) {
+			rejectAs(domain.ReasonLLMNoSubmit, why+"; the prompt is no longer on screen",
+				domain.ReasonAutoDismissStale)
+			return
+		}
+		rejectAs(domain.ReasonLLMNoSubmit, why, "")
+	}
 	if s.EffectiveAnswerCount() > 1 {
 		// Multi-tab situations carry the swept AGGREGATE as content, which
 		// never hashes equal to any single frame: staleness here means the
@@ -5301,7 +5345,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		form, ok := domain.ParseMCQForm(s.AgentType, pane)
 		if !ok || form.Kind != s.MCQKind || form.AnswerCount != s.EffectiveAnswerCount() ||
 			domain.ExtractAgentMCQForm(s.MCQKind, pane) != domain.FirstMCQQuestion(s.Content) {
-			reject(domain.ReasonLLMNoSubmit, "stale: form changed during consult")
+			staleReject("stale: form changed during consult")
 			return
 		}
 	} else if current.Type != s.Type {
@@ -5309,7 +5353,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// below covered a type flip implicitly; the jitter-tolerant compare it
 		// now uses works on salients alone and cannot see one, so assert it
 		// explicitly (the action-review path does the same).
-		reject(domain.ReasonLLMNoSubmit, "stale: situation changed during consult")
+		staleReject("stale: situation changed during consult")
 		return
 	} else {
 		// Compare raw content hashes: the staged signature may have been
@@ -5321,7 +5365,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		// is not the pane moving on (see domain.SignatureHeldStill).
 		freshSig := domain.ComputeSignatureN(current, cfg.Embedding.PaneSalientChars)
 		if !domain.SignatureHeldStill(res.sig, freshSig, staleDeferredSendJitterPercent) {
-			reject(domain.ReasonLLMNoSubmit, "stale: situation changed during consult")
+			staleReject("stale: situation changed during consult")
 			return
 		}
 		if freshSig.Raw != res.sig.Raw {
