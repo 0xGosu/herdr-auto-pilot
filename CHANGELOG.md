@@ -8,6 +8,16 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.33
+
+- Fixed the timed auto-accept and full self-prompting sending an answer the `--action` rules refuse: the unattended path, the one that types with nobody watching, was the only send that never screened what it chose. A refused answer now waits for you instead, without counting as a failed delivery.
+- Fixed `hap config rules disable-seed` rejecting the ids `hap config rules list` prints for the shipped action rules, so a builtin action rule could be listed but never silenced — and an escalation one of them forced now names the rule to silence, as a situation rule's already did.
+- Documented the never-auto ACTION rules and `safety.enable_never_auto_action_seeds` in the shipped `hap` skill, including which kind of rule to reach for: written as an ordinary rule, a pattern aimed at a menu option matches the menu that prints it and escalates every prompt.
+- `hap config rules --help` now names `--action` as a flag and the `--` escape for adding it as a literal pattern.
+- Fixed the never-auto ACTION rules refusing an operator's own confirmed answer: a human who deliberately picks a widening menu option is making that call themselves, and the refusal left the reply marked as attempted and failed, so it could not even be retried. Only hap's own unattended sends are screened.
+- Fixed a task hand-out being refused for words in the task text: the action rules describe menu options hap must never pick, so a checklist item that happens to contain one is work to do, not an option being chosen — such an item used to sit unsent and unexplained forever.
+- Fixed the TUI offering to silence a builtin ACTION rule and then reporting it was already off: the shipped action rules have their own switch, so `safety.disable_never_auto_seed_patterns` never silenced them and the escalation kept coming back.
+
 ## 0.9.32
 
 - Fixed a stale LLM consult escalating a prompt that had already left the screen: when the pane is proven back at rest the outcome is now recorded as dismissed instead of queued for the operator, while a situation that genuinely changed into something else still escalates.
