@@ -726,6 +726,8 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 		live[a.AgentID] = struct{}{}
 		if !autoSendParked(a.Status) {
 			delete(d.idleSince, a.AgentID)
+			// The parked episode ended, so the next one may propose again.
+			delete(d.noopVsPendingRaised, a.AgentID)
 			delete(d.autoTaskClaim, a.AgentID)
 			// The agent is working (or gone): whatever its episodes were not
 			// resolving, they are resolving now. Start the next parked spell
@@ -747,11 +749,19 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 		// A new parked episode (or a recycled pane) is a fresh start for the
 		// backoff too — the budget belongs to the spell, not to the agent id.
 		delete(d.pollRedrive, a.AgentID)
+		// Same reasoning for the hand-out proposal: the latch belongs to the
+		// spell, and a recycled pane is a different agent entirely.
+		delete(d.noopVsPendingRaised, a.AgentID)
 		d.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, terminalID: a.TerminalID, at: now}
 	}
 	for id := range d.idleSince {
 		if _, ok := live[id]; !ok {
 			delete(d.idleSince, id)
+		}
+	}
+	for id := range d.noopVsPendingRaised {
+		if _, ok := live[id]; !ok {
+			delete(d.noopVsPendingRaised, id)
 		}
 	}
 	for id := range d.pollRedrive {

@@ -229,6 +229,21 @@ type DeclaredTask struct {
 	// must not grow a list past the size the daemon would refuse to refill.
 	// 0 means uncapped.
 	MaxTasks int
+	// InProgress reports that the source already holds at least one "[-]" item
+	// (InProgressDeclaredTasks). It suppresses the noop-vs-pending ESCALATION
+	// only: proposing a hand-out while a task is already being worked asks the
+	// operator to start a second one, and an agy repaints between every
+	// background command, so each repaint mints a fresh pane excerpt and slips
+	// past duplicatePendingEscalation — the queue fills with the same proposal.
+	//
+	// It deliberately does NOT gate the Reserve hand-out above it: the idle
+	// poll pairs DISTINCT agents with DISTINCT items, so a "[-]" there is
+	// another agent's reservation and suppressing on it would stop the second
+	// agent ever being handed work.
+	//
+	// Zero value is the permissive one (false = propose), so a caller that does
+	// not populate it keeps the historical behavior.
+	InProgress bool
 }
 
 // DefaultRemoteNextTaskTemplate is DefaultNextTaskTemplate for a task list that
