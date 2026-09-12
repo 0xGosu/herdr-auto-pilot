@@ -689,7 +689,6 @@ func TestAgyApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
 			ctx := context.Background()
 			h := newHarness(t, "")
 			h.herdr.setPane(tc.pane)
-			h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
 			h.herdr.failRead = tc.failRead
 			mutations := 0
 			h.daemon.opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {
@@ -755,7 +754,6 @@ func TestAgyReviewApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
 			h := newHarness(t, cfg)
 			h.llm.configured = true
 			h.herdr.setPane(tc.pane)
-			h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
 			h.herdr.failRead = tc.failRead
 
 			var mu sync.Mutex
@@ -833,6 +831,22 @@ func TestAgyReviewApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
 			}
 			if n != 0 {
 				t.Errorf("attempts = %d, want 0: no attempt should be counted on a refusal", n)
+			}
+
+			audits, err := h.raw.AuditLog(ctx, 10)
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, a := range audits {
+				if a.Action == domain.AuditActionTaskReviewFailed && strings.Contains(a.Rationale, "[agy_composer_not_ready]") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("expected audit row with action %s and reason agy_composer_not_ready",
+					domain.AuditActionTaskReviewFailed)
 			}
 		})
 	}
