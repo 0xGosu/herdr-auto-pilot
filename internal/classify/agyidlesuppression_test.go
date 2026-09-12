@@ -53,6 +53,31 @@ func TestAgyUnknownModalSuppressesTheIdleVerdict(t *testing.T) {
 	}
 }
 
+// The recorded screen this rule exists for, and the reason the synthetic pane
+// above is no longer the only evidence. This is the pane hap read as idle while
+// the agent sat behind it for ten minutes; the audit row it produced was
+// [noop_vs_pending_tasks], i.e. hap offering the next task to a blocked agent.
+//
+// Asserting the two composer predicates alongside the verdict is the point: the
+// suppression must come from the composer being absent, and AgyComposerReady
+// must stay false so no send path can ever type into this screen.
+func TestAgyRecordedEditApprovalSuppressesTheIdleVerdict(t *testing.T) {
+	c := New(nil)
+	pane := readAgyFixture(t, "idle_agy_edit_approval.txt")
+	for _, status := range []string{"idle", "done"} {
+		if s := c.Classify(domain.AgentTypeAgy, status, pane); s.Type != domain.SituationUnclassifiable {
+			t.Errorf("@%s: type = %s, want unclassifiable — this is the recorded screen "+
+				"hap reported as a parked agent free to take the next task", status, s.Type)
+		}
+	}
+	if domain.AgyComposerVisible(pane) {
+		t.Error("the composer is covered by the modal; it must not read as visible")
+	}
+	if domain.AgyComposerReady(pane) {
+		t.Error("a standing approval must never read as a ready composer")
+	}
+}
+
 // The control, and the reason this is not simply "agy is never idle": a parked
 // composer must still earn the idle verdict, or the suppression kills every agy
 // hand-out instead of fixing a stall.

@@ -127,7 +127,14 @@ func TestAgyStandingPromptsStillRefuseTheComposer(t *testing.T) {
 	}
 	for _, e := range ents {
 		name := e.Name()
-		if !strings.HasPrefix(name, "approval_agy_") && !strings.HasPrefix(name, "choice_agy_") {
+		// idle_agy_edit_approval is named for the STATUS herdr reports, not
+		// for what is on screen: it is a standing approval and belongs in this
+		// sweep. Without naming it here the prefixes alone would skip the one
+		// recorded modal whose composer-readiness nothing else checks.
+		standing := strings.HasPrefix(name, "approval_agy_") ||
+			strings.HasPrefix(name, "choice_agy_") ||
+			name == "idle_agy_edit_approval.txt"
+		if !standing {
 			continue
 		}
 		b, err := os.ReadFile(filepath.Join(dir, name))
