@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.30
+
+- Fixed an agent whose task list is finished filling the queue with `task_source_exhausted` escalations — one per sweep, forever. It is now raised at most once per parked episode, the way the hand-out proposal already was, and survives its own auto-dismissal under full self-prompting. Its text names the remedy (queue more work) instead of only restating that the list is empty, so silencing it no longer means reaching for `hap disable`
+- Fixed the orchestrator's `hap task … send` refusing ordinary task text: a hand-out is now screened by the never-auto patterns alone (yours and the shipped strict seeds), without the suspected-irreversible heuristic or the never-auto action rules, which judge a pending pane operation and so refused a task for merely describing the work. A generated task's text, invented by the task-generator LLM, still gets the whole screen
+
 ## 0.9.29
 
 - Fixed daemon tests failing on a loaded machine for timing rather than behaviour: two of them read state the daemon writes a moment later, and every shared test wait can now be stretched by one multiplier that CI sets, instead of each deadline being tuned by hand
