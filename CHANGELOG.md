@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.32
+
+- Fixed a stale LLM consult escalating a prompt that had already left the screen: when the pane is proven back at rest the outcome is now recorded as dismissed instead of queued for the operator, while a situation that genuinely changed into something else still escalates.
+
 ## 0.9.31
 
 - Fixed pre-delivery task review taking the agy composer proof before reserving the checklist item rather than after: an agy agent parked in a modal (or a pane that cannot be read) no longer churns the task list with reserve-refuse-release writes on every sweep.
