@@ -60,11 +60,6 @@ func NodeStale(n NodeInfo, now time.Time) bool {
 	return n.LastSeen.IsZero() || now.Sub(n.LastSeen) > nodeStaleAfter
 }
 
-// NodeWatching reports whether a TUI on that node is watching the fleet.
-func NodeWatching(n NodeInfo, now time.Time) bool {
-	return !n.WatchingUntil.IsZero() && now.Before(n.WatchingUntil)
-}
-
 // NodeLabelOrID is the display label, falling back to the id's first eight
 // characters — the same shape a git short hash has, for the same reason.
 func NodeLabelOrID(n NodeInfo) string {

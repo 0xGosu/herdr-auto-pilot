@@ -541,3 +541,11 @@ func VarianceGuardTripped(history []DecisionRecord, minimumAgreement, confirmWei
 	conf := Confidence(history, confirmWeight)
 	return conf.Score < minimumAgreement
 }
+
+// ShortSignature abbreviates a signature hash for one-line rows and listings.
+func ShortSignature(sig string) string {
+	if len(sig) <= 16 {
+		return sig
+	}
+	return sig[:16] + "…"
+}
