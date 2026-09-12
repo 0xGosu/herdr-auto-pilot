@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.23
+
+- Fixed a daemon crash under concurrent fleet sync. Waiting a bounded time for in-flight Turso sync operations stranded a waiter on a `sync.WaitGroup`, and the next operation to start as the counter fell to zero panicked the whole process with "WaitGroup is reused before previous Wait has returned" — twice in one night on a machine driving two agents, each crash followed by a restart that raced the dying daemon's lock.
+- Fixed a Turso sync operation being able to start while the database was closing, when it would have run against a handle already being freed; it is now refused and reported instead.
+
 ## 0.9.22
 
 - Removed unreferenced internal helpers (`NodeWatching`, `SeedRuleDisabled`, `TaskFilePath`, `GetTask`) across domain and frontend layers.
