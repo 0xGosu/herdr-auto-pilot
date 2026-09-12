@@ -50,6 +50,7 @@ func TestGoldenTranscripts(t *testing.T) {
 		"idle_agy_background_task.txt":     "done",
 		"idle_agy_composer_draft.txt":      "done",
 		"idle_agy_declined.txt":            "done",
+		"idle_agy_edit_approval.txt":       "done",
 		"idle_agy_effort_picker.txt":       "idle",
 		"idle_agy_fresh.txt":               "idle",
 		"idle_agy_mode_accept_edits.txt":   "idle",

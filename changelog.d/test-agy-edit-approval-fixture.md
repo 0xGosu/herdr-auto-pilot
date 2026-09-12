@@ -1,0 +1,1 @@
+- Added the real agy file-edit approval screen to the classifier corpus, so the idle-verdict suppression is proved against the recorded pane that caused the stall rather than a synthetic stand-in.

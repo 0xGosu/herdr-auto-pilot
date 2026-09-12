@@ -410,13 +410,17 @@ func TestAgyAgentModeOverEveryRecordedScreen(t *testing.T) {
 		"choice_agy_mcq_two":           {unknown, false},
 		"choice_agy_mcq_two_q2":        {unknown, false},
 		"choice_agy_mcq_two_recent":    {unknown, false},
-		"idle_agy_effort_picker":       {unknown, false},
-		"idle_agy_model_picker":        {unknown, false},
-		"idle_agy_shortcuts_overlay":   {unknown, false},
-		"idle_agy_signin_method":       {unknown, false},
-		"idle_agy_signin_url":          {unknown, false},
-		"idle_agy_slash_popup":         {unknown, false},
-		"idle_agy_terms":               {unknown, false},
+		// The file-edit approval ends in a FORM's bar ("esc to cancel" beside
+		// the model segment), not the composer's rule, so there is no mode to
+		// read and nothing safe to press into.
+		"idle_agy_edit_approval":     {unknown, false},
+		"idle_agy_effort_picker":     {unknown, false},
+		"idle_agy_model_picker":      {unknown, false},
+		"idle_agy_shortcuts_overlay": {unknown, false},
+		"idle_agy_signin_method":     {unknown, false},
+		"idle_agy_signin_url":        {unknown, false},
+		"idle_agy_slash_popup":       {unknown, false},
+		"idle_agy_terms":             {unknown, false},
 	}
 	files, err := filepath.Glob(filepath.Join("..", "classify", "testdata", "transcripts", "*_agy_*.txt"))
 	if err != nil || len(files) == 0 {

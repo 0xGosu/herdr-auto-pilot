@@ -83,6 +83,15 @@ var agyFixtures = map[string]agyCase{
 	"idle_agy_fresh.txt":             {typ: domain.SituationIdle},
 	"idle_agy_mode_accept_edits.txt": {typ: domain.SituationIdle},
 	"idle_agy_mode_plan.txt":         {typ: domain.SituationIdle},
+	// The screen from the reported stall: agy's file-edit approval, which no
+	// parser recognises. Recorded from the live run (signature
+	// idle:6c4846ec20090256ca937aa0, audit #224376287763128320 — the
+	// [noop_vs_pending_tasks] escalation raised while this modal stood).
+	//
+	// It earns unclassifiable STRUCTURALLY, because the composer is not on
+	// screen, and NOT through AgyHeldForm, which does not know this modal
+	// either — which is exactly why it is the case worth pinning.
+	"idle_agy_edit_approval.txt":     {typ: domain.SituationUnclassifiable},
 	"idle_agy_effort_picker.txt":     {typ: domain.SituationUnclassifiable, held: domain.AgyHeldPanel},
 	"idle_agy_model_picker.txt":      {typ: domain.SituationUnclassifiable, held: domain.AgyHeldPanel},
 	"idle_agy_shortcuts_overlay.txt": {typ: domain.SituationUnclassifiable, held: domain.AgyHeldPanel},

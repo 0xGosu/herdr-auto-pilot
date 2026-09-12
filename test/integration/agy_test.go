@@ -419,3 +419,107 @@ func TestRealAgyModeToggle(t *testing.T) {
 		t.Errorf("after a refused set the mode is %s (read ok=%v); want it unchanged at %s", got, ok, start)
 	}
 }
+
+// TestRealAgyEditApprovalIsNotIdle is a DRIFT TRIPWIRE for the recorded
+// idle_agy_edit_approval fixture, not a source for it. The corpus screen was
+// captured from the run that produced the stall report; this case proves the
+// live agy still renders that modal the same way, so the suppression the unit
+// suite pins is still about a screen agy actually paints.
+//
+// It deliberately does NOT write into testdata. A test that refreshes its own
+// fixture cannot fail honestly — it would rewrite the evidence and go green on
+// whatever agy happens to render today. When agy's layout really does move,
+// this fails and LOGS the capture for a human to install.
+//
+// The assertion is the one that matters in production: herdr reports this pane
+// idle/done, and hap must NOT agree, or the agent is offered the next task
+// while a modal stands (the [noop_vs_pending_tasks] row in the report).
+func TestRealAgyEditApprovalIsNotIdle(t *testing.T) {
+	requireAgy(t)
+	cli := herdr.NewCLI()
+	work := t.TempDir()
+
+	// The target sits outside agy's start directory, matching the reported
+	// stall's shape (an agent started in the main checkout editing a sibling
+	// worktree). Be warned that this is NOT known to be sufficient.
+	//
+	// Measured live, agy 1.2.2 / Gemini 3.6 Flash Low, twice: an edit INSIDE the
+	// start directory and an edit outside it under /tmp were BOTH applied with
+	// no modal at all — Read, then Edit, then a success message. So whatever
+	// raises "Accept this file edit?" is not simply "outside the workspace";
+	// the remaining candidates (agy trusting /tmp, or the prompt depending on
+	// mode or on how the edit was reached) are untested guesses.
+	//
+	// The case therefore SKIPS with the pane logged rather than failing. The
+	// corpus fixture it guards was captured from the real stall, so the unit
+	// suite's coverage does not depend on reproducing the modal on demand.
+	outside := t.TempDir()
+	target := filepath.Join(outside, "hello.txt")
+	if err := os.WriteFile(target, []byte("one\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pane := startAgyAgent(t, cli, work)
+
+	promptAgy(t, cli, pane, "Use your edit tool to change the single line in "+target+
+		" from 'one' to 'two'. Do not run any shell command.")
+
+	// The modal is not one ParseAgyForm knows, which is the whole point, so
+	// poll for its own anchor rather than for a parsed form.
+	// A skip must carry evidence. "agy did not raise the modal" has several
+	// causes that need different fixes — it auto-approved an in-workspace edit,
+	// it reached for a shell tool instead, or it was still thinking — and a bare
+	// skip cannot tell them apart, so the last screen goes into the log.
+	var capture, last string
+	deadline := time.Now().Add(150 * time.Second)
+	for time.Now().Before(deadline) {
+		content, err := cli.ReadPaneVisible(context.Background(), pane, 60)
+		if err == nil {
+			last = content
+			if strings.Contains(content, "Accept this file edit?") {
+				capture = content
+				break
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if capture == "" {
+		if _, standing := domain.ParseAgyForm(last); standing {
+			t.Skipf("agy raised a DIFFERENT form than the file-edit approval; nothing to assert.\npane:\n%s",
+				lastLines(last, 20))
+		}
+		t.Skipf("agy did not raise a file-edit approval (auto-approved, refused, or slow); "+
+			"nothing to assert.\npane:\n%s", lastLines(last, 20))
+	}
+
+	c := classify.New(nil)
+	for _, status := range []string{"idle", "done"} {
+		if s := c.Classify(domain.AgentTypeAgy, status, capture); s.Type != domain.SituationUnclassifiable {
+			t.Errorf("@%s: the live edit approval classified %s, want unclassifiable.\npane:\n%s",
+				status, s.Type, lastLines(capture, 16))
+		}
+	}
+	if domain.AgyComposerReady(capture) {
+		t.Errorf("the live edit approval read as a READY composer — a send path could type into it.\npane:\n%s",
+			lastLines(capture, 16))
+	}
+	if domain.AgyComposerVisible(capture) {
+		t.Errorf("the live edit approval read as a visible composer.\npane:\n%s", lastLines(capture, 16))
+	}
+
+	// Drift check against the recorded corpus screen. A changed footer does not
+	// fail the case on its own — the assertions above are what must hold — but
+	// it is the signal that the fixture needs re-capturing.
+	for _, anchor := range []string{
+		"shift+tab to auto-approve file edits",
+		"1. Yes, accept this change",
+		"2. No, reject this change",
+		"esc to cancel",
+	} {
+		if !strings.Contains(capture, anchor) {
+			t.Logf("DRIFT: the live modal no longer contains %q; refresh "+
+				"internal/classify/testdata/transcripts/idle_agy_edit_approval.txt from:\n%s",
+				anchor, lastLines(capture, 20))
+			break
+		}
+	}
+}
