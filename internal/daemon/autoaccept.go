@@ -959,11 +959,14 @@ func (d *Daemon) generatedTaskUnsafe(rec *domain.AuditRecord) string {
 //
 // A nil rule list means none are configured, which is the operator having no
 // patterns — not a reason to refuse.
+// Both halves read ONE snapshot: a reload landing between two reads would judge
+// the strict half against one rule list and the heuristic half against another,
+// and a gate that screens against two different policies is not a gate.
 func (d *Daemon) screenOutbound(agentType, text string) error {
-	if err := d.screenOutboundStrict(agentType, text); err != nil {
+	_, allow, _ := d.snapshot()
+	if err := screenStrict(allow, agentType, text); err != nil {
 		return err
 	}
-	_, allow, _ := d.snapshot()
 	if allow == nil {
 		return nil
 	}
@@ -988,6 +991,12 @@ func (d *Daemon) screenOutbound(agentType, text string) error {
 // those rules refuse work for discussing it. See actionScreen.
 func (d *Daemon) screenOutboundStrict(agentType, text string) error {
 	_, allow, _ := d.snapshot()
+	return screenStrict(allow, agentType, text)
+}
+
+// screenStrict is screenOutboundStrict against a rule list the caller already
+// holds, so screenOutbound can run both halves over ONE snapshot.
+func screenStrict(allow *domain.NeverAutoList, agentType, text string) error {
 	if allow == nil {
 		return nil
 	}
