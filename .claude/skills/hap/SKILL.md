@@ -704,13 +704,23 @@ Action rules are listed under their own heading with their own index space, and
 dropped with `remove-action`.
 
 hap also ships action rules for the scope-widening options ("and always allow",
-"don't ask again", "Persist to settings.json", "allow all"). They are **off**
-unless you set `safety.enable_never_auto_action_seeds = true`: refusing an
-option only escalates it, it does not pick a narrower one, so arming them turns
-most approvals into escalations until hap prefers the narrowest option itself.
-They matter because such a row pre-authorises a whole command prefix — later
-commands then never raise a prompt at all, so they never reach a pane, a
-classifier, or any of these rules.
+"don't ask again", "Persist to settings.json", "allow all"). They matter because
+such a row pre-authorises a whole command prefix — later commands then never
+raise a prompt at all, so they never reach a pane, a classifier, or any of these
+rules.
+
+They are **off** unless you set `safety.enable_never_auto_action_seeds = true`,
+because they are the *hard* half of that guard: refusing an option only
+escalates it, it does not answer the prompt, so on an agent that is offered one
+of these rows every time they turn approvals into escalations. For agy, hap
+already substitutes the narrowest option that still grants the request, which
+answers the prompt and keeps the agent moving; arm these when you want a refusal
+even where no narrower option exists.
+
+They screen hap's **own unattended sends only** — the timed auto-accept and full
+self-prompting. Your own confirmed answer is never refused by them: picking a
+widening option deliberately is your call. Neither is a task hand-out, whose
+text is work to do rather than an option being picked.
 
 A seed rule's `id` is a short hash of its pattern, so it names the same rule
 across upgrades (and is rejected if that pattern no longer ships). `disable-seed`

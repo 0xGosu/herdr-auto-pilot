@@ -113,8 +113,19 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 //
 // A disabled agent is suppression, not a fault: the answer waits rather than
 // burning the retry budget, matching how the auto-accept pass treats it.
+//
+// The nil screen is the operator path's defining property, not an omission.
+// screenOutbound already ran above, on the same materialized text, and the
+// ACTION rules deliberately stop there: they name menu options the DAEMON must
+// never pick, and a human who looked at the menu and chose to widen a permission
+// has made that call themselves (see actionRefused). Screening here would also
+// be unrecoverable rather than merely wrong — MarkAgentActionSideEffect is
+// written before this call, so the refusal would leave the row marked
+// side-effect AND failed with nothing typed, which is failed-at-next-start
+// rather than replayable: the operator would have no way to carry out their own
+// decision.
 func (d *Daemon) deliverToPane(ctx context.Context, audit *domain.AuditRecord, action string) error {
-	err := d.autoAcceptDeliver(ctx, audit, action)
+	err := d.autoAcceptDeliver(ctx, audit, action, nil)
 	switch {
 	case err == nil:
 		return nil

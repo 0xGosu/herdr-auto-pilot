@@ -424,7 +424,9 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	// the suggestion outright for every other flavour — and only through the
 	// seam, whose absence means the capability was never wired (the row simply
 	// waits for the operator).
-	deliver := func() error { return d.autoAcceptDeliver(ctx, rec, suggestion) }
+	deliver := func() error {
+		return d.autoAcceptDeliver(ctx, rec, suggestion, d.autoAcceptActionScreen(rec, suggestion))
+	}
 	if suggestion == domain.SuggestGenerateTask {
 		unhandled := ""
 		switch {
@@ -570,17 +572,10 @@ func (d *Daemon) claimBlockedBy(ctx context.Context, rec *domain.AuditRecord,
 	return ""
 }
 
-// autoAcceptDeliver sends the suggestion through the shared reply pipeline —
-// the same fail-closed implementation the operator's confirm uses, so the two
-// paths cannot drift on delivery or safety behavior.
-//
-// The send runs inside the cross-process per-agent lifecycle barrier, so an
-// operator disabling the agent cannot commit mid-delivery.
-//
-// It is also where the ACTION rules screen an unattended send, and this is the
-// main one: every other actionRefused call site is a decision the daemon makes
-// with a human able to see the queue, while this path types the suggestion into
-// a pane with nobody watching. `ReasonNeverAutoMatch` being in
+// autoAcceptActionScreen is the ACTION-rule screen for the UNATTENDED send, and
+// this is the main one: every other actionRefused call site is a decision the
+// daemon makes with a human able to see the queue, while this path types the
+// suggestion into a pane with nobody watching. ReasonNeverAutoMatch being in
 // autoAcceptExcludedReasons protects only rows escalated BY an action rule — it
 // says nothing about a row escalated for some other reason (llm_low_confidence,
 // below_threshold) whose SUGGESTION happens to be the widening option, which is
@@ -589,22 +584,67 @@ func (d *Daemon) claimBlockedBy(ctx context.Context, rec *domain.AuditRecord,
 // re-asks the kill switch, the mode and accept_generated_task, and none of them
 // looks at the text.
 //
-// Screened inside the barrier and immediately before the keystrokes, the same
-// last-look ordering d.act and the orchestrator's actionScreen use, and on the
-// materialized outbound rather than the stored suggestion so what is judged is
-// what is typed. A hit is a VERDICT, not a fault: wrapped in errOutboundRefused,
-// which autoAcceptDeliveryFailed already reverts the claim for and leaves
-// pending (FR-015 — a never-auto match always reaches a human), rather than
-// burning an attempt per sweep until the row is dismissed.
-func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord, suggestion string) error {
+// It judges the MATERIALIZED outbound, so what is screened is what is typed —
+// with one exception it must make itself. MaterializeForSend expands the two
+// next-task sentinels into the task TEXT, and action rules describe menu options
+// one must never pick; matching them against prose an agent is being asked to do
+// would refuse work for containing a phrase, which actionRefused's own doc
+// comment rules out. A checklist item like "allow all origins in dev" would
+// otherwise match the shipped `\ballow\s+all\b` seed and — since a refusal never
+// burns an attempt — revert to pending on every sweep forever: never delivered,
+// never dismissed.
+//
+// The expansion is the whole signal and needs no flag: MaterializeForSend
+// returns its argument VERBATIM for everything except those sentinels, and
+// SuggestedAction has already peeled the source prefix, so outbound differing
+// from the suggestion means exactly "a sentinel became prose". A future sentinel
+// that expands the same way is covered without touching this.
+func (d *Daemon) autoAcceptActionScreen(rec *domain.AuditRecord, suggestion string) func(string) error {
+	return func(outbound string) error {
+		if outbound != suggestion {
+			return nil
+		}
+		if why := d.actionRefused(rec.AgentType, outbound); why != "" {
+			return fmt.Errorf("%w: an action rule refused the answer: %s", errOutboundRefused, why)
+		}
+		return nil
+	}
+}
+
+// autoAcceptDeliver sends the suggestion through the shared reply pipeline —
+// the same fail-closed implementation the operator's confirm uses, so the two
+// paths cannot drift on delivery or safety behavior.
+//
+// The send runs inside the cross-process per-agent lifecycle barrier, so an
+// operator disabling the agent cannot commit mid-delivery.
+//
+// screen is the caller's last look at the exact text about to be typed, called
+// inside the barrier immediately before the keystrokes. It is a PARAMETER, not
+// something this function decides, because its two callers differ on precisely
+// this point: the unattended pass screens, and the operator's confirm
+// (deliverreply.go) deliberately does not — a human choosing to widen a
+// permission is the human's call, and the screen this function would have
+// applied is one actionRefused's own doc comment says must never reach them.
+// nil means "no further screen", the same shape ports.TaskSendHost and the
+// orchestrator's actionScreen use for the same distinction.
+//
+// A refusal is a VERDICT, not a fault: wrapped in errOutboundRefused, which
+// autoAcceptDeliveryFailed reverts the claim for and leaves pending (FR-015 —
+// a never-auto match always reaches a human) rather than burning an attempt per
+// sweep until the row is dismissed.
+func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
+	suggestion string, screen func(string) error) error {
+
 	var deliverErr error
-	refused := ""
+	var refused error
 	sent := false
 	disabled, err := d.opt.Store.WithAgentAutomation(ctx, rec.AgentID, func() {
 		outbound := domain.MaterializeForSend(suggestion, rec)
-		if why := d.actionRefused(rec.AgentType, outbound); why != "" {
-			refused = why
-			return
+		if screen != nil {
+			if err := screen(outbound); err != nil {
+				refused = err
+				return
+			}
 		}
 		deliverErr = deliver.Deliver(ctx, deliver.Config{
 			Herdr:     d.opt.Herdr,
@@ -628,8 +668,8 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 		return errAgentDisabled
 	// Above the !sent branch on purpose: a refusal leaves sent false and
 	// deliverErr NIL, so the generic branch would report success.
-	case refused != "":
-		return fmt.Errorf("%w: an action rule refused the answer: %s", errOutboundRefused, refused)
+	case refused != nil:
+		return refused
 	case errors.Is(deliverErr, deliver.ErrReplyWithheld):
 		// A verdict about the agent's form, not a delivery fault: every
 		// retry would be refused the same way, so it must not burn the

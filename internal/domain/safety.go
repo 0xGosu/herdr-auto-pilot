@@ -214,6 +214,26 @@ func IsSeedPattern(pattern string) bool {
 	return false
 }
 
+// IsActionSeedPattern reports whether pattern is a shipped ACTION seed rather
+// than a situation one.
+//
+// The two sides share safety.disabled_seed_patterns but NOT their master
+// switch: the situation seeds are governed by
+// safety.disable_never_auto_seed_patterns, the action seeds by
+// safety.enable_never_auto_action_seeds, and neither key touches the other's
+// set. So anything that reports whether a seed rule is currently in force has
+// to know which side it is on first — see tui.seedRuleDisabled, where applying
+// the wrong master switch told the operator a rule was already off while it was
+// still armed.
+func IsActionSeedPattern(pattern string) bool {
+	for _, r := range SeedNeverAutoActionRules {
+		if r.Pattern == pattern {
+			return true
+		}
+	}
+	return false
+}
+
 // SeedRuleForRationale maps an escalation rationale back to the seed rule that
 // produced it, by parsing the FIRST hit-shaped diagnostic in the string and
 // requiring that hit's own provenance to say seed. The bool is false when the
