@@ -6156,10 +6156,7 @@ func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.
 
 // shortSig abbreviates a signature hash for one-line rows.
 func shortSig(sig string) string {
-	if len(sig) <= 16 {
-		return sig
-	}
-	return sig[:16] + "…"
+	return domain.ShortSignature(sig)
 }
 
 // auditIDColWidth is the width of the ID column in the Escalations, Audit and

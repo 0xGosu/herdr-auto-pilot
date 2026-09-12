@@ -3634,21 +3634,6 @@ func (a *App) RemoveNeverAutoPattern(ctx context.Context, index int, expected st
 	})
 }
 
-// SeedRuleDisabled reports whether a shipped seed pattern has been disabled
-// individually via safety.disabled_seed_patterns, for list rendering.
-func (a *App) SeedRuleDisabled(pattern string) bool {
-	cfg, err := a.Config()
-	if err != nil {
-		return false
-	}
-	for _, p := range cfg.Safety.DisabledSeedPatterns {
-		if p == pattern {
-			return true
-		}
-	}
-	return false
-}
-
 // DisableSeedRule silences one shipped seed never-auto rule (strict or
 // heuristic) permanently, keeping every other seed rule active. The rule is
 // named by its exact pattern (resolved from a durable domain.SeedRuleID by the
@@ -4885,15 +4870,7 @@ func (a *App) ListTasks(agent, path string) ([]domain.ChecklistItem, error) {
 	return a.readList(context.Background(), cfg, locator)
 }
 
-// TaskFilePath resolves the checklist file a task target names, without
-// reading it: an explicit --path (made absolute) wins, otherwise the agent's
-// configured source. Exported for the CLI, which prints the resolved path in
-// the task-management hints under `hap task … list`.
-func (a *App) TaskFilePath(agent, path string) (string, error) {
-	return a.taskFilePath(agent, path)
-}
-
-// TaskListFor is TaskFilePath plus the resolved source's config position —
+// TaskListFor resolves the checklist file plus the resolved source's config position —
 // what the CLI's hints render as the provider-independent fallback selector.
 // sourceIndex is "" for a --path target (no config entry to point back at).
 func (a *App) TaskListFor(agent, path string) (locator, sourceIndex string, err error) {
@@ -4922,23 +4899,6 @@ func (a *App) ResolveTaskRef(agent, path, ref string) (domain.ChecklistItem, err
 		return domain.ChecklistItem{}, err
 	}
 	return items[index-1], nil
-}
-
-// GetTask returns the single item addressed by its 1-based number.
-func (a *App) GetTask(agent, path string, index int) (domain.ChecklistItem, error) {
-	items, err := a.ListTasks(agent, path)
-	if err != nil {
-		return domain.ChecklistItem{}, err
-	}
-	for _, it := range items {
-		if it.Index == index {
-			return it, nil
-		}
-	}
-	if len(items) == 0 {
-		return domain.ChecklistItem{}, fmt.Errorf("no task #%d: the checklist has no items", index)
-	}
-	return domain.ChecklistItem{}, fmt.Errorf("no task #%d: valid task numbers are 1..%d", index, len(items))
 }
 
 // taskSourceLimit returns the max_tasks cap of the [[task_sources]] entry that

@@ -856,10 +856,7 @@ func graduationN(app *frontend.App) int {
 
 // shortSignature abbreviates a signature for one-line listings.
 func shortSignature(sig string) string {
-	if len(sig) <= 16 {
-		return sig
-	}
-	return sig[:16] + "…"
+	return domain.ShortSignature(sig)
 }
 
 func orDash(s string) string {
@@ -1225,7 +1222,7 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 			status += " (stale)"
 		}
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			orDashCLI(r.Name), r.AgentID, r.AgentType, status, automation, orDashCLI(r.Cwd), "-", r.NodeLabel)
+			orDash(r.Name), r.AgentID, r.AgentType, status, automation, orDash(r.Cwd), "-", r.NodeLabel)
 	}
 	// The first column is the handle every other command takes, so the footer
 	// spells the follow-ups with <agent> in that position.
@@ -1474,7 +1471,7 @@ func audit(ctx context.Context, app *frontend.App, out io.Writer, args []string)
 		fmt.Fprintf(out, "#%d\t%s\t%s\t%s\t%s\tconf=%s\tllm=%s\trule=%s\t%s\tagent=%s\tby=%s\tnode=%s\n",
 			r.ID, r.CreatedAt.Format("01-02 15:04:05"), frontend.AuditStatusLabel(r), r.SituationType,
 			r.Action, frontend.ConfidenceLabel(r.Confidence), llmConfCLI(r.LLMConfidence), rule, r.Rationale,
-			st.RecordAgent(r), orDashCLI(r.Actor), st.NodeLabel(r.NodeID))
+			st.RecordAgent(r), orDash(r.Actor), st.NodeLabel(r.NodeID))
 	}
 	return nil
 }
@@ -3495,13 +3492,4 @@ func reloadNote(reloaded bool) string {
 		return " (daemon reloaded)"
 	}
 	return " (saved — no daemon running; it takes effect when the daemon starts)"
-}
-
-// orDashCLI renders an optional value as "-" so tab-separated rows keep their
-// field count.
-func orDashCLI(v string) string {
-	if v == "" {
-		return "-"
-	}
-	return v
 }

@@ -471,3 +471,20 @@ func TestStructuredSalient(t *testing.T) {
 		}
 	}
 }
+
+func TestShortSignature(t *testing.T) {
+	cases := []struct {
+		sig  string
+		want string
+	}{
+		{"", ""},
+		{"short", "short"},
+		{"exact-16-chars--", "exact-16-chars--"},
+		{"longer-than-sixteen-characters", "longer-than-sixt…"},
+	}
+	for _, tc := range cases {
+		if got := ShortSignature(tc.sig); got != tc.want {
+			t.Errorf("ShortSignature(%q) = %q, want %q", tc.sig, got, tc.want)
+		}
+	}
+}
