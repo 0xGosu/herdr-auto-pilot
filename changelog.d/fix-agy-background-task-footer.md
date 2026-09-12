@@ -1,2 +1,0 @@
-- Fixed `hap mode` failing to read or set an agy agent's permission mode while it had background work running: agy paints a task strip above its footer and adds a `N task(s)` suffix to the status bar, and neither was recognised — which put `acceptEdits` out of reach for exactly the agents that run background tasks.
-- The unreadable-mode error now says what was actually seen instead of asserting that an approval or form is up.
