@@ -83,12 +83,43 @@ func auditActions(t *testing.T, h *harness) []domain.AuditRecord {
 // poll forever, so a review that escalates switches unattended hand-out off.
 func noEscalations(t *testing.T, h *harness) {
 	t.Helper()
+	noEscalationsExcept(t, h)
+}
+
+// noEscalationsExcept is noEscalations with an allowance for reasons the caller
+// has a stated reason to tolerate.
+//
+// It reads ONCE and deliberately does not poll, so it asserts over an INSTANT
+// rather than a window. That makes it exact for "this code path must not
+// escalate", and unsafe for a scenario whose own success legitimately produces
+// a LATER escalation: on a slow machine that follow-up lands inside the read
+// and the test fails for something it never claimed to be about. Such a caller
+// names the reason here rather than hoping the timing holds — naming it keeps
+// the assertion strict about every OTHER reason, which "just poll for longer"
+// would not.
+func noEscalationsExcept(t *testing.T, h *harness, allowed ...domain.EscalateReason) {
+	t.Helper()
 	esc, err := h.raw.PendingEscalations(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(esc) != 0 {
-		t.Errorf("the review must never escalate, got %d escalation(s): %+v", len(esc), esc)
+	var unexpected []domain.AuditRecord
+	for _, e := range esc {
+		tolerated := false
+		for _, r := range allowed {
+			// escalate() writes the reason as a "[reason]" prefix on Rationale.
+			if strings.HasPrefix(e.Rationale, "["+string(r)+"]") {
+				tolerated = true
+				break
+			}
+		}
+		if !tolerated {
+			unexpected = append(unexpected, e)
+		}
+	}
+	if len(unexpected) != 0 {
+		t.Errorf("nothing may be awaiting the operator, got %d escalation(s): %+v",
+			len(unexpected), unexpected)
 	}
 }
 
