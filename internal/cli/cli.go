@@ -1653,7 +1653,8 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		return nil
 	case "set":
 		if len(args) < 3 {
-			return fmt.Errorf("usage: config set <field> <value>, or config set <command field> --preset <claude|codex> (see: config fields)")
+			return fmt.Errorf("usage: config set <field> <value>, or config set <command field> --preset <%s> (see: config fields)",
+				strings.Join(frontend.LLMPresetNames, "|"))
 		}
 		// --preset is intercepted BEFORE the join below, which would otherwise
 		// flatten it into the value and store the literal string "--preset

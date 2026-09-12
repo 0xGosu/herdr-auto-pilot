@@ -103,6 +103,12 @@ var agyValueFlags = map[string]bool{
 var agyBoolFlags = map[string]bool{
 	"-c": true, "--continue": true, "-continue": true,
 	"--dangerously-skip-permissions": true, "-dangerously-skip-permissions": true,
+	// Every agy preset carries it — it is the only scoping flag agy offers that
+	// actually works (see LLMPresetAgy in internal/frontend) — so an
+	// unregistered entry here would make fixPromptAdjacency bail out on the
+	// RECOMMENDED template, exactly the way --no-session-persistence did for
+	// claude.
+	"--disable-slash-commands": true, "-disable-slash-commands": true,
 	"--new-project": true, "-new-project": true,
 	"--sandbox": true, "-sandbox": true,
 }

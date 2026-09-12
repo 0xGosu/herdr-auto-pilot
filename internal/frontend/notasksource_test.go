@@ -49,6 +49,7 @@ func TestConfirmNoTaskSourceReturnsGuidance(t *testing.T) {
 		for _, want := range []string{
 			"hap config set " + frontend.LLMTaskGenerateCommandKey + " --preset claude",
 			"hap config set " + frontend.LLMTaskGenerateCommandKey + " --preset codex",
+			"hap config set " + frontend.LLMTaskGenerateCommandKey + " --preset agy",
 			"hap config task-source add",
 			"hap dismiss",
 		} {
