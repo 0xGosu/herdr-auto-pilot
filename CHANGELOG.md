@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.25
+
+- Added never-auto rules that match the ANSWER hap is about to send rather than the screen it is answering (`[[safety.never_auto_actions]]`, `hap config rules add --action` / `remove-action`, agent-type scoping as usual). The existing rules can only match situation text, so an option that is printed on every prompt — agy's "(Persist to settings.json)" — could not be refused without escalating every prompt and stalling the agent.
+- Added shipped action rules that refuse the scope-widening menu options ("and always allow…", "Persist to settings.json", "allow all"), which pre-authorise a whole command prefix so later commands never raise a prompt at all. They are OFF unless `safety.enable_never_auto_action_seeds = true`, because refusing an option only escalates it — hap has to prefer the narrowest option first, or most approvals would become escalations.
+
 ## 0.9.24
 
 - Fixed the escalation queue filling with the same "send next declared task" proposal: a hand-out is no longer proposed while the list already has an item in progress, and a repeat within one parked spell is folded into the row the operator already has instead of adding another
