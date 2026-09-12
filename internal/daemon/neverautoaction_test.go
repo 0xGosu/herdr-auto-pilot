@@ -2,6 +2,9 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -215,5 +218,88 @@ func TestTheActionScreenSkipsAMaterializedTaskPromptButNotAnAnswer(t *testing.T)
 		domain.MaterializeForSend(answerAction, answer)); err == nil {
 		t.Error("an ANSWER carrying the same phrase must still be refused — the exemption is for " +
 			"a sentinel that became prose, not for the phrase")
+	}
+}
+
+// A TASK HAND-OUT IS NOT AN ANSWER, so the ACTION rules do not judge it — the
+// same exemption the auto-accept copy of this screen already makes, at act's
+// call site.
+//
+// act screens dec.Input, and for a declared-task decision dec.Input IS the
+// rendered checklist prompt. These rules name menu options that must never be
+// picked, so matching them against a task refuses the WORK for containing a
+// phrase. Deterministic once any action rule exists, with reason
+// never_auto_match — which is in autoAcceptExcludedReasons, so the hand-out is
+// then permanently operator-only.
+//
+// The task text here carries the rule's phrase in the way a real checklist item
+// would: it is describing the change, not choosing an option.
+func TestATaskHandoutIsNotScreenedByTheActionRules(t *testing.T) {
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	const task = "Update the CORS config so the dev server can always allow local origins"
+	if err := os.WriteFile(taskFile, []byte("- [ ] "+task+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	idlePane := "All tests pass. Task is complete.\n"
+	h := newHarness(t, actionRuleCfg+
+		fmt.Sprintf("\n[[task_sources]]\nagent = \"agent-act-screen\"\npath = %q\n", taskFile))
+	h.herdr.setPane(idlePane)
+	h.seedAutonomous(idlePane, domain.SituationIdle, domain.ActionNextDeclaredTask)
+
+	h.push("agent-act-screen", "idle")
+
+	// Wait for the episode to RESOLVE either way, so a refusal is reported as
+	// the refusal it is rather than as a timeout.
+	waitFor(t, 5*time.Second, func() bool {
+		if len(h.herdr.sentInputs()) > 0 {
+			return true
+		}
+		pend, _ := h.raw.PendingEscalations(context.Background())
+		return len(pend) > 0
+	})
+	pend, err := h.raw.PendingEscalations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range pend {
+		if strings.Contains(e.Rationale, "outbound action") {
+			t.Fatalf("the hand-out was refused by an action rule: %s", e.Rationale)
+		}
+	}
+	sent := h.herdr.sentInputs()
+	if len(sent) != 1 || !strings.Contains(sent[0], task) {
+		t.Fatalf("sent %v, want the task handed out verbatim", sent)
+	}
+}
+
+// THE CONTROL, and the reason the case above is not vacuous: the same rule, the
+// same agent, the same phrase — but chosen as an ANSWER rather than arriving as
+// a checklist item. It must still be refused.
+//
+// Without this, the exemption could be "act no longer screens anything" and
+// nothing would say so. The task source is configured here too, so the ONLY
+// difference between the two cases is whether dec.Input is the declared task's
+// rendered prompt — which is exactly what isDeclaredTaskPrompt decides.
+func TestAnAnswerIsStillScreenedForAnAgentThatAlsoHasATaskSource(t *testing.T) {
+	dir := t.TempDir()
+	taskFile := filepath.Join(dir, "tasks.md")
+	if err := os.WriteFile(taskFile, []byte("- [ ] polish the docs\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := newHarness(t, actionRuleCfg+
+		fmt.Sprintf("\n[[task_sources]]\nagent = \"agent-act-answer\"\npath = %q\n", taskFile))
+	h.herdr.setPane(wideningApprovalPane)
+	h.seedAutonomous(wideningApprovalPane, domain.SituationApproval,
+		"Yes, and always allow commands starting with 'go'")
+
+	h.push("agent-act-answer", "blocked")
+
+	esc := waitForOneEscalation(t, h)
+	if !strings.Contains(esc.Rationale, "outbound action") {
+		t.Errorf("rationale = %q, want the action screen named as the refusal", esc.Rationale)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("sent %v; a refused answer must reach no pane", got)
 	}
 }

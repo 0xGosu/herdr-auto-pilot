@@ -2971,6 +2971,24 @@ func (d *Daemon) readDecisionState(ctx context.Context, sig domain.SignatureResu
 	return state, history, rate, retries, killActive, nil
 }
 
+// isDeclaredTaskPrompt reports whether the text about to be delivered IS the
+// resolved checklist item's rendered prompt, rather than a learned reply that
+// happens to be going to an agent a task source also matches.
+//
+// The comparison is exact because Decide puts declared.Prompt() into dec.Input
+// verbatim for a declared-task decision — it is the same rendering, not a
+// paraphrase of it.
+//
+// It has TWO callers in act and they must agree: one decides that the ACTION
+// rules do not judge this text, the other that the delivery carries the task
+// (and so reserves the item and may go through the pre-delivery review). A
+// second copy of the expression that drifted would leave a hand-out screened as
+// though it were an answer, or an answer treated as though it were a task.
+func isDeclaredTaskPrompt(declared *domain.DeclaredTask, input string) bool {
+	return declared != nil && declared.Task != domain.NoTaskContent &&
+		declared.Prompt() == input
+}
+
 // act performs a confirmed autonomous action with the pre-action audit
 // guard: the audit record must be durably committed BEFORE any input is
 // sent; a persistence failure blocks the action and notifies (FR-024).
@@ -2992,13 +3010,38 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		}, tr, now)
 		return
 	}
-	if why := d.actionRefused(s.AgentType, dec.Input); why != "" {
-		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonNeverAutoMatch,
-			Rationale:  "outbound action: " + why,
-			Confidence: dec.Confidence,
-		}, tr, now)
-		return
+	// The ACTION rules screen the chosen ANSWER — never a task hand-out. They
+	// name menu options that must never be picked ("and always allow",
+	// "Persist to settings.json"), and a checklist item is prose describing work
+	// to do: matching them against it refuses the work for containing a phrase,
+	// which actionRefused's own doc comment rules out and which the auto-accept
+	// copy of this screen already exempts.
+	//
+	// It is latent only until an operator writes one rule — which is precisely
+	// what the never-auto action feature invites — and then deterministic: a
+	// task reading "allow all origins in dev" escalates every time, for a reason
+	// (never_auto_match) that is in autoAcceptExcludedReasons, so it is
+	// permanently operator-only.
+	//
+	// The discriminator here is stronger than the auto-accept path's, because
+	// this site HOLDS the resolved task: there, the only evidence is that
+	// MaterializeForSend expanded a sentinel into prose, so it infers the case
+	// from outbound differing from the suggestion; here the rendered prompt can
+	// be compared directly. Same question, better answer — do not replace this
+	// with the inequality.
+	//
+	// What stays is the whole never-auto SITUATION screen above: FR-015 says a
+	// next-task line naming an irreversible operation must never be delivered
+	// automatically, and that is the gate saying so.
+	if !isDeclaredTaskPrompt(declared, dec.Input) {
+		if why := d.actionRefused(s.AgentType, dec.Input); why != "" {
+			d.escalate(ctx, s, sig, domain.Decision{
+				Action: domain.ActionEscalate, Reason: domain.ReasonNeverAutoMatch,
+				Rationale:  "outbound action: " + why,
+				Confidence: dec.Confidence,
+			}, tr, now)
+			return
+		}
 	}
 
 	// Multi-tab MCQ forms are answered with a digit series, one keystroke
@@ -3113,10 +3156,9 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		return
 	}
 
-	// Mark this delivery as THE declared task only when it really is one
-	// (comparing the rendered prompt, which is exactly what Decide put in
-	// dec.Input) — a learned free-text reply for the same agent must not
-	// consume a task or be routed into the task-list review.
+	// Mark this delivery as THE declared task only when it really is one — a
+	// learned free-text reply for the same agent must not consume a task or be
+	// routed into the task-list review.
 	//
 	// Deliberately NOT gated on declared.Reserve. Reserving is what an
 	// auto-send source does with the item; carrying the declared task is what
@@ -3125,8 +3167,7 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// still no-ops for a non-reserving source, so nothing is marked "[-]" that
 	// was not before.
 	del := delivery{sendText: outbound, input: dec.Input, rationale: dec.Rationale}
-	if declared != nil && declared.Task != domain.NoTaskContent &&
-		declared.Prompt() == dec.Input {
+	if isDeclaredTaskPrompt(declared, dec.Input) {
 		del.declared, del.taskText = declared, declared.Task
 	}
 

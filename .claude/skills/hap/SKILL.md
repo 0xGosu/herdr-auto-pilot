@@ -727,10 +727,13 @@ already substitutes the narrowest option that still grants the request, which
 answers the prompt and keeps the agent moving; arm these when you want a refusal
 even where no narrower option exists.
 
-They screen hap's **own unattended sends only** — the timed auto-accept and full
-self-prompting. Your own confirmed answer is never refused by them: picking a
-widening option deliberately is your call. Neither is a task hand-out, whose
-text is work to do rather than an option being picked.
+They screen the **answers hap chooses for itself** — a learned rule acting on a
+prompt, an LLM's answer, the timed auto-accept, full self-prompting. Your own
+confirmed answer is never refused by them: picking a widening option
+deliberately is your call. Neither is a task hand-out, whose text is work to do
+rather than an option being picked — a checklist item that happens to contain
+one of these phrases is still handed out, and it is the `never_auto_patterns`
+above (plus the irreversible heuristic) that hold a dangerous one back.
 
 A seed rule's `id` is a short hash of its pattern, so it names the same rule
 across upgrades (and is rejected if that pattern no longer ships). `disable-seed`
