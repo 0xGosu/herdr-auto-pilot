@@ -372,3 +372,87 @@ func TestAgyFormSameAs(t *testing.T) {
 		t.Errorf("question 1 and question 2 must be different forms: %+v / %+v", q1, q2)
 	}
 }
+
+const agyRule = "────────────────────────────────────────"
+
+// agyDraftScreen renders a capture whose composer holds body, with the bottom
+// chrome agy paints while a draft stands: the model segment WITHOUT the
+// "? for shortcuts" token, which agy drops as soon as anything is typed.
+func agyDraftScreen(body string) string {
+	return "  Working on it.\n\n" + agyRule + "\n" + body + "\n" + agyRule + "\n" +
+		"                                                        Gemini 3.6 Flash · low\n"
+}
+
+// AgyComposerDraft is what tells "the hand-out is queued, unsent" apart from
+// "the agent took it and is working" — AgyComposerReady collapses both into
+// "not ready", which is the right answer before a send and useless after one.
+func TestAgyComposerDraftReadsBackQueuedText(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pane string
+		want string
+	}{
+		{"empty composer is not a draft", agyComposer, ""},
+		{"operator's draft", agyDraftScreen("> half-typed thought"), "half-typed thought"},
+		// The whole reason the block is read between the rules rather than at a
+		// fixed offset: a hand-out is long and agy wraps it.
+		{"a wrapped multi-line hand-out is rejoined",
+			agyDraftScreen("> Next task: run the suite\n  and report back"),
+			"Next task: run the suite and report back"},
+		// A mode placeholder is agy's own text in an EMPTY composer, not a draft.
+		{"mode placeholder is not a draft",
+			agyDraftScreen("> Plan mode: research & plan only (shift+tab to cycle)"), ""},
+		// No composer sandwich at the bottom at all.
+		{"standing approval", agyApprovalScreen(), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := AgyComposerDraft(tc.pane)
+			if tc.want == "" {
+				if ok {
+					t.Fatalf("AgyComposerDraft = %q, true; want no draft", got)
+				}
+				return
+			}
+			if !ok || got != tc.want {
+				t.Errorf("AgyComposerDraft = %q, %v; want %q, true", got, ok, tc.want)
+			}
+		})
+	}
+}
+
+// agyApprovalScreen is agy's shell approval — the screen a hand-out must never
+// be typed into, and one with no composer sandwich at the bottom.
+func agyApprovalScreen() string {
+	return "Requesting permission for:\n   go test ./...\n\nRun this command?\n" +
+		"> 1. Yes, run command\n" +
+		"  2. Yes, and always allow in this conversation for commands that start with 'go'\n" +
+		"  3. Yes, and always allow for commands that start with 'go' (Persist to settings.json)\n" +
+		"  4. No, cancel\n\n" +
+		"  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\n" +
+		"esc to cancel                                              Gemini 3.6 Flash · low\n"
+}
+
+// Attribution decides whether a task is stranded at "[-]" for a human, so an
+// operator's own draft must never be mistaken for hap's hand-out.
+func TestAgyDraftMatchesOnlyTheTextHapSent(t *testing.T) {
+	sent := "Next task: run the suite and report back when it is green"
+	for _, tc := range []struct {
+		name  string
+		draft string
+		want  bool
+	}{
+		{"the whole hand-out", sent, true},
+		{"the head of a wrapped hand-out", "Next task: run the suite", true},
+		{"the operator's own note", "remember to check the flake", false},
+		// A containment test would pass this one: "suite" appears in what was
+		// sent. Only a PREFIX proves the composer is holding our message.
+		{"a fragment from the middle", "suite and report back", false},
+		{"nothing typed", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AgyDraftMatches(tc.draft, sent); got != tc.want {
+				t.Errorf("AgyDraftMatches(%q) = %v, want %v", tc.draft, got, tc.want)
+			}
+		})
+	}
+}

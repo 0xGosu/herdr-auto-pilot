@@ -104,6 +104,12 @@ type fakeHerdr struct {
 	// session-rename push verifies its own keystroke by re-reading the pane,
 	// so a fake that never repaints could only ever prove the failure path.
 	onSend func(f *fakeHerdr, input string)
+	// paneScript serves a DIFFERENT pane to each successive read, the last entry
+	// sticking. A gate that is re-proven immediately before a send is invisible
+	// to a fake that answers every read identically — such a test passes whether
+	// or not the second proof is there — so the window has to be modelled as what
+	// it is: the screen changing between one read and the next.
+	paneScript []string
 }
 
 func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
@@ -142,10 +148,25 @@ func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (str
 	if f.failReadOver > 0 && lines > f.failReadOver {
 		return "", errors.New("induced deep read failure")
 	}
+	if len(f.paneScript) > 0 {
+		content := f.paneScript[0]
+		if len(f.paneScript) > 1 {
+			f.paneScript = f.paneScript[1:]
+		}
+		return content, nil
+	}
 	if len(f.frames) > 0 {
 		return f.renderFrame(), nil
 	}
 	return f.pane, nil
+}
+
+// setPaneScript makes successive reads return successive contents, the last one
+// sticking once the script runs out.
+func (f *fakeHerdr) setPaneScript(contents ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paneScript = append([]string(nil), contents...)
 }
 
 // renderFrame serves the focused multi-tab frame with the tab header's ☐ marks

@@ -189,3 +189,111 @@ func AgyComposerReady(pane string) bool {
 	_, held := AgyHeldForm(pane)
 	return !held
 }
+
+// agyComposerScanLimit bounds the search for the composer's opening rule. A
+// queued multi-line hand-out renders as several lines between the rules, so the
+// block cannot be read at a fixed offset the way AgyComposerReady reads an empty
+// one — but scanning the whole capture would happily pair the closing rule with
+// one agy drew between two earlier turns.
+const agyComposerScanLimit = 20
+
+// agyDraftMatchRunes is how much of the composer must match what was sent for
+// the draft to be attributed to hap. Long enough that an operator's own sentence
+// cannot collide by accident, short enough to survive agy wrapping or truncating
+// a long hand-out.
+const agyDraftMatchRunes = 24
+
+// AgyComposerDraft returns the text agy is holding UNSENT in its composer.
+//
+// It answers what AgyComposerReady cannot. That one proves the composer is
+// EMPTY, and lumps everything else together as "not ready" — a working turn, a
+// modal and a draft are all equally unsafe to type into. After a hand-out those
+// stop being interchangeable: agy QUEUES text typed during a turn in its
+// composer rather than acting on it (observed live 2026-09-12), and the queued
+// copy fires whenever the turn ends. So a hand-out still sitting here has NOT
+// been taken up, while a working turn means it has — and only reading the
+// composer back tells the two apart.
+//
+// The block is read BETWEEN the composer's two rules rather than at a fixed
+// offset, because a multi-line hand-out wraps across several lines. The bottom
+// chrome line is required but its left token is not: agy DROPS "? for shortcuts"
+// while a draft stands, which is precisely the state this looks for.
+//
+// A held screen returns false — something else is on top, so the caret line is
+// not simply an unsent message.
+func AgyComposerDraft(pane string) (string, bool) {
+	lines := trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n"))
+	n := len(lines)
+	if n < 4 || !agyBottomChromeLine(lines[n-1]) ||
+		!agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) {
+		return "", false
+	}
+	open := -1
+	for i := n - 3; i >= 0 && i >= n-3-agyComposerScanLimit; i-- {
+		if agyRuleLineRE.MatchString(strings.TrimSpace(lines[i])) {
+			open = i
+			break
+		}
+	}
+	if open < 0 || open >= n-3 {
+		return "", false
+	}
+	block := lines[open+1 : n-2]
+	first := strings.TrimSpace(block[0])
+	if !strings.HasPrefix(first, ">") || agyModePlaceholderRE.MatchString(first) {
+		return "", false
+	}
+	var b strings.Builder
+	b.WriteString(strings.TrimSpace(strings.TrimPrefix(first, ">")))
+	for _, l := range block[1:] {
+		if t := strings.TrimSpace(l); t != "" {
+			b.WriteString(" ")
+			b.WriteString(t)
+		}
+	}
+	text := strings.TrimSpace(b.String())
+	if text == "" {
+		return "", false
+	}
+	if _, held := AgyHeldForm(pane); held {
+		return "", false
+	}
+	return text, true
+}
+
+// agyBottomChromeLine matches the line agy paints at the very bottom: its status
+// bar, or — while a draft stands, which removes the bar's left token — the bare
+// right-aligned model segment.
+func agyBottomChromeLine(line string) bool {
+	if agyStatusBarLine(line) {
+		return true
+	}
+	trimmed := strings.TrimSpace(line)
+	return trimmed != "" && agyModelSegmentRE.MatchString(trimmed)
+}
+
+// AgyDraftMatches reports whether the text agy is holding in its composer is the
+// hand-out that was just sent, rather than something the operator typed.
+//
+// A queued hand-out is typed from its FIRST character, so the composer holds a
+// prefix of what was sent — hence HasPrefix rather than a containment test,
+// which a two-word operator draft could satisfy by coincidence. Only the head is
+// compared, over collapsed whitespace, because agy wraps a long message and the
+// composer shows only what fits.
+//
+// Getting this wrong is not symmetric, and it is deliberately biased: a draft
+// wrongly attributed to hap strands a task at "[-]" until an operator looks,
+// while one wrongly attributed to the operator merely falls back to the ordinary
+// ledger path that already existed. So this refuses whenever it cannot tell.
+func AgyDraftMatches(draft, sent string) bool {
+	d := strings.Join(strings.Fields(draft), " ")
+	s := strings.Join(strings.Fields(sent), " ")
+	if d == "" || s == "" {
+		return false
+	}
+	head := []rune(d)
+	if len(head) > agyDraftMatchRunes {
+		head = head[:agyDraftMatchRunes]
+	}
+	return strings.HasPrefix(s, string(head))
+}

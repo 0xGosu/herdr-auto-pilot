@@ -123,6 +123,74 @@ func (d *Daemon) agyComposerRefusal(ctx context.Context, paneID string) error {
 	return nil
 }
 
+// agyHandoutQueued reports that a hand-out just sent to agy is still sitting
+// UNSENT in its composer.
+//
+// herdr accepting the keystrokes is not proof the agent took them, and for agy
+// the gap is not merely theoretical: text typed during a turn is QUEUED in the
+// composer instead of acted on, then fires whenever the current turn ends — out
+// of order, minutes later (observed live 2026-09-12). There is no way to take it
+// back, because herdr rejects every spelling of C-u, so the queued copy WILL
+// run. That is what makes rolling the item back to "[ ]" the dangerous answer: a
+// second agent handed the same item turns one late delivery into two. The caller
+// leaves it "[-]" and escalates instead.
+//
+// An unreadable pane answers false — deliberately the ORDINARY path rather than
+// a refusal. Nothing has gone wrong here that stranding the item would fix: the
+// ledger row and reclaimStrandedTasks already handle "sent but never started",
+// and failing the other way would strand an item on any transient read error.
+func (d *Daemon) agyHandoutQueued(ctx context.Context, paneID, sent string) bool {
+	pane, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
+	if err != nil {
+		slog.Warn("agy hand-out could not be verified against the composer; treating it as delivered",
+			"pane", paneID, "error", err)
+		return false
+	}
+	draft, ok := domain.AgyComposerDraft(pane)
+	if !ok {
+		return false
+	}
+	// The composer holds SOMETHING, which is not yet evidence it holds OURS —
+	// the operator may have started typing in the moment after the send.
+	return domain.AgyDraftMatches(draft, sent)
+}
+
+// escalateQueuedHandout records the escalation for a hand-out the agent queued
+// in its composer instead of starting.
+//
+// The item is deliberately LEFT "[-]" and no ledger row is written: the queued
+// text fires when the current turn ends, so returning the item to "[ ]" would
+// let a second agent take work already on its way to this one, and a ledger row
+// would let reclaimStrandedTasks do exactly that a few minutes later.
+//
+// Deliberately NO Suggestion and NO Input, like escalateNeverStartedTask: a
+// confirm sends the suggestion to the pane as literal text and there is nothing
+// to re-send — the operator has to look at the agent. An empty suggestion makes
+// the row informational: explained by its rationale, dismissible, not
+// confirmable.
+func (d *Daemon) escalateQueuedHandout(ctx context.Context, s domain.Situation,
+	del delivery, now time.Time) {
+
+	sourcePath := ""
+	if del.declared != nil {
+		sourcePath = canonicalTaskPath(del.declared.Locator)
+	}
+	if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: domain.TriggerAutoSendReclaim,
+		SituationType: domain.SituationIdle,
+		Action:        domain.AuditActionTaskQueuedPrefix + domain.DisplayTaskText(del.taskText),
+		Rationale: fmt.Sprintf("[%s] %s queued this hand-out in its composer instead of starting it; "+
+			"it will fire when the current turn ends. Left [-] so it is not sent twice — an agy composer "+
+			"cannot be cleared from outside. Check the agent, then `hap task --path %s undone <n>` if it never runs.",
+			domain.ReasonTaskQueuedInComposer, s.AgentID, sourcePath),
+		Status: "escalated", CreatedAt: now,
+	}); err != nil {
+		slog.Error("auto-send: queued hand-out escalation could not be recorded; "+
+			"the item is left [-] with nothing to explain it",
+			"agent", s.AgentID, "task", del.taskText, "error", err)
+	}
+}
+
 // deliverKeyedForm answers a keyed form autonomously: audit-first (FR-024),
 // then — off the main loop, the verify-commit keystrokes take seconds — the
 // form's deliverer, which re-reads the live pane itself and fails closed when

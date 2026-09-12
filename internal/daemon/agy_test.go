@@ -373,3 +373,121 @@ func TestAgyHandoutsNeedAnEmptyComposer(t *testing.T) {
 		})
 	}
 }
+
+// agyIdleHandout is a caller-reserved declared-task delivery: the shape the
+// pre-delivery review hands down, and the cheapest way to reach the hand-out
+// bookkeeping without standing up a task file.
+func agyIdleHandout(rollback func()) delivery {
+	return delivery{
+		sendText: "Next task: run the suite", input: "Next task: run the suite",
+		declared: &domain.DeclaredTask{Task: "run the suite", Locator: "/tmp/agy-tasks.md"},
+		taskText: "run the suite", rollback: rollback, reservedIndex: 1,
+	}
+}
+
+func agyAgent() domain.AgentTransition {
+	return domain.AgentTransition{AgentID: "pA", PaneID: "pA",
+		AgentType: domain.AgentTypeAgy, Status: "idle"}
+}
+
+// A hand-out is refused when a menu appears AFTER the composer proof.
+//
+// The proof at the top of deliverAutonomousClaimed is taken BEFORE the audit
+// write and the checklist reservation, and each of those is a remote round trip
+// under turso or a gist source — so the screen it certified can be seconds stale
+// by the time the keystrokes go out. agy commits a menu choice on the bare digit
+// and does not honour bracketed paste at a modal, so a hand-out landing on an
+// approval picks an option; option 3 on that menu writes settings.json.
+//
+// The "ignored" audit row is the DISCRIMINATOR. It is written after the opening
+// proof, so its presence proves that proof passed and only the last look before
+// the send refused. Without it this test would pass just as happily if the
+// opening proof had done the refusing — which is what a fake answering every
+// read identically would have shown.
+func TestAgyHandoutRefusedWhenAMenuAppearsAfterTheComposerProof(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "")
+	// Read one is the ready composer the opening proof certifies; every read
+	// after it is the approval agy drew while the audit row was being written.
+	h.herdr.setPaneScript(agyReadyPane, agyApprovalPane)
+	h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
+
+	rolled := false
+	s := domain.Situation{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+		Type: domain.SituationIdle, Status: "idle", Content: agyReadyPane}
+	sent := h.daemon.deliverAutonomous(ctx, s, domain.ComputeSignature(s),
+		domain.Decision{Input: "Next task: run the suite", Confidence: 1},
+		agyAgent(), agyIdleHandout(func() { rolled = true }), time.Now())
+
+	if sent {
+		t.Error("reported a send after the composer stopped being ready")
+	}
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Fatalf("typed %v into a standing approval — a bare digit there commits an option", got)
+	}
+	if !rolled {
+		t.Error("the checklist reservation must be released when nothing was sent")
+	}
+	if !auditFor(t, h, "pA", domain.AuditStatusIgnored) {
+		t.Error("want an 'ignored' audit row: the opening proof passed and the audit row was " +
+			"written, so only the last look before the send can have refused")
+	}
+}
+
+// agy accepting the keystrokes is not agy starting the task: text typed during a
+// turn is QUEUED in the composer and fires whenever that turn ends. Such an item
+// must be left "[-]" and escalated, never given a ledger row — reclaimStranded
+// Tasks would return it to "[ ]" a few minutes later while the queued copy was
+// still on its way to this same agent, and nothing can clear an agy composer
+// from outside (herdr rejects every spelling of C-u), so that is a double send
+// that cannot be called back.
+func TestAgyQueuedHandoutIsLeftInProgressAndEscalated(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "")
+	h.herdr.setPane(agyReadyPane)
+	h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
+	// The pane repaints to show the hand-out sitting unsent in the composer —
+	// what agy really does when the text arrives mid-turn.
+	h.herdr.onSend = func(f *fakeHerdr, input string) {
+		f.pane = "  Working on it.\n\n────────────────────────────────────────\n> " + input +
+			"\n────────────────────────────────────────\n" +
+			"                                                        Gemini 3.6 Flash · low\n"
+	}
+
+	rolled := false
+	s := domain.Situation{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+		Type: domain.SituationIdle, Status: "idle", Content: agyReadyPane}
+	sent := h.daemon.deliverAutonomous(ctx, s, domain.ComputeSignature(s),
+		domain.Decision{Input: "Next task: run the suite", Confidence: 1},
+		agyAgent(), agyIdleHandout(func() { rolled = true }), time.Now())
+
+	if !sent || len(h.herdr.sentInputs()) != 1 {
+		t.Fatalf("the hand-out should still have been sent: sent=%v inputs=%v", sent, h.herdr.sentInputs())
+	}
+	if rolled {
+		t.Error("a queued hand-out must NOT be rolled back to [ ]: the queued copy still fires, " +
+			"so a second agent taking the item would run it twice")
+	}
+	res, err := h.raw.OpenTaskReservations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 0 {
+		t.Errorf("reservations = %+v, want none: a ledger row is what reclaimStrandedTasks would "+
+			"later use to return this item to [ ]", res)
+	}
+	rows, err := h.raw.AuditLog(ctx, 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if strings.HasPrefix(r.Action, domain.AuditActionTaskQueuedPrefix) && r.Status == "escalated" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("want an escalation naming the queued hand-out, so the operator learns the item " +
+			"is parked at [-] rather than lost")
+	}
+}
