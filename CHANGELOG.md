@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.38
+
+- Fixed hap reporting an agy agent as idle while a prompt it does not recognise is on screen: agy must now show its composer to earn the idle verdict, so an unreadable modal escalates instead of being offered the next task. Previously such an agent could sit untouched behind a standing prompt while hap treated it as free — and a pane scored idle is exactly the one a hand-out gets typed into.
+
 ## 0.9.37
 
 - Fixed `hap mode` failing to read or set an agy agent's permission mode while it had background work running: agy paints a task strip above its footer and adds a `N task(s)` suffix to the status bar, and neither was recognised — which put `acceptEdits` out of reach for exactly the agents that run background tasks.
