@@ -117,6 +117,18 @@ func TestAStaleConsultWhoseSituationChangedStillEscalates(t *testing.T) {
 		})
 	h.herdr.setPane(agyApprovalPane)
 
+	// The fixture must genuinely be a DIFFERENT situation. This case would pass
+	// on the old code too, which escalated unconditionally, so without this the
+	// whole test could be asserting on a pane that never actually moved — the
+	// two approvals differ only in the command, and their option lists are
+	// byte-identical.
+	cl := classifierForTest()
+	before := domain.ComputeSignature(cl.Classify(domain.AgentTypeAgy, "done", agyApprovalPane))
+	after := domain.ComputeSignature(cl.Classify(domain.AgentTypeAgy, "done", agyOtherApprovalPane))
+	if before.Raw == after.Raw {
+		t.Fatalf("fixture is not a different situation: both panes hash to %s", before.Raw)
+	}
+
 	h.pushAgy("agent-stale-changed", "done")
 
 	esc := waitForOneEscalation(t, h)

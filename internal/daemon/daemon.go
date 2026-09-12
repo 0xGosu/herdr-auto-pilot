@@ -5345,6 +5345,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		form, ok := domain.ParseMCQForm(s.AgentType, pane)
 		if !ok || form.Kind != s.MCQKind || form.AnswerCount != s.EffectiveAnswerCount() ||
 			domain.ExtractAgentMCQForm(s.MCQKind, pane) != domain.FirstMCQQuestion(s.Content) {
+			// Routed through staleReject so all three staleness exits behave
+			// alike, but the "gone" answer is currently unreachable HERE: this
+			// branch needs EffectiveAnswerCount() > 1, which is never set on an
+			// agy situation (see domain.AgyMCQForm), and for claude/codex
+			// ConsultTargetGone answers false by construction. It escalates
+			// today; it is wired this way so a future widening cannot forget it.
 			staleReject("stale: form changed during consult")
 			return
 		}
