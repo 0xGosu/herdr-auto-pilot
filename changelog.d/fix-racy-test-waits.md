@@ -1,0 +1,1 @@
+- Fixed two daemon tests that read state the daemon writes a moment later, so a loaded machine no longer fails the fleet-sync recovery and SQLite hand-out cases for reasons unrelated to what they cover

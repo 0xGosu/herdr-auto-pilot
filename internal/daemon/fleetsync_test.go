@@ -205,9 +205,17 @@ func TestFleetSyncHealthReportsErrorsAndRecovery(t *testing.T) {
 	sync.mu.Lock()
 	sync.pullErr = nil
 	sync.mu.Unlock()
+	// The wait must cover EVERY field the assertion below reads, revision
+	// included. A successful pull publishes the recovery in two steps —
+	// fleetPull sets lastPull and clears the error, and only then does
+	// fleetRefreshStats store the revision — so a wait on lastPull/LastError
+	// alone can return in the window where Revision is still empty, and the
+	// assertion then fails on a half-updated snapshot rather than on anything
+	// the test is about. Cheap under load, invisible when the machine is idle.
 	waitFor(t, 2*time.Second, func() bool {
 		fh := h.daemon.fleetHealth()
-		return fh != nil && fh.LastError == "" && !fh.LastPullAt.IsZero()
+		return fh != nil && fh.LastError == "" && !fh.LastPullAt.IsZero() &&
+			fh.Revision == "r1"
 	})
 	fh = h.daemon.fleetHealth()
 	if fh.LastError != "" || fh.Revision != "r1" {

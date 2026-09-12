@@ -1912,10 +1912,15 @@ func TestAutoSendIdleHandsOutFromASQLiteProviderList(t *testing.T) {
 	}
 	// The reservation ledger keys on the locator, so the reclaim sweep can
 	// find the row again through the same database backend.
-	res, err := h.raw.OpenTaskReservations(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
+	//
+	// WAITED for, never asserted outright: deliverAutonomousClaimed records the
+	// row AFTER the send ("Recorded AFTER the send, so the failed-send path …
+	// never leaves a row behind"), while both signals this test already waited
+	// on — the sent input and the "[-]" mark — land BEFORE it. Reading the
+	// ledger immediately therefore races that write and fails with an empty
+	// list under load, which is a property of the test, not of the hand-out.
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	res := openHandouts(t, h)
 	if len(res) != 1 || res[0].SourcePath != locator {
 		t.Errorf("reservations = %+v, want one keyed on %s", res, locator)
 	}
