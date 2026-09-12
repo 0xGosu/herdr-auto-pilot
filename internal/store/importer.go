@@ -55,8 +55,8 @@ func ImportLegacy(ctx context.Context, legacyPath, markerPath string, dst *Store
 	}
 	defer src.Close()
 
-	imp := &importer{src: src, dst: dst, ctx: ctx, legacyPath: legacyPath,
-		decisions: map[int64]int64{}, audits: map[int64]int64{}, corrections: map[int64]int64{}}
+	imp := newImporter(ctx, src, dst)
+	imp.legacyPath = legacyPath
 	err = dst.tx(ctx, imp.run)
 	switch {
 	case errors.Is(err, errAlreadyImported):
@@ -87,29 +87,89 @@ type importer struct {
 	decisions   map[int64]int64
 	audits      map[int64]int64
 	corrections map[int64]int64
+
+	// srcNode, when non-empty, restricts every NODE-SCOPED table to that
+	// node's rows. Empty means "take the table whole", which is what
+	// ImportLegacy does (a legacy file is one machine's by construction) and
+	// what `hap migrate --all-nodes` asks for.
+	srcNode string
+	// seq holds a per-table id counter, used ONLY when the destination has no
+	// allocator — the sqlite engine, where ids are normally AUTOINCREMENT.
+	// See nextID for why an explicit id is still assigned there.
+	seq map[string]int64
+	// table is the table being copied, which is what nextID keys seq on.
+	table string
+	// counts records rows written per table, in copy order, for the migrate
+	// report. Nil for ImportLegacy, which reports through the log instead.
+	counts map[string]int
+	order  []string
+}
+
+// newImporter builds a copier from src into dst with empty remap tables. The
+// caller sets legacyPath, srcNode and counts for what it needs.
+func newImporter(ctx context.Context, src, dst *Store) *importer {
+	return &importer{
+		src: src, dst: dst, ctx: ctx,
+		decisions: map[int64]int64{}, audits: map[int64]int64{}, corrections: map[int64]int64{},
+		seq: map[string]int64{},
+	}
 }
 
 // row is one legacy row, by column name.
 type row map[string]any
 
+// copyStep is one table's copy: which rows come over, and how each is rewritten
+// before it is inserted.
+type copyStep struct {
+	table string
+	cols  string
+	order string
+	// keep decides whether a row is imported; xform rewrites it (ids,
+	// references, node) before the insert.
+	keep  func(r row) bool
+	xform func(r row)
+}
+
 func (im *importer) run(tx *sql.Tx) error {
-	self := im.dst.self
 	var done int
-	if err := tx.QueryRowContext(im.ctx, `SELECT count(*) FROM legacy_imports WHERE node_id = ?`, self).Scan(&done); err != nil {
+	if err := tx.QueryRowContext(im.ctx, `SELECT count(*) FROM legacy_imports WHERE node_id = ?`, im.dst.self).Scan(&done); err != nil {
 		return err
 	}
 	if done > 0 {
 		return errAlreadyImported
 	}
-	steps := []struct {
-		table string
-		cols  string
-		order string
-		// keep decides whether a row is imported; xform rewrites it (ids,
-		// references, node) before the insert.
-		keep  func(r row) bool
-		xform func(r row)
-	}{
+	if err := im.copyAll(tx); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(im.ctx, `INSERT INTO legacy_imports (node_id, legacy_path, imported_at) VALUES (?, ?, ?)`,
+		im.dst.self, im.legacyPath, unix(time.Now()))
+	return err
+}
+
+// copyAll runs every step of the copy list against tx. It is the whole of the
+// data movement, shared by ImportLegacy and Migrate so the two can never drift
+// — the id re-allocation, the reference remapping and the deliberate omissions
+// are the hard part, and a second implementation of them would be the worst
+// outcome for a database this one writes into.
+func (im *importer) copyAll(tx *sql.Tx) error {
+	for _, st := range im.copySteps() {
+		if err := im.copyTable(tx, st.table, st.cols, st.order, st.keep, st.xform); err != nil {
+			return fmt.Errorf("%s: %w", st.table, err)
+		}
+		if im.idErr != nil {
+			return fmt.Errorf("%s: allocate id: %w", st.table, im.idErr)
+		}
+	}
+	return nil
+}
+
+// copySteps is the copy list, in dependency order: a table that is remapped
+// THROUGH another (audit_log through decisions, corrections through audit_log,
+// agent_actions through corrections) is copied after it, because the old→new
+// map is built as the referenced table is written.
+func (im *importer) copySteps() []copyStep {
+	self := im.dst.self
+	return []copyStep{
 		{"operator", "id, label", "id", nil, nil},
 		{"decisions", decisionCols, "id", nil, func(r row) {
 			old := r["id"].(int64)
@@ -175,22 +235,25 @@ func (im *importer) run(tx *sql.Tx) error {
 				r["id"], r["node_id"] = im.nextID(), self
 			}},
 	}
-	for _, st := range steps {
-		if err := im.copyTable(tx, st.table, st.cols, st.order, st.keep, st.xform); err != nil {
-			return fmt.Errorf("%s: %w", st.table, err)
-		}
-		if im.idErr != nil {
-			return fmt.Errorf("%s: allocate id: %w", st.table, im.idErr)
-		}
-	}
-	_, err := tx.ExecContext(im.ctx, `INSERT INTO legacy_imports (node_id, legacy_path, imported_at) VALUES (?, ?, ?)`,
-		self, im.legacyPath, unix(time.Now()))
-	return err
 }
 
 // nextID allocates an id for an imported row, remembering the first failure;
-// run aborts the transaction on it rather than writing rows with no id.
+// copyAll aborts the transaction on it rather than writing rows with no id.
+//
+// A destination with no allocator is the sqlite engine, whose INTEGER PRIMARY
+// KEYs are normally AUTOINCREMENT. The copy still assigns them EXPLICITLY,
+// counting up from the table's current MAX(id): the copy list is walked in
+// ascending old-id order precisely so relative order — and every "newest by
+// id" query — survives, and letting the database assign would put that
+// property at the mercy of insert order while giving nothing back. SQLite
+// advances sqlite_sequence for an explicit rowid above the current maximum, so
+// ordinary AUTOINCREMENT inserts continue after the copied rows rather than
+// colliding with them.
 func (im *importer) nextID() int64 {
+	if im.dst.ids == nil {
+		im.seq[im.table]++
+		return im.seq[im.table]
+	}
 	id, err := im.dst.ids.Next()
 	if err != nil && im.idErr == nil {
 		im.idErr = err
@@ -230,9 +293,37 @@ func remapFloor(decisions map[int64]int64, oldFloor int64) int64 {
 }
 
 // copyTable streams one table from src into tx.
+//
+// The node filter is applied to the SOURCE read, not to the write: a shared
+// turso database holds every node's rows, and a local sqlite file belongs to
+// one machine, so a copy out of the fleet has to choose. It is a predicate on
+// the read rather than a `keep` func because a fleet-sized audit_log should not
+// cross the process boundary only to be discarded.
+//
+// (This statement is invisible to TestEveryNodeOwnedStatementIsNodeScoped — the
+// guard flattens a call's SQL argument, and every part of this one, the table
+// name included, is a variable. That is pre-existing and unavoidable for a
+// generic copier; the scoping is enforced here by migrateNodeScoped, which a
+// test pins against the guard's own list.)
 func (im *importer) copyTable(tx *sql.Tx, table, cols, order string, keep func(row) bool, xform func(row)) error {
+	im.table = table
 	names := splitCols(cols)
-	rows, err := im.src.db.QueryContext(im.ctx, `SELECT `+cols+` FROM `+table+` ORDER BY `+order)
+	query := `SELECT ` + cols + ` FROM ` + table + ` ORDER BY ` + order
+	var args []any
+	if im.srcNode != "" && migrateNodeScoped[table] {
+		query = `SELECT ` + cols + ` FROM ` + table + ` WHERE node_id = ? ORDER BY ` + order
+		args = []any{im.srcNode}
+	}
+	// Seeded before the first insert, from the DESTINATION: an explicit id
+	// counting up from a stale maximum would collide with rows already there.
+	if im.dst.ids == nil && migrateExplicitID[table] {
+		var maxID int64
+		if err := tx.QueryRowContext(im.ctx, `SELECT COALESCE(MAX(id), 0) FROM `+table).Scan(&maxID); err != nil {
+			return err
+		}
+		im.seq[table] = maxID
+	}
+	rows, err := im.src.db.QueryContext(im.ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -261,6 +352,7 @@ func (im *importer) copyTable(tx *sql.Tx, table, cols, order string, keep func(r
 	// destination may be one and the same engine in tests, and an open reader
 	// blocks a writer on Turso.
 	insert := `INSERT OR IGNORE INTO ` + table + ` (` + cols + `) VALUES (` + inPlaceholders(len(names)) + `)`
+	written := 0
 	for _, r := range batch {
 		if keep != nil && !keep(r) {
 			continue
@@ -268,13 +360,33 @@ func (im *importer) copyTable(tx *sql.Tx, table, cols, order string, keep func(r
 		if xform != nil {
 			xform(r)
 		}
-		args := make([]any, len(names))
+		vals := make([]any, len(names))
 		for i, n := range names {
-			args[i] = r[n]
+			vals[i] = r[n]
 		}
-		if _, err := tx.ExecContext(im.ctx, insert, args...); err != nil {
+		res, err := tx.ExecContext(im.ctx, insert, vals...)
+		if err != nil {
 			return err
 		}
+		// RowsAffected, not the loop count: content-keyed knowledge merges
+		// into what the destination already holds (INSERT OR IGNORE), so a row
+		// the destination already had is offered and not written — and a
+		// report that counted it would tell the operator their rules were
+		// copied when they were skipped. An engine that cannot answer is
+		// counted optimistically rather than dropping the table from the
+		// report altogether.
+		if im.counts != nil {
+			n, err := res.RowsAffected()
+			if err != nil || n > 0 {
+				written++
+			}
+		}
+	}
+	if im.counts != nil {
+		if _, seen := im.counts[table]; !seen {
+			im.order = append(im.order, table)
+		}
+		im.counts[table] += written
 	}
 	return nil
 }

@@ -793,6 +793,17 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # turso_database_url = "libsql://<name>-<org>.turso.io"
 # turso_auth_token = ""                   # empty = read TURSO_AUTH_TOKEN from the environment
 # turso_sync_interval_seconds = 15        # how often the daemon pulls (min 5)
+# turso_sync_paused = false               # true = stop talking to Turso Cloud, keep everything else
+#                                         # the same: the engine stays "turso", the local replica
+#                                         # stays the store, and unpushed writes travel on the first
+#                                         # push after you turn it off. For a metered network or a
+#                                         # Turso incident, without unpicking the URL and the token.
+#                                         # While paused this node sees none of the fleet's
+#                                         # escalations and the fleet sees none of its own; `hap
+#                                         # status` reports the sync as PAUSED, never as failing.
+#                                         # The ONE key in this section that applies on
+#                                         # `hap daemon --reload` (so `hap config set` is enough) —
+#                                         # the rest are read when a process opens its store.
 # node_label = ""                         # how other machines see this one (default: hostname)
 
 # ── Where task lists are stored: the DEFAULT (per-source overridable) ──

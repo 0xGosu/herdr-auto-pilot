@@ -6703,6 +6703,13 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 		return config.ValidTaskSourceProviders, true
 	case "database.engine":
 		return config.ValidDatabaseEngines, true
+	case "database.turso_sync_paused":
+		// A picker rather than the free-text box every other bool key gets,
+		// for the reason taskSourceBoolPrompt gives: this one decides whether
+		// the herd is on the wire at all, so it is chosen from a list instead
+		// of typed — and mistyped, which here would fail the SetField parse
+		// and leave the operator believing they had paused.
+		return []string{"false", "true"}, true
 	default:
 		return nil, false
 	}

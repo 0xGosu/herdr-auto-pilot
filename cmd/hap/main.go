@@ -242,6 +242,12 @@ func run(verb string, args []string) error {
 		return embedder.RunWorker(ctx, os.Stdin, os.Stdout)
 	case "mcp":
 		return runMCP(ctx, paths)
+	case "migrate":
+		// Dispatched here rather than through cli.Run's handler table because
+		// it opens BOTH store engines directly, which only this package may do
+		// — see runMigrate. buildApp would open exactly one, through the proxy
+		// this command's own precondition rules out.
+		return runMigrate(ctx, paths, os.Stdout, args)
 	case "tui":
 		app, closeStore, err := buildApp(paths)
 		if err != nil {

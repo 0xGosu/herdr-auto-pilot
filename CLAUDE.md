@@ -623,6 +623,40 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   them one at a time and wipe between.
   - `hasOpenEscalation` asks the store, never filters the fleet queue by agent id in Go — that would let
     another machine's pane `1` block this one's reconcile.
+  - **There is ONE copier between the two engines** (`store.importer.copyAll`), and both the automatic
+    legacy import and `hap migrate` go through it. Re-allocating ids in ascending old-id order, remapping
+    every cross reference and omitting the in-flight rows is the hard part; a second implementation that
+    drifted would corrupt the database it writes into. Four direction-specific rules:
+    - **The two ends of node scope are ASYMMETRIC on purpose: the SOURCE's node selects, the
+      DESTINATION's stamps.** A shared database holds every node's rows and a local file belongs to one
+      machine, so `--to sqlite` filters `migrateNodeScoped` on the SOURCE's node ("which rows are mine to
+      take") while `stampNode` writes the DESTINATION's ("whose they are now"). Getting either backwards
+      fails silently in its own way: filtering on the destination's selects NOTHING when the two differ,
+      and stamping the source's copies a history that every operational query — all scoped to
+      `node_id = self` — then refuses to show, so the migration reports success over an empty
+      `hap escalations`. `--all-nodes` therefore FLATTENS the fleet into one node, which is what makes it a
+      consolidation rather than an archive (and why colliding agent names lose the second copy).
+      `migrateNodeScoped`/`migrateExplicitID` MIRROR the lists in `nodescope_test.go` and are pinned to
+      them by `TestMigrateScopeListsMatchTheGuard`: a table that gains a `node_id` elsewhere and is not
+      added here comes over WHOLE, silently.
+    - **Knowledge is never scoped.** `signatures`, `signature_embeddings`, `signature_snapshots` and
+      `decisions` carry no `node_id` on purpose (rules graduate on the FLEET's evidence), so filtering them
+      would silently downgrade what the destination knows.
+    - **A destination with no allocator still gets EXPLICIT ids** (`nextID`, counting from that table's
+      `MAX(id)`), rather than falling back to AUTOINCREMENT: the ascending-order property is the whole
+      reason the copy list is walked in old-id order, and SQLite advances `sqlite_sequence` for an explicit
+      rowid above the maximum, so later inserts continue after the copied rows.
+    - **The re-run guard is an EMPTY destination, not `legacy_imports`.** That table is keyed by node and
+      records one origin, so gating on it would make the round trip this feature exists for impossible;
+      migrate writes it as a RECORD (which also stops the automatic import re-folding the same local file)
+      and refuses on `ErrDestinationNotEmpty` instead. Merging is not available at all — every id is
+      re-allocated, so `INSERT OR IGNORE` cannot recognize a row it already wrote under a different one.
+
+    `cmd/hap/migrate.go` holds the preconditions because it is the only package that may open BOTH engines:
+    every other process reaches a turso store through the daemon's proxy, and the command's own precondition
+    is that no daemon is running. It backs the destination up **before either handle is opened** and takes
+    the `-wal`/`-shm` sidecars with it (a copy from under an open handle loses whatever the WAL had not
+    folded in), and it honours `database.turso_sync_paused` by skipping the framing pull/push.
   - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a
     `database/sql` driver over `<state>/store.sock` (`internal/store/sqlbridge`), lazily dialled so
     `hap config` works with no daemon.
@@ -642,6 +676,30 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     cannot establish the lease fails closed rather than migrating blind.
   - `fleetRun` runs every sync op off the loop and waits for it OR shutdown; `turso.DB.Close` waits a
     bounded time and refuses to close underneath an in-flight op.
+  - **`database.turso_sync_paused` gates the CLOUD round trips only, and it is the one `[database]` key
+    read LIVE** (`daemon.fleetSyncPaused` off `d.snapshot()`, not captured at loop start like
+    `FleetSyncInterval`) — a pause reachable only through `--restart` costs the herd the in-flight work it
+    exists to protect, which is why `hap config set` suppresses the section's usual restart note for this
+    key alone and `hap help daemon` states the exception. Four things the gate must NOT do:
+    - **the shutdown push is gated too** — it is the one cloud call outside the loop's ordinary path, so a
+      paused node would otherwise reach Turso Cloud exactly once, at exit;
+    - **the pull tick still runs its LOCAL half** (`fleetPausedTick`): a sync database never checkpoints
+      itself, so gating the whole pull path grows the replica's WAL for the length of the pause — an engine
+      change, which is precisely what this key promises not to be. Its checkpoint is gated on the WAL bound
+      ALONE, never `fleetPull`'s pull counter: that counter does not advance while paused and starts at 0,
+      so `pulls%fleetCheckpointEveryPulls == 0` is true on EVERY tick of a daemon that started paused;
+    - **`checkFleetSyncWedged` refuses while paused.** A pause freezes `lastError`, the failure count and
+      both timestamps while the outage clock keeps running, so a node that happened to be failing when it
+      was paused meets every bound minutes later and restarts itself, again every `fleetRecoveryRetryInterval`
+      — elapsed time is evidence of an outage only while something is still trying;
+    - **lifting the pause pushes**, via the loop's own `fleetPushNow` nudge. Every write during the pause
+      armed a debounce timer that fired into the gate and was NOT re-armed, so without it the queued rows
+      wait for an unrelated write — on a quiet machine the node heartbeat, and never the operator's own act.
+    Reporting is one choke point: `daemonhealth.FleetSyncHealth.Paused` short-circuits `Degraded`, from which
+    `IsolatedFor`, `Isolated`, `DiagLines` and both `frontend` banners fall silent; only `Line` carries its own
+    paused branch. A deliberate pause reported as failing is how an operator learns to ignore the banner that
+    means a real outage — but it is still SAID (`hap status`, `FleetSyncPaused`), because a herd off the wire
+    looks exactly like a quiet one.
   - **A front end polls a change token, not the data** (`Store.Revision` → `ports.RevisionReporter`,
     `frontend.App.ChangeKey`, `tui.Model.poll`). Under turso it is the executor's counter
     (`sqlbridge.Executor.Revision`, a `rev` request over a POOLED connection), bumped AFTER every committed

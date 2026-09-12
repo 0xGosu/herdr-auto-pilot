@@ -160,3 +160,60 @@ func TestDiagLinesSayWhenTheAutomaticRecoveryIsSpent(t *testing.T) {
 		t.Errorf("a spent recovery must say that a human is needed now, got %q", got)
 	}
 }
+
+// TestADeliberatePauseIsNeverAFailure: the whole reporting contract for
+// database.turso_sync_paused, on the hardest input — a record that was failing,
+// and isolated, at the moment the operator paused it. The pause freezes
+// LastError, the failure count and both timestamps, so every clock-derived
+// answer would go on aging; reported as DEGRADED or ISOLATED it teaches an
+// operator to ignore the banner that means a real outage.
+//
+// Degraded is the single choke point (IsolatedFor returns 0 for a sync that is
+// not degraded), so asserting all four here is what proves the cascade rather
+// than one branch of it.
+func TestADeliberatePauseIsNeverAFailure(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	paused := &FleetSyncHealth{
+		Engine: "turso", Bootstrapped: true, Paused: true,
+		LastPullAt:          now.Add(-3 * time.Hour),
+		LastPushAt:          now.Add(-3 * time.Hour),
+		LastError:           "SecPolicyCreateSSL error: 0",
+		FirstFailureAt:      now.Add(-3 * time.Hour),
+		ConsecutiveFailures: 400,
+		PendingOps:          17,
+		FDSoft:              256, FDHard: 4096, FDExhausted: true,
+	}
+	if paused.Degraded() {
+		t.Error("a paused sync must not be degraded — nothing is being attempted")
+	}
+	if paused.Isolated(now) || paused.IsolatedFor(now) != 0 {
+		t.Errorf("a paused sync read as isolated for %s", paused.IsolatedFor(now))
+	}
+	if paused.DiagLines(now) != nil {
+		t.Errorf("a paused sync produced failure evidence: %q", paused.DiagLines(now))
+	}
+	line := paused.Line(now)
+	if !strings.Contains(line, "PAUSED") || !strings.Contains(line, "turso_sync_paused") {
+		t.Errorf("status line %q must name the pause and the key that ends it", line)
+	}
+	// The unpushed count is how an operator judges when to lift the pause.
+	if !strings.Contains(line, "17 unpushed") {
+		t.Errorf("status line %q does not carry the queued-write count", line)
+	}
+	for _, unwanted := range []string{"DEGRADED", "ISOLATED", "BOOTSTRAP", "SecPolicyCreateSSL"} {
+		if strings.Contains(line, unwanted) {
+			t.Errorf("status line %q reports a paused sync as %q", line, unwanted)
+		}
+	}
+
+	// The control: the identical record with the pause off is the failure it
+	// always was. Without this, a Degraded() hardwired to false passes above.
+	running := *paused
+	running.Paused = false
+	if !running.Degraded() || !running.Isolated(now) {
+		t.Fatal("the same record with the pause OFF must still be degraded and isolated")
+	}
+	if !strings.Contains(running.Line(now), "ISOLATED") {
+		t.Errorf("unpaused status line = %q, want ISOLATED", running.Line(now))
+	}
+}
