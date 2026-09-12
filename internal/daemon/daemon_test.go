@@ -104,6 +104,20 @@ type fakeHerdr struct {
 	// session-rename push verifies its own keystroke by re-reading the pane,
 	// so a fake that never repaints could only ever prove the failure path.
 	onSend func(f *fakeHerdr, input string)
+	// paneScript serves a DIFFERENT pane to each successive read, the last entry
+	// sticking. A gate that is re-proven immediately before a send is invisible
+	// to a fake that answers every read identically — such a test passes whether
+	// or not the second proof is there — so the window has to be modelled as what
+	// it is: the screen changing between one read and the next.
+	paneScript []string
+	// readAt / sentAt record WHEN each pane read and each send happened. A
+	// verification that must wait for the agent's TUI to repaint before it reads
+	// back cannot be proven by content alone: a fake that repaints inside Send
+	// has the new screen up before the read either way. The GAP between the send
+	// and the read is the thing under test, so it is recorded rather than
+	// inferred. See TestAgyHandoutIsNotReadBackBeforeAgyCanRepaint.
+	readAt []time.Time
+	sentAt []time.Time
 }
 
 func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
@@ -113,6 +127,7 @@ func (f *fakeHerdr) Send(ctx context.Context, paneID, input string) error {
 		return errors.New("induced send failure")
 	}
 	f.sent = append(f.sent, input)
+	f.sentAt = append(f.sentAt, time.Now())
 	if f.onSend != nil {
 		f.onSend(f, input)
 	}
@@ -136,16 +151,32 @@ func (f *fakeHerdr) ReadPane(ctx context.Context, paneID string, lines int) (str
 		panic("induced pane read panic")
 	}
 	f.readLines = append(f.readLines, lines)
+	f.readAt = append(f.readAt, time.Now())
 	if f.failRead {
 		return "", errors.New("induced read failure")
 	}
 	if f.failReadOver > 0 && lines > f.failReadOver {
 		return "", errors.New("induced deep read failure")
 	}
+	if len(f.paneScript) > 0 {
+		content := f.paneScript[0]
+		if len(f.paneScript) > 1 {
+			f.paneScript = f.paneScript[1:]
+		}
+		return content, nil
+	}
 	if len(f.frames) > 0 {
 		return f.renderFrame(), nil
 	}
 	return f.pane, nil
+}
+
+// setPaneScript makes successive reads return successive contents, the last one
+// sticking once the script runs out.
+func (f *fakeHerdr) setPaneScript(contents ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paneScript = append([]string(nil), contents...)
 }
 
 // renderFrame serves the focused multi-tab frame with the tab header's ☐ marks
@@ -498,6 +529,22 @@ func (f *fakeHerdr) sentInputs() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.sent...)
+}
+
+// lastSendToLastReadGap is how long the fake waited between the last send it
+// accepted and the last pane read after it — the settle a read-back has to
+// interpose. Zero when either never happened, or when no read followed the send.
+func (f *fakeHerdr) lastSendToLastReadGap() time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.sentAt) == 0 || len(f.readAt) == 0 {
+		return 0
+	}
+	send, read := f.sentAt[len(f.sentAt)-1], f.readAt[len(f.readAt)-1]
+	if !read.After(send) {
+		return 0
+	}
+	return read.Sub(send)
 }
 
 func (f *fakeHerdr) notified() []string {
@@ -965,6 +1012,12 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The agy hand-out read-back waits a second in production for agy's TUI to
+	// repaint; every test that delivers one would pay it. Shortened here (not in
+	// Options: the daemon's goroutines read it only on a delivery, which cannot
+	// have started before Run) so a test asserting the WAIT itself sets its own
+	// longer value.
+	d.agyHandoutSettle = 20 * time.Millisecond
 
 	ctx, cancel := context.WithCancel(context.Background())
 	runDone := make(chan struct{})

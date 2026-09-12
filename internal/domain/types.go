@@ -525,6 +525,11 @@ const (
 	// ReasonTaskNeverStarted is the bracketed rationale tag of that escalation
 	// (the daemon's convention for machine-readable reasons).
 	ReasonTaskNeverStarted = "task_never_started"
+	// AuditActionTaskQueuedPrefix prefixes the escalation raised when an agent
+	// queued a hand-out in its composer instead of starting it.
+	AuditActionTaskQueuedPrefix = "task_queued:"
+	// ReasonTaskQueuedInComposer is that escalation's bracketed rationale tag.
+	ReasonTaskQueuedInComposer = "task_queued_in_composer"
 )
 
 // TaskReservation is one unattended task hand-out recorded at delivery: the

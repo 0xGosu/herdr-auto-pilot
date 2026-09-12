@@ -216,6 +216,9 @@ type Daemon struct {
 	// verifyUnblockDelay is initialized from unblockCheckDelay. Tests in this
 	// package shorten it to keep asynchronous verification coverage fast.
 	verifyUnblockDelay time.Duration
+	// agyHandoutSettle is initialized from agyHandoutSettleDelay. Tests in this
+	// package shorten it for the same reason.
+	agyHandoutSettle time.Duration
 
 	// exePath is the binary this daemon started from, resolved once at Run
 	// before anything can replace it, and never written again — so the
@@ -826,6 +829,7 @@ func New(opt Options) (*Daemon, error) {
 		taskSnapshots:             map[string]taskSnapshot{},
 		taskReclaimResults:        make(chan taskReclaimOutcome, 32),
 		verifyUnblockDelay:        unblockCheckDelay,
+		agyHandoutSettle:          agyHandoutSettleDelay,
 		transitions:               make(chan domain.AgentTransition, 256),
 		nudges:                    make(chan control.Kind, 16),
 		llmResults:                make(chan llmOutcome, 16),
@@ -3345,6 +3349,30 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		}
 	}
 
+	// The LAST look before the keystrokes go out. The proof above was taken
+	// before the audit write and the checklist reservation, and each of those is
+	// a remote round trip — a Turso commit, or a gist read-modify-write — so
+	// seconds can pass in which agy draws an approval menu over the composer that
+	// was empty when we looked. agy commits a menu choice on the BARE DIGIT and
+	// does not honour bracketed paste at a modal, so a hand-out landing there
+	// selects an option and spills its remainder into the composer: observed live
+	// 2026-09-12, where the hand-out boilerplate's "index 2" took the
+	// conversation-wide "always allow" row. Option 3 on that same menu writes
+	// settings.json, so nothing here may be sent on a stale proof. Same shape as
+	// claimBlockedBy's last look before an auto-accept claim.
+	if domain.IsAgy(s.AgentType) {
+		if err := d.agyComposerRefusal(ctx, s.PaneID); err != nil {
+			slog.Info("agy's composer stopped being ready between the proof and the send; nothing was typed",
+				"agent", s.AgentID, "reason", err)
+			rollback()
+			// Nothing reached the pane, so this is not a delivery failure and the
+			// operator is not notified: the row is retired and a later sweep
+			// decides again. The claim is released by deliverAutonomous on !sent.
+			d.opt.Store.UpdateAuditStatus(ctx, auditID, domain.AuditStatusIgnored)
+			return false
+		}
+	}
+
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
 		// A failed send leaves NO reservation behind — the ledger row below is
@@ -3396,19 +3424,22 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	// again without ever doing so returns the item to "[ ]" for a fresh attempt
 	// (reclaimStrandedTasks). Recorded AFTER the send, so the failed-send path
 	// above — which rolls the item back itself — never leaves a row behind.
-	if reservedIndex > 0 {
-		if _, err := d.opt.Store.RecordTaskReservation(ctx, domain.TaskReservation{
-			SourcePath: canonicalTaskPath(del.declared.Locator), TaskText: del.taskText,
-			ItemIndex: reservedIndex,
-			AgentID:   s.AgentID, PaneID: s.PaneID, TerminalID: s.TerminalID,
-			AuditID: auditID, ReservedAt: now,
-		}); err != nil {
-			// Losing the row costs the self-healing for THIS hand-out (the item
-			// stays "[-]" until an operator clears it), exactly the old
-			// behavior — never a double send.
-			slog.Error("auto-send: hand-out could not be recorded; this task will not self-heal if it is never started",
-				"agent", s.AgentID, "task", del.taskText, "error", err)
-		}
+	//
+	// agy is the one agent that can accept the keystrokes and still not start:
+	// it QUEUES text typed during a turn in its composer. Reading the composer
+	// back is what tells that apart from a turn that began, and a queued item
+	// must NOT get a ledger row — reclaimStrandedTasks would return it to "[ ]"
+	// while the queued copy is still on its way to this same agent, and that
+	// double send cannot be called back (herdr rejects C-u, so nothing can clear
+	// an agy composer). It stays "[-]" and the operator is asked instead.
+	//
+	// That read-back has to WAIT for agy to repaint and so cannot happen here —
+	// verifyAgyHandout owns both outcomes off the loop.
+	switch {
+	case reservedIndex > 0 && domain.IsAgy(s.AgentType):
+		d.verifyAgyHandout(ctx, s, del, auditID, reservedIndex, now)
+	case reservedIndex > 0:
+		d.recordHandoutReservation(ctx, s, del, auditID, reservedIndex, now)
 	}
 
 	// Learning + counters (daemon-owned hot-path rows). The action-review

@@ -372,3 +372,158 @@ func TestAgyFormSameAs(t *testing.T) {
 		t.Errorf("question 1 and question 2 must be different forms: %+v / %+v", q1, q2)
 	}
 }
+
+const agyRule = "────────────────────────────────────────"
+
+// agyDraftScreen renders a capture whose composer holds body, with the bottom
+// chrome agy paints while a draft stands: the model segment WITHOUT the
+// "? for shortcuts" token, which agy drops as soon as anything is typed.
+func agyDraftScreen(body string) string {
+	return "  Working on it.\n\n" + agyRule + "\n" + body + "\n" + agyRule + "\n" +
+		"                                                        Gemini 3.6 Flash · low\n"
+}
+
+// AgyComposerDraft is what tells "the hand-out is queued, unsent" apart from
+// "the agent took it and is working" — AgyComposerReady collapses both into
+// "not ready", which is the right answer before a send and useless after one.
+func TestAgyComposerDraftReadsBackQueuedText(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pane string
+		want string
+	}{
+		{"empty composer is not a draft", agyComposer, ""},
+		{"operator's draft", agyDraftScreen("> half-typed thought"), "half-typed thought"},
+		// The whole reason the block is read between the rules rather than at a
+		// fixed offset: a hand-out is long and agy wraps it.
+		{"a wrapped multi-line hand-out is rejoined",
+			agyDraftScreen("> Next task: run the suite\n  and report back"),
+			"Next task: run the suite and report back"},
+		// A mode placeholder is agy's own text in an EMPTY composer, not a draft.
+		{"mode placeholder is not a draft",
+			agyDraftScreen("> Plan mode: research & plan only (shift+tab to cycle)"), ""},
+		// No composer sandwich at the bottom at all.
+		{"standing approval", agyApprovalScreen(), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, verdict := AgyComposerDraft(tc.pane, agyComposerScanLimit)
+			if tc.want == "" {
+				if verdict != AgyDraftNone {
+					t.Fatalf("AgyComposerDraft = %q, %v; want no draft", got, verdict)
+				}
+				return
+			}
+			if verdict != AgyDraftPresent || got != tc.want {
+				t.Errorf("AgyComposerDraft = %q, %v; want %q, AgyDraftPresent", got, verdict, tc.want)
+			}
+		})
+	}
+}
+
+// A hand-out taller than the scan window must read as UNREADABLE, never as "no
+// draft". The two used to be the same answer, and the caller's ledger path —
+// safe only when the item really was taken up — then ran for precisely the
+// LARGE hand-outs, returning an item to "[ ]" while its queued copy was still on
+// its way to the same agent.
+//
+// The control is the same pane read with a window wide enough for it: without
+// it this test would pass just as happily if the parser had stopped recognizing
+// the screen at all.
+func TestATallComposerBlockIsUnreadableRatherThanAbsent(t *testing.T) {
+	body := "> Next task: run the suite"
+	for i := 0; i < 40; i++ {
+		body += "\n  and then report back on what failed"
+	}
+	pane := agyDraftScreen(body)
+
+	if got, verdict := AgyComposerDraft(pane, agyComposerScanLimit); verdict != AgyDraftUnreadable {
+		t.Errorf("with a %d-line window: = %q, %v; want AgyDraftUnreadable — "+
+			"reading a too-tall composer as 'no draft' is what sends the caller down the ledger path",
+			agyComposerScanLimit, got, verdict)
+	}
+	// Control: the SAME pane, with the window a caller who knows what it sent
+	// would compute, reads the draft back.
+	sent := "Next task: run the suite" + strings.Repeat(" and then report back on what failed", 40)
+	got, verdict := AgyComposerDraft(pane, AgyDraftScanLimit(sent))
+	if verdict != AgyDraftPresent || !strings.HasPrefix(got, "Next task: run the suite and then") {
+		t.Errorf("with the scaled window: = %.60q, %v; want the draft back", got, verdict)
+	}
+}
+
+// The scan window has to reach past a realistic hand-out, which wraps well
+// beyond 20 lines, while still being bounded.
+func TestAgyDraftScanLimitScalesWithWhatWasSent(t *testing.T) {
+	if got := AgyDraftScanLimit("go"); got != agyComposerScanLimit {
+		t.Errorf("AgyDraftScanLimit(short) = %d, want the %d floor", got, agyComposerScanLimit)
+	}
+	// A rendered task prompt: boilerplate plus the task text.
+	handout := strings.Repeat("Next task: run the full suite and report back. ", 20)
+	got := AgyDraftScanLimit(handout)
+	if want := len(handout) / agyDraftWrapWidth; got < want {
+		t.Errorf("AgyDraftScanLimit(handout) = %d, want at least %d lines — a window shorter than "+
+			"the text can wrap to is unreachable for exactly the common case", got, want)
+	}
+	if got := AgyDraftScanLimit(strings.Repeat("x", 100000)); got != agyComposerScanCeiling {
+		t.Errorf("AgyDraftScanLimit(huge) = %d, want the %d ceiling", got, agyComposerScanCeiling)
+	}
+}
+
+// agyApprovalScreen is agy's shell approval — the screen a hand-out must never
+// be typed into, and one with no composer sandwich at the bottom.
+func agyApprovalScreen() string {
+	return "Requesting permission for:\n   go test ./...\n\nRun this command?\n" +
+		"> 1. Yes, run command\n" +
+		"  2. Yes, and always allow in this conversation for commands that start with 'go'\n" +
+		"  3. Yes, and always allow for commands that start with 'go' (Persist to settings.json)\n" +
+		"  4. No, cancel\n\n" +
+		"  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\n" +
+		"esc to cancel                                              Gemini 3.6 Flash · low\n"
+}
+
+// Attribution decides whether a task is stranded at "[-]" for a human, so an
+// operator's own draft must never be mistaken for hap's hand-out.
+func TestAgyDraftMatchesOnlyTheTextHapSent(t *testing.T) {
+	sent := "Next task: run the suite and report back when it is green"
+	for _, tc := range []struct {
+		name  string
+		draft string
+		want  bool
+	}{
+		{"the whole hand-out", sent, true},
+		{"the head of a wrapped hand-out", "Next task: run the suite", true},
+		{"the operator's own note", "remember to check the flake", false},
+		// A containment test would pass this one: "suite" appears in what was
+		// sent. Only a PREFIX proves the composer is holding our message.
+		{"a fragment from the middle", "suite and report back", false},
+		{"nothing typed", "", false},
+		// The window is a FLOOR too. One or two characters the operator typed
+		// in the moment after the send can open the hand-out text by accident;
+		// attributing those to hap strands the task at "[-]" with no ledger
+		// row, the outcome this function exists to avoid.
+		{"one character the operator just typed", "N", false},
+		{"a few characters that happen to open the hand-out", "Next t", false},
+		// The wrap falls wherever the column runs out, so the composer's first
+		// line can end mid-word. Rejoining the block with a space used to
+		// insert a separator that is not in what was sent, so a genuinely
+		// queued hand-out matched nothing and took the ledger path.
+		{"a wrap that fell mid-word", "Next task: run the su ite and report", true},
+		{"a narrow pane wrapping every few words",
+			"Next\ntask: run\nthe suite and\nreport back", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := AgyDraftMatches(tc.draft, sent); got != tc.want {
+				t.Errorf("AgyDraftMatches(%q) = %v, want %v", tc.draft, got, tc.want)
+			}
+		})
+	}
+
+	// The floor must not refuse a SHORT hand-out that really is sitting there:
+	// a flat "refuse anything under the window" would, and that is the costly
+	// direction — the item gets a ledger row and is re-offered while the queued
+	// copy is still on its way.
+	t.Run("a short hand-out queued in full", func(t *testing.T) {
+		if !AgyDraftMatches("Next task: fix #12", "Next task: fix #12") {
+			t.Error("a draft that is the WHOLE of what was sent must match however short it is")
+		}
+	})
+}
