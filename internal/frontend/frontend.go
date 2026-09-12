@@ -3888,6 +3888,7 @@ func validateAgentSelector(agent string) error {
 	return nil
 }
 
+// SetTaskSourceAgent re-points a task source to a different agent selector.
 // An empty selector is legal and means "any agent" — the widest re-point there
 // is, which is why the caller says so rather than silently applying it.
 func (a *App) SetTaskSourceAgent(ctx context.Context, index int, expected config.TaskSource,

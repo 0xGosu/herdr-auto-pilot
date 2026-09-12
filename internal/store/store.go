@@ -2131,7 +2131,6 @@ func (s *Store) GetAudit(ctx context.Context, id int64) (*domain.AuditRecord, er
 	return &audits[0], nil
 }
 
-// PendingEscalations returns unresolved escalations, newest first.
 // CountPendingEscalations reports how many escalations are pending without
 // fetching the rows (each can carry a multi-KB pane excerpt).
 func (s *Store) CountPendingEscalations(ctx context.Context) (int64, error) {
@@ -2166,6 +2165,7 @@ func (s *Store) HasOpenEscalation(ctx context.Context, agentID string) (bool, er
 	return err == nil, err
 }
 
+// PendingEscalations returns unresolved escalations, newest first.
 func (s *Store) PendingEscalations(ctx context.Context) ([]domain.AuditRecord, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT `+s.auditColumns(ctx)+` FROM audit_log WHERE status = 'escalated' ORDER BY id DESC LIMIT 200`)
