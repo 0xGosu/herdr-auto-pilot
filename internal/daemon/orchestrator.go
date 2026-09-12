@@ -64,12 +64,20 @@ const (
 // orchestrator_agent_prompt replaces it). {self} is this hap binary, expanded
 // at send time — named ONCE, as the fallback for a session whose PATH has no
 // hap, so every command reads as the plain `hap …` the skill documents.
+//
+// {skills} is expanded the same way, and it is expanded rather than written out
+// because the answer depends on WHERE the session runs: hap installs both
+// skills into its own <state>/orchestrator, and deliberately installs nothing
+// into an orchestrator_agent_cwd the operator chose. Telling a session in the
+// operator's directory to load a skill that is not there would send it after a
+// file it can never find — and `hap --skill` prints only the hap document, so
+// there is no fallback route to the orchestrator one at all.
 const orchestratorBrief = `You are hap's herd orchestrator on this machine. hap (Herd Auto Prompter) watches every coding agent in this herdr session, answers their prompts from rules it has learned, and runs in full self-prompting mode, so anything it cannot answer itself is left for a human. Your job is to be that human's deputy: keep every agent in the herd unblocked and moving toward the goals the operator gives you in this conversation. hap ignores this session completely — nothing here is classified, answered or handed work.
 
 If the ` + "`hap`" + ` CLI is not on your PATH, use the binary at {self} in place of ` + "`hap`" + ` in every command below.
 
 Start by setting yourself up:
-1. Load the ` + "`hap-orchestrator`" + ` skill: hap has installed it, and the ` + "`hap`" + ` skill, into this working directory, so both are yours to re-read at any time — do that whenever your context is compacted and this brief is gone. ` + "`hap --skill`" + ` prints the hap one if the skill is somehow missing. Read ` + "`herdr --skill`" + ` too: it documents herdr (workspaces, panes, agents, reading and prompting an agent), which hap does not.
+1. {skills}
 2. Run ` + "`hap status`" + `, ` + "`hap agents`" + ` and ` + "`hap escalations`" + ` to survey the herd.
 3. Start the Monitor tool on ` + "`hap stream orchestrator`" + `. It prints a ` + "`# … head=N`" + ` line, then one line per event: ` + "`<seq> <time> <kind> key=value … by=<author>`" + `. Remember the last seq you handled; if the monitor stops, restart it with ` + "`hap stream orchestrator --resume <that seq>`" + `. A ` + "`# gap`" + ` or ` + "`# reset`" + ` line means events were lost: re-survey.
 4. Schedule an hourly health check with the CronCreate tool — a recurring job every hour whose prompt tells you to run ` + "`hap status`" + ` and ` + "`hap agents`" + ` and rescue what you find. Check CronList first so there is only ever one. It runs whether or not the stream said anything, because a stopped hap daemon and a hung agent are both silent: if ` + "`hap status`" + ` shows no running daemon, start it with ` + "`hap daemon --ensure`" + `; if an agent has sat working or blocked with no progress, read its screen with herdr and unblock it or tell the operator here.
@@ -85,6 +93,24 @@ How to act:
 - hap knows these commands come from you: it screens what they would send with the same safety rules as its own unattended answers, and refuses them while the herd is paused. A refusal is final for that item — leave it for the operator; never retype it into the agent with herdr.
 
 When you are set up, report the herd's state in a few lines and ask the operator what the goals are.`
+
+// The two answers {skills} expands to. The first is the default, where hap owns
+// the working directory and has put both skills in it; the second is an
+// operator's own orchestrator_agent_cwd, where hap installs nothing — so the
+// brief must not claim otherwise, and must say plainly that nothing will hand
+// these documents back after a compaction.
+const (
+	orchestratorSkillsInstalled = "Load the `hap-orchestrator` skill: hap has installed it, and the `hap` skill, " +
+		"into this working directory, so both are yours to re-read at any time — do that whenever your context is " +
+		"compacted and this brief is gone. `hap --skill` prints the hap one if it is somehow missing. Read " +
+		"`herdr --skill` too: it documents herdr (workspaces, panes, agents, reading and prompting an agent), " +
+		"which hap does not."
+	orchestratorSkillsAbsent = "Run `hap --skill` and `herdr --skill` and read both: they document the hap CLI " +
+		"(status, escalations, tasks, rules, config) and herdr (workspaces, panes, agents, reading and prompting " +
+		"an agent). This working directory is the operator's own (full_self_prompting.orchestrator_agent_cwd), so " +
+		"hap installed no skills in it — keep notes on what those two documents say, because nothing here will " +
+		"hand them back to you after your context is compacted."
+)
 
 // orchestratorState is the daemon's in-memory view of the orchestrator,
 // guarded by its own mutex: the ingest filter reads it on the select loop
@@ -618,9 +644,11 @@ func (d *Daemon) briefOrchestrator(ctx context.Context, id domain.OrchestratorId
 	d.updateOrchestratorIfCurrent(id)
 }
 
-// orchestratorPrompt renders the brief with {self} expanded at send time — the
-// binary running NOW, since an upgrade may have replaced the one the daemon
-// started as.
+// orchestratorPrompt renders the brief at send time: {self} is the binary
+// running NOW, since an upgrade may have replaced the one the daemon started
+// as, and {skills} is whether this session's working directory is one hap put
+// the skills in. Both are expanded in an operator's own brief too, so a custom
+// prompt can use either.
 func (d *Daemon) orchestratorPrompt(cfg config.Config) string {
 	text := cfg.FullSelfPrompting.OrchestratorAgentPrompt
 	if text == "" {
@@ -632,7 +660,13 @@ func (d *Daemon) orchestratorPrompt(cfg config.Config) string {
 			self = p
 		}
 	}
-	return strings.ReplaceAll(text, "{self}", self)
+	// The same condition bootstrapOrchestratorSkills installs on: hap's own
+	// directory gets the skills, an operator's gets nothing.
+	skills := orchestratorSkillsInstalled
+	if cfg.FullSelfPrompting.OrchestratorAgentCwd != "" {
+		skills = orchestratorSkillsAbsent
+	}
+	return strings.NewReplacer("{self}", self, "{skills}", skills).Replace(text)
 }
 
 // noteOrchestratorWaiting tells the operator, once per session, that the

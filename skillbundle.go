@@ -19,6 +19,7 @@ package skilldoc
 import (
 	"bytes"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -78,18 +79,26 @@ func AgentSkillsDir(kind string) string {
 // a hand-written skill points full_self_prompting.orchestrator_agent_cwd at a
 // directory of their own, where hap writes nothing.
 //
-// A failure mid-tree still returns the paths already written, so the caller can
-// report what did land.
+// One file failing NEVER stops the rest: each error is recorded and the walk
+// carries on, so a single unwritable path costs that one file rather than every
+// file after it. Aborting was the shape to avoid — fs.WalkDir walks in lexical
+// order, so the same file fails on every later pass too, and SKILL.md would be
+// left linking references that were never installed. The paths actually written
+// come back alongside the joined errors.
 func InstallAgentSkills(root, kind string) ([]string, error) {
 	base := filepath.Join(root, filepath.FromSlash(AgentSkillsDir(kind)))
 	var written []string
-	changed, err := syncSkillFile(filepath.Join(base, hapSkillDirName, SkillFileName), []byte(HapSkill))
-	if changed {
-		written = append(written, filepath.Join(base, hapSkillDirName, SkillFileName))
+	var errs []error
+	record := func(dest string, data []byte) {
+		changed, err := syncSkillFile(dest, data)
+		if changed {
+			written = append(written, dest)
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
-	if err != nil {
-		return written, err
-	}
+	record(filepath.Join(base, hapSkillDirName, SkillFileName), []byte(HapSkill))
 	walkErr := fs.WalkDir(orchestratorSkillFS, orchestratorSkillRoot, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return err
@@ -97,16 +106,13 @@ func InstallAgentSkills(root, kind string) ([]string, error) {
 		rel := strings.TrimPrefix(p, orchestratorSkillRoot+"/")
 		data, err := orchestratorSkillFS.ReadFile(p)
 		if err != nil {
-			return fmt.Errorf("read embedded %s: %w", p, err)
+			errs = append(errs, fmt.Errorf("read embedded %s: %w", p, err))
+			return nil
 		}
-		dest := filepath.Join(base, orchestratorSkillDirName, filepath.FromSlash(rel))
-		changed, err := syncSkillFile(dest, data)
-		if changed {
-			written = append(written, dest)
-		}
-		return err
+		record(filepath.Join(base, orchestratorSkillDirName, filepath.FromSlash(rel)), data)
+		return nil
 	})
-	return written, walkErr
+	return written, errors.Join(append(errs, walkErr)...)
 }
 
 // syncSkillFile writes data to path unless it is already there byte for byte,

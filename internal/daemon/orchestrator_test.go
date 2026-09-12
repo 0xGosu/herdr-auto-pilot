@@ -662,11 +662,11 @@ func TestOrchestratorBriefShape(t *testing.T) {
 	if n := strings.Count(orchestratorBrief, "{self}"); n != 1 {
 		t.Fatalf("{self} appears %d times, want once", n)
 	}
+	if n := strings.Count(orchestratorBrief, "{skills}"); n != 1 {
+		t.Fatalf("{skills} appears %d times, want once", n)
+	}
 	for _, want := range []string{
-		// The skills are on disk in the session's cwd, which is what survives an
-		// automatic compaction; `hap --skill` stays named as the fallback.
-		"`hap-orchestrator`", "compacted",
-		"`hap --skill`", "`hap stream orchestrator`", "CronCreate", "CronList", "CronDelete",
+		"`hap stream orchestrator`", "CronCreate", "CronList", "CronDelete",
 		"`hap daemon --ensure`", "`fsp.off`", "`fsp.on`",
 	} {
 		if !strings.Contains(orchestratorBrief, want) {
@@ -831,5 +831,46 @@ func TestOrchestratorWritesNoSkillsIntoAnOperatorsCwd(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(state, orchestratorDirName)); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("hap fell back to its own directory instead of skipping (stat err = %v)", err)
+	}
+}
+
+// The brief's step 1 must MATCH what the bootstrap did. In hap's own directory
+// the skills are there and the session is told to re-read them after a
+// compaction; in an operator's orchestrator_agent_cwd nothing was installed, so
+// claiming otherwise would send it after a file it can never find —
+// `hap --skill` prints only the hap document, never the orchestrator one.
+func TestOrchestratorBriefMatchesWhereTheSkillsWent(t *testing.T) {
+	h, _, _ := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+
+	own := h.daemon.orchestratorPrompt(cfg)
+	if !strings.Contains(own, "hap has installed it") || strings.Contains(own, "{skills}") {
+		t.Errorf("hap's own directory should promise the installed skills:\n%s", own)
+	}
+
+	cfg.FullSelfPrompting.OrchestratorAgentCwd = t.TempDir()
+	operators := h.daemon.orchestratorPrompt(cfg)
+	if strings.Contains(operators, "hap has installed") || strings.Contains(operators, "{skills}") {
+		t.Errorf("an operator's directory has no skills in it; the brief must not claim any:\n%s", operators)
+	}
+	if !strings.Contains(operators, "`hap --skill`") || !strings.Contains(operators, "installed no skills") {
+		t.Errorf("the brief must name the route that DOES work, and say nothing was installed:\n%s", operators)
+	}
+	// Both variants still tell it how to survive losing this brief.
+	for _, text := range []string{own, operators} {
+		if !strings.Contains(text, "compacted") {
+			t.Errorf("the brief says nothing about a compaction:\n%s", text)
+		}
+	}
+}
+
+// An operator's own brief gets both placeholders too.
+func TestOrchestratorCustomBriefExpandsSkills(t *testing.T) {
+	h, _, _ := newOrchHarness(t, "", nil)
+	cfg := orchestratorModeOnIn(h)
+	cfg.FullSelfPrompting.OrchestratorAgentPrompt = "Use {self}. Setup: {skills}"
+	got := h.daemon.orchestratorPrompt(cfg)
+	if strings.Contains(got, "{skills}") || !strings.Contains(got, "/opt/hap/bin/hap") {
+		t.Errorf("a custom brief did not get both placeholders: %s", got)
 	}
 }

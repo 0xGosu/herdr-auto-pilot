@@ -1639,8 +1639,11 @@ hap also puts the `hap` and `hap-orchestrator` skills on disk in that working
 directory (`<state>/orchestrator/.claude/skills/`, refreshed whenever an upgrade
 changes them), so the session can look them up again at any time — including
 after an automatic context compaction has dropped its brief. Nothing is written
-into an `orchestrator_agent_cwd` you chose yourself: that directory is yours, so
-run `hap skill install` in it if you want them there.
+into an `orchestrator_agent_cwd` you chose yourself — that directory is yours —
+and the brief's first step changes to match, sending the session to `hap --skill`
+and `herdr --skill` rather than at skills that are not there. (`hap skill install`
+puts the **hap** skill wherever you like; `hap-orchestrator` is installed only
+into hap's own directory.)
 
 ## Pause/kill switch & audit
 

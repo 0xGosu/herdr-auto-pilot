@@ -204,7 +204,9 @@ func buildCommands() {
 				"skills/) whenever it checks on it, so the session can re-read them after a\n" +
 				"context compaction, and an upgrade refreshes them. Set\n" +
 				"full_self_prompting.orchestrator_agent_cwd and hap writes nothing there — it is\n" +
-				"your directory; run `hap skill install` in it yourself.",
+				"your directory — and its brief changes to match, sending the session to\n" +
+				"`hap --skill` and `herdr --skill` instead. This install covers the hap skill\n" +
+				"anywhere you like; hap-orchestrator goes only into hap's own directory.",
 			Examples: []string{"hap skill | less", "hap skill install claude codex"},
 			Bare:     true,
 		},

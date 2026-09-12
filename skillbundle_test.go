@@ -207,6 +207,58 @@ func TestInstallAgentSkillsRefreshesAChangedFile(t *testing.T) {
 	}
 }
 
+// One unwritable file costs THAT file and nothing else. Aborting the walk was
+// the shape to avoid: fs.WalkDir goes in lexical order, so the same file fails
+// on every later pass too and SKILL.md would be left linking references that
+// were never installed.
+func TestInstallAgentSkillsInstallsTheRestAroundAFailure(t *testing.T) {
+	tree := orchestratorTreeFiles(t)
+	if len(tree) < 3 {
+		t.Skipf("need a tree with a middle file, have %v", tree)
+	}
+	// A file that sorts in the middle, so both earlier and later ones prove the
+	// walk neither stopped nor skipped ahead.
+	blocked := tree[len(tree)/2]
+
+	root := t.TempDir()
+	// A non-empty DIRECTORY where the file must go: its parent is created fine,
+	// so only this one file's rename fails.
+	inTheWay := filepath.Join(root, ".claude", "skills", "hap-orchestrator", filepath.FromSlash(blocked))
+	if err := os.MkdirAll(inTheWay, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inTheWay, "keep"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	written, err := InstallAgentSkills(root, domain.OrchestratorAgentKind)
+	if err == nil {
+		t.Fatal("expected the blocked file to fail")
+	}
+	if !strings.Contains(err.Error(), blocked) {
+		t.Errorf("the error does not name the blocked file %q: %v", blocked, err)
+	}
+	for _, rel := range tree {
+		dest := filepath.Join(root, ".claude", "skills", "hap-orchestrator", filepath.FromSlash(rel))
+		if rel == blocked {
+			if slices.Contains(written, dest) {
+				t.Errorf("%s was reported written despite failing", rel)
+			}
+			continue
+		}
+		if !slices.Contains(written, dest) {
+			t.Errorf("%s was not installed — the walk stopped at %s", rel, blocked)
+		}
+		if _, statErr := os.Stat(dest); statErr != nil {
+			t.Errorf("%s missing on disk: %v", rel, statErr)
+		}
+	}
+	// The hap document is written before the tree and is unaffected.
+	if _, statErr := os.Stat(filepath.Join(root, ".claude", "skills", "hap", SkillFileName)); statErr != nil {
+		t.Errorf("the hap skill was not installed: %v", statErr)
+	}
+}
+
 // A failure partway still reports what DID land, so the caller can say so.
 func TestInstallAgentSkillsReportsPartialWritesOnFailure(t *testing.T) {
 	root := t.TempDir()
