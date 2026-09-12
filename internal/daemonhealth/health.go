@@ -78,6 +78,47 @@ type Health struct {
 	// operator should answer. Absent when the feature is off or all is well
 	// (and on older daemons) — its failures otherwise live only in the log.
 	Orchestrator *OrchestratorHealth `json:"orchestrator,omitempty"`
+	// AgyWorkspace lists agy agents observed asking permission for files
+	// outside the directory they were started in. Absent when there are none
+	// (and on older daemons).
+	AgyWorkspace []AgyWorkspaceMismatch `json:"agy_workspace,omitempty"`
+}
+
+// AgyWorkspaceMismatch records one agy agent working outside its own
+// workspace root.
+//
+// agy scopes permissions to the directory it was STARTED in and raises an
+// approval per file outside it, so an agent started in one checkout and told
+// to work in another pays a round trip per file read. hap answers those
+// prompts once the rule graduates — the path is masked out of the salient, so
+// every such prompt shares one signature — but the approvals keep coming, and
+// nothing else tells the operator that restarting the agent in the right
+// directory would remove them altogether.
+type AgyWorkspaceMismatch struct {
+	AgentID string `json:"agent_id"`
+	// Name is the agent's short name when it has one, for a line an operator
+	// can act on without translating a pane id.
+	Name string `json:"name,omitempty"`
+	// Root is where the agent was started; Elsewhere is where its work
+	// actually is, reduced to a directory rather than the first file seen.
+	Root      string    `json:"root"`
+	Elsewhere string    `json:"elsewhere"`
+	SeenAt    time.Time `json:"seen_at,omitempty"`
+}
+
+// Line renders one mismatch as the status page's advisory: the consequence and
+// the remedy, not the observation. Empty for a zero value.
+func (m AgyWorkspaceMismatch) Line() string {
+	if m.Root == "" || m.Elsewhere == "" {
+		return ""
+	}
+	who := m.Name
+	if who == "" {
+		who = m.AgentID
+	}
+	return who + " was started in " + m.Root + " but is working in " + m.Elsewhere +
+		" — agy asks permission for every file outside its start directory;" +
+		" restart it in " + m.Elsewhere + " to stop the prompts"
 }
 
 // OrchestratorHealth is the heartbeat's copy of the orchestrator's state.

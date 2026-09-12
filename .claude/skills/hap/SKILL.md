@@ -171,6 +171,16 @@ hap capture backend-dev           # re-run the capture pipeline for one agent no
 `cwd` and `mode` are `-` when unreadable. New columns are appended, so existing
 field positions never move.
 
+**Start an agy agent in the directory it will work in.** agy scopes its
+permissions to the directory it was STARTED in and asks approval for every file
+outside it (`Reason: outside workspace`), so an agy agent started in one
+checkout and told to work in another pays an approval round trip per file it
+reads. hap answers those prompts itself once the rule graduates — the path is
+masked out of the signature, so every one of them shares a single rule — but
+the only way to stop them being raised at all is to start the agent in the right
+directory. `hap status` says so when it sees the mismatch. This is agy-specific:
+claude and codex scope permissions differently.
+
 A disabled agent stays in the list marked `DISABLED`: autonomous actions are
 audited as `denied` with `[agent_disabled]`, and escalations are audited
 straight to `dismissed` and never enter the pending queue.

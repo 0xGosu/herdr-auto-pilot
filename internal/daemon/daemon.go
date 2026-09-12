@@ -664,6 +664,12 @@ type Daemon struct {
 	paneCwds          map[string]paneCwdEntry
 	paneCwdRefreshing map[string]bool
 
+	// agyOutsideWorkspace records agy agents seen asking permission for files
+	// outside the directory they were started in, keyed by agent id. In
+	// memory only: it is an advisory about how an agent was launched, so
+	// losing it on restart costs one re-observation and nothing else.
+	agyOutsideWorkspace map[string]agyWorkspaceNote
+
 	// Background lifecycle. bg tracks every goroutine and AfterFunc callback
 	// the daemon spawns via spawn/afterFunc; Run awaits it (shutdownBackground)
 	// before its deferred matcher/embedder Close — and before the caller closes
@@ -882,6 +888,7 @@ func New(opt Options) (*Daemon, error) {
 		snapshotSaved:             map[string]bool{},
 		paneCwds:                  map[string]paneCwdEntry{},
 		paneCwdRefreshing:         map[string]bool{},
+		agyOutsideWorkspace:       map[string]agyWorkspaceNote{},
 		embedder:                  opt.Embedder,
 		timers:                    map[*time.Timer]struct{}{},
 	}
@@ -1335,6 +1342,7 @@ func (d *Daemon) writeHealth(startedAt time.Time) {
 		BinaryReplaced: d.binaryReplaced.Load(),
 		FleetSync:      d.fleetHealth(),
 		Orchestrator:   d.orchestratorHealth(),
+		AgyWorkspace:   d.agyWorkspaceHealth(),
 	}
 	if err := daemonhealth.Write(d.opt.StateDir, h); err != nil {
 		slog.Debug("heartbeat write failed", "error", err)
@@ -2457,6 +2465,12 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	if situation.AgentType == "" {
 		situation.AgentType = "unknown"
 	}
+
+	// Noted from the capture that is already in hand, and from the CLASSIFY
+	// path rather than escalate(): the prompt this reads is one hap answers by
+	// itself once the rule graduates, so by the time it matters most it never
+	// reaches an escalation at all.
+	d.noteAgyWorkspace(ctx, situation, agentName, pane)
 
 	// Multi-tab MCQ forms show one question at a time: sweep the remaining
 	// tabs (Right-arrow protocol) so the signature, the escalation, and the
