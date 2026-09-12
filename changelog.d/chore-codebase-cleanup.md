@@ -1,3 +1,0 @@
-- Removed unreferenced internal helpers (`NodeWatching`, `SeedRuleDisabled`, `TaskFilePath`, `GetTask`) across domain and frontend layers.
-- Consolidated duplicate signature truncation logic across the CLI and TUI into `domain.ShortSignature`.
-- Consolidated duplicate CLI row formatting helpers.
