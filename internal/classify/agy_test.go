@@ -67,14 +67,17 @@ var agyFixtures = map[string]agyCase{
 	"approval_agy_shell_wrapped.txt": {typ: domain.SituationApproval, verb: agyRunRM, options: agyRMOptions},
 	"approval_agy_trust_folder.txt": {typ: domain.SituationApproval, verb: domain.PermissionVerbAgyTrust,
 		options: []string{"Yes, I trust this folder", "No, exit"}},
-	"choice_agy_mcq.txt":             {typ: domain.SituationChoice, options: []string{"Apple", "Banana", "Cherry"}},
-	"choice_agy_mcq_two.txt":         {typ: domain.SituationChoice, options: []string{"Red", "Green", "Blue"}},
-	"choice_agy_mcq_two_recent.txt":  {typ: domain.SituationChoice, options: []string{"Red", "Green", "Blue"}},
-	"choice_agy_mcq_two_q2.txt":      {typ: domain.SituationChoice, options: []string{"Cat", "Dog"}},
-	"error_agy_interrupted.txt":      {typ: domain.SituationError, errSum: domain.AgyErrorInterrupted},
-	"error_agy_offline.txt":          {typ: domain.SituationError, errSum: domain.AgyErrorEligibilityCheck},
-	"error_agy_model_warning.txt":    {typ: domain.SituationIdle}, // a warning: the agent is usable
-	"idle_agy_after_turn.txt":        {typ: domain.SituationIdle},
+	"choice_agy_mcq.txt":            {typ: domain.SituationChoice, options: []string{"Apple", "Banana", "Cherry"}},
+	"choice_agy_mcq_two.txt":        {typ: domain.SituationChoice, options: []string{"Red", "Green", "Blue"}},
+	"choice_agy_mcq_two_recent.txt": {typ: domain.SituationChoice, options: []string{"Red", "Green", "Blue"}},
+	"choice_agy_mcq_two_q2.txt":     {typ: domain.SituationChoice, options: []string{"Cat", "Dog"}},
+	"error_agy_interrupted.txt":     {typ: domain.SituationError, errSum: domain.AgyErrorInterrupted},
+	"error_agy_offline.txt":         {typ: domain.SituationError, errSum: domain.AgyErrorEligibilityCheck},
+	"error_agy_model_warning.txt":   {typ: domain.SituationIdle}, // a warning: the agent is usable
+	"idle_agy_after_turn.txt":       {typ: domain.SituationIdle},
+	// Same parked composer, with agy's background-task strip between it and
+	// the status bar: still idle, because nothing is covering the composer.
+	"idle_agy_background_task.txt":   {typ: domain.SituationIdle},
 	"idle_agy_composer_draft.txt":    {typ: domain.SituationIdle},
 	"idle_agy_declined.txt":          {typ: domain.SituationIdle},
 	"idle_agy_fresh.txt":             {typ: domain.SituationIdle},

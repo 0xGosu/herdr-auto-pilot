@@ -47,6 +47,7 @@ func TestGoldenTranscripts(t *testing.T) {
 		"error_agy_model_warning.txt":      "idle",
 		"error_agy_offline.txt":            "idle",
 		"idle_agy_after_turn.txt":          "done",
+		"idle_agy_background_task.txt":     "done",
 		"idle_agy_composer_draft.txt":      "done",
 		"idle_agy_declined.txt":            "done",
 		"idle_agy_effort_picker.txt":       "idle",

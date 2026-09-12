@@ -290,8 +290,13 @@ func modeReadError(r frontend.ModeReport, target string, err error) error {
 		return fmt.Errorf("%s is a %q agent, which has no shift+tab mode toggle (claude, codex and agy do)",
 			r.Label(target), r.AgentType)
 	case errors.Is(err, frontend.ErrModeUnreadable):
-		return fmt.Errorf("could not read %s's mode: its pane is not showing the composer footer "+
-			"(an approval or form is probably up — answer it, then retry)", r.Label(target))
+		// Say what was SEEN, not what is presumed. This message used to assert
+		// that an approval or form was up; it was reported firing on a pane
+		// plainly showing its composer, which sends the operator looking for a
+		// modal that is not there.
+		return fmt.Errorf("could not read %s's mode: no composer footer this build recognises at the "+
+			"bottom of its pane — a form or approval may be covering it, or the footer may carry "+
+			"something new (run `hap capture %s` to see the pane)", r.Label(target), target)
 	case errors.Is(err, frontend.ErrModeUnsafe):
 		return fmt.Errorf("%s is not at its composer, so shift+tab would answer whatever is on screen "+
 			"instead of changing the mode — refusing to send it", r.Label(target))

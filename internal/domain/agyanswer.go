@@ -174,7 +174,8 @@ var agyModePlaceholderRE = regexp.MustCompile(`^>\s*(?:Plan|Accept-edits) mode: 
 //
 // Absence of any piece is "not ready", never "unknown so go ahead".
 func AgyComposerReady(pane string) bool {
-	lines := trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n"))
+	lines := agyDropBackgroundStrip(
+		trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")))
 	n := len(lines)
 	if n < 4 {
 		return false
