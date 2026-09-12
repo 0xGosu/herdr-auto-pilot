@@ -84,8 +84,9 @@ type DB struct {
 	db   *sql.DB
 	// ops counts sync operations in flight, so Close can wait for them: a
 	// native operation is never cancelled, and closing the handle underneath
-	// one is a use-after-close.
-	ops sync.WaitGroup
+	// one is a use-after-close. It also LATCHES at Close, refusing to start a
+	// new one — see opGate.
+	ops opGate
 }
 
 // closeWait bounds how long Close waits for in-flight sync operations. Past
@@ -97,6 +98,11 @@ const closeWait = 10 * time.Second
 // remote — the first start of a node needs Turso Cloud reachable. The daemon
 // retries on its sync interval.
 var ErrBootstrap = errors.New("turso: bootstrap from the remote failed")
+
+// ErrClosing reports that a sync operation was refused because Close has begun.
+// Shutdown is the only time it is returned, and the caller's own logging is the
+// right place for it: there is nothing to retry against a handle going away.
+var ErrClosing = errors.New("turso: the database is closing; the sync operation was not started")
 
 // Open bootstraps (or reopens) the local sync database and returns it gated.
 func Open(ctx context.Context, opts Options) (*DB, error) {
@@ -193,8 +199,10 @@ func (d *DB) Executor() *sqlbridge.Executor { return d.exec }
 // gate and is never cancelled (see the package comment); changed reports
 // whether anything new arrived.
 func (d *DB) Pull() (changed bool, err error) {
-	d.ops.Add(1)
-	defer d.ops.Done()
+	if !d.ops.add() {
+		return false, ErrClosing
+	}
+	defer d.ops.done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
 	changed, err = d.sdb.Pull(context.Background())
@@ -208,8 +216,10 @@ func (d *DB) Pull() (changed bool, err error) {
 
 // Push sends local changes to the remote.
 func (d *DB) Push() error {
-	d.ops.Add(1)
-	defer d.ops.Done()
+	if !d.ops.add() {
+		return ErrClosing
+	}
+	defer d.ops.done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
 	return d.sdb.Push(context.Background())
@@ -218,8 +228,10 @@ func (d *DB) Push() error {
 // Checkpoint compacts the local WAL (auto-checkpoint is off for sync
 // databases, so a node that never checkpoints grows its WAL forever).
 func (d *DB) Checkpoint() error {
-	d.ops.Add(1)
-	defer d.ops.Done()
+	if !d.ops.add() {
+		return ErrClosing
+	}
+	defer d.ops.done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
 	return d.sdb.Checkpoint(context.Background())
@@ -231,8 +243,10 @@ func (d *DB) Checkpoint() error {
 // that wedges the next Push (see the package comment). The ctx parameter is
 // kept for the port; it is deliberately not passed through.
 func (d *DB) Stats(_ context.Context) (ports.FleetSyncStats, error) {
-	d.ops.Add(1)
-	defer d.ops.Done()
+	if !d.ops.add() {
+		return ports.FleetSyncStats{}, ErrClosing
+	}
+	defer d.ops.done()
 	d.exec.Lock()
 	defer d.exec.Unlock()
 	st, err := d.sdb.Stats(context.Background())
@@ -259,7 +273,14 @@ func (d *DB) Stats(_ context.Context) (ports.FleetSyncStats, error) {
 // remaining life of the process) rather than closed underneath it, and Close
 // says so.
 func (d *DB) Close() error {
-	if !waitBounded(&d.ops, closeWait) {
+	// Latch FIRST, then wait. The daemon abandons a running sync op at
+	// shutdown (daemon.fleetRun: "leaving it to the adapter") but the goroutine
+	// runs on — fleetPush calls Stats after its Push returns, and
+	// fleetFinalPush leaves a Push behind its own budget — so without the latch
+	// an operation can still BEGIN here, against a handle Close is about to
+	// free.
+	d.ops.beginClose()
+	if !d.ops.waitIdle(closeWait) {
 		return fmt.Errorf("turso: a sync operation is still running after %s; leaving the database open rather than closing it underneath the call", closeWait)
 	}
 	err := d.db.Close()
@@ -269,17 +290,88 @@ func (d *DB) Close() error {
 	return err
 }
 
-// waitBounded waits for wg up to d, reporting whether it finished.
-func waitBounded(wg *sync.WaitGroup, d time.Duration) bool {
-	done := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
+// opGate counts the sync operations in flight and lets Close wait for them
+// with a BOUND, then refuse any that have not started yet.
+//
+// It replaces a sync.WaitGroup, which cannot express either half safely:
+//
+//   - A bounded wait needs a Wait that can be abandoned, and WaitGroup has
+//     none. The old helper spawned a goroutine to call wg.Wait() and gave up on
+//     the timeout — leaving that goroutine parked in Wait FOREVER. The
+//     WaitGroup contract forbids an Add that races a Wait which has not
+//     returned, so the next time the counter fell to zero while an operation
+//     called Add, the runtime panicked "WaitGroup is reused before previous
+//     Wait has returned" and took the whole daemon down. Seen twice on
+//     2026-09-12 under hap v0.9.21 with two agents driving the store, each
+//     crash followed by a restart that raced the dying process's daemon lock.
+//     A channel a waiter merely SELECTS on leaks nothing when it gives up.
+//
+//   - Removing the panic is not by itself enough, and this is the trap: the
+//     panic was the only thing stopping an operation that began after Close
+//     from running against a freed handle. So the counter latches — once
+//     beginClose has run, add refuses and the operation returns ErrClosing
+//     instead of touching the native handle. Trading a loud crash for a silent
+//     use-after-close would have been the worse bug.
+//
+// idle is closed while no operation is in flight and replaced on each 0 -> 1
+// transition, so a waiter holding an earlier one is never woken by a later
+// operation's completion.
+type opGate struct {
+	mu     sync.Mutex
+	n      int
+	idle   chan struct{}
+	closed bool
+}
+
+// add registers an operation, reporting false once Close has begun.
+func (g *opGate) add() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return false
+	}
+	if g.n == 0 {
+		g.idle = make(chan struct{})
+	}
+	g.n++
+	return true
+}
+
+// done retires an operation registered by a successful add.
+func (g *opGate) done() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.n--
+	if g.n == 0 && g.idle != nil {
+		close(g.idle)
+		g.idle = nil
+	}
+}
+
+// beginClose latches the gate so no further operation starts. Idempotent.
+func (g *opGate) beginClose() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.closed = true
+}
+
+// waitIdle waits up to d for every operation in flight to return, reporting
+// whether they all did. Giving up leaves nothing behind.
+func (g *opGate) waitIdle(d time.Duration) bool {
+	g.mu.Lock()
+	if g.n == 0 {
+		g.mu.Unlock()
 		return true
-	case <-time.After(d):
+	}
+	ch := g.idle
+	g.mu.Unlock()
+
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-t.C:
 		return false
 	}
 }
