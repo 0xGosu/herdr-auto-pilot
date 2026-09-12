@@ -164,12 +164,17 @@ func TestEveryPresetKeyIsCovered(t *testing.T) {
 }
 
 // TestSamplePresetsMatchTheGoRecipes is the drift guard between the docs and
-// the code. sample/config.toml is not embedded and not loaded at runtime, so
-// the Go table is the source of truth — but the two recipes the sample leaves
-// ACTIVE are decodable, so they are held byte-identical for free. The other
-// four exist only as TOML comments and are deliberately not parsed: comment
-// parsing would be the only such code in this repo, and the sample's own
-// prose is what ties them together.
+// the code for the two recipes the sample leaves ACTIVE. sample/config.toml is
+// not embedded and not loaded at runtime, so the Go table is the source of
+// truth — but an active recipe is decodable by config.Load, so it is held
+// byte-identical for free, with no knowledge of how the file is laid out.
+//
+// The commented-out recipes — which is now every codex and agy one, nine of
+// the eleven — are covered by TestEveryPresetHasAByteIdenticalTwinInTheSample
+// instead, which strips the leading "# " and parses them. That test subsumes
+// this one; this stays because it is the half that cannot break when the
+// sample's COMMENT STYLE changes, so a failure here always means the recipe
+// moved rather than the scanner.
 func TestSamplePresetsMatchTheGoRecipes(t *testing.T) {
 	cfg, err := config.Load(filepath.Join("..", "..", "sample", "config.toml"))
 	if err != nil {

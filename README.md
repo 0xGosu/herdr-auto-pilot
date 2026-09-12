@@ -447,7 +447,7 @@ offered — falls back to the answer hap would have given without the judge, so 
 broken judge never costs you a rule you already taught it.
 
 ```sh
-hap config set llm.reranking_command --preset claude   # or: codex
+hap config set llm.reranking_command --preset claude   # or: codex, agy
 ```
 
 ```toml
@@ -471,8 +471,9 @@ Like the other LLM commands it runs in the **monitored agent's own directory**
 presets close that access rather than leave it unused. The claude recipe
 disables Claude's built-in tools outright (`--tools ""`, alongside
 `--strict-mcp-config`); the codex one is weaker, restricting it to `--sandbox
-read-only`, which can still read that project. If you write your own recipe,
-grant it nothing.
+read-only`, which can still read that project; the agy one takes no permission
+flag at all, because headless agy soft-denies every tool a run reaches for. If
+you write your own recipe, grant it nothing.
 
 ## Task sources
 
@@ -1029,15 +1030,40 @@ to retype. **Use a preset:**
 
 ```sh
 hap config set llm.command --preset claude                # or: codex
-hap config set llm.task_generate_command --preset claude
-hap config set llm.learn_from_user_command --preset claude
-hap config set llm.reranking_command --preset claude      # see "Semantic rule matching"
+hap config set llm.task_generate_command --preset claude  # or: codex, agy
+hap config set llm.learn_from_user_command --preset claude   # or: codex, agy
+hap config set llm.reranking_command --preset claude      # or: codex, agy — see "Semantic rule matching"
 ```
+
+**Not every CLI serves every field.** The picker (and `--preset`) only offers
+the ones that do:
+
+| preset | serves |
+|---|---|
+| `claude` | all four `[llm]` fields, plus the orchestrator session |
+| `codex` | all four `[llm]` fields |
+| `agy` | `task_generate_command`, `learn_from_user_command`, `reranking_command` |
+
+`agy` has no `llm.command` recipe because the consult needs hap's MCP server and
+agy cannot be handed one on the command line (see below), and no orchestrator
+recipe because herdr starts that session by agent KIND and only `claude` is
+supported.
+
+Two things to weigh before picking `agy`. Its learn recipe takes
+`--dangerously-skip-permissions`, **wider** than the claude one's
+`--permission-mode acceptEdits`: agy's single grant covers tools, writes *and*
+shell, there is no edits-only setting, and `--sandbox` is not a middle ground —
+it silently drops writes and reads while the model still reports success. And
+the `AUTO.md` loop runs **one way** under agy: the learn recipe writes lessons,
+the generate recipe never reads them back, because agy has no `@file` expansion
+at prompt-parse time. Generate and rerank therefore take no permission flag at
+all, and every agy recipe carries `--disable-slash-commands`.
 
 A preset only ever bootstraps a field **nobody has configured** — once one is
 set, tuning it is a `config.toml` edit (or the TUI Config tab's `e` on a
 `(disabled)` row). [`sample/config.toml`](sample/config.toml) carries the full
-annotated argv for both CLIs, including the commented codex recipes.
+annotated argv for all three CLIs, including the commented codex and agy
+recipes.
 
 ```toml
 [llm]
@@ -1093,9 +1119,10 @@ inserted); an unrecognized shape is left untouched.
 > one exited in under a second, and the refill of an exhausted declared task
 > source, which now always escalates `task_source_exhausted`.
 
-For **Antigravity (`agy`)** there is no preset and no per-invocation MCP flag —
-register hap once in `~/.gemini/config/mcp_config.json` with the database path
-in `env`:
+For **Antigravity (`agy`)** there is no per-invocation MCP flag, which is why
+there is no `agy` preset for **this** field (it does have presets for the other
+three `[llm]` commands, none of which needs an MCP server) — register hap once
+in `~/.gemini/config/mcp_config.json` with the database path in `env`:
 
 ```json
 {"mcpServers": {"hap": {"command": "/path/to/plugin/bin/hap", "args": ["mcp"],

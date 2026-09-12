@@ -833,7 +833,10 @@ func buildCommands() {
 				"hap config fields",
 				"hap config path",
 				"hap config set <field> <value>",
-				"hap config set <command field> --preset <claude|codex>",
+				// Rendered from the registry, never spelled out: a fourth CLI
+				// would otherwise leave the help naming three while the picker
+				// offers four, and nothing would fail.
+				"hap config set <command field> --preset <" + strings.Join(frontend.LLMPresetNames, "|") + ">",
 				"hap config set-threshold <minimum|idle|approval|choice|error> <value>",
 				"hap config env [list [<scope>]]",
 				"hap config env set <scope> <NAME> [--value V]",
@@ -845,7 +848,7 @@ func buildCommands() {
 			},
 			Flags: []FlagDoc{
 				{Name: "--value", Arg: "V", Desc: "config env set: the value; omit it and the value is read from stdin, which keeps a secret out of shell history and `ps`"},
-				{Name: "--preset", Arg: "NAME", Desc: "config set: install a built-in recipe into an UNSET llm.command / llm.task_generate_command / llm.learn_from_user_command (claude or codex) or full_self_prompting.orchestrator_agent_command (claude only); refused once the field is configured"},
+				{Name: "--preset", Arg: "NAME", Desc: "config set: install a built-in recipe into an UNSET [llm] command field or full_self_prompting.orchestrator_agent_command. Not every CLI serves every field: task_generate_command / learn_from_user_command / reranking_command take claude, codex or agy; llm.command takes claude or codex (agy cannot be handed an MCP server on the command line); the orchestrator takes claude only (herdr starts it by agent kind). Refused once the field is configured"},
 			},
 			Details: "Every command that writes config.toml lives here — nothing else in hap does,\n" +
 				"so `hap config …` is the whole surface and the file never has to be opened by\n" +
@@ -856,11 +859,12 @@ func buildCommands() {
 				"`fields` lists every settable field with its current value — that is the\n" +
 				"authoritative list of names for `set` (dotted, e.g. llm.timeout_seconds).\n" +
 				"`set` writes config.toml and reloads the running daemon; no restart needed.\n" +
-				"The three [llm] command fields ship as \"(disabled)\" and their argv is far too\n" +
-				"long to retype, so `set <field> --preset claude` (or codex) installs the\n" +
-				"built-in recipe for that CLI. It only ever bootstraps a field nobody has\n" +
-				"configured: once one is set, tuning it is a config.toml edit, and the same\n" +
-				"picker is on the TUI's Config tab (press e on a \"(disabled)\" row).\n" +
+				"The four [llm] command fields ship as \"(disabled)\" and their argv is far too\n" +
+				"long to retype, so `set <field> --preset claude` (or codex, or agy on the\n" +
+				"three that support it) installs the built-in recipe for that CLI. It only\n" +
+				"ever bootstraps a field nobody has configured: once one is set, tuning it is\n" +
+				"a config.toml edit, and the same picker is on the TUI's Config tab (press e\n" +
+				"on a \"(disabled)\" row); the picker offers only the CLIs that field has.\n" +
 				"`set-threshold` is the shorthand for confidence_thresholds.*: how confident a\n" +
 				"rule must be before hap answers that situation type on its own.\n" +
 				"`path` prints the config file location, bare, for scripting.\n\n" +

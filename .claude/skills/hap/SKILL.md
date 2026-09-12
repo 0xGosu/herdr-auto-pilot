@@ -541,23 +541,23 @@ tab-separated stdout is unaffected.
 | `full_self_prompting.enabled` | false | answer every escalation carrying a proposed answer, immediately |
 | `full_self_prompting.honour_limits` | false | apply the `[limits]` ceilings to the mode, and switch it off when one is reached |
 | `full_self_prompting.accept_generated_task` | false | also act on an idle escalation whose suggestion is an LLM-generated task |
-| `full_self_prompting.orchestrator_agent_command` | (disabled) | keep an interactive `orchestrator` claude session alive while the mode is on (`--preset claude`) |
+| `full_self_prompting.orchestrator_agent_command` | (disabled) | keep an interactive `orchestrator` claude session alive while the mode is on (`--preset claude` — the only preset here: herdr starts the session by agent KIND and only `claude` is supported) |
 | `full_self_prompting.orchestrator_agent_prompt` | (built-in brief) | replace the brief sent to the orchestrator; `{self}` = this hap binary |
 | `full_self_prompting.orchestrator_agent_cwd` | `<state>/orchestrator` | the orchestrator's working directory: absolute (`~`/`$VAR` expand), must exist; read at creation |
 | `safety.disable_never_auto_seed_patterns` | false | disable every shipped strict and heuristic rule |
 | `safety.enable_never_auto_action_seeds` | false | arm the shipped ACTION rules — the scope-widening menu options ("and always allow", "Persist to settings.json") |
-| `llm.command` | (disabled) | argv for the consult CLI; this key alone gates the LLM fallback |
+| `llm.command` | (disabled) | argv for the consult CLI; this key alone gates the LLM fallback. Presets: claude, codex (no agy — it cannot be handed an MCP server on the command line) |
 | `llm.timeout_seconds` | 60 | timeout for one consult |
 | `llm.auto_act_confidence_threshold` | 85 | min LLM self-reported score (0-100) to auto-act; below it (or no score) escalates as `[llm_low_confidence]`. Set >100 (e.g. 999) to never auto-act |
 | `llm.pane_excerpt_chars` | 5000 | pane excerpt size in the consult context |
 | `llm.enable_rewrite_action` | false | let the consult LLM adapt learned free-text replies before delivery |
 | `llm.run_in_agent_cwd` | true | run the CLI in the monitored agent's own project directory |
 | `llm.rewrite_action_fallback_template` | `{original_text}` | optional wrapper when an action review fails (`{original_text}`, `{agent_name}`) |
-| `llm.task_generate_command` | (disabled) | argv to synthesize a next task for an idle agent with no source |
+| `llm.task_generate_command` | (disabled) | argv to synthesize a next task for an idle agent with no source. Presets: claude, codex, agy — the agy one cannot read `AUTO.md` (no `@file` expansion), so under agy the lesson loop is write-only |
 | `llm.task_generate_timeout_seconds` | inherits `timeout_seconds` | timeout for one generation run |
-| `llm.learn_from_user_command` | (disabled) | argv run when you CORRECT an escalation, to record the lesson in `AUTO.md` in the agent's project |
+| `llm.learn_from_user_command` | (disabled) | argv run when you CORRECT an escalation, to record the lesson in `AUTO.md` in the agent's project. The one recipe with write access: claude `--permission-mode acceptEdits`, codex `--dangerously-bypass-approvals-and-sandbox`, agy `--dangerously-skip-permissions` (wider than claude's — agy has no edits-only setting) |
 | `llm.learn_from_user_timeout_seconds` | inherits `timeout_seconds` | timeout for one learn run |
-| `llm.reranking_command` | (disabled) | argv for the LLM-as-a-judge rule re-ranker; empty keeps the plain cosine → BM25 chain. The run answers from its prompt alone but executes in the monitored agent's directory, so the presets differ in what they grant: the claude one disables Claude's built-in tools outright (`--tools ""` plus `--strict-mcp-config`), the codex one only restricts it to `--sandbox read-only`, which can still READ that project |
+| `llm.reranking_command` | (disabled) | argv for the LLM-as-a-judge rule re-ranker; empty keeps the plain cosine → BM25 chain. The run answers from its prompt alone but executes in the monitored agent's directory, so the presets differ in what they grant: the claude one disables Claude's built-in tools outright (`--tools ""` plus `--strict-mcp-config`), the codex one only restricts it to `--sandbox read-only`, which can still READ that project, and the agy one takes no permission flag at all (headless agy soft-denies every tool) |
 | `llm.reranking_timeout_seconds` | 30 | timeout for one judge run. Deliberately does NOT inherit `timeout_seconds` — the agent is parked and unanswered while it runs |
 | `llm.reranking_top_k` | 3 | most rules the judge may return; must be >= 1. hap walks the list in order and acts on the first rule that yields an autonomous decision, falling back to the best match for the escalation when none does |
 | `llm.relevance_score_threshold` | 0.95 | min relevance score a judged rule needs to be usable; passed to the judge in its prompt |
@@ -613,14 +613,42 @@ switch off exactly the paraphrase matching the feature exists for.
 
 ### LLM commands: use the presets
 
-The three `[llm]` command fields ship disabled and their argv is far too long
+The four `[llm]` command fields ship disabled and their argv is far too long
 to retype. Bootstrap one:
 
 ```bash
 hap config set llm.command --preset claude              # or: codex
-hap config set llm.task_generate_command --preset claude
-hap config set llm.learn_from_user_command --preset claude
+hap config set llm.task_generate_command --preset claude   # or: codex, agy
+hap config set llm.learn_from_user_command --preset claude # or: codex, agy
+hap config set llm.reranking_command --preset claude       # or: codex, agy
 ```
+
+**Not every CLI serves every field**, and the picker only offers the ones that
+do — `--preset agy` on `llm.command` is refused, naming the presets that key
+does have:
+
+| preset | serves |
+|---|---|
+| `claude` | all four `[llm]` fields, plus `full_self_prompting.orchestrator_agent_command` |
+| `codex` | all four `[llm]` fields |
+| `agy` | `task_generate_command`, `learn_from_user_command`, `reranking_command` only |
+
+`agy` has no `llm.command` recipe because the consult needs hap's MCP server
+and agy cannot be given one on the command line (no `--mcp-config`, no `-c`
+override — only the machine-wide `agy mcp add` registry), and no orchestrator
+recipe because herdr starts that session by agent KIND and only `claude` is
+supported.
+
+Two things to know before choosing `agy`. Its learn recipe takes
+`--dangerously-skip-permissions`, which is **wider** than the claude one's
+`--permission-mode acceptEdits`: agy's only grant is all-or-nothing (tools,
+writes AND shell), it has no middle setting, and `--sandbox` is not one — it
+silently drops writes and reads while the model still reports success. And
+under agy the `AUTO.md` loop runs **one way only**: the learn recipe writes
+lessons, but the generate recipe never reads them back, because agy has no
+`@file` expansion at prompt-parse time. The generate and rerank recipes
+therefore take no permission flag at all, and every agy recipe carries
+`--disable-slash-commands`.
 
 A preset only ever bootstraps a field **nobody has configured** — once one is
 set, tuning it is a `config.toml` edit (or the TUI Config tab's `e` on a
@@ -1034,8 +1062,10 @@ Placeholders for the argv template: `{self}` (the hap binary), `{request_id}`,
 launch (claude/agy: prompt moved next to `-p`/`--print`; codex: missing `exec`
 inserted).
 
-For `agy` there is no preset and no per-invocation MCP flag — register hap once
-in `~/.gemini/config/mcp_config.json` with `HAP_DB_PATH` in its `env`.
+For `agy` there is no per-invocation MCP flag, which is why there is no `agy`
+preset for THIS field — register hap once in `~/.gemini/config/mcp_config.json`
+with `HAP_DB_PATH` in its `env`. (agy does have presets for the other three
+`[llm]` commands, none of which needs an MCP server.)
 
 ### LLM action review (optional)
 

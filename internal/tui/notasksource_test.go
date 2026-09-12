@@ -84,6 +84,7 @@ func TestConfirmNoTaskSourceShowsANoteNotAnError(t *testing.T) {
 			for _, want := range []string{
 				"hap config set llm.task_generate_command --preset claude",
 				"hap config set llm.task_generate_command --preset codex",
+				"hap config set llm.task_generate_command --preset agy",
 				"hap config task-source add",
 				"hap dismiss",
 			} {

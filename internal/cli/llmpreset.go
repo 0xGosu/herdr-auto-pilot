@@ -1,8 +1,11 @@
 package cli
 
-// `hap config set <command field> --preset claude|codex` — the CLI half of
-// the command presets (the three [llm] templates, plus the orchestrator
-// command, which offers claude only).
+// `hap config set <command field> --preset claude|codex|agy` — the CLI half of
+// the command presets (the four [llm] templates, plus the orchestrator
+// command). Not every CLI serves every key: the orchestrator offers claude
+// only, llm.command offers claude and codex, and the usage line above is
+// rendered from frontend.LLMPresetNames rather than spelled out, so a new CLI
+// cannot leave it naming the old set.
 //
 // Three [llm] argv templates ship disabled (llm.command,
 // llm.task_generate_command, llm.learn_from_user_command). Turning one on by

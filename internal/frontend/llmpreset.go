@@ -27,12 +27,18 @@ import (
 // config.toml job, exactly as before.
 //
 // The recipes are copied VERBATIM from sample/config.toml (claude active,
-// codex commented). Two asymmetries there are deliberate and must survive any
-// edit here: the learn recipes run with WRITE access (claude
-// --permission-mode acceptEdits; codex --dangerously-bypass-approvals-and-sandbox)
-// because they are the only ones that edit a file, where the read-only consult
-// and generate recipes do not; and codex's consult names a different model
-// (gpt-5.6-terra) from its generate/learn recipes (gpt-5.6-sol).
+// codex and agy commented). Two asymmetries there are deliberate and must
+// survive any edit here: the learn recipes run with WRITE access (claude
+// --permission-mode acceptEdits; codex --dangerously-bypass-approvals-and-sandbox;
+// agy --dangerously-skip-permissions) because they are the only ones that edit
+// a file, where the read-only consult and generate recipes do not; and codex's
+// consult names a different model (gpt-5.6-terra) from its generate/learn
+// recipes (gpt-5.6-sol).
+//
+// agy adds a THIRD asymmetry and does NOT follow the codex pattern — read
+// LLMPresetAgy's own doc comment before assuming it does. It serves three of
+// the five keys, its only model split is the judge, and its one write-capable
+// recipe takes a grant strictly wider than either other CLI asks for.
 //
 // Model names age. That is an accepted cost, not an oversight: a preset is a
 // starting point the operator then tunes in config.toml, which is why the
@@ -144,8 +150,68 @@ const (
 	LLMPresetCodex  = "codex"
 )
 
+// LLMPresetAgy is the Antigravity CLI. It is LAST in the picker because it is
+// the only one of the three that cannot serve every key it is offered beside,
+// and the notes below are what a reader needs before assuming it mirrors codex.
+// Verified live against agy 1.2.2 on 2026-09-12.
+//
+// WHAT AGY CANNOT SERVE, and why neither gap is closeable from argv:
+//
+//   - llm.command (the consult) NEEDS hap's MCP server, and agy has no
+//     per-invocation MCP flag at all — no --mcp-config, no `-c` override. Its
+//     only MCP surface is `agy mcp add`, which writes a MACHINE-WIDE registry
+//     (~/.gemini/config/mcp_config.json). A preset writes argv and nothing
+//     else, so it cannot reach that; and registering hap's server there would
+//     attach hap's tools to every interactive agy session the operator runs,
+//     which is not a thing a picker keystroke may do. Compounding it, agy has
+//     no --allowedTools equivalent either, so the consult prompt's own "Use
+//     ONLY get_context and submit_decision" would be unenforced in the
+//     monitored agent's project. An agy option here would install argv that
+//     fails opaquely with nothing staged, so there is none.
+//   - The orchestrator command is claude-only by construction, not by taste:
+//     argv[0] is the herdr agent KIND (domain.OrchestratorAgentKind ==
+//     "claude"), and domain.OrchestratorLaunch refuses anything else.
+//
+// WHAT THE GRANTS BUY, which is where agy differs most from the other two:
+//
+//   - agy has exactly ONE working permission flag, --dangerously-skip-permissions
+//     ("Auto-approve all tool permission requests without prompting"), and it is
+//     all-or-nothing: tools, file writes and shell, in the MONITORED AGENT's own
+//     directory. There is no --permission-mode acceptEdits to step down to and no
+//     --sandbox read-only floor. Only the LEARN recipe takes it, because only that
+//     recipe writes a file; generate and rerank do not, so they run with agy's
+//     headless default, where any tool a run reaches for is soft-denied.
+//   - --sandbox is NOT the narrower grant it looks like and is deliberately
+//     unused. Under `--sandbox --dangerously-skip-permissions` a write was
+//     silently dropped while the model still answered "DONE", and a read of a
+//     present AUTO.md came back "NOFILE". A flag that fails by lying is worse
+//     than no flag.
+//   - --disable-slash-commands is the one genuine scoping flag agy does offer,
+//     and every recipe carries it. These runs are handed untrusted pane text
+//     ({pane_excerpt}, {salient}, {candidates}) and start in a repo hap does
+//     not control, so slash-command and SKILL expansion is an instruction
+//     channel none of them needs. It is print-mode-only, hence its position
+//     before -p.
+//
+// THE LESSON LOOP IS ONE-DIRECTIONAL UNDER AGY, and this is the cost an
+// operator most needs to know. llmLessonDirective leans on claude expanding
+// `@AUTO.md` at prompt-parse time; agy has no such syntax, so honouring it
+// would need a real read tool. Measured: the generate recipe was run 13 times
+// WITHOUT --dangerously-skip-permissions across two models and answered
+// cleanly every time (exit 0, a well-formed markdown list) — and 2 further runs
+// WITH the flag ignored a deliberately loud AUTO.md just as completely as the
+// flagless ones did. So the flag buys generate nothing observable at the price
+// of write+shell in someone's project, and it is not taken. agy's learn recipe
+// still WRITES AUTO.md; the generate recipe simply never reads it back.
+//
+// One residual, scoped honestly: a headless agy run whose model does reach for
+// a denied tool prints NOTHING and exits 0. That was observed once with an
+// abbreviated prompt of our own, and never with the shipped prompt across those
+// 13 runs — a taskgen run that returns no tasks is the benign direction anyway.
+const LLMPresetAgy = "agy"
+
 // LLMPresetNames is the picker's option list. Order is display order.
-var LLMPresetNames = []string{LLMPresetClaude, LLMPresetCodex}
+var LLMPresetNames = []string{LLMPresetClaude, LLMPresetCodex, LLMPresetAgy}
 
 // llmCommandPresets maps a config key to its per-CLI recipe. A key absent
 // here has no preset.
@@ -217,6 +283,21 @@ var llmCommandPresets = map[string]map[string][]string{
 			"read-only",
 			llmTaskGeneratePrompt,
 		},
+		// No permission flag, and that is the measured choice rather than the
+		// cautious-looking one: agy's only grant is all-or-nothing, and 2 runs
+		// WITH it ignored a deliberately loud AUTO.md exactly as 13 runs
+		// without it did. Where codex buys a real capability with
+		// `--sandbox read-only`, agy would be buying write+shell in someone
+		// else's repo for nothing. The cost is stated plainly on LLMPresetAgy:
+		// under agy the lesson loop only runs one way.
+		LLMPresetAgy: {
+			"agy",
+			"--model",
+			"gemini-3.1-pro-high",
+			"--disable-slash-commands",
+			"-p",
+			llmTaskGeneratePrompt,
+		},
 	},
 	LLMLearnFromUserCommandKey: {
 		LLMPresetClaude: {
@@ -238,6 +319,24 @@ var llmCommandPresets = map[string]map[string][]string{
 			"--ephemeral",
 			"--skip-git-repo-check",
 			"--dangerously-bypass-approvals-and-sandbox",
+			llmLearnFromUserPrompt,
+		},
+		// The ONLY agy recipe that takes the permission flag, and the only one
+		// that has to: this run creates or edits AUTO.md, and agy denies every
+		// tool headless without it. It is a WIDER grant than the claude recipe
+		// beside it asks for — claude steps down to --permission-mode
+		// acceptEdits, which is edits and nothing else, while agy's flag also
+		// carries shell — because agy offers no middle setting and --sandbox
+		// is not one (it drops the write silently, see LLMPresetAgy). The
+		// prompt naming AUTO.md as the only file it may touch is doing more
+		// work here than it does for claude.
+		LLMPresetAgy: {
+			"agy",
+			"--model",
+			"gemini-3.1-pro-high",
+			"--dangerously-skip-permissions",
+			"--disable-slash-commands",
+			"-p",
 			llmLearnFromUserPrompt,
 		},
 	},
@@ -284,6 +383,23 @@ var llmCommandPresets = map[string]map[string][]string{
 			"--skip-git-repo-check",
 			"--sandbox",
 			"read-only",
+			llmRerankPrompt,
+		},
+		// The judge is the one place agy is no weaker than the others: it
+		// answers from its own prompt, so "needs no tools" is served by taking
+		// no grant at all — agy's headless default soft-denies every tool, and
+		// a run that tried one would degrade to the cosine answer, which is
+		// the direction a judge failure is supposed to fall. This is also agy's
+		// only model split (flash-low against pro), mirroring why the claude
+		// and codex judges name a smaller model: the agent is parked for the
+		// whole run. Measured at 3.7-4.9s against the 30s
+		// reranking_timeout_seconds budget.
+		LLMPresetAgy: {
+			"agy",
+			"--model",
+			"gemini-3.8-flash-low",
+			"--disable-slash-commands",
+			"-p",
 			llmRerankPrompt,
 		},
 	},
