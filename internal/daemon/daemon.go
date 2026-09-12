@@ -4311,7 +4311,16 @@ func (d *Daemon) consultContext(ctx context.Context, cfg config.Config, s domain
 		}
 		fields["answer_format"] = answer
 	} else if len(s.Options) > 0 {
-		fields["answer_format"] = "answer with submit_decision select_options: a one-element list with the 1-based number of the chosen option, e.g. [2]"
+		answer := "answer with submit_decision select_options: a one-element list with the 1-based number of the chosen option, e.g. [2]"
+		if s.Type == domain.SituationApproval {
+			// Guidance only — the deterministic guard is NarrowestAgyApproval,
+			// because a prompt cannot be relied on for a safety property.
+			answer += ". Choose the NARROWEST option that satisfies this one request: an option that also " +
+				"grants future requests (\"and always allow…\", \"don't ask again\", \"Persist to settings.json\") " +
+				"pre-authorises commands nobody will be asked about again, so prefer the plain approval even when " +
+				"a broader option is offered"
+		}
+		fields["answer_format"] = answer
 	} else if s.Type == domain.SituationApproval || s.Type == domain.SituationChoice {
 		fields["answer_format"] = "no numbered options were detected on the pane: answer with submit_decision recommend_action — the literal text the prompt expects (e.g. \"y\" for a y/n confirmation)"
 	}
@@ -5380,6 +5389,23 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		if !ok {
 			reject(domain.ReasonLLMNoSubmit, "stale: no answerable agy form on screen")
 			return
+		}
+		// Prefer the narrowest option that still grants the request. The LLM
+		// picks agy's "and always allow…" row at confidence 98-99 on nearly
+		// every approval, which pre-authorises a command PREFIX for the rest of
+		// the conversation — every later command matching it then runs with no
+		// prompt, so it never reaches a pane, a classifier or this screen again.
+		//
+		// Substituted BEFORE the answer is verified and before the audit row is
+		// written inside deliverKeyedFormLLM, so what is recorded and learned is
+		// what is actually typed. The rationale says so, or the audit would show
+		// the LLM choosing an option it did not choose.
+		if narrow, swapped := domain.NarrowestAgyApproval(form, llmDec.Action); swapped {
+			slog.Info("agy approval: preferring the narrowest option over a scope-widening one",
+				"agent", s.AgentID, "llm_chose", llmDec.Action, "sending", narrow)
+			llmDec.Action = narrow
+			llmDec.Rationale += " [hap: the LLM chose an option that would also allow future " +
+				"commands; substituted the narrowest option that grants this one request]"
 		}
 		if _, err := domain.AgyAnswerKey(form, llmDec.Action); err != nil {
 			reject(agyAnswerRefusalReason(err), "LLM answer: "+err.Error())
