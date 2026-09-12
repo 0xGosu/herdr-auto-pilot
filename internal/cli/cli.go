@@ -1061,6 +1061,14 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	if h.OrchestratorLine != "" {
 		fmt.Fprintf(out, "orchestrator:        %s\n", h.OrchestratorLine)
 	}
+	// agy asks approval per file outside its start directory, so an agent
+	// launched in the wrong one turns every file read into a round trip. The
+	// remedy is in the line because the observation alone is not actionable:
+	// an operator seeing two directory paths would not know that RESTARTING
+	// the agent is what stops the prompts.
+	for _, line := range h.AgyWorkspaceLines {
+		fmt.Fprintf(out, "  agy workspace: %s\n", line)
+	}
 	// The evidence behind the state: which budgets are in force, how many calls
 	// hit them, and the last error. Printed even when NOT degraded, so a run of
 	// timeouts is visible before the latch trips (the diag lines are empty

@@ -116,6 +116,14 @@ type DaemonHealth struct {
 	// page's full rendering (retry timing included).
 	OrchestratorError string
 	OrchestratorLine  string
+	// AgyWorkspaceLines names agy agents working outside the directory they
+	// were started in, one advisory line each. A WARNING at most: the herd is
+	// served correctly either way, and hap answers the resulting prompts
+	// itself once the rule graduates. What it buys the operator is knowing
+	// that RELAUNCHING the agent removes those prompts at the source — which
+	// neither this page nor `hap agents` says, though the cwd column has
+	// carried the raw fact all along.
+	AgyWorkspaceLines []string
 	// Reason explains a gave-up / auto-disabled latch.
 	Reason string
 	// StderrLog is the captured daemon stderr path (for hung/crashed post-mortem).
@@ -167,6 +175,11 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 				h.OrchestratorWaiting = o.Waiting
 				h.OrchestratorError = o.LastError
 				h.OrchestratorLine = o.Line(now)
+			}
+			for _, m := range rec.AgyWorkspace {
+				if line := m.Line(); line != "" {
+					h.AgyWorkspaceLines = append(h.AgyWorkspaceLines, line)
+				}
 			}
 		}
 	}
