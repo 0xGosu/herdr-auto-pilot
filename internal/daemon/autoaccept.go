@@ -960,15 +960,39 @@ func (d *Daemon) generatedTaskUnsafe(rec *domain.AuditRecord) string {
 // A nil rule list means none are configured, which is the operator having no
 // patterns — not a reason to refuse.
 func (d *Daemon) screenOutbound(agentType, text string) error {
+	if err := d.screenOutboundStrict(agentType, text); err != nil {
+		return err
+	}
+	_, allow, _ := d.snapshot()
+	if allow == nil {
+		return nil
+	}
+	if hit, sus := allow.SuspectedIrreversible(agentType, text); sus {
+		return fmt.Errorf("tripped irreversible %s", hit.Diagnostic())
+	}
+	return nil
+}
+
+// screenOutboundStrict is screenOutbound's first half: the STRICT never-auto
+// rules only — the operator's own never_auto_patterns (always compiled strict,
+// so their declared policy is entirely inside this half) and the shipped strict
+// seeds, which are literal command shapes (`git push --force`, `DROP TABLE`,
+// `rm -rf ~`).
+//
+// It exists so a gate screening PROSE can keep the policy half and drop the
+// heuristic one. The suspected-irreversible seeds corroborate a destructive verb
+// against a data target within a line or two precisely because they judge a
+// PENDING pane operation — SeedHeuristicNeverAutoRules says so: "a verb and
+// target separated by other lines of text is narration, not a pending
+// operation". A task hand-out is narration by construction, so over a hand-out
+// those rules refuse work for discussing it. See actionScreen.
+func (d *Daemon) screenOutboundStrict(agentType, text string) error {
 	_, allow, _ := d.snapshot()
 	if allow == nil {
 		return nil
 	}
 	if hit, matched := allow.Match(agentType, text); matched {
 		return fmt.Errorf("matched never-auto %s", hit.Diagnostic())
-	}
-	if hit, sus := allow.SuspectedIrreversible(agentType, text); sus {
-		return fmt.Errorf("tripped irreversible %s", hit.Diagnostic())
 	}
 	return nil
 }

@@ -1279,9 +1279,17 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
 - **hap knows when the orchestrator is acting.** A `hap` command run inside its
   pane is authored `orchestrator` (`by=orchestrator` on the stream and in
   `hap audit`, `orch` in the TUI Audit tab's BY column): its generated-task
-  confirms and `hap task … send` go through the same never-auto and
-  irreversibility screen as hap's own unattended sends, and all its sends are
-  refused while the herd is paused. Your own commands are unaffected.
+  confirms go through the same never-auto and irreversibility screen as hap's own
+  unattended sends, and all its sends are refused while the herd is paused. Your
+  own commands are unaffected.
+  - **`hap task … send` is screened by POLICY only** — the never-auto patterns
+    (yours and the shipped strict seeds), without the suspected-irreversible
+    heuristic and without the never-auto *action* rules. A hand-out's text is a
+    checklist item somebody wrote as a task, and those two halves judge a pending
+    pane operation: over prose they refuse a task for *discussing* the work (a
+    task explaining a failing CI run, a task that uses the word "irreversible").
+    A generated task's text, which the task-generator LLM invented rather than
+    was asked for, keeps the whole screen.
 - **`HAP_ACTOR=orchestrator` declares it explicitly** — for an orchestrating
   agent hap did not start (your own claude or codex session, a script), or any
   process outside the orchestrator's pane:

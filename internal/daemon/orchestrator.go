@@ -755,9 +755,41 @@ func CallerIsOrchestrator(stateDir, paneID string) bool {
 // for an operator — they saw the text, and their confirm is the gate — and
 // the daemon's own never-auto and irreversibility screen for the orchestrator,
 // an LLM whose text no human has seen.
+//
+// A send_task hand-out is the one kind screened by POLICY only
+// (screenOutboundStrict): the operator's never_auto_patterns and the strict
+// seeds, without the suspected-irreversible heuristic and without the action
+// rules. Its text is an existing checklist item somebody WROTE as a task — prose
+// instructing an agent — and both of the other halves judge something else. The
+// heuristic seeds corroborate a destructive verb against a data target across a
+// line or two because they read a pending pane operation, so over prose they
+// refuse a task for discussing the work: observed live refusing a task that
+// explained how to fix a failing CI run, and again refusing one that used the
+// word "irreversible" while describing this very rule. The action rules are
+// already excluded from a generated task prompt for exactly this reason — see
+// actionRefused's comment: "matching them against prose an agent is being asked
+// to do would refuse work for containing a phrase" — and a hand-out is prose,
+// not a menu option.
+//
+// This narrows the ONLY screen a hand-out's text ever gets: `hap task add`
+// screens nothing. What makes that sound is that the whole of the operator's
+// declared policy is strict-kind and survives here; what is dropped is two
+// shipped heuristics written to read a screen.
+//
+// Nothing changes for accept_generated_task, whose text the task-generator LLM
+// INVENTED rather than was asked for, and nothing for the daemon's own FSP
+// sends (screenOutbound, unchanged).
 func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(string) error {
 	if a.Author != domain.OrchestratorAuthor {
 		return nil
+	}
+	if a.Kind == domain.AgentActionSendTask {
+		return func(text string) error {
+			if err := d.screenOutboundStrict(agentType, text); err != nil {
+				return fmt.Errorf("%w: %v", errOutboundRefused, err)
+			}
+			return nil
+		}
 	}
 	return func(text string) error {
 		if err := d.screenOutbound(agentType, text); err != nil {
