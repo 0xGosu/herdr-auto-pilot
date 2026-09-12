@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.22
+
+- Removed unreferenced internal helpers (`NodeWatching`, `SeedRuleDisabled`, `TaskFilePath`, `GetTask`) across domain and frontend layers.
+- Consolidated duplicate signature truncation logic across the CLI and TUI into `domain.ShortSignature`.
+- Consolidated duplicate CLI row formatting helpers.
+
 ## 0.9.21
 
 - Added real-agy integration cases, gated on `HAP_ITEST_AGY=1` (detection, a shell approval and a question answered through `hap confirm --send`, a task hand-out refused over a draft and delivered at an empty composer, and the permission-mode cycle), so agy's live screens and keys are checked the way claude's and codex's are
