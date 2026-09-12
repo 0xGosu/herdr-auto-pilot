@@ -55,6 +55,16 @@ func TestMigrateScopeListsMatchTheGuard(t *testing.T) {
 	}
 }
 
+// Node ids are 16 lowercase hex characters (store.nodeIDRE) — a readable
+// label is REFUSED by OpenDB, which is the right call: the id is the key every
+// row a node ever wrote is filed under.
+const (
+	nodeMine      = "aaaaaaaaaaaaaaaa"
+	nodeTheirs    = "bbbbbbbbbbbbbbbb"
+	nodeSource    = "cccccccccccccccc"
+	nodeElsewhere = "dddddddddddddddd"
+)
+
 // sharedShapedStore opens a store with the SHARED database's shape — an id
 // allocator and EngineTurso — on a plain sqlite file. It is the turso side of
 // every test here: the sync engine is what makes a database remote, while what
@@ -252,8 +262,8 @@ func TestMigrateTakesThisNodesRowsButAllOfTheKnowledge(t *testing.T) {
 	skipUnlessSQLite(t)
 	ctx := context.Background()
 	sharedPath := filepath.Join(t.TempDir(), "shared.db")
-	mine := sharedShapedStore(t, sharedPath, "node-mine", 3)
-	theirs := sharedShapedStore(t, sharedPath, "node-theirs", 4)
+	mine := sharedShapedStore(t, sharedPath, nodeMine, 3)
+	theirs := sharedShapedStore(t, sharedPath, nodeTheirs, 4)
 	seedHistory(t, mine, "1")
 	seedHistory(t, theirs, "2")
 
@@ -305,11 +315,11 @@ func TestMigrateTakesThisNodesRowsButAllOfTheKnowledge(t *testing.T) {
 func TestMigrateScopesToTheSourcesNodeNotTheDestinations(t *testing.T) {
 	skipUnlessSQLite(t)
 	ctx := context.Background()
-	shared := sharedShapedStore(t, filepath.Join(t.TempDir(), "shared.db"), "node-source", 3)
+	shared := sharedShapedStore(t, filepath.Join(t.TempDir(), "shared.db"), nodeSource, 3)
 	seedHistory(t, shared, "1")
 
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, NodeIDFile), []byte("node-elsewhere\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, NodeIDFile), []byte(nodeElsewhere+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	dst, err := Open(filepath.Join(dir, "herd-auto-prompter.db"))
