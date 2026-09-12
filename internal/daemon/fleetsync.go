@@ -116,12 +116,16 @@ func (d *Daemon) fleetHealth() *daemonhealth.FleetSyncHealth {
 	if d.opt.FleetSync == nil {
 		return nil
 	}
+	// Read before taking the state lock: fleetSyncPaused takes the config
+	// lock, and the two are never nested in the other order.
+	paused := d.fleetSyncPaused()
 	s := &d.fleet
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return &daemonhealth.FleetSyncHealth{
 		Engine:              "turso",
 		Bootstrapped:        true,
+		Paused:              paused,
 		LastPullAt:          s.lastPull,
 		LastPushAt:          s.lastPush,
 		PendingOps:          s.pendingOps,
@@ -167,12 +171,78 @@ func (d *Daemon) adoptFleetRecoveryMarker() {
 		"consecutive_failures", m.ConsecutiveFailures, "isolated_for", m.IsolatedFor)
 }
 
+// fleetSyncPaused reports whether the operator has deliberately taken this
+// node off the wire (database.turso_sync_paused).
+//
+// Read from the LIVE config snapshot on every operation rather than captured
+// at loop start like FleetSyncInterval, which is what makes this the one
+// [database] key that applies on `hap daemon --reload`: a pause switch whose
+// only route into the daemon is `--restart` would cost the herd its in-flight
+// captures and consults to take effect, which is the opposite of what an
+// operator reaching for it wants. The rest of the section still needs a
+// restart — it is read when a process opens its store.
+//
+// It gates the cloud round trips ONLY. The pull tick still refreshes the
+// engine's counters and checkpoints the local WAL, because a replica whose
+// write-ahead log grows without bound for the length of the pause is an
+// engine change, not a pause.
+func (d *Daemon) fleetSyncPaused() bool {
+	cfg, _, _ := d.snapshot()
+	return cfg.Database.TursoSyncPaused
+}
+
+// notePausedSkip says that an operation was skipped, at Debug: it happens on
+// every tick for as long as the pause stands, and the operator already has the
+// PAUSED state on `hap status` and in the TUI. The pause itself is announced
+// at Info once, by the loop's own `paused` gate, on the tick that first sees
+// it — and again when it is lifted.
+func (d *Daemon) notePausedSkip(op string) {
+	slog.Debug("fleet sync: skipped; sync is paused by database.turso_sync_paused", "op", op)
+}
+
 // runFleetSync is the loop. It returns when ctx is done.
 func (d *Daemon) runFleetSync(ctx context.Context) {
 	sync := d.opt.FleetSync
 	interval := d.opt.FleetSyncInterval
 	if interval <= 0 {
 		interval = 15 * time.Second
+	}
+	// announced tracks whether the CURRENT pause has been logged at Info, so
+	// the transition into and out of one is visible in the log without a line
+	// per tick. Not a control: every gate re-reads the live config.
+	announced := false
+	paused := func(op string) bool {
+		if !d.fleetSyncPaused() {
+			if announced {
+				announced = false
+				slog.Info("fleet sync: resumed; database.turso_sync_paused is off, " +
+					"pushing what accumulated while it was on")
+				// Nothing else would. Every write during the pause armed a
+				// debounce timer that then fired into the gate and was NOT
+				// re-armed, so the only push left on an idle herd is whatever
+				// write happens to come next — which on a quiet machine is the
+				// node heartbeat, up to a minute away, and by construction not
+				// the operator's own. The nudge reuses the loop's own
+				// push-at-once path rather than pushing inline, because the
+				// resume is noticed from INSIDE a case that has its own
+				// operation to run. Skipped on a push case: that one is about
+				// to push anyway, and a second would carry nothing.
+				if op != "push" && op != "push-now" && d.fleetPushNow != nil {
+					select {
+					case d.fleetPushNow <- struct{}{}:
+					default:
+					}
+				}
+			}
+			return false
+		}
+		if !announced {
+			announced = true
+			slog.Info("fleet sync: PAUSED by database.turso_sync_paused; this node keeps using its " +
+				"local replica but exchanges no rows with Turso Cloud until the key is turned off")
+		}
+		d.notePausedSkip(op)
+		return true
 	}
 	pull := time.NewTicker(interval)
 	defer pull.Stop()
@@ -183,6 +253,13 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 		case <-ctx.Done():
 			if pushTimer != nil {
 				pushTimer.Stop()
+			}
+			// Shutdown is a push like any other: paused means paused, and the
+			// writes wait in the replica's change log for a process that is
+			// allowed to send them.
+			if d.fleetSyncPaused() {
+				d.notePausedSkip("final-push")
+				return
 			}
 			d.fleetFinalPush(sync)
 			return
@@ -209,15 +286,30 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 				pushTimer.Stop()
 				pushTimer, pushC = nil, nil
 			}
+			if paused("push-now") {
+				continue
+			}
 			if !d.fleetRun(ctx, "push", func() { d.fleetPush(sync) }) {
 				return
 			}
 		case <-pushC:
 			pushTimer, pushC = nil, nil
+			if paused("push") {
+				continue
+			}
 			if !d.fleetRun(ctx, "push", func() { d.fleetPush(sync) }) {
 				return
 			}
 		case <-pull.C:
+			if paused("pull") {
+				// The local half of a pull tick still runs: counters for the
+				// status line (so "N unpushed" stays honest while paused) and
+				// the WAL checkpoint. See fleetPausedTick.
+				if !d.fleetRun(ctx, "paused-tick", func() { d.fleetPausedTick(sync) }) {
+					return
+				}
+				continue
+			}
 			if !d.fleetRun(ctx, "pull", func() { d.fleetPull(sync) }) {
 				return
 			}
@@ -259,6 +351,36 @@ func (d *Daemon) fleetPush(sync ports.FleetSyncPort) {
 		d.fleet.mu.Unlock()
 		d.noteFleetSuccess()
 		d.fleetRefreshStats(sync)
+		return nil
+	})
+}
+
+// fleetPausedTick is the pull tick's LOCAL half, run in place of a pull while
+// the operator has sync paused. It talks to the replica only.
+//
+// Two things still have to happen. The engine's counters feed the PAUSED
+// status line, and an operator watching unpushed operations pile up is how
+// they judge when to lift the pause — frozen numbers would read as "nothing
+// is accumulating". And a sync database never checkpoints itself (see the
+// package comment), so skipping the whole pull path would let the local WAL
+// grow for the length of the pause.
+//
+// The checkpoint is gated on the WAL bound ALONE, deliberately: fleetPull's
+// other trigger counts pulls, a counter that does not advance while paused and
+// starts at 0 — so `pulls%fleetCheckpointEveryPulls == 0` is true on every
+// tick of a daemon that started paused, which would checkpoint every fifteen
+// seconds forever.
+//
+// It records neither success nor failure against the sync state: nothing here
+// is evidence about reaching Turso Cloud in either direction.
+func (d *Daemon) fleetPausedTick(sync ports.FleetSyncPort) {
+	_ = logging.Guard("fleet-paused-tick", func() error {
+		st := d.fleetRefreshStats(sync)
+		if st.MainWALBytes > fleetCheckpointWALBytes {
+			if err := sync.Checkpoint(); err != nil {
+				slog.Warn("fleet sync: checkpoint failed while paused", "error", err)
+			}
+		}
 		return nil
 	})
 }
@@ -354,10 +476,17 @@ const fleetRecoveryRetryInterval = 5 * time.Minute
 //     on those buys nothing and costs the herd its in-flight work every
 //     cooldown, forever;
 //   - the recovery latch is free: a daemon born from a recovery does not order
-//     another until one has succeeded (see fleetrecovery.go).
+//     another until one has succeeded (see fleetrecovery.go);
+//   - sync is not deliberately PAUSED. A pause freezes lastError, the failure
+//     count and both timestamps, while `since` keeps aging — so a node that
+//     happened to be failing when the operator paused it would satisfy every
+//     bound five minutes later and restart itself, then again every
+//     fleetRecoveryRetryInterval, abandoning the herd's in-flight work each
+//     time to fix something nobody is asking it to do. Elapsed time is only
+//     evidence of an outage while something is actually trying.
 func (d *Daemon) checkFleetSyncWedged() bool {
 	if d.opt.FleetSync == nil || d.opt.RestartSelf == nil ||
-		d.handedOff.Load() || d.fleetRecoveryOrdered.Load() {
+		d.handedOff.Load() || d.fleetRecoveryOrdered.Load() || d.fleetSyncPaused() {
 		return false
 	}
 	now := d.opt.Clock.Now()

@@ -162,3 +162,37 @@ func TestConfigTopicHelpResolvesToTheTopic(t *testing.T) {
 		t.Errorf("`hap config --help` printed the wrong page:\n%s", firstLine(out))
 	}
 }
+
+// TestTursoSyncPauseDoesNotTellTheOperatorToRestart: every other [database]
+// key is read when a process opens its store, so `hap config set` prints a
+// "run `hap daemon --restart`" note. turso_sync_paused is the one the running
+// daemon re-reads, and a restart is exactly what a pause exists to avoid — so
+// printing that note here would be false advice, and advice that costs the herd
+// its in-flight work when followed.
+//
+// The control is its neighbour: without it, code that dropped the note for the
+// whole section passes.
+func TestTursoSyncPauseDoesNotTellTheOperatorToRestart(t *testing.T) {
+	app, _ := testApp(t)
+	var notes bytes.Buffer
+	defer cli.SetDeprecationOutput(&notes)()
+
+	out, err := run(t, app, "config", "set", "database.turso_sync_paused", "true")
+	if err != nil {
+		t.Fatalf("hap config set database.turso_sync_paused: %v", err)
+	}
+	if !strings.Contains(out, "database.turso_sync_paused set to true") {
+		t.Errorf("the write was not confirmed:\n%s", out)
+	}
+	if strings.Contains(notes.String(), "--restart") {
+		t.Errorf("a pause was reported as needing a daemon restart: %q", notes.String())
+	}
+
+	notes.Reset()
+	if _, err := run(t, app, "config", "set", "database.node_label", "laptop"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(notes.String(), "--restart") {
+		t.Errorf("the rest of [database] must still say a restart is needed: %q", notes.String())
+	}
+}

@@ -115,7 +115,7 @@ func buildCommands() {
 			Flags: []FlagDoc{
 				{Name: "--ensure", Desc: "start a daemon only if none is running; replace one left by an older binary or a binary at a different path (this is what herdr's event hook runs, and how you pick up a rebuild)"},
 				{Name: "--replace-only", Desc: "with --ensure: replace a running daemon, but never start one when none is running (used by the plugin install step, so installing hap does not bring a daemon up as a side effect)"},
-				{Name: "--restart", Desc: "stop the running daemon whatever binary it came from, and start a fresh one (starts one if none is running) — the only way to pick up a [database] or [logging] change. It waits for the new daemon to report healthy, and says so plainly when it does not"},
+				{Name: "--restart", Desc: "stop the running daemon whatever binary it came from, and start a fresh one (starts one if none is running) — the only way to pick up a [database] or [logging] change, apart from database.turso_sync_paused, which applies on a reload. It waits for the new daemon to report healthy, and says so plainly when it does not"},
 				{Name: "--reload", Desc: "ask the running daemon to re-read config.toml, without restarting it; fails when no daemon is running"},
 			},
 			Details: "Without a flag the daemon runs in the foreground and holds the state-dir lock.\n" +
@@ -129,7 +129,11 @@ func buildCommands() {
 				"sends the same nudge). [database] and [logging] are NOT — they are read once, when a\n" +
 				"process opens its store, so switching engine, pointing at a different Turso database,\n" +
 				"rotating its token, changing node_label or the log level takes effect only in a NEW\n" +
-				"process. Front ends read their store once too, so reopen `hap tui` after a restart.\n\n" +
+				"process. Front ends read their store once too, so reopen `hap tui` after a restart.\n" +
+				"The ONE exception is database.turso_sync_paused, which applies on a --reload (every\n" +
+				"`hap config set` sends one): the sync loop asks the live config before each pull and\n" +
+				"push, because taking a machine off the wire must not cost the herd the in-flight work\n" +
+				"a restart discards.\n\n" +
 				"--restart does not report success on the fork alone: a [database] error exits AFTER the\n" +
 				"new daemon takes the lock, so it waits for a heartbeat from the process now holding that\n" +
 				"lock. Failing to see one it says so and EXITS NON-ZERO, so `hap daemon --restart && …`\n" +
@@ -1236,6 +1240,50 @@ func buildCommands() {
 		},
 
 		// ------------------------------------------------------------------- Data
+		{
+			Name:    "migrate",
+			Group:   groupData,
+			Summary: "copy hap's data between the local sqlite database and the shared turso one",
+			Usage: []string{"hap migrate --to sqlite", "hap migrate --to turso",
+				"hap migrate --to sqlite --all-nodes"},
+			Flags: []FlagDoc{
+				{Name: "--to", Arg: "ENGINE", Desc: "required: `sqlite` copies the shared database into this machine's local file, `turso` copies the local file into the shared database. The other engine is the source"},
+				{Name: "--all-nodes", Desc: "with `--to sqlite`: copy EVERY node's rows, not just this machine's. For consolidating a herd that is being retired — they arrive stamped as THIS machine's, so a herdr pane id that repeats on every machine collapses into one agent, and two machines' agent names collide (the second is dropped)"},
+				{Name: "--force", Desc: "copy into a destination that already holds history. It does NOT merge: every id is re-allocated, so a second run duplicates every row"},
+			},
+			Details: "Switching `database.engine` does not move anything — it points hap at a different\n" +
+				"database, and the old one's history stays where it is. This is how the data\n" +
+				"follows, in either direction, so trying the shared database is reversible.\n\n" +
+				"Stop the daemon first. Under turso it holds the only handle to the sync database,\n" +
+				"and under either engine a running daemon would be writing into a database being\n" +
+				"copied; the command refuses rather than racing it, and names the pid to kill.\n\n" +
+				"What comes over: learned signatures with their embeddings and snapshots, decisions,\n" +
+				"the audit log, corrections, kill history, agent names and rate state, task handouts\n" +
+				"and reservations. Ids are re-allocated by the destination and every cross reference\n" +
+				"is remapped, so `hap audit` history and the learning floor survive the move.\n\n" +
+				"What does not: in-flight rows — pending LLM requests and decisions, queued agent\n" +
+				"actions, and the roster, which is republished within a minute. An answer decided\n" +
+				"against a screen from before the switch is not one to deliver afterwards.\n\n" +
+				"Scope: a shared database holds every node's rows and a local file belongs to one\n" +
+				"machine, so `--to sqlite` takes THIS node's rows by default. Learned knowledge is\n" +
+				"fleet-wide by design and always comes over whole, whatever the scope.\n\n" +
+				"Copied rows are stamped as THIS machine's, which is what makes them visible to\n" +
+				"this machine's commands afterwards. Under --all-nodes that also means the fleet\n" +
+				"is flattened into one node: a herdr pane id repeats on every machine, so two\n" +
+				"machines' agent `1` become one agent, and where their agent NAMES collide only\n" +
+				"the first survives. Use it to consolidate a herd you are retiring, not to keep\n" +
+				"several live machines' histories side by side.\n\n" +
+				"The destination is copied aside first (`<database>.pre-migrate-<stamp>.bak`), and a\n" +
+				"destination that already holds history is refused unless you pass --force.\n" +
+				"Nothing switches engines: run `hap config set database.engine <engine>` and\n" +
+				"`hap daemon --ensure` when the copy reports what you expected.",
+			Examples: []string{"hap migrate --to sqlite", "hap config set database.engine sqlite", "hap daemon --ensure"},
+			Next: []Hint{
+				{Cmd: "hap config set database.engine sqlite", Why: "start using the database the data was copied into"},
+				{Cmd: "hap daemon --ensure", Why: "bring the daemon up on the new engine"},
+				{Cmd: "hap status", Why: "confirm it came up healthy"},
+			},
+		},
 		{
 			Name:    "clear-data",
 			Group:   groupData,
