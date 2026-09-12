@@ -257,7 +257,22 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 	// is the idle/finished situation; a blocked agent we cannot read is
 	// unclassifiable and escalates (FR-018).
 	if agentStatus == "idle" || agentStatus == "done" {
-		s.Type = domain.SituationIdle
+		// On agy, a parked status is NOT evidence that the pane is free: herdr
+		// reports every agy modal as idle/done, so an unrecognised one reads
+		// exactly like a finished turn. Falling through to idle here is what
+		// let hap offer the next task to an agent sat behind an edit-approval
+		// prompt, and a pane scored idle is precisely the state in which a
+		// hand-out gets typed into a live modal.
+		//
+		// So agy must show its composer to earn the idle verdict. This is
+		// deliberately structural rather than a list of known modals: it holds
+		// for the ones nobody has met yet, which is the whole failure — the
+		// modal that caused this was one no parser recognised. Unclassifiable
+		// escalates with no suggestion and no keystroke (FR-018), which is the
+		// fail-safe answer for "something is on screen and hap cannot read it".
+		if !domain.IsAgy(agentType) || domain.AgyComposerVisible(pane) {
+			s.Type = domain.SituationIdle
+		}
 	}
 	return s
 }
