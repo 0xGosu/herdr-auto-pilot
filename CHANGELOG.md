@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.29
+
+- Fixed daemon tests failing on a loaded machine for timing rather than behaviour: two of them read state the daemon writes a moment later, and every shared test wait can now be stretched by one multiplier that CI sets, instead of each deadline being tuned by hand
+
 ## 0.9.28
 
 - Standardized and tightened doc comments on exported symbols across `domain`, `frontend`, and `store` to follow Go conventions and maintain precision.
