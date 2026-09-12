@@ -201,7 +201,13 @@ const agyHandoutSettleDelay = time.Second
 // When the daemon is already shutting down, afterFunc schedules nothing and the
 // ledger row is written inline instead: an item at "[-]" with no row is
 // unreachable by every sweep, so the unverifiable case takes the same ordinary
-// path agyHandoutQueued takes for an unreadable pane.
+// path agyHandoutQueued takes for an unreadable pane. A shutdown landing in the
+// settle itself is the one window with no answer — shutdownBackground STOPS the
+// pending timer, so that hand-out gets neither a ledger row nor an escalation.
+// Accepted rather than plumbed around: it is the same cost the store-write
+// failure below already carries (this item does not self-heal), it needs a
+// shutdown inside a one-second window, and the alternative — writing the row
+// before the read-back — is the double send this exists to prevent.
 func (d *Daemon) verifyAgyHandout(ctx context.Context, s domain.Situation, del delivery,
 	auditID int64, reservedIndex int, now time.Time) {
 
