@@ -1620,7 +1620,10 @@ task-source edits, task items, database task lists, escalations that auto-accept
 left for a human, dismissals and corrections, pause/resume, full self-prompting
 on/off, manual rule edits and daemon restarts — for an agent to watch and react
 to. Lines carry ids, not content, and a sequence number: `--resume N` replays
-everything after N (events are kept for 7 days) before following. See
+everything after N (events are kept for 7 days) before following. What the
+reader itself did (`by=orchestrator`) is left out — it is the one thing an
+orchestrating agent already knows — though those events keep their sequence
+numbers, so resuming never replays them; `--include-self` shows them. See
 `hap help stream orchestrator`.
 
 Set `full_self_prompting.orchestrator_agent_command` (`hap config set

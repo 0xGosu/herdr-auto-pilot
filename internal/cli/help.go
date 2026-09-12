@@ -678,9 +678,9 @@ func buildCommands() {
 			},
 			Handler: func(_ context.Context, _ *frontend.App, _ io.Writer, args []string) error {
 				if len(args) > 0 {
-					return fmt.Errorf("unknown stream %q (usage: hap stream orchestrator [--resume N])", args[0])
+					return fmt.Errorf("unknown stream %q (usage: hap stream orchestrator [--resume N] [--include-self])", args[0])
 				}
-				return fmt.Errorf("name a stream (usage: hap stream orchestrator [--resume N])")
+				return fmt.Errorf("name a stream (usage: hap stream orchestrator [--resume N] [--include-self])")
 			},
 		},
 		{
@@ -688,9 +688,10 @@ func buildCommands() {
 			Hidden:  true,
 			Group:   groupOperate,
 			Summary: "every change an orchestrating agent reacts to, one line per event, resumable",
-			Usage:   []string{"hap stream orchestrator [--resume N]"},
+			Usage:   []string{"hap stream orchestrator [--resume N] [--include-self]"},
 			Flags: []FlagDoc{
 				{Name: "--resume", Arg: "N", Desc: "replay every event after N (the last seq you handled), then keep following"},
+				{Name: "--include-self", Desc: "also print the events the orchestrator itself authored (suppressed by default)"},
 			},
 			Details: "Prints one line per event as it happens, and runs until interrupted:\n\n" +
 				"  <seq> <time UTC> <kind> [key=value ...] by=<author>\n\n" +
@@ -717,7 +718,13 @@ func buildCommands() {
 				"file outside hap is not an event.\n\n" +
 				"An orchestrating agent hap did not start itself should run its own hap\n" +
 				"commands with HAP_ACTOR=orchestrator, so they read by=orchestrator here and in\n" +
-				"`hap audit`, and get the orchestrator's screening and pause refusal.",
+				"`hap audit`, and get the orchestrator's screening and pause refusal.\n\n" +
+				"Events by=orchestrator are NOT printed: they are the reader's own actions\n" +
+				"coming back at it, and a stream exists to say what it has not seen yet. They\n" +
+				"still consume their sequence numbers, so a --resume cursor never replays them\n" +
+				"and a run of them is not a gap. Pass --include-self to see them anyway when\n" +
+				"debugging what an emitter writes. Another node's orchestrator is not affected:\n" +
+				"the log is per machine.",
 			Examples: []string{"hap stream orchestrator", "hap stream orchestrator --resume 1024"},
 			// Every line is for a machine to read; a footer on exit is noise.
 			Bare:    true,
