@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.36
+
+- Fixed a task hand-out being refused for words in the task text on the ordinary rule path, the way it already was for the timed auto-accept: the never-auto ACTION rules describe menu options hap must never pick, so a checklist item that happens to contain one is work to do, not an option being chosen. Latent until you added a single `--action` rule or armed the shipped ones, then that item escalated on every attempt and could only ever be handed out by hand.
+
 ## 0.9.35
 
 - `hap status` now says when an agy agent is working outside the directory it was started in, and names the directory to relaunch it in — agy asks approval for every file outside its start directory, so a misplaced agent turns each file read into a round trip.
