@@ -416,8 +416,14 @@ func resolveSituation(in DecideInput, conf ConfidenceResult) (candidate, suggest
 		// screens), so the conflict escalates for the operator, suggesting
 		// the next declared task; confirming delivers it and teaches
 		// @next_task:declared.
+		//
+		// An item already marked "[-]" is the one exception: the list IS being
+		// worked, so asking the operator to start another task is noise rather
+		// than a conflict. See DeclaredTask.InProgress — it gates this
+		// escalation alone, never the unattended hand-out above.
 		if conf.TopAction == ActionNoop &&
-			in.DeclaredTask != nil && in.DeclaredTask.Task != NoTaskContent {
+			in.DeclaredTask != nil && in.DeclaredTask.Task != NoTaskContent &&
+			!in.DeclaredTask.InProgress {
 			return "", "send next declared task: " + in.DeclaredTask.Prompt(), ReasonNoopVsPendingTasks
 		}
 		// With no pending work there is nothing to park, and a learned noop

@@ -84,6 +84,51 @@ func TestDecideIdlePendingTasksEscalateOverNoopRule(t *testing.T) {
 	}
 }
 
+func TestDecideInProgressListSuppressesTheHandoutProposal(t *testing.T) {
+	// Finding 5: the proposal above is worth an operator's attention only while
+	// NOBODY is working the list. With an item already "[-]" it asks them to
+	// start a SECOND task, and since an agy repaints between every background
+	// command each repeat carries a fresh pane excerpt and slips past the
+	// escalation dedup — the queue fills with one proposal per repaint.
+	//
+	// Both halves are asserted: suppressing unconditionally would pass the
+	// first check alone while silently deleting the #175 guard.
+	base := func(inProgress bool) DecideInput {
+		in := baseInput(SituationIdle)
+		in.State = &SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 8}
+		in.History = sourcedHistory(SourceOperator, noopHistory()...)
+		in.DeclaredTask = &DeclaredTask{Task: "build the parser", InProgress: inProgress}
+		return in
+	}
+
+	if d := Decide(base(true)); d.Action == ActionEscalate && d.Reason == ReasonNoopVsPendingTasks {
+		t.Fatalf("a list already being worked must not propose another hand-out, got %+v", d)
+	}
+	// The control: the very same input with nothing in progress still escalates.
+	if d := Decide(base(false)); d.Action != ActionEscalate || d.Reason != ReasonNoopVsPendingTasks {
+		t.Fatalf("an unworked list must still escalate over a noop rule, got %+v", d)
+	}
+}
+
+func TestDecideInProgressNeverGatesTheUnattendedHandout(t *testing.T) {
+	// The suppression is scoped to the ESCALATION. The idle poll pairs distinct
+	// agents with distinct items, so a "[-]" is routinely another agent's
+	// reservation — gating the unattended send on it would stop the second
+	// agent ever being handed work.
+	in := baseInput(SituationIdle)
+	in.State = &SignatureState{Mode: ModeAutonomous, ConsecutiveConfirmations: 8}
+	in.History = sourcedHistory(SourceOperator, noopHistory()...)
+	in.DeclaredTask = &DeclaredTask{Task: "build the parser", Reserve: true, InProgress: true}
+
+	d := Decide(in)
+	if d.Action != ActionSend {
+		t.Fatalf("an unattended source must still send while another item is in progress, got %+v", d)
+	}
+	if !strings.Contains(d.Input, "build the parser") {
+		t.Errorf("delivered input lost the task: %q", d.Input)
+	}
+}
+
 func TestDecideIdleOperatorNoopStillQuietOnExhaustedSource(t *testing.T) {
 	// The noop-vs-pending escalation is about REAL pending work only: with
 	// the declared list fully checked off, an operator-backed noop keeps

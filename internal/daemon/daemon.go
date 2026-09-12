@@ -345,6 +345,30 @@ type Daemon struct {
 	lastAutoSend map[string]time.Time
 	lastAutoNoop map[string]time.Time
 
+	// noopVsPendingRaised latches the noop-vs-pending proposal to ONE per
+	// parked episode, per agent. duplicatePendingEscalation keys on the pane
+	// excerpt, and an agy repaints between every background command, so a
+	// parked agy mints a new excerpt on every event and the same proposal is
+	// re-raised until the operator's queue is nothing else (finding 5).
+	//
+	// An episode latch rather than a cooldown duration: there is no interval to
+	// justify, and the happy path self-clears — confirming the escalation
+	// delivers the task, the agent goes working, and the latch is dropped with
+	// the episode. Accepted behavior change: after the operator DISMISSES the
+	// row, nothing re-raises it until the agent works again.
+	//
+	// Deliberately not hung on idleSince's idleMark, which would be
+	// episode-scoped for free: that mark is written only by the 60s sweep, so
+	// an attention-path proposal in the first minute of a park would have
+	// nothing to stamp and the next event would re-raise. Cleared wherever
+	// idleSince is, and pruned against the live listing in noteIdleAgents.
+	//
+	// Counts rather than latches so the suppression can name itself exactly
+	// ONCE per episode (notePending's rule): 0 = not raised, 1 = raised, n>1 =
+	// n-1 repeats ignored. A log line per suppressed event would move the very
+	// flood this fixes into the log.
+	noopVsPendingRaised map[string]int
+
 	// preDeliveryReviewInFlight tracks the one live pre-delivery review per
 	// agent; the token lets the outcome handler drop superseded results.
 	// Guarded by mu alongside preDeliveryReviewSeq.
@@ -813,6 +837,7 @@ func New(opt Options) (*Daemon, error) {
 		learnInFlight:             map[string]bool{},
 		lastAutoSend:              map[string]time.Time{},
 		lastAutoNoop:              map[string]time.Time{},
+		noopVsPendingRaised:       map[string]int{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
 		rerankInFlight:            map[string]rerankFlight{},
 		rerankCache:               map[string][]domain.RerankResult{},
@@ -1863,7 +1888,10 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		d.mu.Lock()
 		delete(d.episodeHandled, tr.PaneID)
 		delete(d.idleSince, tr.AgentID)
+		delete(d.noopVsPendingRaised, tr.AgentID)
 		delete(d.autoTaskClaim, tr.AgentID)
+		// The parked episode is over, so the next one may propose its own
+		// hand-out: confirming the escalation is what set the agent working.
 		// A genuinely new episode: the session-name sync gets its full patience
 		// budget back, and its settle window starts again from the next park.
 		delete(d.sessionSyncDeferred, tr.AgentID)
@@ -2102,6 +2130,7 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	delete(d.lastAutoSend, a.AgentID)
 	delete(d.lastAutoNoop, a.AgentID)
 	delete(d.idleSince, a.AgentID)
+	delete(d.noopVsPendingRaised, a.AgentID)
 	delete(d.autoTaskClaim, a.AgentID)
 	d.forgetSessionRenamePushesLocked(a.AgentID)
 	d.mu.Unlock()
@@ -3538,6 +3567,40 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 }
 
 // escalate records and surfaces an escalation: no input is sent (FR-018).
+// noteNoopVsPendingRaised records that this agent's parked episode now carries
+// a hand-out proposal. Called only once the audit row exists — see the call
+// site in escalate.
+func (d *Daemon) noteNoopVsPendingRaised(agentID string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.noopVsPendingRaised[agentID] == 0 {
+		d.noopVsPendingRaised[agentID] = 1
+	}
+}
+
+// noopVsPendingSuppressed reports whether this parked episode already raised a
+// hand-out proposal, counting the repeat.
+//
+// It names itself exactly ONCE per episode. The screen this exists for repaints
+// several times a minute, so a line per suppressed event would reproduce the
+// flood in the log; silence is not the alternative (notePending's rule — the
+// unlogged auto-accept skips cost a five-round investigation).
+func (d *Daemon) noopVsPendingSuppressed(agentID string) bool {
+	d.mu.Lock()
+	n := d.noopVsPendingRaised[agentID]
+	if n == 0 {
+		d.mu.Unlock()
+		return false
+	}
+	d.noopVsPendingRaised[agentID] = n + 1
+	d.mu.Unlock()
+	if n == 1 {
+		slog.Info("hand-out already proposed for this parked episode; ignoring repeats until the agent works again",
+			"agent", agentID, "reason", domain.ReasonNoopVsPendingTasks)
+	}
+	return true
+}
+
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 	// The episode ended without an autonomous send, so an auto-send pairing for
@@ -3560,6 +3623,18 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	// pending row turn that lifecycle decision into an opaque "duplicate".
 	if autoDismissReason == "" && d.duplicatePendingEscalation(ctx, s) {
 		d.ignoreDuplicate(ctx, s, tr, now)
+		return
+	}
+
+	// One hand-out proposal per parked episode. The dedup above keys on the
+	// pane excerpt, which an agy changes on every repaint, so this reason needs
+	// an identity that survives a moving screen (finding 5, noopVsPendingRaised).
+	// Scoped to this ONE reason: every other escalation on the same event still
+	// reaches the operator. Below the auto-dismiss guard for the same reason the
+	// dedup is — a lifecycle dismissal must stay visible in history — and no
+	// audit row is written per repeat, since audit_log is never swept.
+	if autoDismissReason == "" && dec.Reason == domain.ReasonNoopVsPendingTasks &&
+		d.noopVsPendingSuppressed(s.AgentID) {
 		return
 	}
 
@@ -3610,6 +3685,12 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 	auditID, auditErr := d.opt.Store.AppendAudit(ctx, rec)
 	if auditErr != nil {
 		slog.Error("audit write failed for escalation", "error", auditErr)
+	}
+	// Latch AFTER the row exists: a failed insert must leave the next event
+	// free to raise the proposal, or one store error silences it for the
+	// whole parked episode.
+	if auditErr == nil && dec.Reason == domain.ReasonNoopVsPendingTasks {
+		d.noteNoopVsPendingRaised(s.AgentID)
 	}
 
 	// Rate-limit escalations pause the agent until human check-in — EXCEPT an
@@ -5969,6 +6050,11 @@ func (d *Daemon) declaredTask(ctx context.Context, cfg config.Config, tr domain.
 		// is handed the very same "[ ]" line. Composes with LLMReview above:
 		// the review runs at delivery and reserves the task it actually chose.
 		Reserve: m.src.EnableAutoSendTaskWhenIdle,
+		// Gates the noop-vs-pending ESCALATION only (see the field's doc): a
+		// list already being worked does not need the operator asked to start
+		// another task. Read from the same content NextDeclaredTask parsed, so
+		// the two can never disagree about the list they describe.
+		InProgress: len(domain.InProgressDeclaredTasks(string(m.data))) > 0,
 	}
 }
 

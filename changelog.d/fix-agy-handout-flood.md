@@ -1,0 +1,1 @@
+- Fixed the escalation queue filling with the same "send next declared task" proposal: a hand-out is no longer proposed while the list already has an item in progress, and a repeat within one parked spell is folded into the row the operator already has instead of adding another
