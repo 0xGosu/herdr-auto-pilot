@@ -371,6 +371,24 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 		return
 	}
 
+	// agy only ever receives typed text at a proven EMPTY composer: herdr reports
+	// its modals idle, so an unattended send could type a hand-out into a
+	// standing approval, a picker or the operator's draft. Proving the pane
+	// before taskfile.ApplyReview ensures a refusal costs no task-list write
+	// (and no remote read-modify-write under a gist source).
+	//
+	// Unlike out.Noop below — which commits edits because the source is
+	// genuinely exhausted and no delivery was requested — a busy pane is a
+	// transient refusal of a delivery attempt: applying edits here would still
+	// cost remote read-modify-writes on every idle sweep while the modal stands,
+	// and risks drifting the list out from under a human working in that modal.
+	if domain.IsAgy(s.AgentType) {
+		if err := d.agyComposerRefusal(ctx, s.PaneID); err != nil {
+			d.standDown(ctx, res, "agy_composer_not_ready", err.Error(), llmConf, proposal, now)
+			return
+		}
+	}
+
 	// The safety re-gate. The reviewer is an LLM authoring both task text and
 	// the choice of task, so its output is screened exactly like any other
 	// LLM-authored outbound (FR-015). It runs INSIDE the mutation, against the
@@ -519,13 +537,15 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 }
 
 // standDown abandons a review without sending anything — not the reviewed task
-// and not the original either. It exists for the kill switch, which is the one
-// outcome where fail-open is wrong: the operator asked the daemon to stop, so
-// "keep the agent working" is exactly what they did not want.
+// and not the original either. It exists for outcomes where fail-open is wrong:
+// the kill switch is active, or the target pane is busy/unready (e.g. an agy
+// composer modal) and sending the unreviewed original would violate the same
+// barrier.
 //
-// It still does not escalate. There is nobody to ask — the operator already
-// said "stop" — so an escalation would only add a row to answer later for
-// something that needs no answer; the audit row is what tells them it happened.
+// It still does not escalate. There is nobody to ask — the operator paused or
+// the pane is temporarily occupied — so an escalation would only add a row to
+// answer later for something that needs no answer; the audit row is what tells
+// them it happened.
 func (d *Daemon) standDown(ctx context.Context, res taskListReviewOutcome,
 	reason, why string, llmConf *int, proposal string, now time.Time) {
 
