@@ -62,12 +62,31 @@ var (
 	// agyRuleLineRE matches the full-width rules agy draws around its composer
 	// and between turns.
 	agyRuleLineRE = regexp.MustCompile(`^[─━]{8,}$`)
+
+	// agyBackgroundTaskRE matches one row of agy's background-task strip, which
+	// it paints BETWEEN the composer and the status bar while work is running:
+	//
+	//	  ● [03:57:33] go build -tags "vectors cpu" ./... running
+	//
+	// Anchored on the bullet AND a clock-shaped timestamp on purpose. agy also
+	// prints "● Bash(…)" rows in the ordinary transcript, and the composer
+	// checks below decide whether hap may TYPE into the pane — so a loose
+	// "skip a line above the footer" rule would let a modal's last row be
+	// skipped and turn a standing prompt into a ready composer.
+	agyBackgroundTaskRE = regexp.MustCompile(`^\s*●\s+\[\d{1,2}:\d{2}:\d{2}\]\s`)
 	// agyModelSegmentRE matches the right-aligned half of agy's status bar:
 	// "[accept-edits · |plan · ]<model>[ · <effort>]", e.g.
 	// "plan · Gemini 3.6 Flash · low" or "Claude Sonnet 4.6 (Thinking)".
 	// It must END on a word character or ")", never on the period a sentence
 	// ends with: a right-indented "Done." as the last line is prose.
-	agyModelSegmentRE = regexp.MustCompile(`^(?:(?:accept-edits|plan) · )?[A-Za-z](?:[\w.() -]*[\w)])?(?: · (?:low|medium|high))?$`)
+	// The trailing "· N task(s) · /tasks" is agy's BACKGROUND-TASK suffix: it
+	// appears in the status bar whenever the agent has work running, which for
+	// an agent worth automating is most of the time. Without it the whole
+	// footer fails to parse, so the mode reads UNKNOWN and `hap mode` refuses
+	// -- putting acceptEdits out of reach for exactly those agents. The count
+	// and the "/tasks" hint are matched separately because only the count was
+	// observed varying.
+	agyModelSegmentRE = regexp.MustCompile(`^(?:(?:accept-edits|plan) · )?[A-Za-z](?:[\w.() -]*[\w)])?(?: · (?:low|medium|high))?(?: · \d+ task\(s\))?(?: · /tasks)?$`)
 	// agyStatusPadRE is the terminal-width padding run that separates the status
 	// bar's left token from its right-aligned model segment.
 	agyStatusPadRE = regexp.MustCompile(`\s{10,}`)
@@ -113,6 +132,51 @@ func agyStatusBar(line string) (segment string, ok bool) {
 // agyBody returns the capture's lines with trailing blank lines and agy's
 // status bar removed — what is left ends with the live form's key-hint line
 // when a form stands.
+// agyDropBackgroundStrip removes agy's background-task rows from directly above
+// the status bar, so the composer sits where the footer-anchored checks expect
+// it again.
+//
+// Everything that reads agy's footer counts lines UP from the bottom (status
+// bar, rule, caret, rule). A running background task inserts a row into that
+// run, so the mode reads UNKNOWN and the composer never proves ready — which
+// is how `hap mode` came to refuse on a pane plainly showing its composer, and
+// left acceptEdits unreachable for any agent doing background work.
+//
+// Deliberately narrow: it requires the bottom line to already BE a recognised
+// status bar, and removes only rows matching agyBackgroundTaskRE from the
+// window just above it. Anything it cannot positively identify is kept.
+//
+// It filters the WINDOW rather than walking the unbroken run directly above the
+// footer, because the strip's position relative to the composer's lower rule is
+// not settled: the report that produced this shows the caret, the strip and the
+// status bar with the rules elided, so the strip may sit either side of that
+// rule, and a run-walk anchored on the footer handles only one of the two. A
+// count above one is expected too — the status bar itself says "N task(s)".
+//
+// Dropping a row can only ever bring a genuine rule/caret/rule sandwich into
+// alignment: a modal's rows are not strip-shaped, so no prompt can be collapsed
+// into a "ready" composer this way.
+func agyDropBackgroundStrip(lines []string) []string {
+	n := len(lines)
+	if n < 2 || !agyStatusBarLine(lines[n-1]) {
+		return lines
+	}
+	// The composer sandwich is three rows; the window leaves room for it plus
+	// several task rows, and bounds how far a match can reach into the
+	// transcript body.
+	const window = 8
+	start := max(0, n-1-window)
+	out := make([]string, 0, n)
+	out = append(out, lines[:start]...)
+	for _, line := range lines[start : n-1] {
+		if agyBackgroundTaskRE.MatchString(line) {
+			continue
+		}
+		out = append(out, line)
+	}
+	return append(out, lines[n-1])
+}
+
 func agyBody(pane string) []string {
 	lines := strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")
 	lines = trimTrailingBlank(lines)

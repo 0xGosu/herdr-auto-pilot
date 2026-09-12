@@ -39,6 +39,7 @@ error_codex_interrupted.txt status=blocked type=error verb= options=0
 error_codex_rate_limit.txt status=idle type=error verb= options=3
 error_codex_usage_limit.txt status=idle type=error verb= options=0
 idle_agy_after_turn.txt status=done type=idle verb= options=0
+idle_agy_background_task.txt status=done type=idle verb= options=0
 idle_agy_composer_draft.txt status=done type=idle verb= options=0
 idle_agy_declined.txt status=done type=idle verb= options=0
 idle_agy_effort_picker.txt status=idle type=unclassifiable verb= options=0

@@ -379,8 +379,12 @@ func TestAgyAgentModeOverEveryRecordedScreen(t *testing.T) {
 		mode  AgentMode
 		ready bool
 	}{
-		"idle_agy_fresh":             {AgentModeDefault, true},
-		"idle_agy_after_turn":        {AgentModeDefault, true},
+		"idle_agy_fresh":      {AgentModeDefault, true},
+		"idle_agy_after_turn": {AgentModeDefault, true},
+		// The same parked composer with a background task running. Both must
+		// hold THROUGH the task strip agy paints above the footer: the mode is
+		// readable, and the composer is safe to press into.
+		"idle_agy_background_task":   {AgentModeDefault, true},
 		"idle_agy_declined":          {AgentModeDefault, true},
 		"idle_agy_mode_accept_edits": {AgentModeAcceptEdits, true},
 		"idle_agy_mode_plan":         {AgentModePlan, true},

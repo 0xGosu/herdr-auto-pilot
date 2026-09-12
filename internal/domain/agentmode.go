@@ -350,7 +350,8 @@ func codexFooterLine(pane string) (string, bool) {
 // as whatever its cycle shows — "default" at launch. Callers MUST gate this on
 // the agent type being agy.
 func AgyAgentMode(pane string) (AgentMode, bool) {
-	lines := trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n"))
+	lines := agyDropBackgroundStrip(
+		trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")))
 	n := len(lines)
 	if n < 2 || !agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) {
 		return AgentModeUnknown, false
