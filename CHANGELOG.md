@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.24
+
+- Fixed the escalation queue filling with the same "send next declared task" proposal: a hand-out is no longer proposed while the list already has an item in progress, and a repeat within one parked spell is folded into the row the operator already has instead of adding another
+
 ## 0.9.23
 
 - Fixed a daemon crash under concurrent fleet sync. Waiting a bounded time for in-flight Turso sync operations stranded a waiter on a `sync.WaitGroup`, and the next operation to start as the counter fell to zero panicked the whole process with "WaitGroup is reused before previous Wait has returned" — twice in one night on a machine driving two agents, each crash followed by a restart that raced the dying daemon's lock.
