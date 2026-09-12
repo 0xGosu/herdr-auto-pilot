@@ -468,6 +468,8 @@ func TestAgyQueuedHandoutIsLeftInProgressAndEscalated(t *testing.T) {
 		t.Error("a queued hand-out must NOT be rolled back to [ ]: the queued copy still fires, " +
 			"so a second agent taking the item would run it twice")
 	}
+	// The read-back settles first and so completes off the loop.
+	waitFor(t, 3*time.Second, func() bool { return queuedHandoutEscalations(t, h) == 1 })
 	res, err := h.raw.OpenTaskReservations(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -476,18 +478,250 @@ func TestAgyQueuedHandoutIsLeftInProgressAndEscalated(t *testing.T) {
 		t.Errorf("reservations = %+v, want none: a ledger row is what reclaimStrandedTasks would "+
 			"later use to return this item to [ ]", res)
 	}
-	rows, err := h.raw.AuditLog(ctx, 50)
+	if queuedHandoutEscalations(t, h) != 1 {
+		t.Error("want an escalation naming the queued hand-out, so the operator learns the item " +
+			"is parked at [-] rather than lost")
+	}
+}
+
+// queuedHandoutEscalations counts the escalations raised for a hand-out agy left
+// sitting in its composer.
+func queuedHandoutEscalations(t *testing.T, h *harness) int {
+	t.Helper()
+	rows, err := h.raw.AuditLog(context.Background(), 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	found := false
+	n := 0
 	for _, r := range rows {
 		if strings.HasPrefix(r.Action, domain.AuditActionTaskQueuedPrefix) && r.Status == "escalated" {
-			found = true
+			n++
 		}
 	}
-	if !found {
-		t.Error("want an escalation naming the queued hand-out, so the operator learns the item " +
-			"is parked at [-] rather than lost")
+	return n
+}
+
+// agyWorkingPane is the screen agy paints once it has TAKEN a hand-out: the
+// composer is empty again and the turn is running. It is what the composer
+// read-back must see on the ordinary success path.
+const agyWorkingPane = "  Next task: run the suite\n\n● Running the suite…\n\n" +
+	"────────────────────────────────────────\n>\n" +
+	"────────────────────────────────────────\n" +
+	"esc to cancel                                           Gemini 3.6 Flash · low\n"
+
+// agyHandoutRepaint models what a real agy pane does with an accepted hand-out:
+// the text is briefly still in the composer, because ports.SendToAgent returns
+// as soon as herdr has written the request and nothing waits for the agent
+// (internal/herdr's retrySubmit covers codex and claude only). Some tens of
+// milliseconds later agy clears the composer and starts the turn.
+//
+// The delayed repaint is the whole point. A fake that repaints INSIDE Send has
+// the final screen up before the read either way, so it cannot tell a read-back
+// that settles first from one that does not.
+func agyHandoutRepaint(after time.Duration) func(*fakeHerdr, string) {
+	return func(f *fakeHerdr, input string) {
+		f.pane = "  Working on it.\n\n────────────────────────────────────────\n> " + input +
+			"\n────────────────────────────────────────\n" +
+			"                                                        Gemini 3.6 Flash · low\n"
+		go func() {
+			time.Sleep(after)
+			f.setPane(agyWorkingPane)
+		}()
+	}
+}
+
+// The ORDINARY success path must not be read as "queued".
+//
+// ports.SendToAgent returns as soon as herdr has written the request, so an
+// immediate read-back sees an accepted hand-out still standing in the composer
+// of an agy that simply has not repainted yet. AgyComposerDraft returns it,
+// AgyDraftMatches confirms it, and a SUCCESSFUL delivery is then left "[-]" with
+// no task_reservations row and no counted attempt — which neither
+// reclaimStrandedTasks nor the maxTaskHandouts ceiling can ever reach. Unlike
+// escalateNeverStartedTask, that is operator-only forever, on the happy path.
+//
+// Two assertions, because content alone cannot prove a delay: the bookkeeping
+// the run produced, and the GAP between the send and the read that produced it.
+func TestAgyHandoutIsNotReadBackBeforeAgyCanRepaint(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "")
+	h.herdr.setPane(agyReadyPane)
+	h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
+	settle := 400 * time.Millisecond
+	h.daemon.agyHandoutSettle = settle
+	h.herdr.onSend = agyHandoutRepaint(settle / 8)
+
+	rolled := false
+	s := domain.Situation{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+		Type: domain.SituationIdle, Status: "idle", Content: agyReadyPane}
+	sent := h.daemon.deliverAutonomous(ctx, s, domain.ComputeSignature(s),
+		domain.Decision{Input: "Next task: run the suite", Confidence: 1},
+		agyAgent(), agyIdleHandout(func() { rolled = true }), time.Now())
+
+	if !sent || len(h.herdr.sentInputs()) != 1 {
+		t.Fatalf("the hand-out should have been sent: sent=%v inputs=%v", sent, h.herdr.sentInputs())
+	}
+	waitFor(t, 5*time.Second, func() bool {
+		res, err := h.raw.OpenTaskReservations(ctx)
+		return err == nil && len(res) == 1
+	})
+	if n := queuedHandoutEscalations(t, h); n != 0 {
+		t.Errorf("%d queued-hand-out escalations for a hand-out agy ACCEPTED: a successful delivery "+
+			"must not be parked at [-] for an operator", n)
+	}
+	res, err := h.raw.OpenTaskReservations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("reservations = %+v, want the ledger row: without it neither reclaimStrandedTasks "+
+			"nor the maxTaskHandouts ceiling can ever reach this item", res)
+	}
+	if rolled {
+		t.Error("a delivered hand-out must not be rolled back to [ ]")
+	}
+	// The discriminator: the read that decided this came at least a settle
+	// after the keystrokes went out. Asserted directly because a fake could
+	// always be made to repaint fast enough to pass on content alone.
+	if gap := h.herdr.lastSendToLastReadGap(); gap < settle {
+		t.Errorf("the composer was read back %v after the send, want at least the %v settle — "+
+			"herdr accepting the keystrokes is not agy having repainted", gap, settle)
+	}
+}
+
+// A LARGE queued hand-out is the common case, and it must not take the ledger
+// path.
+//
+// A hand-out is a rendered task prompt and wraps well past the 20 lines the
+// composer's opening rule used to be searched for, so the block could not be
+// read and "no draft" was the answer for exactly the hand-outs most likely to
+// have been queued: the ledger row was written and reclaimStrandedTasks returned
+// the item to "[ ]" minutes later, while the queued copy was still on its way to
+// the same agent — the uncallable double send this gate exists to prevent.
+func TestATallQueuedAgyHandoutIsStillLeftInProgress(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "")
+	h.herdr.setPane(agyReadyPane)
+	h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
+	// The pane keeps holding the hand-out: agy queued it mid-turn.
+	h.herdr.onSend = func(f *fakeHerdr, input string) {
+		var b strings.Builder
+		b.WriteString("  Working on it.\n\n────────────────────────────────────────\n> ")
+		for i, seg := range strings.Split(input, " ") {
+			if i > 0 && i%4 == 0 {
+				b.WriteString("\n ")
+			}
+			b.WriteString(seg + " ")
+		}
+		b.WriteString("\n────────────────────────────────────────\n" +
+			"                                                        Gemini 3.6 Flash · low\n")
+		f.pane = b.String()
+	}
+
+	del := agyIdleHandout(func() { t.Error("a queued hand-out must not be rolled back to [ ]") })
+	del.sendText = "Next task: " + strings.TrimSpace(strings.Repeat("run the full suite and report back on what failed ", 12))
+	del.input = del.sendText
+
+	s := domain.Situation{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+		Type: domain.SituationIdle, Status: "idle", Content: agyReadyPane}
+	if !h.daemon.deliverAutonomous(ctx, s, domain.ComputeSignature(s),
+		domain.Decision{Input: del.input, Confidence: 1}, agyAgent(), del, time.Now()) {
+		t.Fatal("the hand-out should still have been sent")
+	}
+
+	waitFor(t, 5*time.Second, func() bool { return queuedHandoutEscalations(t, h) == 1 })
+	res, err := h.raw.OpenTaskReservations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res) != 0 {
+		t.Errorf("reservations = %+v, want none: a ledger row lets reclaimStrandedTasks re-offer an "+
+			"item whose queued copy still fires", res)
+	}
+}
+
+// The daemon must never take the settle on the select loop: deliverAutonomous is
+// reached from handleAttention and from the idle sweep, both of which serve
+// every other agent from the same goroutine, so a blocking wait would stall the
+// whole herd for a second per hand-out.
+func TestTheAgyHandoutSettleIsNotTakenOnTheMainLoop(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, "")
+	h.herdr.setPane(agyReadyPane)
+	h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
+	settle := 3 * time.Second
+	h.daemon.agyHandoutSettle = settle
+	h.herdr.onSend = agyHandoutRepaint(10 * time.Millisecond)
+
+	s := domain.Situation{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+		Type: domain.SituationIdle, Status: "idle", Content: agyReadyPane}
+	start := time.Now()
+	h.daemon.deliverAutonomous(ctx, s, domain.ComputeSignature(s),
+		domain.Decision{Input: "Next task: run the suite", Confidence: 1},
+		agyAgent(), agyIdleHandout(func() {}), time.Now())
+	if elapsed := time.Since(start); elapsed >= settle {
+		t.Errorf("the delivery call took %v, at least the %v settle: the read-back has to be "+
+			"deferred off the loop, not waited for inline", elapsed, settle)
+	}
+}
+
+// 461-D control: a pane sitting in a standing approval — the state the last look
+// before the send exists for — is refused by the OPENING proof, above both the
+// audit write and reserveDeclaredTask. So it costs no task-list write and no
+// audit row, and there is nothing per-sweep to bound: the last look is only ever
+// reached when the screen CHANGED between the two proofs, which is not a steady
+// state. The same holds for an unreadable pane, which both proofs fail closed on.
+//
+// This is what makes the placement of the last look below the reservation
+// affordable, so it is pinned rather than left to reasoning.
+func TestAgyApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		pane     string
+		failRead bool
+	}{
+		{name: "a standing approval", pane: agyApprovalPane},
+		{name: "a pane that cannot be read", pane: agyReadyPane, failRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			h := newHarness(t, "")
+			h.herdr.setPane(tc.pane)
+			h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
+			h.herdr.failRead = tc.failRead
+			mutations := 0
+			h.daemon.opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {
+				mutations++
+				return nil
+			}
+
+			del := agyIdleHandout(nil)
+			// No caller-owned claim: this delivery would do its own reserving,
+			// which is the write the refusal must come above.
+			del.rollback, del.reservedIndex = nil, 0
+			s := domain.Situation{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+				Type: domain.SituationIdle, Status: "idle", Content: agyReadyPane}
+			sent := h.daemon.deliverAutonomous(ctx, s, domain.ComputeSignature(s),
+				domain.Decision{Input: "Next task: run the suite", Confidence: 1},
+				agyAgent(), del, time.Now())
+
+			if sent || len(h.herdr.sentInputs()) != 0 {
+				t.Fatalf("typed into a pane that is not at an empty composer: sent=%v inputs=%v",
+					sent, h.herdr.sentInputs())
+			}
+			if mutations != 0 {
+				t.Errorf("the task list was written %d times for a refusal that never got as far as "+
+					"a reservation — under a gist source that is a remote read-modify-write per sweep",
+					mutations)
+			}
+			rows, err := h.raw.AuditLog(ctx, 50)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rows) != 0 {
+				t.Errorf("audit rows = %+v, want none: the opening proof refuses above the audit "+
+					"write, so a pane parked like this leaves no row per sweep either", rows)
+			}
+		})
 	}
 }

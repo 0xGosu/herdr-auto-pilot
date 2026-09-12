@@ -6,6 +6,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // Answering agy — docs/designer/agy-support.md §4 and §5 ("Keystrokes").
@@ -190,18 +192,84 @@ func AgyComposerReady(pane string) bool {
 	return !held
 }
 
-// agyComposerScanLimit bounds the search for the composer's opening rule. A
-// queued multi-line hand-out renders as several lines between the rules, so the
-// block cannot be read at a fixed offset the way AgyComposerReady reads an empty
-// one — but scanning the whole capture would happily pair the closing rule with
-// one agy drew between two earlier turns.
+// agyComposerScanLimit is the FLOOR on the search for the composer's opening
+// rule. A queued multi-line hand-out renders as several lines between the rules,
+// so the block cannot be read at a fixed offset the way AgyComposerReady reads
+// an empty one — but scanning the whole capture would happily pair the closing
+// rule with one agy drew between two earlier turns. A caller that knows what it
+// sent widens the window with AgyDraftScanLimit; 20 lines is what is left for a
+// caller that does not.
 const agyComposerScanLimit = 20
 
+// agyComposerScanCeiling caps AgyDraftScanLimit. Past it the risk of pairing
+// with an inter-turn rule outweighs the reach, and the cost of stopping is only
+// an AgyDraftUnreadable verdict — which callers already treat as the cautious
+// answer, not as "nothing is there".
+const agyComposerScanCeiling = 120
+
+// agyDraftWrapWidth is the narrowest pane AgyDraftScanLimit budgets for. agy
+// hard-wraps the composer at the terminal width, which the capture does not
+// report, so the line count has to be estimated from the text alone and the
+// estimate must be generous: too FEW lines is what makes the opening rule
+// unreachable, which is the failure this constant exists to prevent.
+const agyDraftWrapWidth = 40
+
+// agyDraftScanSlack is added to the estimate to cover agy's own framing of a
+// draft (indentation, a blank continuation line).
+const agyDraftScanSlack = 4
+
 // agyDraftMatchRunes is how much of the composer must match what was sent for
-// the draft to be attributed to hap. Long enough that an operator's own sentence
-// cannot collide by accident, short enough to survive agy wrapping or truncating
-// a long hand-out.
+// the draft to be attributed to hap. Both a FLOOR and a cap: a shorter draft is
+// only evidence when it is the whole of what was sent (see AgyDraftMatches).
+// Long enough that an operator's own sentence cannot collide by accident, short
+// enough to survive agy wrapping or truncating a long hand-out.
 const agyDraftMatchRunes = 24
+
+// AgyDraftVerdict is what reading agy's composer back established.
+type AgyDraftVerdict int
+
+const (
+	// AgyDraftNone: no unsent draft is on screen. An empty composer, a mode
+	// placeholder, a working turn, a form — every screen that positively is
+	// not a message waiting to be sent.
+	AgyDraftNone AgyDraftVerdict = iota
+	// AgyDraftPresent: the returned text is sitting unsent in the composer.
+	AgyDraftPresent
+	// AgyDraftUnreadable: a composer is on screen and its closing rule is
+	// directly above the bottom chrome, but no opening rule is within reach —
+	// so the block cannot be read and the draft cannot be compared.
+	//
+	// This is NOT the same as AgyDraftNone, and collapsing the two is the bug
+	// it exists to prevent. An EMPTY composer finds its opening rule at n-4 on
+	// the first step of the scan, always; so does a one-line draft. Reaching
+	// the end of the window means something LARGE is in the composer —
+	// overwhelmingly a wrapped hand-out that has just been queued, which is
+	// exactly the case a caller must not read as "delivered".
+	AgyDraftUnreadable
+)
+
+// AgyDraftScanLimit is the scan window a caller should allow when it knows what
+// it sent: enough lines for that text to wrap at a pessimistically narrow pane
+// width, floored at agyComposerScanLimit and capped at agyComposerScanCeiling.
+//
+// A hand-out is a rendered task prompt — boilerplate plus the task text — and
+// wraps well past 20 lines for anything but a one-liner, so a fixed window
+// answers AgyDraftUnreadable for precisely the LARGE hand-outs, i.e. the common
+// case. Widening it is what keeps that verdict rare enough to be a real signal.
+func AgyDraftScanLimit(sent string) int {
+	lines := 0
+	for _, seg := range strings.Split(strings.ReplaceAll(sent, "\r", ""), "\n") {
+		lines += utf8.RuneCountInString(seg)/agyDraftWrapWidth + 1
+	}
+	limit := lines + agyDraftScanSlack
+	if limit < agyComposerScanLimit {
+		return agyComposerScanLimit
+	}
+	if limit > agyComposerScanCeiling {
+		return agyComposerScanCeiling
+	}
+	return limit
+}
 
 // AgyComposerDraft returns the text agy is holding UNSENT in its composer.
 //
@@ -219,29 +287,45 @@ const agyDraftMatchRunes = 24
 // chrome line is required but its left token is not: agy DROPS "? for shortcuts"
 // while a draft stands, which is precisely the state this looks for.
 //
-// A held screen returns false — something else is on top, so the caret line is
-// not simply an unsent message.
-func AgyComposerDraft(pane string) (string, bool) {
+// A held screen returns AgyDraftNone — something else is on top, so the caret
+// line is not simply an unsent message.
+//
+// scanLimit bounds how far above the closing rule the opening one is looked
+// for; callers that know what they sent pass AgyDraftScanLimit(sent). Running
+// out of window is AgyDraftUnreadable, never AgyDraftNone: see that constant.
+func AgyComposerDraft(pane string, scanLimit int) (string, AgyDraftVerdict) {
+	if scanLimit < agyComposerScanLimit {
+		scanLimit = agyComposerScanLimit
+	}
 	lines := trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n"))
 	n := len(lines)
 	if n < 4 || !agyBottomChromeLine(lines[n-1]) ||
 		!agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) {
-		return "", false
+		return "", AgyDraftNone
 	}
 	open := -1
-	for i := n - 3; i >= 0 && i >= n-3-agyComposerScanLimit; i-- {
+	for i := n - 3; i >= 0 && i >= n-3-scanLimit; i-- {
 		if agyRuleLineRE.MatchString(strings.TrimSpace(lines[i])) {
 			open = i
 			break
 		}
 	}
-	if open < 0 || open >= n-3 {
-		return "", false
+	if open < 0 {
+		// The composer's closing rule is there but its opening rule is not
+		// within reach — the block is too tall to read, not absent.
+		return "", AgyDraftUnreadable
+	}
+	if open >= n-3 {
+		return "", AgyDraftNone
 	}
 	block := lines[open+1 : n-2]
 	first := strings.TrimSpace(block[0])
+	// The nearest rule above the closing one IS the composer's opening rule
+	// whenever a draft stands, so a first line that is not a caret line means
+	// this is not a composer at all — the guard that keeps a widened window
+	// from pairing with a rule agy drew between two earlier turns.
 	if !strings.HasPrefix(first, ">") || agyModePlaceholderRE.MatchString(first) {
-		return "", false
+		return "", AgyDraftNone
 	}
 	var b strings.Builder
 	b.WriteString(strings.TrimSpace(strings.TrimPrefix(first, ">")))
@@ -253,12 +337,12 @@ func AgyComposerDraft(pane string) (string, bool) {
 	}
 	text := strings.TrimSpace(b.String())
 	if text == "" {
-		return "", false
+		return "", AgyDraftNone
 	}
 	if _, held := AgyHeldForm(pane); held {
-		return "", false
+		return "", AgyDraftNone
 	}
-	return text, true
+	return text, AgyDraftPresent
 }
 
 // agyBottomChromeLine matches the line agy paints at the very bottom: its status
@@ -278,22 +362,59 @@ func agyBottomChromeLine(line string) bool {
 // A queued hand-out is typed from its FIRST character, so the composer holds a
 // prefix of what was sent — hence HasPrefix rather than a containment test,
 // which a two-word operator draft could satisfy by coincidence. Only the head is
-// compared, over collapsed whitespace, because agy wraps a long message and the
-// composer shows only what fits.
+// compared, because agy wraps a long message and the composer shows only what
+// fits.
+//
+// ALL whitespace is dropped from both sides before comparing, rather than
+// collapsed to single spaces. A terminal wrap breaks the text wherever the
+// column runs out — mid-word as readily as at a space — and the composer block
+// is rejoined line by line, so a collapsed comparison inserts a separator that
+// is not in what was sent ("…run the su" + " " + "ite…") and a genuinely queued
+// hand-out then matches nothing. Dropping whitespace entirely makes the
+// comparison independent of where the wrap fell; 24 runes of non-whitespace is
+// still far more than an operator's opening words could collide with.
+//
+// The window is a FLOOR as well as a cap: a draft shorter than it is compared in
+// full only when it IS the whole of what was sent. Otherwise one or two
+// characters the operator typed just after the send ("N" against "Next task: …")
+// would prefix-match and their draft would be attributed to hap. The operator's
+// literal suggestion — refuse whenever the head is shorter than the window —
+// would instead refuse a short hand-out that really was queued, which is the
+// costly direction; hence the min() rather than a flat floor.
 //
 // Getting this wrong is not symmetric, and it is deliberately biased: a draft
 // wrongly attributed to hap strands a task at "[-]" until an operator looks,
-// while one wrongly attributed to the operator merely falls back to the ordinary
-// ledger path that already existed. So this refuses whenever it cannot tell.
+// while one wrongly attributed to the operator falls back to the ledger path —
+// which is only safe when the item really was taken up, so this refuses
+// whenever it cannot tell rather than guessing either way.
 func AgyDraftMatches(draft, sent string) bool {
-	d := strings.Join(strings.Fields(draft), " ")
-	s := strings.Join(strings.Fields(sent), " ")
-	if d == "" || s == "" {
+	// The floor is measured on the draft as it READS — whitespace collapsed to
+	// single spaces — because it answers "how much did somebody have to type".
+	// The comparison is on whitespace-stripped text because it answers "where
+	// did the wrap fall", which must not change the answer either way.
+	typed := []rune(strings.Join(strings.Fields(draft), " "))
+	d := []rune(agyStripSpace(draft))
+	s := []rune(agyStripSpace(sent))
+	if len(d) == 0 || len(s) == 0 {
 		return false
 	}
-	head := []rune(d)
+	if len(typed) < agyDraftMatchRunes && len(d) < len(s) {
+		return false
+	}
+	head := d
 	if len(head) > agyDraftMatchRunes {
 		head = head[:agyDraftMatchRunes]
 	}
-	return strings.HasPrefix(s, string(head))
+	return strings.HasPrefix(string(s), string(head))
+}
+
+// agyStripSpace removes every whitespace rune, so a comparison cannot depend on
+// where a terminal wrap fell. See AgyDraftMatches.
+func agyStripSpace(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
 }

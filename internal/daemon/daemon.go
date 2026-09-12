@@ -216,6 +216,9 @@ type Daemon struct {
 	// verifyUnblockDelay is initialized from unblockCheckDelay. Tests in this
 	// package shorten it to keep asynchronous verification coverage fast.
 	verifyUnblockDelay time.Duration
+	// agyHandoutSettle is initialized from agyHandoutSettleDelay. Tests in this
+	// package shorten it for the same reason.
+	agyHandoutSettle time.Duration
 
 	// exePath is the binary this daemon started from, resolved once at Run
 	// before anything can replace it, and never written again — so the
@@ -797,6 +800,7 @@ func New(opt Options) (*Daemon, error) {
 		taskSnapshots:             map[string]taskSnapshot{},
 		taskReclaimResults:        make(chan taskReclaimOutcome, 32),
 		verifyUnblockDelay:        unblockCheckDelay,
+		agyHandoutSettle:          agyHandoutSettleDelay,
 		transitions:               make(chan domain.AgentTransition, 256),
 		nudges:                    make(chan control.Kind, 16),
 		llmResults:                make(chan llmOutcome, 16),
@@ -3355,25 +3359,14 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	// while the queued copy is still on its way to this same agent, and that
 	// double send cannot be called back (herdr rejects C-u, so nothing can clear
 	// an agy composer). It stays "[-]" and the operator is asked instead.
+	//
+	// That read-back has to WAIT for agy to repaint and so cannot happen here —
+	// verifyAgyHandout owns both outcomes off the loop.
 	switch {
-	case reservedIndex > 0 && domain.IsAgy(s.AgentType) &&
-		d.agyHandoutQueued(ctx, s.PaneID, del.sendText):
-		slog.Warn("agy queued the hand-out in its composer instead of starting it; leaving the item [-]",
-			"agent", s.AgentID, "task", del.taskText)
-		d.escalateQueuedHandout(ctx, s, del, now)
+	case reservedIndex > 0 && domain.IsAgy(s.AgentType):
+		d.verifyAgyHandout(ctx, s, del, auditID, reservedIndex, now)
 	case reservedIndex > 0:
-		if _, err := d.opt.Store.RecordTaskReservation(ctx, domain.TaskReservation{
-			SourcePath: canonicalTaskPath(del.declared.Locator), TaskText: del.taskText,
-			ItemIndex: reservedIndex,
-			AgentID:   s.AgentID, PaneID: s.PaneID, TerminalID: s.TerminalID,
-			AuditID: auditID, ReservedAt: now,
-		}); err != nil {
-			// Losing the row costs the self-healing for THIS hand-out (the item
-			// stays "[-]" until an operator clears it), exactly the old
-			// behavior — never a double send.
-			slog.Error("auto-send: hand-out could not be recorded; this task will not self-heal if it is never started",
-				"agent", s.AgentID, "task", del.taskText, "error", err)
-		}
+		d.recordHandoutReservation(ctx, s, del, auditID, reservedIndex, now)
 	}
 
 	// Learning + counters (daemon-owned hot-path rows). The action-review

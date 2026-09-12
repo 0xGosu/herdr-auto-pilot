@@ -139,6 +139,16 @@ func (d *Daemon) agyComposerRefusal(ctx context.Context, paneID string) error {
 // a refusal. Nothing has gone wrong here that stranding the item would fix: the
 // ledger row and reclaimStrandedTasks already handle "sent but never started",
 // and failing the other way would strand an item on any transient read error.
+//
+// A composer whose block is too tall to read (domain.AgyDraftUnreadable) is the
+// opposite case and answers TRUE. That verdict is only reachable while something
+// large is in the composer, and the largest thing that could just have arrived
+// there is the hand-out itself; reading it as "delivered" would write the ledger
+// row and let reclaimStrandedTasks re-offer an item that is still on its way.
+//
+// The caller must give agy time to repaint before calling this — see
+// verifyAgyHandout. Read too early, a normally delivered hand-out is still
+// visible in the composer and would be reported queued.
 func (d *Daemon) agyHandoutQueued(ctx context.Context, paneID, sent string) bool {
 	pane, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
 	if err != nil {
@@ -146,13 +156,101 @@ func (d *Daemon) agyHandoutQueued(ctx context.Context, paneID, sent string) bool
 			"pane", paneID, "error", err)
 		return false
 	}
-	draft, ok := domain.AgyComposerDraft(pane)
-	if !ok {
+	draft, verdict := domain.AgyComposerDraft(pane, domain.AgyDraftScanLimit(sent))
+	switch verdict {
+	case domain.AgyDraftUnreadable:
+		slog.Warn("agy's composer holds more than can be read back; treating the hand-out as queued",
+			"pane", paneID)
+		return true
+	case domain.AgyDraftPresent:
+		// The composer holds SOMETHING, which is not yet evidence it holds
+		// OURS — the operator may have started typing in the moment after the
+		// send.
+		return domain.AgyDraftMatches(draft, sent)
+	default:
 		return false
 	}
-	// The composer holds SOMETHING, which is not yet evidence it holds OURS —
-	// the operator may have started typing in the moment after the send.
-	return domain.AgyDraftMatches(draft, sent)
+}
+
+// agyHandoutSettleDelay is how long agy is given to act on a hand-out before its
+// composer is read back. Fixed rather than operator-configurable, and the same
+// second scheduleUnblockCheck waits: the question is identical ("did our
+// keystrokes land"), and every path in this daemon that asks it interposes a
+// delay first.
+//
+// It has to exist at all because ports.SendToAgent returns as soon as herdr has
+// written the request. Nothing waits for agy to repaint — internal/herdr's
+// retrySubmit covers codex and claude only — so an immediate read sees the
+// hand-out still standing in the composer of an agent that has ACCEPTED it, and
+// a successful delivery is then recorded as queued: left "[-]" with no ledger
+// row and no counted attempt, which no sweep can ever reach. The miss is on the
+// happy path, which is what makes it worse than the ones it guards.
+const agyHandoutSettleDelay = time.Second
+
+// verifyAgyHandout settles, reads agy's composer back, and records the hand-out
+// either in the ledger (it was taken up) or as an escalation (it is queued,
+// unsent — see escalateQueuedHandout).
+//
+// It runs OFF the main loop. Its caller is reached from the select loop
+// (handleAttention, the idle sweep), so waiting out the settle inline would
+// stall every other agent for a second per hand-out; the timer is tracked by
+// afterFunc so shutdown drains it. The deferred half is only the bookkeeping —
+// the keystrokes are already out — and nothing reads the ledger row sooner than
+// the next reclaim sweep a minute later.
+//
+// When the daemon is already shutting down, afterFunc schedules nothing and the
+// ledger row is written inline instead: an item at "[-]" with no row is
+// unreachable by every sweep, so the unverifiable case takes the same ordinary
+// path agyHandoutQueued takes for an unreadable pane.
+func (d *Daemon) verifyAgyHandout(ctx context.Context, s domain.Situation, del delivery,
+	auditID int64, reservedIndex int, now time.Time) {
+
+	delay := d.agyHandoutSettle
+	if delay <= 0 {
+		delay = agyHandoutSettleDelay
+	}
+	scheduled := d.afterFunc(delay, func() {
+		_ = logging.Guard("agy-handout-verify", func() error {
+			// Rooted at shutdownCtx, not the caller's ctx: the caller has
+			// returned to the loop and its ctx may already be done.
+			vctx, cancel := context.WithTimeout(d.shutdownCtx, 30*time.Second)
+			defer cancel()
+			if d.agyHandoutQueued(vctx, s.PaneID, del.sendText) {
+				slog.Warn("agy queued the hand-out in its composer instead of starting it; leaving the item [-]",
+					"agent", s.AgentID, "task", del.taskText)
+				d.escalateQueuedHandout(vctx, s, del, now)
+				return nil
+			}
+			d.recordHandoutReservation(vctx, s, del, auditID, reservedIndex, now)
+			return nil
+		})
+	})
+	if scheduled == nil {
+		slog.Warn("daemon is shutting down; recording the agy hand-out without reading the composer back",
+			"agent", s.AgentID, "task", del.taskText)
+		d.recordHandoutReservation(ctx, s, del, auditID, reservedIndex, now)
+	}
+}
+
+// recordHandoutReservation writes the ledger row that lets the reclaim sweep
+// decide from what the agent does NEXT — going "working" confirms the hand-out,
+// parking again without ever doing so returns the item to "[ ]"
+// (reclaimStrandedTasks).
+func (d *Daemon) recordHandoutReservation(ctx context.Context, s domain.Situation,
+	del delivery, auditID int64, reservedIndex int, now time.Time) {
+
+	if _, err := d.opt.Store.RecordTaskReservation(ctx, domain.TaskReservation{
+		SourcePath: canonicalTaskPath(del.declared.Locator), TaskText: del.taskText,
+		ItemIndex: reservedIndex,
+		AgentID:   s.AgentID, PaneID: s.PaneID, TerminalID: s.TerminalID,
+		AuditID: auditID, ReservedAt: now,
+	}); err != nil {
+		// Losing the row costs the self-healing for THIS hand-out (the item
+		// stays "[-]" until an operator clears it), exactly the old
+		// behavior — never a double send.
+		slog.Error("auto-send: hand-out could not be recorded; this task will not self-heal if it is never started",
+			"agent", s.AgentID, "task", del.taskText, "error", err)
+	}
 }
 
 // escalateQueuedHandout records the escalation for a hand-out the agent queued
