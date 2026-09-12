@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.27
+
+- Fixed hap answering an agy approval with a scope-widening option. The LLM was choosing "Yes, and always allow in this conversation for commands that start with X" at confidence 98-99 on nearly every approval, which pre-authorises a whole command prefix — every later command matching it then runs with no prompt, so it never reaches the classifier, the never-auto screen or the operator. hap now substitutes the narrowest option that still grants the request, and the audit rationale says when it did.
+- Added guidance to the consult context telling the LLM to prefer the narrowest option on an approval, so the deterministic substitution is a backstop rather than the only defence.
+
 ## 0.9.26
 
 - Fixed a task hand-out landing in an agy agent's approval menu: the empty-composer proof is now re-taken immediately before the keystrokes go out, closing the window the audit write and the checklist reservation opened. A menu choice commits on the bare digit, so a hand-out arriving there could select an option on its own.
