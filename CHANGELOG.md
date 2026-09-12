@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.41
+
+- Added a `hap-orchestrator` skill documenting how to run a herd as the operator's deputy: escalation triage, handing work out through task lists, agy-specific behaviour, watcher patterns, PR review and merging, and incident playbooks.
+- Recorded three lessons hap learned from operator corrections in `AUTO.md`: approve a permission prompt for the command on screen rather than taking an "always allow" option, never answer a vendor's survey on the operator's behalf (take Skip, chosen by label), and approve a temporary live daemon swap only when the herd keeps running and restoration is planned.
+- Added: hap now installs the bundled `hap` and `hap-orchestrator` skills into the orchestrator session's working directory, so it can look them up again at any time — including after an automatic context compaction has dropped its brief. Written under `<state>/orchestrator/.claude/skills/`, refreshed whenever an upgrade changes them, and skipped entirely when `full_self_prompting.orchestrator_agent_cwd` points at a directory of your own, where the brief instead sends the session to `hap --skill` and `herdr --skill`.
+- Added: `full_self_prompting.orchestrator_agent_prompt` accepts a `{skills}` placeholder — how this session reaches the hap and hap-orchestrator documents, which depends on whether its working directory is hap's own.
+
 ## 0.9.40
 
 - Added an `agy` (Antigravity CLI) option to the LLM command presets — `hap config set llm.task_generate_command --preset agy`, the same for `llm.learn_from_user_command` and `llm.reranking_command`, and the TUI Config tab's `e` picker — with two caveats worth reading first: the agy learn recipe runs under `--dangerously-skip-permissions`, wider than the claude recipe's `--permission-mode acceptEdits` because agy has no edits-only setting, and under agy the AUTO.md loop runs one way only, since the learn recipe writes lessons but the task-generation one cannot read them back. The generate and re-ranking recipes take no permission flag at all, and all three pass `--disable-slash-commands`.
