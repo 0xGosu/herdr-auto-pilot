@@ -35,6 +35,20 @@ never raises a prompt at all and never reaches the never-auto rules.
 dismissing a genuine correction throws away the lesson, and resolving a ghost
 teaches hap about a screen that no longer exists.
 
+## your corrections become lessons
+
+`hap resolve` does more than answer: `llm.learn_from_user_command` may record a
+short rule in that repo's `AUTO.md`, under the heading
+`## Lessons for hap's auto-answer assistant`, and the consult reads it back on
+later decisions for the same repo. So read `AUTO.md` at the start of a session
+and again after a correction that mattered — it shows which of your decisions
+stuck, and a lesson that came out wrong is worth editing rather than leaving to
+steer every future answer.
+
+Two caveats: the file lives in the **agent's** repo, not hap's state directory,
+so each repo has its own; and with some backends the loop is one-way — lessons
+are written but never read back — so check rather than assume.
+
 ## clearing inert notices in batches
 
 Queue notices (`task_source_exhausted`, `noop_vs_pending_tasks`) are inert —

@@ -38,6 +38,17 @@ export HAP_NO_HINTS=1                 # `hap --no-hints <cmd>` is not a thing
 hap status && hap agents && hap escalations
 ```
 
+Read **`AUTO.md` in the root of every repo your agents work in**, if it exists.
+It is hap's own lessons file for that repo — written by
+`llm.learn_from_user_command` when an operator corrects an answer, and read back
+by the consult on later decisions there. It tells you what hap has already been
+taught in this codebase, so your answers stay consistent with it instead of
+quietly contradicting them.
+
+```sh
+cat /path/to/repo/AUTO.md      # section: "## Lessons for hap's auto-answer assistant"
+```
+
 Then arm two things and keep them alive:
 
 - a persistent Monitor on `hap stream orchestrator --resume <last-seq>` —
