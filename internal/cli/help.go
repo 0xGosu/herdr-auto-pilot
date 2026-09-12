@@ -197,7 +197,16 @@ func buildCommands() {
 				"  codex  → ~/.codex/skills/hap/SKILL.md\n" +
 				"  agy    → ~/.gemini/antigravity-cli/skills/hap/SKILL.md\n" +
 				"  agents → ~/.agents/skills/hap/SKILL.md   (other tools sharing ~/.agents)\n" +
-				"The TUI's Config tab offers the same install as a quick shortcut.",
+				"The TUI's Config tab offers the same install as a quick shortcut.\n" +
+				"\n" +
+				"The orchestrator session needs no install: hap writes this skill and the\n" +
+				"hap-orchestrator one into its working directory (<state>/orchestrator/.claude/\n" +
+				"skills/) whenever it checks on it, so the session can re-read them after a\n" +
+				"context compaction, and an upgrade refreshes them. Set\n" +
+				"full_self_prompting.orchestrator_agent_cwd and hap writes nothing there — it is\n" +
+				"your directory — and its brief changes to match, sending the session to\n" +
+				"`hap --skill` and `herdr --skill` instead. This install covers the hap skill\n" +
+				"anywhere you like; hap-orchestrator goes only into hap's own directory.",
 			Examples: []string{"hap skill | less", "hap skill install claude codex"},
 			Bare:     true,
 		},

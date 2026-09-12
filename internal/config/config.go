@@ -211,7 +211,10 @@ type FullSelfPrompting struct {
 	// only the words after it reach the agent (domain.OrchestratorLaunch).
 	OrchestratorAgentCommand []string `toml:"orchestrator_agent_command,omitempty"`
 	// OrchestratorAgentPrompt replaces the built-in brief the daemon sends the
-	// orchestrator once it is ready. {self} expands to this hap binary's path.
+	// orchestrator once it is ready. {self} expands to this hap binary's path,
+	// and {skills} to how the session reaches the hap and hap-orchestrator
+	// documents — which differs by working directory, since hap installs them
+	// into its own <state>/orchestrator and never into an OrchestratorAgentCwd.
 	// Empty means the built-in brief.
 	OrchestratorAgentPrompt string `toml:"orchestrator_agent_prompt,omitempty"`
 	// OrchestratorAgentCwd is the orchestrator session's working directory: an
