@@ -576,10 +576,36 @@ func (d *Daemon) claimBlockedBy(ctx context.Context, rec *domain.AuditRecord,
 //
 // The send runs inside the cross-process per-agent lifecycle barrier, so an
 // operator disabling the agent cannot commit mid-delivery.
+//
+// It is also where the ACTION rules screen an unattended send, and this is the
+// main one: every other actionRefused call site is a decision the daemon makes
+// with a human able to see the queue, while this path types the suggestion into
+// a pane with nobody watching. `ReasonNeverAutoMatch` being in
+// autoAcceptExcludedReasons protects only rows escalated BY an action rule — it
+// says nothing about a row escalated for some other reason (llm_low_confidence,
+// below_threshold) whose SUGGESTION happens to be the widening option, which is
+// exactly the shape the seeds were written for: hap's LLM chose agy's "Yes, and
+// always allow …" at confidence 98-99 on nearly every approval. claimBlockedBy
+// re-asks the kill switch, the mode and accept_generated_task, and none of them
+// looks at the text.
+//
+// Screened inside the barrier and immediately before the keystrokes, the same
+// last-look ordering d.act and the orchestrator's actionScreen use, and on the
+// materialized outbound rather than the stored suggestion so what is judged is
+// what is typed. A hit is a VERDICT, not a fault: wrapped in errOutboundRefused,
+// which autoAcceptDeliveryFailed already reverts the claim for and leaves
+// pending (FR-015 — a never-auto match always reaches a human), rather than
+// burning an attempt per sweep until the row is dismissed.
 func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord, suggestion string) error {
 	var deliverErr error
+	refused := ""
 	sent := false
 	disabled, err := d.opt.Store.WithAgentAutomation(ctx, rec.AgentID, func() {
+		outbound := domain.MaterializeForSend(suggestion, rec)
+		if why := d.actionRefused(rec.AgentType, outbound); why != "" {
+			refused = why
+			return
+		}
 		deliverErr = deliver.Deliver(ctx, deliver.Config{
 			Herdr:     d.opt.Herdr,
 			Read:      d.readVisible,
@@ -589,7 +615,7 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 			AgentType:     rec.AgentType,
 			SituationType: rec.SituationType,
 			PaneExcerpt:   rec.PaneExcerpt,
-			Outbound:      domain.MaterializeForSend(suggestion, rec),
+			Outbound:      outbound,
 		})
 		sent = deliverErr == nil
 	})
@@ -600,6 +626,10 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 		// The operator turned this agent off. Not a delivery fault and not a
 		// reason to retire the escalation — it simply waits.
 		return errAgentDisabled
+	// Above the !sent branch on purpose: a refusal leaves sent false and
+	// deliverErr NIL, so the generic branch would report success.
+	case refused != "":
+		return fmt.Errorf("%w: an action rule refused the answer: %s", errOutboundRefused, refused)
 	case errors.Is(deliverErr, deliver.ErrReplyWithheld):
 		// A verdict about the agent's form, not a delivery fault: every
 		// retry would be refused the same way, so it must not burn the

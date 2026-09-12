@@ -36,13 +36,14 @@ func TestNeverAutoActionRuleJudgesTheAnswerNotTheScreen(t *testing.T) {
 	if _, matched := list.Match("agy", "Yes, run command"); matched {
 		t.Error("the narrow answer must stay available — refusing it is what stalled the agent")
 	}
-	if hit, matched := list.Match("agy", agyApproval); !matched {
-		_ = hit
-		// Matching the whole pane text is not itself wrong (it contains the
-		// answer); what matters is that this list is never HANDED pane text.
-		// Documented here so the call-site test is understood as the real guard.
-		t.Log("note: the list is content-blind; daemon.actionRefused is only ever called with a chosen action")
-	}
+	// Deliberately NOT asserted here, either way: handed the whole screen this
+	// list matches it, because the screen CONTAINS the answer — the list is
+	// content-blind and cannot tell the two apart. What makes the feature work
+	// is that it is never handed pane text, which only a call-site test can
+	// prove (daemon.actionRefused, and TestAutoAcceptScreensTheAnswerItWouldSend
+	// for the unattended path). A branch here that logged on one outcome and
+	// said nothing on the other asserted neither.
+	_ = agyApproval
 }
 
 func TestNeverAutoActionRulesHonourAgentScope(t *testing.T) {
@@ -93,13 +94,91 @@ func TestNeverAutoActionSeedsCanBeSilencedIndividually(t *testing.T) {
 	if persist == "" {
 		t.Fatal("the settings.json seed rule is missing")
 	}
-	list, _ := NewNeverAutoActionList(true, []string{persist}, nil)
-	if _, matched := list.Match("agy", "Yes, and always allow (Persist to settings.json)"); !matched {
-		t.Error("control: the other seeds must still fire on this answer")
+	// The discriminator is the TEXT: of the four shipped action seeds, only the
+	// persist rule matches this answer — it carries no "and always allow", no
+	// "don't ask again" and no "allow all". An answer several seeds match
+	// cannot discriminate at all, because the pair below would pass just as
+	// happily if the disable had dropped the WRONG rule, or every rule but it.
+	const onlyPersistMatches = "Yes, allow this command (Persist to settings.json)"
+
+	enabled, _ := NewNeverAutoActionList(true, nil, nil)
+	if _, matched := enabled.Match("agy", onlyPersistMatches); !matched {
+		t.Fatal("control: with the seeds on, the persist rule must refuse this answer — " +
+			"without this half, the assertion below passes on a list that refuses nothing")
 	}
-	only, _ := NewNeverAutoActionList(true, []string{persist}, nil)
-	if _, matched := only.Match("agy", "write it to the Persist to settings.json file"); matched {
+	silenced, _ := NewNeverAutoActionList(true, []string{persist}, nil)
+	if _, matched := silenced.Match("agy", onlyPersistMatches); matched {
 		t.Error("a silenced seed must not fire")
+	}
+	// Silencing ONE seed leaves the rest armed, which is what makes this a
+	// per-rule switch rather than enable_never_auto_action_seeds by another name.
+	if _, matched := silenced.Match("agy", "Yes, and always allow in this conversation"); !matched {
+		t.Error("silencing the persist seed disarmed the other action seeds too")
+	}
+	// An operator rule is never filtered by disabled_seed_patterns, even when
+	// its pattern is byte-identical to a silenced seed: the operator wrote it
+	// after silencing the builtin, so it is the newer instruction.
+	withOperator, _ := NewNeverAutoActionList(true, []string{persist}, []NeverAutoRule{{Pattern: persist}})
+	if _, matched := withOperator.Match("agy", onlyPersistMatches); !matched {
+		t.Error("an operator rule must survive a disabled_seed_patterns entry naming the same pattern")
+	}
+}
+
+// Every shipped action seed must be addressable by the same id and disable
+// commands the situation seeds are. They read the same
+// safety.disabled_seed_patterns, so the domain side always supported silencing
+// one — but every resolver searched the SITUATION set alone, so `rules list`
+// printed an id and a [disabled] column for rules no command could resolve:
+// `hap config rules disable-seed <that id>` failed with `no seed rule`, and the
+// column could never become true.
+func TestEveryShippedActionSeedIsAddressableByID(t *testing.T) {
+	for _, r := range SeedNeverAutoActionRules {
+		id := SeedRuleID(r.Pattern)
+		got, ok := SeedRuleByID(id)
+		if !ok {
+			t.Errorf("SeedRuleByID(%q) found nothing for action seed %q", id, r.Pattern)
+			continue
+		}
+		if got.Pattern != r.Pattern {
+			t.Errorf("SeedRuleByID(%q) = %q, want %q", id, got.Pattern, r.Pattern)
+		}
+		if !IsSeedPattern(r.Pattern) {
+			t.Errorf("IsSeedPattern(%q) = false, so App.DisableSeedRule refuses to record it",
+				r.Pattern)
+		}
+	}
+	// The union must not leak the other way: the compiled SITUATION seed set is
+	// what carries the irreversibility heuristic, and an action rule reaching it
+	// would judge a chosen menu option against indicators written for pane
+	// content.
+	for _, r := range SeedNeverAutoRules() {
+		for _, a := range SeedNeverAutoActionRules {
+			if r.Pattern == a.Pattern {
+				t.Errorf("action seed %q is also in the situation seed set", a.Pattern)
+			}
+		}
+	}
+}
+
+// An escalation an ACTION seed forced must offer the same "silence this builtin
+// rule" hint a situation seed's does. It carries the same [never_auto_match]
+// reason and the same diagnostic shape, so searching one side left exactly the
+// rows that most need the hint — the rule refused an ANSWER, so the operator
+// cannot rephrase their way past it — with none at all.
+func TestAnActionSeedEscalationNamesTheRuleThatForcedIt(t *testing.T) {
+	for _, r := range SeedNeverAutoActionRules {
+		hit := NeverAutoHit{Pattern: r.Pattern, Source: NeverAutoSeed,
+			Kind: NeverAutoStrict, Excerpt: "Yes, and always allow"}
+		rationale := "[" + string(ReasonNeverAutoMatch) + "] " + hit.Diagnostic()
+		got, ok := SeedRuleForcedEscalation(rationale)
+		if !ok {
+			t.Errorf("no seed rule attributed for action rule %q; the operator is offered no way to silence it",
+				r.Pattern)
+			continue
+		}
+		if got.Pattern != r.Pattern {
+			t.Errorf("attributed %q, want %q", got.Pattern, r.Pattern)
+		}
 	}
 }
 

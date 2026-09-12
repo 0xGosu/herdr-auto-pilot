@@ -62,6 +62,67 @@ func TestNeverAutoActionRuleIgnoresThePaneItIsAnswering(t *testing.T) {
 	}
 }
 
+// THE UNATTENDED SEND. Every other actionRefused call site is a decision made
+// while a human can still see the queue; this one types the suggestion into a
+// pane with nobody watching, and it was the one path with no action screen at
+// all.
+//
+// The row is escalated for an ORDINARY reason — here shadow mode — and it is
+// its SUGGESTION that is the widening option, which is the shape the seeds were
+// written for: hap's LLM chose agy's "and always allow …" at confidence 98-99
+// on nearly every approval. ReasonNeverAutoMatch being in
+// autoAcceptExcludedReasons does not cover this: that protects rows escalated
+// BY an action rule, not rows whose answer happens to be one.
+func TestAutoAcceptScreensTheAnswerItWouldSend(t *testing.T) {
+	h := newHarness(t, actionRuleCfg+autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setPane(wideningApprovalPane)
+	id := seedAgedEscalation(t, h, "pA", wideningApprovalPane, domain.SituationApproval,
+		"respond: Yes, and always allow commands starting with 'go'", 20*time.Minute)
+
+	// More sweeps than the delivery budget: a refusal is a VERDICT, not a
+	// fault, so it must not burn an attempt and retire the row — FR-015 says a
+	// never-auto match always reaches a human.
+	for i := 0; i < maxAutoAcceptAttempts+1; i++ {
+		h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+	}
+
+	if got := h.herdr.sentInputs(); len(got) != 0 {
+		t.Errorf("sent %v: the action rules must screen the unattended send too", got)
+	}
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Errorf("status = %q, want the row left pending for a human after %d sweeps",
+			got, maxAutoAcceptAttempts+1)
+	}
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 1 {
+		t.Errorf("pending = %d, want the escalation still queued for the operator", len(esc))
+	}
+}
+
+// THE CONTROL for the case above, and not optional: without it that test passes
+// on a daemon whose auto-accept is broken outright, or whose pane read fails —
+// every "nothing was sent" assertion is satisfied by doing nothing at all.
+//
+// Same rule, same config, same pane (which CONTAINS "always allow", since the
+// menu prints that option every time) — only the suggested answer is the narrow
+// one. It must still be delivered, and delivered as the DIGIT.
+func TestAutoAcceptStillDeliversTheNarrowAnswerBesideAnActionRule(t *testing.T) {
+	h := newHarness(t, actionRuleCfg+autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setPane(wideningApprovalPane)
+	id := seedAgedEscalation(t, h, "pA", wideningApprovalPane, domain.SituationApproval,
+		"respond: Yes", 20*time.Minute)
+
+	h.daemon.autoAcceptEscalations(ctx, parked("pA", "blocked"))
+
+	if got := auditStatus(t, h, id); got != domain.AuditStatusAutoAccepted {
+		t.Fatalf("status = %q, want %q", got, domain.AuditStatusAutoAccepted)
+	}
+	if got := h.herdr.sentInputs(); len(got) != 1 || got[0] != "1" {
+		t.Errorf("sent = %v, want [1]", got)
+	}
+}
+
 // The situation-side rules must keep working beside the new list — the mirror
 // of the control above.
 func TestSituationRulesStillFireBesideTheActionList(t *testing.T) {

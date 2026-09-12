@@ -1,6 +1,7 @@
 package frontend_test
 
 import (
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -131,6 +132,64 @@ func TestLLMEnvScopesCoverEveryEnvTable(t *testing.T) {
 		if !byScope[scope] {
 			t.Errorf("[%s] has no scope name in frontend.LLMEnvScopes — `hap config env set %s …` "+
 				"would be rejected, leaving the table editable only by hand", key, scope)
+		}
+	}
+}
+
+// skillDocPath is the shipped operator reference, embedded into the binary by
+// skilldoc.go and installed by `hap skill install`.
+const skillDocPath = "../../.claude/skills/hap/SKILL.md"
+
+// skillDocListExemptions are list sections the reference covers without naming
+// them literally. Every entry needs a reason, and a missing row is the default
+// answer — not a new exemption.
+var skillDocListExemptions = map[string]string{
+	"llm.task_generate_command_env":   "covered by the `[llm.*_env]` wildcard row in the list-key table",
+	"llm.learn_from_user_command_env": "covered by the `[llm.*_env]` wildcard row in the list-key table",
+	"llm.reranking_command_env":       "covered by the `[llm.*_env]` wildcard row in the list-key table",
+}
+
+// TestEveryConfigListIsNamedInTheShippedReference closes the gap the two tests
+// above leave open: a key can have a CLI verb and still be undiscoverable.
+//
+// SKILL.md ships INSIDE the binary (`hap --skill`, `hap skill install`), so it
+// is what an agent or an operator reads to find out how to do something — and
+// nothing enforced it. `[[safety.never_auto_actions]]` was absent from its
+// list-key table for its whole first release, so anyone looking for "how do I
+// stop hap picking that option" found only the SITUATION lists and wrote
+// exactly the rule that matches the menu printing the option, escalating every
+// prompt.
+//
+// Only the list sections are checked, not every scalar: they are the ones an
+// operator cannot discover by guessing a dotted key for `hap config set`.
+func TestEveryConfigListIsNamedInTheShippedReference(t *testing.T) {
+	doc, err := os.ReadFile(skillDocPath)
+	if err != nil {
+		t.Fatalf("reading the shipped reference: %v", err)
+	}
+	text := string(doc)
+
+	_, lists, _ := tomlScalarKeys(reflect.TypeOf(config.Config{}))
+	present := map[string]bool{}
+	for _, key := range lists {
+		present[key] = true
+		if _, exempt := configListsExemptFromCLI[key]; exempt {
+			// Deprecated aliases are deliberately not taught.
+			continue
+		}
+		if _, exempt := skillDocListExemptions[key]; exempt {
+			continue
+		}
+		if strings.Contains(text, key) {
+			continue
+		}
+		t.Errorf("config list section %q is not named anywhere in %s — an operator or agent "+
+			"reading the shipped reference cannot find it. Add a row to its list-key table, or "+
+			"add the key to skillDocListExemptions with a reason.", key, skillDocPath)
+	}
+	for key, why := range skillDocListExemptions {
+		if !present[key] {
+			t.Errorf("skillDocListExemptions names %q (%s), which config.Config no longer has — drop it", key, why)
 		}
 	}
 }

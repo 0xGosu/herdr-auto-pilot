@@ -1,0 +1,4 @@
+- Fixed the timed auto-accept and full self-prompting sending an answer the `--action` rules refuse: the unattended path, the one that types with nobody watching, was the only send that never screened what it chose. A refused answer now waits for you instead, without counting as a failed delivery.
+- Fixed `hap config rules disable-seed` rejecting the ids `hap config rules list` prints for the shipped action rules, so a builtin action rule could be listed but never silenced — and an escalation one of them forced now names the rule to silence, as a situation rule's already did.
+- Documented the never-auto ACTION rules and `safety.enable_never_auto_action_seeds` in the shipped `hap` skill, including which kind of rule to reach for: written as an ordinary rule, a pattern aimed at a menu option matches the menu that prints it and escalates every prompt.
+- `hap config rules --help` now names `--action` as a flag and the `--` escape for adding it as a literal pattern.

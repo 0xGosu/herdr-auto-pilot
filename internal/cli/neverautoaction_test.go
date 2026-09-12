@@ -58,3 +58,71 @@ func TestNeverAutoActionRulesAreEditableFromTheCLI(t *testing.T) {
 		t.Errorf("dash-leading pattern not stored verbatim: %+v", cfg.Safety.NeverAutoActionRules)
 	}
 }
+
+// Every id `rules list` prints for a shipped ACTION seed must resolve, and the
+// [disabled] column beside it must be reachable.
+//
+// Both were printed from the first release of this feature and neither worked:
+// `rules disable-seed` resolves through domain.SeedRuleByID and
+// App.DisableSeedRule guards on domain.IsSeedPattern, and both searched the
+// SITUATION seed registry alone. So an operator who copied the id straight out
+// of the listing got `no seed rule "<id>"`, and nothing could ever write the
+// entry that column reads.
+func TestActionSeedIDsFromTheListingResolve(t *testing.T) {
+	app, _ := testApp(t)
+
+	if _, err := run(t, app, "config", "set", "safety.enable_never_auto_action_seeds", "true"); err != nil {
+		t.Fatalf("enabling the action seeds: %v", err)
+	}
+	out, err := run(t, app, "rules", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Take the ids from the LISTING, exactly as an operator would — asking the
+	// domain package for them directly would not prove the two agree.
+	var ids []string
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.HasPrefix(line, "seed action ") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			t.Fatalf("unexpected action seed line: %q", line)
+		}
+		ids = append(ids, fields[2])
+	}
+	if len(ids) == 0 {
+		t.Fatal("`rules list` printed no shipped action seeds with the key enabled")
+	}
+
+	for _, id := range ids {
+		if _, err := run(t, app, "rules", "disable-seed", id); err != nil {
+			t.Errorf("rules disable-seed %s: %v", id, err)
+		}
+	}
+	cfg := loadCfg(t, app.ConfigPath)
+	if len(cfg.Safety.DisabledSeedPatterns) != len(ids) {
+		t.Fatalf("disabled_seed_patterns = %v, want one entry per action seed (%d)",
+			cfg.Safety.DisabledSeedPatterns, len(ids))
+	}
+
+	out, err = run(t, app, "rules", "list")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "seed action ") && !strings.Contains(line, "[disabled]") {
+			t.Errorf("action seed still listed as active after disable-seed: %q", line)
+		}
+	}
+
+	// And back off again, or the column is a one-way door.
+	for _, id := range ids {
+		if _, err := run(t, app, "rules", "enable-seed", id); err != nil {
+			t.Errorf("rules enable-seed %s: %v", id, err)
+		}
+	}
+	if cfg := loadCfg(t, app.ConfigPath); len(cfg.Safety.DisabledSeedPatterns) != 0 {
+		t.Errorf("disabled_seed_patterns = %v, want empty after enable-seed", cfg.Safety.DisabledSeedPatterns)
+	}
+}
