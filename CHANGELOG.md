@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.31
+
+- Fixed pre-delivery task review taking the agy composer proof before reserving the checklist item rather than after: an agy agent parked in a modal (or a pane that cannot be read) no longer churns the task list with reserve-refuse-release writes on every sweep.
+
 ## 0.9.30
 
 - Fixed an agent whose task list is finished filling the queue with `task_source_exhausted` escalations — one per sweep, forever. It is now raised at most once per parked episode, the way the hand-out proposal already was, and survives its own auto-dismissal under full self-prompting. Its text names the remedy (queue more work) instead of only restating that the list is empty, so silencing it no longer means reaching for `hap disable`
