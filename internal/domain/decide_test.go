@@ -539,7 +539,7 @@ func TestIdleDeclaredTaskExhaustedEscalatesWithoutGenerateConfig(t *testing.T) {
 	if d.Suggestion != ActionNoopSuggestion {
 		t.Errorf("exhausted declared list should suggest doing nothing, got %q", d.Suggestion)
 	}
-	if d.Rationale != "No more pending tasks" {
+	if d.Rationale != TaskSourceExhaustedRationale {
 		t.Errorf("exhausted declared list rationale mismatch, got %q", d.Rationale)
 	}
 }

@@ -226,6 +226,40 @@ const (
 	ReasonReplyWithheld EscalateReason = "reply_withheld"
 )
 
+// TaskSourceExhaustedRationale is the rationale on a ReasonTaskSourceExhausted
+// escalation. It is a BOOKKEEPING NOTICE, not a question: the suggestion is
+// ActionNoopSuggestion, so there is no answer an operator could give, and the
+// only thing that moves this agent is more work in its list.
+//
+// It names the remedy for that reason. The previous wording ("No more pending
+// tasks") described the state and left the remedy to be inferred, which in
+// practice meant reaching for `hap disable` to silence the notice — a heavy
+// instrument, since a disabled agent also stops having its prompts answered. No
+// CLI invocation is spelled out here: the source's own selector is an index or a
+// name this package cannot know, and the escalation line prints its own hints.
+const TaskSourceExhaustedRationale = "the task list is finished; queue more work to send any"
+
+// LatchedPerParkedEpisode reports whether an escalation reason is raised at most
+// ONCE per parked episode, per agent (daemon.escalate's episode latch).
+//
+// Both members are NOTICES ABOUT A QUEUE rather than questions about a screen,
+// and both are re-derived from scratch on every event of a parked spell — so
+// without a latch one parked agent mints one row per sweep, forever. The pane
+// excerpt dedup cannot collapse them: an agy repaints between every background
+// command, so every event presents a new excerpt.
+//
+// It is a reason PREDICATE, and the latch is keyed per (agent, reason), because
+// one parked episode can legitimately raise both in sequence: the operator reads
+// the exhausted notice, adds tasks, and the hand-out proposal must then still
+// reach them. A single per-agent latch would swallow exactly the row that gets
+// the agent working again.
+//
+// Deliberately NOT ReasonNoTaskSource: its remedy is registering a source rather
+// than queueing work, and nothing has reported it flooding.
+func LatchedPerParkedEpisode(reason EscalateReason) bool {
+	return reason == ReasonNoopVsPendingTasks || reason == ReasonTaskSourceExhausted
+}
+
 // Decision is the outcome of the pure decision core for one situation.
 type Decision struct {
 	Action     ActionKind

@@ -405,8 +405,8 @@ type LLM struct {
 	// keeps today's behavior: idle with no task source escalates as
 	// no_task_source and the plugin never synthesizes a prompt (FR-011). An
 	// EXHAUSTED declared source always escalates task_source_exhausted (a
-	// confirmable @noop suggestion, "No more pending tasks") — refilling a
-	// list the operator wrote is never automatic.
+	// confirmable @noop suggestion carrying domain.TaskSourceExhaustedRationale)
+	// — refilling a list the operator wrote is never automatic.
 	GenerateTaskCommand []string `toml:"task_generate_command"`
 	// GenerateTaskTimeoutSeconds bounds one task-generation run; zero or
 	// omitted inherits timeout_seconds.

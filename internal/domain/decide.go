@@ -267,8 +267,16 @@ func Decide(in DecideInput) Decision {
 		// so the answer is a confirmable @noop suggestion — the list is done,
 		// nothing to send. (Refilling used to be reachable by ALSO setting
 		// llm.task_generate_command_start; that key is gone.)
+		//
+		// The rationale names the REMEDY rather than restating the tag. There is
+		// nothing for an operator to answer here — the suggestion is @noop and
+		// the list is simply finished — so a line that only says "no more
+		// pending tasks" reads like a question, and an operator looking for one
+		// reaches for `hap disable` to silence it. Queueing work is the only
+		// thing that moves this agent.
 		if in.Situation.Type == SituationIdle && resolveEsc == ReasonTaskSourceExhausted {
-			return esc(ReasonTaskSourceExhausted, "No more pending tasks", conf.Score, ActionNoopSuggestion)
+			return esc(ReasonTaskSourceExhausted, TaskSourceExhaustedRationale,
+				conf.Score, ActionNoopSuggestion)
 		}
 		return esc(resolveEsc, rationaleFor(resolveEsc), conf.Score, suggestion)
 	}
