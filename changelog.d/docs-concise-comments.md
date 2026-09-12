@@ -1,1 +1,0 @@
-- Standardized and tightened doc comments on exported symbols across `domain`, `frontend`, and `store` to follow Go conventions and maintain precision.
