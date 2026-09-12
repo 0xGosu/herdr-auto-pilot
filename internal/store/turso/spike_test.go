@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
+
 	turso "turso.tech/database/tursogo"
 )
 
@@ -48,7 +50,7 @@ func startSyncServer(t *testing.T) string {
 			t.Logf("server log:\n%s", b)
 		}
 	})
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testutil.Scale(10 * time.Second))
 	for time.Now().Before(deadline) {
 		c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
 		if err == nil {

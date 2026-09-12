@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 // localSyncServer runs `tursodb --sync-server` for one test, or skips. (The
@@ -51,7 +53,7 @@ func localSyncServerKillable(t *testing.T) (string, func()) {
 		kill()
 		logf.Close()
 	})
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testutil.Scale(10 * time.Second))
 	for time.Now().Before(deadline) {
 		if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
 			c.Close()
@@ -161,7 +163,7 @@ func TestASlowMigrationKeepsTheLeasePastItsNominalTTL(t *testing.T) {
 	go func() { done <- PrepareSharedSchema(ctx, a, owner, time.Now) }()
 
 	// Wait until A holds the lease, then past the nominal TTL.
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testutil.Scale(10 * time.Second))
 	for {
 		if _, err := b.Pull(); err != nil {
 			t.Fatal(err)
@@ -219,7 +221,7 @@ func TestALockedMigrationStepLosesTheLeaseAndFailsClosed(t *testing.T) {
 	go func() { done <- PrepareSharedSchema(ctx, a, owner, time.Now) }()
 
 	// B keeps trying; once A's lease has lapsed unrenewed, B gets it.
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(testutil.Scale(15 * time.Second))
 	bHolds := false
 	for !bHolds && time.Now().Before(deadline) {
 		got, err := AcquireSchemaLease(ctx, b, "bbbbbbbbbbbbbbbb", time.Now)
@@ -301,7 +303,7 @@ func TestALeaseTakenDuringTheFinalStepIsNotPublished(t *testing.T) {
 
 	owner := &takeoverOwner{id: "aaaaaaaaaaaaaaaa", db: a}
 	owner.steal = func() error {
-		deadline := time.Now().Add(15 * time.Second)
+		deadline := time.Now().Add(testutil.Scale(15 * time.Second))
 		for time.Now().Before(deadline) {
 			got, err := AcquireSchemaLease(ctx, b, "bbbbbbbbbbbbbbbb", time.Now)
 			if err != nil {

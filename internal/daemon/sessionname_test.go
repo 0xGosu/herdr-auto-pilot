@@ -9,6 +9,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 // readPaneNow returns what the fake pane currently shows, so a test can feed
@@ -47,7 +48,7 @@ func claudeTr(agentID, status string) domain.AgentTransition {
 // Path 2 runs off the main loop, so a test cannot read the result inline.
 func waitForSend(t *testing.T, h *harness, want string) bool {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(testutil.Scale(3 * time.Second))
 	for time.Now().Before(deadline) {
 		for _, in := range h.herdr.sentInputs() {
 			if strings.Contains(in, want) {

@@ -12,6 +12,13 @@ permissions:
 
 env:
   GO_BUILD_TAGS: vectors cpu
+  # Multiplies every shared test wait deadline (internal/testutil.Scale). The
+  # deadlines are sized for an unloaded machine — measured idle, the slowest
+  # single wait already consumes 62% of its 3s budget — so a contended runner
+  # crosses them and fails a job for timing rather than behaviour. Scaling only
+  # ever lengthens a wait, so a genuinely stuck condition still fails, just a
+  # few seconds later.
+  HAP_TEST_TIMEOUT_SCALE: "4"
 
 jobs:
   # gofmt is pure text: it neither builds nor typechecks, so it needs no
