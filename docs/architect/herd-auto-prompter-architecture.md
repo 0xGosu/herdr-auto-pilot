@@ -981,6 +981,20 @@ Exactly two tools:
 `task_source_exhausted`, `noop_vs_pending_tasks`, `unfamiliar_options`,
 `no_history`, `graduation_pending`, `task_gen_failed`, `llm_retry`.
 
+Two of them are NOTICES ABOUT A QUEUE rather than questions about a screen, and
+are raised at most **once per parked episode per agent**
+(`domain.LatchedPerParkedEpisode`, `daemon.episodeNoticeRaised`):
+`noop_vs_pending_tasks` and `task_source_exhausted`. Both are re-derived from
+scratch on every event of a parked spell, and the pending-queue dedup keys on the
+pane excerpt — which an agy repaints between every background command — so without
+the latch one finished agent mints one row per sweep indefinitely. The latch is
+keyed per (agent, reason) because one episode can legitimately raise both in
+sequence: an operator reads the exhausted notice, queues work, and the hand-out
+proposal that follows must still reach them. It survives a DISMISSAL of its own row
+(under full self-prompting `task_source_exhausted` is auto-retired, which empties
+the queue the dedup reads) and is cleared only when the episode ends — the agent
+works again, its pane is recycled, or it leaves the listing.
+
 ## 13. Security & Privacy
 
 - **Single operator, no network auth surface.** The plugin runs as the operator's

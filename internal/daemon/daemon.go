@@ -353,11 +353,27 @@ type Daemon struct {
 	lastAutoSend map[string]time.Time
 	lastAutoNoop map[string]time.Time
 
-	// noopVsPendingRaised latches the noop-vs-pending proposal to ONE per
-	// parked episode, per agent. duplicatePendingEscalation keys on the pane
+	// episodeNoticeRaised latches each domain.LatchedPerParkedEpisode reason to
+	// ONE escalation per parked episode, per agent.
+	// duplicatePendingEscalation keys on the pane
 	// excerpt, and an agy repaints between every background command, so a
 	// parked agy mints a new excerpt on every event and the same proposal is
 	// re-raised until the operator's queue is nothing else (finding 5).
+	//
+	// Keyed per (agent, REASON) — the inner map — and that second level is
+	// load-bearing rather than tidy: one parked episode can raise both latched
+	// reasons in sequence, since an operator who reads task_source_exhausted and
+	// then adds tasks must still get the noop_vs_pending_tasks hand-out proposal.
+	// One shared per-agent counter would swallow precisely the row that gets the
+	// agent working again.
+	//
+	// The exhausted notice is the louder half in practice, and the reason it
+	// survives the whole spell rather than the queue: under full self-prompting
+	// retireNoopEscalation DISMISSES it (its suggestion is the @noop sentinel),
+	// so the pending-queue dedup sees nothing and the next sweep raises it again
+	// — observed live as a fresh dism:noop audit row roughly every 30 seconds on
+	// an agent whose work was simply complete. Nothing on the dismissal path
+	// clears this latch, which is what stops that loop at one row.
 	//
 	// An episode latch rather than a cooldown duration: there is no interval to
 	// justify, and the happy path self-clears — confirming the escalation
@@ -375,7 +391,7 @@ type Daemon struct {
 	// ONCE per episode (notePending's rule): 0 = not raised, 1 = raised, n>1 =
 	// n-1 repeats ignored. A log line per suppressed event would move the very
 	// flood this fixes into the log.
-	noopVsPendingRaised map[string]int
+	episodeNoticeRaised map[string]map[domain.EscalateReason]int
 
 	// preDeliveryReviewInFlight tracks the one live pre-delivery review per
 	// agent; the token lets the outcome handler drop superseded results.
@@ -846,7 +862,7 @@ func New(opt Options) (*Daemon, error) {
 		learnInFlight:             map[string]bool{},
 		lastAutoSend:              map[string]time.Time{},
 		lastAutoNoop:              map[string]time.Time{},
-		noopVsPendingRaised:       map[string]int{},
+		episodeNoticeRaised:       map[string]map[domain.EscalateReason]int{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
 		rerankInFlight:            map[string]rerankFlight{},
 		rerankCache:               map[string][]domain.RerankResult{},
@@ -1928,7 +1944,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		d.mu.Lock()
 		delete(d.episodeHandled, tr.PaneID)
 		delete(d.idleSince, tr.AgentID)
-		delete(d.noopVsPendingRaised, tr.AgentID)
+		delete(d.episodeNoticeRaised, tr.AgentID)
 		delete(d.autoTaskClaim, tr.AgentID)
 		// The parked episode is over, so the next one may propose its own
 		// hand-out: confirming the escalation is what set the agent working.
@@ -2170,7 +2186,7 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	delete(d.lastAutoSend, a.AgentID)
 	delete(d.lastAutoNoop, a.AgentID)
 	delete(d.idleSince, a.AgentID)
-	delete(d.noopVsPendingRaised, a.AgentID)
+	delete(d.episodeNoticeRaised, a.AgentID)
 	delete(d.autoTaskClaim, a.AgentID)
 	d.forgetSessionRenamePushesLocked(a.AgentID)
 	d.mu.Unlock()
@@ -3642,36 +3658,41 @@ func (d *Daemon) deliverActionReviewNoop(ctx context.Context, res actionReviewOu
 }
 
 // escalate records and surfaces an escalation: no input is sent (FR-018).
-// noteNoopVsPendingRaised records that this agent's parked episode now carries
-// a hand-out proposal. Called only once the audit row exists — see the call
-// site in escalate.
-func (d *Daemon) noteNoopVsPendingRaised(agentID string) {
+// noteEpisodeNoticeRaised records that this agent's parked episode now carries
+// an escalation for this latched reason. Called only once the audit row exists —
+// see the call site in escalate.
+func (d *Daemon) noteEpisodeNoticeRaised(agentID string, reason domain.EscalateReason) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.noopVsPendingRaised[agentID] == 0 {
-		d.noopVsPendingRaised[agentID] = 1
+	per := d.episodeNoticeRaised[agentID]
+	if per == nil {
+		per = map[domain.EscalateReason]int{}
+		d.episodeNoticeRaised[agentID] = per
+	}
+	if per[reason] == 0 {
+		per[reason] = 1
 	}
 }
 
-// noopVsPendingSuppressed reports whether this parked episode already raised a
-// hand-out proposal, counting the repeat.
+// episodeNoticeSuppressed reports whether this parked episode already raised
+// this reason, counting the repeat.
 //
-// It names itself exactly ONCE per episode. The screen this exists for repaints
-// several times a minute, so a line per suppressed event would reproduce the
-// flood in the log; silence is not the alternative (notePending's rule — the
-// unlogged auto-accept skips cost a five-round investigation).
-func (d *Daemon) noopVsPendingSuppressed(agentID string) bool {
+// It names itself exactly ONCE per episode, per reason. The screens these exist
+// for repaint several times a minute, so a line per suppressed event would
+// reproduce the flood in the log; silence is not the alternative (notePending's
+// rule — the unlogged auto-accept skips cost a five-round investigation).
+func (d *Daemon) episodeNoticeSuppressed(agentID string, reason domain.EscalateReason) bool {
 	d.mu.Lock()
-	n := d.noopVsPendingRaised[agentID]
+	n := d.episodeNoticeRaised[agentID][reason]
 	if n == 0 {
 		d.mu.Unlock()
 		return false
 	}
-	d.noopVsPendingRaised[agentID] = n + 1
+	d.episodeNoticeRaised[agentID][reason] = n + 1
 	d.mu.Unlock()
 	if n == 1 {
-		slog.Info("hand-out already proposed for this parked episode; ignoring repeats until the agent works again",
-			"agent", agentID, "reason", domain.ReasonNoopVsPendingTasks)
+		slog.Info("already raised for this parked episode; ignoring repeats until the agent works again",
+			"agent", agentID, "reason", reason)
 	}
 	return true
 }
@@ -3701,15 +3722,19 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		return
 	}
 
-	// One hand-out proposal per parked episode. The dedup above keys on the
-	// pane excerpt, which an agy changes on every repaint, so this reason needs
-	// an identity that survives a moving screen (finding 5, noopVsPendingRaised).
-	// Scoped to this ONE reason: every other escalation on the same event still
-	// reaches the operator. Below the auto-dismiss guard for the same reason the
-	// dedup is — a lifecycle dismissal must stay visible in history — and no
-	// audit row is written per repeat, since audit_log is never swept.
-	if autoDismissReason == "" && dec.Reason == domain.ReasonNoopVsPendingTasks &&
-		d.noopVsPendingSuppressed(s.AgentID) {
+	// One notice per parked episode, per latched reason. The dedup above keys on
+	// the pane excerpt, which an agy changes on every repaint, so these reasons
+	// need an identity that survives a moving screen (finding 5,
+	// episodeNoticeRaised) — and task_source_exhausted additionally needs one
+	// that survives its own DISMISSAL, since full self-prompting retires it and
+	// the queue is then empty again by the next sweep.
+	// Scoped to domain.LatchedPerParkedEpisode: every other escalation on the
+	// same event still reaches the operator. Below the auto-dismiss guard for the
+	// same reason the dedup is — a lifecycle dismissal must stay visible in
+	// history — and no audit row is written per repeat, since audit_log is never
+	// swept.
+	if autoDismissReason == "" && domain.LatchedPerParkedEpisode(dec.Reason) &&
+		d.episodeNoticeSuppressed(s.AgentID, dec.Reason) {
 		return
 	}
 
@@ -3762,10 +3787,10 @@ func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.Si
 		slog.Error("audit write failed for escalation", "error", auditErr)
 	}
 	// Latch AFTER the row exists: a failed insert must leave the next event
-	// free to raise the proposal, or one store error silences it for the
+	// free to raise the notice, or one store error silences it for the
 	// whole parked episode.
-	if auditErr == nil && dec.Reason == domain.ReasonNoopVsPendingTasks {
-		d.noteNoopVsPendingRaised(s.AgentID)
+	if auditErr == nil && domain.LatchedPerParkedEpisode(dec.Reason) {
+		d.noteEpisodeNoticeRaised(s.AgentID, dec.Reason)
 	}
 
 	// Rate-limit escalations pause the agent until human check-in — EXCEPT an
