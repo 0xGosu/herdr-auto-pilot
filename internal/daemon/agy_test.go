@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -721,6 +722,103 @@ func TestAgyApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
 			if len(rows) != 0 {
 				t.Errorf("audit rows = %+v, want none: the opening proof refuses above the audit "+
 					"write, so a pane parked like this leaves no row per sweep either", rows)
+			}
+		})
+	}
+}
+
+// Driving the pre-delivery review path with a caller-owned claim: an agy pane
+// parked in a modal (or a pane that cannot be read) must not trigger any task
+// file mutations. Without an early proof before taskfile.ApplyReview, the
+// review reserves the item to [-] before deliverAutonomousClaimed takes its
+// opening proof and refuses, which then triggers reviewRollback to release
+// back to [ ] — churning the task list twice per sweep with no attempt counted.
+func TestAgyReviewApprovalIsRefusedBeforeAnythingIsReserved(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		pane     string
+		failRead bool
+	}{
+		{name: "a standing approval", pane: agyApprovalPane},
+		{name: "a pane that cannot be read", pane: agyReadyPane, failRead: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			taskFile := filepath.Join(t.TempDir(), "tasks.md")
+			if err := os.WriteFile(taskFile, []byte("- [ ] 1. run the suite\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg := fmt.Sprintf("[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n\n"+
+				"[[task_sources]]\nagent = %q\npath = %q\nenable_llm_review_before_auto_send = true\nenable_auto_send_task_when_idle = true\n",
+				"pA", taskFile)
+			h := newHarness(t, cfg)
+			h.llm.configured = true
+			h.herdr.setPane(tc.pane)
+			h.herdr.setAgents([]domain.AgentTransition{agyAgent()})
+			h.herdr.failRead = tc.failRead
+
+			var reqID string
+			h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+				reqID = req.RequestID
+				return stageTaskReview(ctx, h, req, nil, "1", 90)
+			}
+
+			mutations := 0
+			var callOrder []string
+			origMutate := h.daemon.opt.MutateTaskFile
+			h.daemon.opt.MutateTaskFile = func(path string, fn func(string) (string, error)) error {
+				mutations++
+				before := readTasks(t, path)
+				err := origMutate(path, fn)
+				after := readTasks(t, path)
+				callOrder = append(callOrder, fmt.Sprintf("call %d: %q -> %q", mutations, strings.TrimSpace(before), strings.TrimSpace(after)))
+				return err
+			}
+
+			del := delivery{
+				sendText: "Next task: run the suite",
+				input:    "Next task: run the suite",
+				taskText: "1. run the suite",
+				declared: &domain.DeclaredTask{
+					Task:      "1. run the suite",
+					Content:   "1. run the suite",
+					Path:      taskFile,
+					Locator:   taskFile,
+					LLMReview: true,
+					Reserve:   true,
+				},
+			}
+			s := domain.Situation{AgentID: "pA", PaneID: "pA", AgentType: domain.AgentTypeAgy,
+				Type: domain.SituationIdle, Status: "idle", Content: agyReadyPane}
+			sent := h.daemon.deliverDeclared(ctx, s, domain.ComputeSignature(s),
+				domain.Decision{Input: "Next task: run the suite", Confidence: 1},
+				agyAgent(), del, time.Now())
+
+			waitFor(t, 5*time.Second, func() bool {
+				if reqID == "" {
+					return false
+				}
+				dec, err := h.raw.LLMDecisionByRequest(ctx, reqID)
+				return err == nil && dec != nil && dec.Status != "pending"
+			})
+
+			t.Logf("observed call order: %v", callOrder)
+
+			if sent || len(h.herdr.sentInputs()) != 0 {
+				t.Fatalf("typed into a pane that is not at an empty composer: sent=%v inputs=%v",
+					sent, h.herdr.sentInputs())
+			}
+			if mutations != 0 {
+				t.Errorf("the task list was written %d times for a refusal that never got as far as "+
+					"a reservation — under a gist source that is a remote read-modify-write per sweep",
+					mutations)
+			}
+			n, err := h.raw.TaskHandoutAttempts(ctx, canonicalTaskPath(taskFile), "1. run the suite")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n != 0 {
+				t.Errorf("attempts = %d, want 0: no attempt should be counted on a refusal", n)
 			}
 		})
 	}

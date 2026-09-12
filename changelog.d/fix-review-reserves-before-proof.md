@@ -1,0 +1,1 @@
+- Fixed pre-delivery task review taking the agy composer proof before reserving the checklist item rather than after: an agy agent parked in a modal (or a pane that cannot be read) no longer churns the task list with reserve-refuse-release writes on every sweep.

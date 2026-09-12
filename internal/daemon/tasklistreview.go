@@ -371,6 +371,24 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 		return
 	}
 
+	// agy only ever receives typed text at a proven EMPTY composer: herdr reports
+	// its modals idle, so an unattended send could type a hand-out into a
+	// standing approval, a picker or the operator's draft. Proving the pane
+	// before taskfile.ApplyReview ensures a refusal costs no task-list write
+	// (and no remote read-modify-write under a gist source).
+	if domain.IsAgy(s.AgentType) {
+		if err := d.agyComposerRefusal(ctx, s.PaneID); err != nil {
+			slog.Info("agy composer not ready; not sending", "agent", s.AgentID, "reason", err)
+			if res.decision != nil {
+				if uerr := d.opt.Store.UpdateLLMDecisionStatus(ctx, res.decision.ID, "rejected"); uerr != nil {
+					slog.Error("llm decision status update failed", "error", uerr)
+				}
+			}
+			d.dropAutoTaskClaim(s.AgentID)
+			return
+		}
+	}
+
 	// The safety re-gate. The reviewer is an LLM authoring both task text and
 	// the choice of task, so its output is screened exactly like any other
 	// LLM-authored outbound (FR-015). It runs INSIDE the mutation, against the
