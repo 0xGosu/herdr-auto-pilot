@@ -1,1 +1,1 @@
-- Fixed two daemon tests that read state the daemon writes a moment later, so a loaded machine no longer fails the fleet-sync recovery and SQLite hand-out cases for reasons unrelated to what they cover
+- Fixed daemon tests failing on a loaded machine for timing rather than behaviour: two of them read state the daemon writes a moment later, and every shared test wait can now be stretched by one multiplier that CI sets, instead of each deadline being tuned by hand

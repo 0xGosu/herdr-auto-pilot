@@ -9,6 +9,9 @@ permissions:
 
 env:
   GO_BUILD_TAGS: vectors cpu
+  # Same reason as ci.yml: the gate below runs the full suite on a shared
+  # runner, and the shared test waits are sized for an unloaded machine.
+  HAP_TEST_TIMEOUT_SCALE: "4"
   MODEL_URL: https://huggingface.co/sudomoniker/all-MiniLM-L6-v2-Q8_0-GGUF/resolve/main/all-minilm-l6-v2-q8_0.gguf
   MODEL_FILE: all-minilm-l6-v2-q8_0.gguf
   MODEL_SHA256: 606364fbf83de64c258ea9e011b74691d509d66292be0da612307488a46dfba5

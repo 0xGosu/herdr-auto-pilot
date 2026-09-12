@@ -11,6 +11,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/streamlog"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 // queryCountingLog counts the two statements an idle stream can issue per
@@ -186,7 +187,7 @@ func TestStreamIdleBackoffStillDeliversEvents(t *testing.T) {
 
 func waitFor(t *testing.T, ok func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(testutil.Scale(5 * time.Second))
 	for !ok() {
 		if time.Now().After(deadline) {
 			t.Fatal("condition never held")

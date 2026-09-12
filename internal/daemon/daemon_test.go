@@ -1050,16 +1050,25 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	}
 }
 
+// waitFor polls cond until it holds or the (scaled) deadline passes.
+//
+// Every caller's timeout goes through testutil.Scale, so a loaded runner gets
+// proportionally longer to satisfy the SAME condition — see the rationale and
+// the measurements there. The failure names the deadline actually in force,
+// because "condition not met within timeout" alone cannot distinguish a genuine
+// hang from a machine that needed one more poll.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
+	scaled := testutil.Scale(timeout)
+	deadline := time.Now().Add(scaled)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("condition not met within timeout")
+	t.Fatalf("condition not met within %s (base %s, scale %.3gx)",
+		scaled, timeout, testutil.TimeoutScale())
 }
 
 // tinyCaptureDelay keeps tests near-synchronous; appended LAST to every

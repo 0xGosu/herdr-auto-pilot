@@ -15,6 +15,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/turso"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 // startLocalSyncServer runs `tursodb --sync-server` for one test, or skips.
@@ -49,7 +50,7 @@ func startLocalSyncServer(t *testing.T) string {
 		_, _ = cmd.Process.Wait()
 		logf.Close()
 	})
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(testutil.Scale(10 * time.Second))
 	for time.Now().Before(deadline) {
 		if c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond); err == nil {
 			c.Close()
