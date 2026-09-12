@@ -44,6 +44,13 @@ func (s *sendTaskSeam) seen() []sendTaskCall {
 
 func newSendTaskHarness(t *testing.T, seam *sendTaskSeam, agentIDs ...string) *harness {
 	t.Helper()
+	return newSendTaskHarnessWith(t, seam, "", agentIDs...)
+}
+
+// newSendTaskHarnessWith is newSendTaskHarness with a config, for the cases that
+// need the operator's own safety rules rather than the shipped defaults.
+func newSendTaskHarnessWith(t *testing.T, seam *sendTaskSeam, cfgTOML string, agentIDs ...string) *harness {
+	t.Helper()
 	rows := make([]domain.AgentTransition, 0, len(agentIDs))
 	for _, id := range agentIDs {
 		rows = append(rows, domain.AgentTransition{
@@ -51,7 +58,7 @@ func newSendTaskHarness(t *testing.T, seam *sendTaskSeam, agentIDs ...string) *h
 		})
 	}
 	fl := &fakeLLM{}
-	h := newHarnessCore(t, "", func(fh *fakeHerdr) ports.HerdrPort {
+	h := newHarnessCore(t, cfgTOML, func(fh *fakeHerdr) ports.HerdrPort {
 		fh.setAgents(rows)
 		return fh
 	}, fl, fl, nil, func(o *Options) {

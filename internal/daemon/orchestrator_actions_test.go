@@ -59,6 +59,102 @@ func TestOrchestratorActionsAreScreenedAndPaused(t *testing.T) {
 	}
 }
 
+// handoutProse are task texts an operator or the orchestrator really wrote,
+// every one of which the PANE heuristics refuse. The first two are the live
+// refusals this behaviour was changed for: a task explaining how to fix a
+// failing CI run, and a task that named a seed rule while describing it.
+var handoutProse = []string{
+	"Fix the failing CI run: the job deletes the cached records before the assertion " +
+		"reads them, so do not weaken the assertion to make it pass.",
+	"hap refuses a hand-out whose prose names an irreversible operation, which is the " +
+		"false positive to remove.",
+	"Teach the runner to allow all branches to publish their own coverage report.",
+}
+
+// A hand-out is PROSE somebody wrote as a task, so the orchestrator's screen
+// holds it to the operator's POLICY (strict never-auto) and nothing else. The
+// suspected-irreversible seeds and the action rules both judge a pending pane
+// operation, and over prose they refuse work for discussing it.
+//
+// The control is the second half: every strict rule — the shipped seeds AND the
+// operator's own patterns — must still refuse, or this test passes on a screen
+// that screens nothing.
+func TestAnOrchestratorHandOutIsScreenedByPolicyNotByPaneHeuristics(t *testing.T) {
+	seam := &sendTaskSeam{}
+	h := newSendTaskHarnessWith(t, seam, "[safety]\n"+
+		"enable_never_auto_action_seeds = true\n"+
+		"never_auto_patterns = [\"(?i)bless the release\"]\n", "w1:p1")
+
+	payload, err := json.Marshal(domain.SendTaskPayload{Locator: "/tmp/tasks.md", Index: 1, TaskText: "work"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionSendTask, Target: "w1:p1", Payload: string(payload),
+		Author: domain.OrchestratorAuthor,
+	}))
+	if got.Status != domain.AgentActionDone {
+		t.Fatalf("orchestrator hand-out: %q (%s)", got.Status, got.Error)
+	}
+	calls := seam.seen()
+	if len(calls) != 1 || calls[0].screen == nil {
+		t.Fatalf("%d calls; want one carrying a screen", len(calls))
+	}
+	screen := calls[0].screen
+
+	for _, text := range handoutProse {
+		if err := screen(text); err != nil {
+			t.Errorf("the hand-out screen refused ordinary prose: %v\ntext: %s", err, text)
+		}
+	}
+
+	// The control. Strict rules are the operator's declared policy plus literal
+	// command shapes, and every one of them still refuses.
+	for _, text := range []string{
+		"Run git push --force to flatten the branch before merging.",
+		"Now bless the release and ship it.",
+	} {
+		if err := screen(text); !errors.Is(err, errOutboundRefused) {
+			t.Errorf("the hand-out screen let a strict rule through: %v\ntext: %s", err, text)
+		}
+	}
+}
+
+// The narrowing is scoped to the hand-out KIND. A generated task's text was
+// INVENTED by the task-generator LLM rather than asked for, so its confirm — and
+// the daemon's own full-self-prompting sends, which share screenOutbound — keep
+// the whole screen, prose or not.
+func TestAGeneratedTaskConfirmKeepsTheWholeScreen(t *testing.T) {
+	seam := &confirmSeam{}
+	h := newConfirmHarness(t, seam, "w1:p1")
+	audit := seedGeneratedEscalation(t, h, "w1:p1", "write the parser")
+	payload, err := json.Marshal(domain.AcceptGeneratedTaskPayload{AuditID: audit, Send: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := h.awaitAction(h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionAcceptGeneratedTask, Target: "w1:p1", Payload: string(payload),
+		Author: domain.OrchestratorAuthor,
+	}))
+	if got.Status != domain.AgentActionDone {
+		t.Fatalf("confirm: %q (%s)", got.Status, got.Error)
+	}
+	calls := seam.seen()
+	if len(calls) != 1 || calls[0].screen == nil {
+		t.Fatalf("%d calls; want one carrying a screen", len(calls))
+	}
+	for _, text := range handoutProse[:2] {
+		if err := calls[0].screen(text); !errors.Is(err, errOutboundRefused) {
+			t.Errorf("the generated-task screen stopped applying the pane heuristics: %v\ntext: %s", err, text)
+		}
+		// The FSP path's own pre-check and at-send screen are the same two
+		// controls under a different entry point.
+		if err := h.daemon.screenOutbound("claude", text); err == nil {
+			t.Errorf("screenOutbound stopped applying the pane heuristics\ntext: %s", text)
+		}
+	}
+}
+
 // The orchestrator's confirm of a generated-task suggestion is handed the
 // screen too; the operator's is not.
 func TestOrchestratorGeneratedTaskConfirmIsScreened(t *testing.T) {
