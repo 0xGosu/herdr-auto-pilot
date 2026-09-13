@@ -56,3 +56,30 @@ func TestBannerReservesChromeLine(t *testing.T) {
 		t.Errorf("detailPageSize with banner = %d, want %d (one less)", got, want)
 	}
 }
+
+// TestFleetSyncPausedIsStated: a paused fleet sync short-circuits both the
+// health banner and FleetSyncDegraded, so the TUI's only fleet-sync output
+// used to vanish — a herd off the wire looking exactly like a quiet one. The
+// pause is not a fault and must not raise a warning, but it must be SAID, with
+// the key that ends it. The unpaused health is the control: a line rendered
+// unconditionally would pass the first half.
+func TestFleetSyncPausedIsStated(t *testing.T) {
+	m := Model{width: 100, height: 30}
+	m.data.daemonHealth = frontend.DaemonHealth{Running: true, FleetSyncPaused: true,
+		FleetSyncLine: "turso — PAUSED by database.turso_sync_paused (3 unpushed, last pull never, last push never)"}
+	view := m.View()
+	for _, want := range []string{"fleet sync PAUSED", "hap config set database.turso_sync_paused false"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("a paused fleet sync must say %q, got:\n%s", want, view)
+		}
+	}
+	if strings.Contains(view, "⚠") {
+		t.Errorf("a deliberate pause is not a warning, got:\n%s", view)
+	}
+
+	m.data.daemonHealth = frontend.DaemonHealth{Running: true,
+		FleetSyncLine: "turso — ok (last pull 2s ago, last push 2s ago, 0 unpushed)"}
+	if strings.Contains(m.View(), "PAUSED") {
+		t.Errorf("an unpaused fleet sync must not read as paused, got:\n%s", m.View())
+	}
+}
