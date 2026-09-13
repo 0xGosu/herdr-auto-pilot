@@ -1249,7 +1249,7 @@ func buildCommands() {
 			Flags: []FlagDoc{
 				{Name: "--to", Arg: "ENGINE", Desc: "required: `sqlite` copies the shared database into this machine's local file, `turso` copies the local file into the shared database. The other engine is the source"},
 				{Name: "--all-nodes", Desc: "with `--to sqlite`: copy EVERY node's rows, not just this machine's. For consolidating a herd that is being retired — they arrive stamped as THIS machine's, so a herdr pane id that repeats on every machine collapses into one agent, and two machines' agent names collide (the second is dropped)"},
-				{Name: "--force", Desc: "copy into a destination that already holds history. It does NOT merge: every id is re-allocated, so a second run duplicates every row"},
+				{Name: "--force", Desc: "copy into a destination that already holds history. It does NOT merge: every id is re-allocated, so a second run duplicates every row. With `--to turso` the duplicates are pushed to every node and no local backup undoes them"},
 			},
 			Details: "Switching `database.engine` does not move anything — it points hap at a different\n" +
 				"database, and the old one's history stays where it is. This is how the data\n" +
@@ -1275,6 +1275,9 @@ func buildCommands() {
 				"several live machines' histories side by side.\n\n" +
 				"The destination is copied aside first (`<database>.pre-migrate-<stamp>.bak`), and a\n" +
 				"destination that already holds history is refused unless you pass --force.\n" +
+				"With `--to turso` that backup is only this machine's local replica: the copy is\n" +
+				"pushed to Turso Cloud and pulled by every node, so a forced duplicate cannot be\n" +
+				"rolled back from it.\n" +
 				"Nothing switches engines: run `hap config set database.engine <engine>` and\n" +
 				"`hap daemon --ensure` when the copy reports what you expected.",
 			Examples: []string{"hap migrate --to sqlite", "hap config set database.engine sqlite", "hap daemon --ensure"},

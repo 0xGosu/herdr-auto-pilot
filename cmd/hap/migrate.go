@@ -64,7 +64,15 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 		return err
 	}
 	if backup != "" {
-		fmt.Fprintf(out, "backed up the destination to %s\n", backup)
+		if opt.toSQLite {
+			fmt.Fprintf(out, "backed up the destination to %s\n", backup)
+		} else {
+			// The shared database's LOCAL replica, not Turso Cloud: saying
+			// "the destination" here reads as a way back from a copy the push
+			// below publishes to every node.
+			fmt.Fprintf(out, "backed up this machine's local replica of the shared database to %s\n"+
+				"(Turso Cloud itself is not backed up: what is pushed there reaches every node)\n", backup)
+		}
 	}
 
 	// The turso side is opened directly, not through the daemon's proxy: the
@@ -137,9 +145,7 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 	rep, err := store.Migrate(ctx, mo)
 	if err != nil {
 		if errors.Is(err, store.ErrDestinationNotEmpty) {
-			return fmt.Errorf("%w.\nThe copy re-allocates every id, so running it twice would duplicate every row\n"+
-				"rather than merging. Start from an empty destination, or pass --force if you\n"+
-				"have decided the duplication is acceptable (the backup above is the way back)", err)
+			return destinationNotEmptyError(err, opt)
 		}
 		return err
 	}
@@ -319,4 +325,27 @@ func refuseNodeBitsCollision(ctx context.Context, st *store.Store, opt migrateAr
 		"Do not simply move %s aside and re-run: this machine's local history stays filed under its current id, "+
 		"so the migration would copy none of it. Regenerate the id on a machine with no history to lose instead",
 		label, other.ID, filepath.Join(stateDir, store.NodeIDFile))
+}
+
+// destinationNotEmptyError explains a refused copy into a destination that
+// already holds history, and what --force would cost — which depends on the
+// DIRECTION, and getting it wrong is the hazard.
+//
+// Going to sqlite the destination is one local file and the pre-migrate backup
+// really is the way back. Going to turso the backup is of this machine's local
+// REPLICA, while the copy is pushed to Turso Cloud and folded in by every peer
+// on its next pull, so a duplicated history is the fleet's and no local file
+// restores it. Pointing an operator at that backup there is what makes --force
+// look recoverable in exactly the direction where it is not.
+func destinationNotEmptyError(err error, opt migrateArgs) error {
+	const head = "%w.\nThe copy re-allocates every id, so running it twice would duplicate every row\n" +
+		"rather than merging. Start from an empty destination, or pass --force if you\n" +
+		"have decided the duplication is acceptable"
+	if opt.toSQLite {
+		return fmt.Errorf(head+" (the backup above is the way back)", err)
+	}
+	return fmt.Errorf(head+".\nGoing to turso there is NO way back: a forced copy is published to Turso Cloud\n"+
+		"(immediately, or on the first push after database.turso_sync_paused is lifted) and\n"+
+		"every other node pulls the duplicates in. The backup above is only this machine's\n"+
+		"local replica, and restoring it undoes none of that", err)
 }

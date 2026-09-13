@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -167,5 +168,32 @@ func TestMigrateToTursoRefusesACollidingNodeID(t *testing.T) {
 	}
 	if err := refuseNodeBitsCollision(ctx, me, down, "/state"); err != nil {
 		t.Errorf("--to sqlite writes nothing to the shared database and must not refuse: %v", err)
+	}
+}
+
+// TestDestinationNotEmptyErrorOnlyPromisesAWayBackGoingToSQLite: the backup is
+// the way back from a forced copy into a local file, and NOT from one into the
+// shared database — that copy is pushed to every node, and the backup there is
+// only this machine's replica. The sqlite case is the control: a version that
+// dropped the promise in both directions would pass the turso half alone.
+func TestDestinationNotEmptyErrorOnlyPromisesAWayBackGoingToSQLite(t *testing.T) {
+	down := destinationNotEmptyError(store.ErrDestinationNotEmpty, migrateArgs{toSQLite: true})
+	if !errors.Is(down, store.ErrDestinationNotEmpty) {
+		t.Errorf("the sentinel was lost: %v", down)
+	}
+	if !strings.Contains(down.Error(), "the backup above is the way back") {
+		t.Errorf("--to sqlite: %q should name the backup as the way back", down)
+	}
+	up := destinationNotEmptyError(store.ErrDestinationNotEmpty, migrateArgs{toSQLite: false})
+	if !errors.Is(up, store.ErrDestinationNotEmpty) {
+		t.Errorf("the sentinel was lost: %v", up)
+	}
+	if strings.Contains(up.Error(), "is the way back") {
+		t.Errorf("--to turso: %q promises a way back the backup cannot give", up)
+	}
+	for _, want := range []string{"NO way back", "every other node", "undoes none of that"} {
+		if !strings.Contains(up.Error(), want) {
+			t.Errorf("--to turso: %q does not say %q", up, want)
+		}
 	}
 }
