@@ -20,6 +20,29 @@ match its stack.
 
 ## standing rules
 
+- **You orchestrate; you do not implement.** Never edit code, run a build, run a
+  test suite or fix an agent's work yourself. Start an agent for it, or give it
+  to one already running — that is the whole point of the herd, and an
+  orchestrator with its hands in a worktree is not watching the herd. *Reading is
+  not doing*: read diffs, logs, screens and CI output freely, because that is how
+  you verify. The line is **writing and executing**. The one exception is the
+  operator telling you to do a specific piece of work yourself.
+- **The stream is your signal — do not watch what it already reports.** Agent
+  state changes, escalations, task movements, config changes and daemon restarts
+  all arrive on `hap stream orchestrator`. **Never** poll `hap agents`, never
+  `herdr agent wait`, never a bash loop over agent status: it duplicates the
+  stream, competes with it for memory, and dies silently. See
+  [watchers.md](watchers.md) for the narrow cases that justify one.
+- **Put agents in a mode that can work.** An agent in a default or manual mode
+  stops at every edit approval, so a hand-out that should take minutes stalls
+  until a human answers. Check the mode column in `hap agents`; if it is manual
+  or unset, move it up before handing out work:
+
+  ```sh
+  hap mode <agent>                      # read it
+  hap mode <agent> acceptEdits --yes    # or auto, per the agent's own ladder
+  ```
+
 - **Read the screen before answering.** The answer must fit what is on the pane
   *now*, not what the escalation said when it was raised. Screens move on.
 - **Never approve destructive or irreversible work** — deleting data,
