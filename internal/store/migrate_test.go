@@ -41,6 +41,54 @@ func TestMigrateScopeListsMatchTheGuard(t *testing.T) {
 				table, explicitIDTables[table], migrateExplicitID[table])
 		}
 	}
+	// Every table the guard knows as node-scoped or explicit-id must be either
+	// copied or deliberately left behind. Iterating only the copy list above
+	// cannot see a table missing from BOTH lists — which is exactly how
+	// task_lists, the whole content of the sqlite task provider, was dropped.
+	for _, guard := range []map[string]bool{nodeScopedTables, explicitIDTables} {
+		for table := range guard {
+			if copied[table] == (migrateNotCopied[table] != "") {
+				t.Errorf("%s: copied=%v, deliberately-not-copied=%q — a table the guard knows must be exactly one",
+					table, copied[table], migrateNotCopied[table])
+			}
+		}
+	}
+	// And the same over the REAL schema, so a new table that never made it
+	// into the guard's lists is not invisible either.
+	s, err := Open(filepath.Join(t.TempDir(), "herd-auto-prompter.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	rows, err := s.db.Query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		schema = append(schema, name)
+	}
+	rows.Close()
+	if len(schema) == 0 {
+		t.Fatal("the schema listed no tables; this half would prove nothing")
+	}
+	inSchema := map[string]bool{}
+	for _, table := range schema {
+		inSchema[table] = true
+		if copied[table] == (migrateNotCopied[table] != "") {
+			t.Errorf("schema table %s: copied=%v, deliberately-not-copied=%q — decide which, or a migration "+
+				"silently drops it", table, copied[table], migrateNotCopied[table])
+		}
+	}
+	for table := range migrateNotCopied {
+		if !inSchema[table] {
+			t.Errorf("migrateNotCopied names %s, which the schema does not have", table)
+		}
+	}
 	// And neither list may name a table the copy does not touch: an entry that
 	// is never consulted reads as coverage it does not provide.
 	for table := range migrateNodeScoped {
@@ -53,6 +101,19 @@ func TestMigrateScopeListsMatchTheGuard(t *testing.T) {
 			t.Errorf("migrateExplicitID names %s, which the copy list does not touch", table)
 		}
 	}
+}
+
+// migrateNotCopied names every table the copy list deliberately leaves behind,
+// with why. TestMigrateScopeListsMatchTheGuard requires each schema table to be
+// either copied or named here, so dropping a table is a decision, never an
+// omission.
+var migrateNotCopied = map[string]string{
+	"agent_roster":            "republished from herdr's live listing within a minute",
+	"agent_roster_tombstones": "retired roster rows' guards; the roster itself is not copied",
+	"herdr_locations":         "machine-local herdr bookkeeping, re-derived by the daemon",
+	"roster_meta":             "the roster's publish stamp, rewritten by the next publish",
+	"nodes":                   "each node's heartbeat row, rewritten by its own daemon",
+	"legacy_imports":          "written by Migrate itself as the record of this copy",
 }
 
 // Node ids are 16 lowercase hex characters (store.nodeIDRE) — a readable
@@ -122,6 +183,8 @@ func seedHistory(t *testing.T, s *Store, agentID string) (escalation int64) {
 		AgentID: agentID, PaneID: agentID, AuditID: esc, ReservedAt: now})
 	must(err)
 	_, err = s.InsertKillEvent(ctx, domain.KillEvent{State: domain.KillStateActiveValue, CreatedAt: now})
+	must(err)
+	_, err = s.EnsureTaskList(ctx, s.self, "list-"+agentID, "agent-"+agentID, "# Tasks\n- [ ] task-"+agentID+"\n", now)
 	must(err)
 	return esc
 }
@@ -231,6 +294,16 @@ func TestMigrateRoundTripPreservesRowsAndReferences(t *testing.T) {
 	}
 	if len(rs) != 1 || rs[0].AuditID != esc.ID {
 		t.Errorf("task reservation = %+v, want one pointing at %d", rs, esc.ID)
+	}
+	// A database-backed checklist is the whole of the sqlite task provider's
+	// state: every [[task_sources]] entry still names db://<node>/list-1, so a
+	// copy that leaves the row behind reports success over a lost list.
+	list, err := back.ReadTaskList(ctx, self, "list-1")
+	if err != nil {
+		t.Fatalf("the task list did not survive the round trip: %v", err)
+	}
+	if list.Content != "# Tasks\n- [ ] task-1\n" || list.AgentName != "agent-1" {
+		t.Errorf("task list after the round trip = %+v", list)
 	}
 	// The returned ids are the plain ascending kind a sqlite file uses, not the
 	// allocator's 63-bit ones: the copy assigned them, counting from the

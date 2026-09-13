@@ -638,7 +638,9 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
       consolidation rather than an archive (and why colliding agent names lose the second copy).
       `migrateNodeScoped`/`migrateExplicitID` MIRROR the lists in `nodescope_test.go` and are pinned to
       them by `TestMigrateScopeListsMatchTheGuard`: a table that gains a `node_id` elsewhere and is not
-      added here comes over WHOLE, silently.
+      added here comes over WHOLE, silently. The same test walks the REAL schema: every table must be
+      copied or named with a reason in `migrateNotCopied` — `task_lists` (the whole `sqlite` task provider)
+      was once in neither, and a migration reported success over lost checklists.
     - **Knowledge is never scoped.** `signatures`, `signature_embeddings`, `signature_snapshots` and
       `decisions` carry no `node_id` on purpose (rules graduate on the FLEET's evidence), so filtering them
       would silently downgrade what the destination knows.

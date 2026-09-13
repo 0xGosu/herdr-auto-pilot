@@ -30,7 +30,8 @@ import (
 // signatures.decision_floor_id; audit_log ← corrections, llm_retries,
 // task_reservations, audit_log.corrects_audit_id; corrections ←
 // agent_actions.correction_id. Content-keyed knowledge merges into what the
-// remote already holds (INSERT OR IGNORE: the fleet's copy wins).
+// remote already holds (INSERT OR IGNORE: the fleet's copy wins), as does a
+// database-backed checklist (task_lists) already present under its (node, name).
 //
 // Deliberately NOT imported: pending LLM requests and decisions (in-flight IPC
 // of a daemon that no longer exists), pending or running agent actions (an
@@ -187,6 +188,12 @@ func (im *importer) copySteps() []copyStep {
 		{"agent_rate", "node_id, agent_id, consecutive_auto, window_start, count_in_window, paused", "agent_id", nil, stampNode(self)},
 		{"error_retries", "node_id, error_signature, agent_id, retry_count, updated_at", "error_signature", nil, stampNode(self)},
 		{"task_handouts", "node_id, source_path, task_text, attempts, updated_at", "source_path, task_text", nil, stampNode(self)},
+		// The WHOLE content of the sqlite task-source provider, not bookkeeping:
+		// every [[task_sources]] entry on this machine names db://<node>/<name>,
+		// and a copy without these rows reports success over checklists that
+		// ReadTaskList can no longer find. Stamped like every node-owned row, so
+		// the locator's node still resolves on the machine that owns the config.
+		{"task_lists", "node_id, name, agent_name, content, revision, updated_at", "node_id, name", nil, stampNode(self)},
 		{"audit_log", auditCols, "id", nil, func(r row) {
 			old := r["id"].(int64)
 			id := im.nextID()

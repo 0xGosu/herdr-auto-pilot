@@ -184,6 +184,7 @@ var migrateNodeScoped = map[string]bool{
 	"agent_names": true, "agent_rate": true, "error_retries": true, "task_handouts": true,
 	"task_reservations": true, "llm_requests": true, "llm_decisions": true, "llm_retries": true,
 	"corrections": true, "kill_events": true, "audit_log": true, "agent_actions": true,
+	"task_lists": true,
 }
 
 // migrateExplicitID names the copy list's INTEGER PRIMARY KEY tables, whose ids
