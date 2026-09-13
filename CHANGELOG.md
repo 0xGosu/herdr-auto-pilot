@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.42
+
+- Added `database.turso_sync_paused` — take a machine off Turso Cloud without unpicking its URL and token. The node keeps the turso engine and its local replica; only the pulls, pushes and the shutdown push stop, and queued writes go out on the first push after you turn it off. It is the one `[database]` key the running daemon re-reads, so `hap config set database.turso_sync_paused true` applies on a reload rather than costing the herd a restart.
+- Fixed `hap status` and the TUI reporting a deliberately paused fleet sync as failing, stale or isolated — it now reads as PAUSED, with the unpushed count, and never raises a banner.
+- Added `hap migrate --to <sqlite|turso>` — copy hap's learned rules, audit history and agent state between the local database and the shared one, in either direction, so trying the shared database is reversible. `--to sqlite` takes this machine's rows by default (`--all-nodes` takes the fleet's); learned knowledge always comes over whole. It backs the destination up first (going to turso that is only this machine's local replica — a copy forced into a shared database that already holds history is pushed to every node and cannot be rolled back from it), refuses to run while a daemon is up, onto a database that already holds history, or into a shared database where this node's id bits collide with another node's (the check the daemon already refuses to start without), and reports what it copied per table. Database-backed checklists (the `sqlite` task provider) come over with it.
+
 ## 0.9.41
 
 - Added a `hap-orchestrator` skill documenting how to run a herd as the operator's deputy: escalation triage, handing work out through task lists, agy-specific behaviour, watcher patterns, PR review and merging, and incident playbooks.
