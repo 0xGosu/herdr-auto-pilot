@@ -1,10 +1,17 @@
 package main
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
 // TestParseMigrateArgs covers the direction and the two flags, including the
@@ -99,5 +106,66 @@ func TestBackupOfAMissingDestinationIsNotAnError(t *testing.T) {
 	}
 	if path != "" {
 		t.Errorf("reported a backup at %q for a file that does not exist", path)
+	}
+}
+
+// TestMigrateToTursoRefusesACollidingNodeID: the daemon refuses to start when
+// another node shares this one's 12 id bits, and a migration INTO the shared
+// database must ask the same question before it writes a whole history there.
+//
+// The --to sqlite case is the control: nothing is written to the shared
+// database going down, and a version refusing unconditionally would block the
+// colliding node's only route home while passing the first case.
+func TestMigrateToTursoRefusesACollidingNodeID(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "shared.db")
+	open := func(id string) *store.Store {
+		t.Helper()
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := store.OpenDB(db, store.Options{NodeID: id, Engine: store.EngineTurso,
+			IDs: store.NewTimeOrderedIDs(store.NodeBits(id), nil), Migrate: true,
+			AgentLockDir: filepath.Join(filepath.Dir(path), "locks-"+id)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { st.Close() })
+		return st
+	}
+	const mine = "aaaaaaaaaaaaaaaa"
+	me := open(mine)
+	up := migrateArgs{toSQLite: false}
+	down := migrateArgs{toSQLite: true}
+	if err := refuseNodeBitsCollision(ctx, me, up, "/state"); err != nil {
+		t.Fatalf("alone in the database: %v", err)
+	}
+
+	var twin string
+	for i := 0; i < 1<<20 && twin == ""; i++ {
+		cand := fmt.Sprintf("%016x", uint64(i)*0x9E3779B97F4A7C15+0x1234)
+		if cand != mine && store.NodeBits(cand) == store.NodeBits(mine) {
+			twin = cand
+		}
+	}
+	if twin == "" {
+		t.Fatal("no colliding id found")
+	}
+	if err := open(twin).UpsertNode(ctx, domain.NodeInfo{Label: "twin", LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+
+	err := refuseNodeBitsCollision(ctx, me, up, "/state")
+	if err == nil {
+		t.Fatal("--to turso went ahead into a colliding id space")
+	}
+	for _, want := range []string{"twin", twin, "nothing was copied", "Do not simply move"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not mention %q", err, want)
+		}
+	}
+	if err := refuseNodeBitsCollision(ctx, me, down, "/state"); err != nil {
+		t.Errorf("--to sqlite writes nothing to the shared database and must not refuse: %v", err)
 	}
 }

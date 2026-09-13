@@ -656,7 +656,9 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
 
     `cmd/hap/migrate.go` holds the preconditions because it is the only package that may open BOTH engines:
     every other process reaches a turso store through the daemon's proxy, and the command's own precondition
-    is that no daemon is running. It backs the destination up **before either handle is opened** and takes
+    is that no daemon is running. Going UP it also asks `NodeBitsCollision` before writing, as the daemon does at start
+    (`refuseNodeBitsCollision`) — with its own remedy, since regenerating THIS machine's id strands the local
+    file's rows under the old one and the copy then takes nothing. It backs the destination up **before either handle is opened** and takes
     the `-wal`/`-shm` sidecars with it (a copy from under an open handle loses whatever the WAL had not
     folded in), and it honours `database.turso_sync_paused` by skipping the framing pull/push.
   - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a

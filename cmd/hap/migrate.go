@@ -103,6 +103,9 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 	if err := turso.PrepareSharedSchema(ctx, tdb, tursoStore, time.Now); err != nil {
 		return fmt.Errorf("prepare the shared database's schema: %w", err)
 	}
+	if err := refuseNodeBitsCollision(ctx, tursoStore, opt, paths.StateDir); err != nil {
+		return err
+	}
 
 	// Deliberately honours the pause. An operator who has taken this machine
 	// off the wire has said what they want from Turso Cloud, and a migration is
@@ -280,4 +283,40 @@ func printMigrateReport(out io.Writer, rep *store.MigrateReport, opt migrateArgs
 	fmt.Fprintf(out, "\nNothing switched engines. To start using it:\n")
 	fmt.Fprintf(out, "    hap config set database.engine %s\n", next)
 	fmt.Fprintf(out, "    hap daemon --ensure\n")
+}
+
+// refuseNodeBitsCollision is the daemon's startup check (cmd/hap/main.go),
+// asked before a copy INTO the shared database writes anything. Ids carry 12
+// bits of the node id, so a node sharing them shares an id space; the daemon
+// refuses to start on that, and a migration that went ahead would both write a
+// whole history into the colliding id space and make this machine a writer —
+// which is what the daemon's remedy (regenerate the id on the machine that has
+// never written) depends on it not being.
+//
+// Only the upward direction asks. Going to sqlite the destination is a local
+// file with no allocator and nothing is written to the shared database, and
+// refusing there would block the one route home a colliding node has.
+//
+// The remedy is NOT the daemon's verbatim. Regenerating THIS machine's id and
+// re-running would copy nothing: the local file's rows stay stamped with the
+// old id, the copy is scoped to the new one, and the migration would report
+// success over an empty history. A read error passes, as it does for the
+// daemon.
+func refuseNodeBitsCollision(ctx context.Context, st *store.Store, opt migrateArgs, stateDir string) error {
+	if opt.toSQLite {
+		return nil
+	}
+	other, clash, err := st.NodeBitsCollision(ctx)
+	if err != nil || !clash {
+		return nil
+	}
+	label := other.Label
+	if label == "" {
+		label = other.ID
+	}
+	return fmt.Errorf("this node's id bits collide with node %s (%s) in the shared database, so ids minted here "+
+		"could equal that machine's; nothing was copied, and the daemon would refuse to start here too.\n"+
+		"Do not simply move %s aside and re-run: this machine's local history stays filed under its current id, "+
+		"so the migration would copy none of it. Regenerate the id on a machine with no history to lose instead",
+		label, other.ID, filepath.Join(stateDir, store.NodeIDFile))
 }
