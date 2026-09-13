@@ -59,7 +59,8 @@ Then arm two things and keep them alive:
   `# gap` or `# reset` in its output means re-survey from scratch. Your own
   actions never come back at you: events `by=orchestrator` are suppressed
   (`--include-self` if you ever need to see them), so anything the Monitor
-  reports is something else moved;
+  reports is something else moved — except a `# suppressed …` line, which only
+  notes that some of yours were left out;
 - an hourly health-check cron: `hap status`, `hap agents`, restart a dead
   daemon with `hap daemon --ensure`, unblock anything stuck, report only if
   something needed action.

@@ -657,7 +657,8 @@ func TestOrchestratorIdentitySurvivesARestart(t *testing.T) {
 
 // The built-in brief names the binary ONCE (the PATH fallback) and sets up the
 // hourly health check that notices a stopped daemon or a hung agent, torn
-// down on fsp.off and re-created on fsp.on.
+// down on fsp.off and re-created on fsp.on, and says the stream omits the
+// orchestrator's own events.
 func TestOrchestratorBriefShape(t *testing.T) {
 	if n := strings.Count(orchestratorBrief, "{self}"); n != 1 {
 		t.Fatalf("{self} appears %d times, want once", n)
@@ -668,6 +669,9 @@ func TestOrchestratorBriefShape(t *testing.T) {
 	for _, want := range []string{
 		"`hap stream orchestrator`", "CronCreate", "CronList", "CronDelete",
 		"`hap daemon --ensure`", "`fsp.off`", "`fsp.on`",
+		// The stream leaves out the orchestrator's own events; a brief that
+		// does not say so disagrees with the binary it drives.
+		"`--include-self`", "`# suppressed`",
 	} {
 		if !strings.Contains(orchestratorBrief, want) {
 			t.Errorf("the brief does not mention %s", want)
