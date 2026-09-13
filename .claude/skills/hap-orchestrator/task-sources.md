@@ -9,18 +9,34 @@ hap task <agent> send <n> --yes
 hap task <agent> list | get <n> | done <n> | undone <n> | remove <n> | move <n> <pos>
 ```
 
+## before the first hand-out: check the mode
+
+An agent in a default or manual mode stops for approval on every file edit, so
+work you hand it stalls behind a prompt nobody is watching. The mode column in
+`hap agents` shows it; move it up before you queue anything.
+
+```sh
+hap mode <agent>                      # read it
+hap mode <agent> acceptEdits --yes    # idempotent; or auto, per the agent's ladder
+```
+
+Prefer the most autonomous mode the agent offers and the operator allows. `hap
+mode` refuses while a modal covers the composer footer — clear the modal first.
+
 ## the traps, each learned the hard way
 
 **A send is refused while the agent is working.** hap only delivers to a cleanly
-parked agent. Wait for the park rather than retrying:
+parked agent. Wait for it to park — the stream reports the transition, so watch
+for the event rather than polling `hap agents`:
 
 ```sh
-for i in $(seq 1 150); do
-  st=$(hap agents | awk '$1=="<agent>"{print $4}')
-  case "$st" in idle|done) hap task <agent> send <n> --yes && break;; esac
-  sleep 15
-done
+hap task <agent> send <n> --yes    # once the stream has reported it parked
 ```
+
+Better still, let hap decide when: a source with `--auto-send-when-idle` hands
+the next task over the moment the agent parks, with no watching at all. That is
+the shape to reach for — the orchestrator should not be sitting on a timer
+waiting for an agent when the daemon is already doing exactly that.
 
 **hap marks the sent task `[-]` itself.** Do not tell agents to run
 `hap task … start <n>` — a hand-out never says which number it carried, so the
@@ -46,7 +62,23 @@ approval menu, hap reads that as idle, and the hand-out is typed into the open
 menu.
 
 **`accept_generated_task=false`** keeps an exhausted list from being refilled
-with LLM-invented work. Check it before leaving a herd unattended.
+with LLM-invented work. Check it before leaving a herd unattended — generated
+tasks have proposed merging a change, deleting its branch and removing the
+worktree, and have named the wrong agent while doing it.
+
+## prompting an agent directly
+
+Sometimes the task list cannot say it — a coordination instruction, a
+correction. Then, and only then, prompt the pane. Two things bite:
+
+**A prompt to a busy agent is queued, not delivered.** It lands when the current
+turn ends. So a correction arrives alongside the thing it corrects, and must
+supersede it in its own words — *disregard my previous message* — rather than
+assuming the agent sees them in order.
+
+**Verify it landed.** Read the pane back. A queued message shows in the composer
+with a `Press up to edit queued messages` hint; nothing at all means it never
+arrived. Never assume delivery from the command's exit status alone.
 
 ## keeping a list honest
 

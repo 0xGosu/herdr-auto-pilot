@@ -66,12 +66,14 @@ cheaper model for the re-ranking judge, which is the most frequent caller.
 
 ## memory pressure
 
-Language servers, not agents, are usually the largest consumers, and each
-worktree adds one:
+Language servers, not agents, are usually the largest resident consumers, and
+each worktree adds one; compilers are the largest transient ones.
 
 ```sh
 ps -eo rss,etime,comm --sort=-rss | head -10
 ```
 
 Report it with numbers and let the operator decide what to reclaim — do not kill
-processes you did not start.
+processes you did not start. What to do about the box itself, and how agents
+competing for it wreck each other's work, is in
+[machine-resources.md](machine-resources.md).
