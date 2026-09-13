@@ -197,3 +197,31 @@ func TestDestinationNotEmptyErrorOnlyPromisesAWayBackGoingToSQLite(t *testing.T)
 		}
 	}
 }
+
+// TestPausedMigrateNoteDoesNotClaimSilenceOnTheWire: under
+// database.turso_sync_paused the copy's own pull or push is skipped, but the
+// schema check before it still pulls. The note must say which round trip was
+// skipped for the direction taken, and must not tell an operator on a metered
+// link that nothing was pulled or pushed.
+func TestPausedMigrateNoteDoesNotClaimSilenceOnTheWire(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opt  migrateArgs
+		want string
+	}{
+		{"to sqlite", migrateArgs{toSQLite: true}, "pull before copying out"},
+		{"to turso", migrateArgs{toSQLite: false}, "push after copying in"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			note := pausedMigrateNote(tc.opt)
+			if strings.Contains(note, "nothing was pulled") {
+				t.Errorf("%q claims silence on the wire the schema check breaks", note)
+			}
+			for _, want := range []string{tc.want, "schema check", "pulls once"} {
+				if !strings.Contains(note, want) {
+					t.Errorf("%q does not say %q", note, want)
+				}
+			}
+		})
+	}
+}

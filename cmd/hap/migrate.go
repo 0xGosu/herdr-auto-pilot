@@ -115,10 +115,20 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 		return err
 	}
 
-	// Deliberately honours the pause. An operator who has taken this machine
-	// off the wire has said what they want from Turso Cloud, and a migration is
-	// not an exception they asked for — it just copies whatever the local
-	// replica holds.
+	// Honours the pause for the COPY's own round trips — the pull that frames a
+	// copy out and the push that publishes a copy in. An operator who has taken
+	// this machine off the wire has said what they want from Turso Cloud, and
+	// the copy itself is not an exception they asked for.
+	//
+	// It does NOT make the command silent on the wire, and nothing may claim
+	// so: PrepareSharedSchema above pulls unconditionally (and pushes when this
+	// node has to lead a schema migration), and opening a replica that does not
+	// exist yet bootstraps it from the cloud. That pull is kept on purpose — it
+	// is what refuseNodeBitsCollision reads its peers from, and a schema step
+	// skipping it under the pause would let a paused node pass that check
+	// against a replica that never saw the colliding node. DDL on a shared
+	// database needs the lease, which needs a push, so a pause-aware schema
+	// step could only refuse anyway.
 	paused := cfg.Database.TursoSyncPaused
 	if opt.toSQLite && !paused {
 		// Pull first, or the copy out is whatever this machine last saw, which
@@ -283,8 +293,7 @@ func printMigrateReport(out io.Writer, rep *store.MigrateReport, opt migrateArgs
 	fmt.Fprintln(out, "In-flight rows were deliberately left behind: pending LLM requests and decisions,")
 	fmt.Fprintln(out, "queued agent actions, and the agent roster (republished within a minute).")
 	if paused {
-		fmt.Fprintln(out, "\ndatabase.turso_sync_paused is on, so nothing was pulled or pushed — the copy used")
-		fmt.Fprintln(out, "the local replica as it stands.")
+		fmt.Fprint(out, pausedMigrateNote(opt))
 	}
 	fmt.Fprintf(out, "\nNothing switched engines. To start using it:\n")
 	fmt.Fprintf(out, "    hap config set database.engine %s\n", next)
@@ -348,4 +357,21 @@ func destinationNotEmptyError(err error, opt migrateArgs) error {
 		"(immediately, or on the first push after database.turso_sync_paused is lifted) and\n"+
 		"every other node pulls the duplicates in. The backup above is only this machine's\n"+
 		"local replica, and restoring it undoes none of that", err)
+}
+
+// pausedMigrateNote is the report's account of what database.turso_sync_paused
+// did and did not keep off the wire. It names the schema check's pull because
+// that pull happens whatever the pause says (see runMigrate), and an operator on
+// a metered link told "nothing was pulled or pushed" would be told something
+// untrue.
+func pausedMigrateNote(opt migrateArgs) string {
+	skipped := "the pull before copying out of the shared database was skipped, so the copy used\n" +
+		"the local replica as it stands"
+	if !opt.toSQLite {
+		skipped = "the push after copying in was skipped, so the copy sits in the local replica\n" +
+			"until the first push after the pause is lifted"
+	}
+	return "\ndatabase.turso_sync_paused is on: " + skipped + ".\n" +
+		"The command still reached Turso Cloud for its schema check, which pulls once (and\n" +
+		"pushes if this node had to migrate the shared schema).\n"
 }
