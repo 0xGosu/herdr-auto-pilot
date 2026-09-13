@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -388,5 +389,86 @@ func TestStreamOrchestratorReportsAPruneDuringTheRead(t *testing.T) {
 	}
 	if !strings.Contains(got, "# gap missed=1..2 ") {
 		t.Fatalf("events pruned under the cursor mid-read were skipped silently:\n%s", got)
+	}
+}
+
+// closingWriter stands in for a pipe whose reader has gone: writes succeed
+// until closed is set, then fail as a closed pipe does — while still recording
+// what was ATTEMPTED, which is what the control assertion needs to see.
+type closingWriter struct {
+	syncBuffer
+	closed    atomic.Bool
+	attempted syncBuffer
+}
+
+func (w *closingWriter) Write(p []byte) (int, error) {
+	if w.closed.Load() {
+		_, _ = w.attempted.Write(p)
+		return 0, io.ErrClosedPipe
+	}
+	return w.syncBuffer.Write(p)
+}
+
+// TestStreamNoticesAVanishedReaderAcrossSuppressedEvents: a write is the only
+// signal that the reader went away, so a window in which the orchestrator
+// authored EVERY event — its Monitor died while the agent kept working — must
+// still produce one, or the stream follows a log nobody reads forever.
+func TestStreamNoticesAVanishedReaderAcrossSuppressedEvents(t *testing.T) {
+	app, log := streamApp(t)
+	t.Cleanup(cli.SetStreamPollInterval(5 * time.Millisecond))
+	t.Cleanup(cli.SetStreamProbeAfter(20 * time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	out := &closingWriter{}
+	done := make(chan error, 1)
+	go func() { done <- cli.Run(ctx, app, out, "stream", []string{"orchestrator"}) }()
+	waitForOutput(t, &out.syncBuffer, "# hap stream orchestrator head=0 floor=0\n")
+	out.closed.Store(true)
+	now := time.Now()
+	for _, kind := range []string{domain.StreamTaskUpdated, domain.StreamCorrection, domain.StreamEscalationDismissed} {
+		appendSelfEvent(t, log, kind, now)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stream returned %v when its reader went away, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never noticed its reader was gone across a batch it suppressed entirely")
+	}
+	// The control: had the stream tried to print any of those events it would
+	// have noticed through that line, and the test would prove nothing about
+	// the probe. What ended it must be the notice.
+	if !strings.Contains(out.attempted.String(), "# suppressed ") {
+		t.Fatalf("the stream exited without attempting the suppressed notice:\n%s", out.attempted.String())
+	}
+	if lines := eventLines(out.attempted.String()); len(lines) != 0 {
+		t.Fatalf("a self-authored event was printed, so the reader was detected the old way: %v", lines)
+	}
+}
+
+// TestStreamProbeIsOneLinePerBurst is the other half: the probe must not undo
+// the suppression it guards. A live reader gets ONE notice for a burst of the
+// orchestrator's own work, not one per poll, and none at all while an event it
+// is owed keeps being printed.
+func TestStreamProbeIsOneLinePerBurst(t *testing.T) {
+	app, log := streamApp(t)
+	t.Cleanup(cli.SetStreamProbeAfter(50 * time.Millisecond))
+	out, stop := startStream(t, app)
+	waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
+	now := time.Now()
+	appendSelfEvent(t, log, domain.StreamTaskUpdated, now)
+	last := appendSelfEvent(t, log, domain.StreamCorrection, now)
+	waitForOutput(t, out, fmt.Sprintf("# suppressed 2 self-authored event(s) through seq=%d", last))
+	time.Sleep(200 * time.Millisecond) // several probe intervals with nothing new
+	appendEvent(t, log, domain.StreamFSPOn, now)
+	waitForOutput(t, out, " fsp.on by=operator\n")
+	time.Sleep(200 * time.Millisecond)
+	if err := stop(); err != nil {
+		t.Fatalf("stream returned %v on cancel, want nil", err)
+	}
+	if n := strings.Count(out.String(), "# suppressed"); n != 1 {
+		t.Fatalf("got %d suppressed notices, want exactly one for one burst:\n%s", n, out.String())
 	}
 }
