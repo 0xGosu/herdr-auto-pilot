@@ -3,8 +3,11 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,9 +44,24 @@ func streamApp(t *testing.T) (*frontend.App, *streamlog.Log) {
 	return app, log
 }
 
+// appendEvent appends an event somebody OTHER than the stream's reader wrote,
+// which is what a stream is for; appendSelfEvent is the orchestrator's own,
+// suppressed unless --include-self. Two named entry points over one body
+// because "who wrote it" is now behaviour rather than decoration, and a bare
+// author string at the call site does not say which side of the filter it is.
 func appendEvent(t *testing.T, log *streamlog.Log, kind string, at time.Time) int64 {
 	t.Helper()
-	seq, err := log.Append(context.Background(), domain.StreamEvent{Kind: kind, Author: "operator", At: at})
+	return appendEventBy(t, log, kind, "operator", at)
+}
+
+func appendSelfEvent(t *testing.T, log *streamlog.Log, kind string, at time.Time) int64 {
+	t.Helper()
+	return appendEventBy(t, log, kind, domain.OrchestratorAuthor, at)
+}
+
+func appendEventBy(t *testing.T, log *streamlog.Log, kind, author string, at time.Time) int64 {
+	t.Helper()
+	seq, err := log.Append(context.Background(), domain.StreamEvent{Kind: kind, Author: author, At: at})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,6 +129,151 @@ func TestStreamOrchestratorStartsAtTheHead(t *testing.T) {
 	}
 	if !strings.Contains(got, "\n3 ") {
 		t.Fatalf("the new event was not printed with its seq:\n%s", got)
+	}
+}
+
+// TestStreamOrchestratorSuppressesItsOwnEvents: the reader of this stream is
+// the orchestrator, so its own actions coming back at it are noise it would
+// have to recognize and discard on every line.
+func TestStreamOrchestratorSuppressesItsOwnEvents(t *testing.T) {
+	app, log := streamApp(t)
+	now := time.Now()
+
+	out, stop := startStream(t, app)
+	waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
+	appendSelfEvent(t, log, domain.StreamPauseOn, now)
+	appendEvent(t, log, domain.StreamFSPOn, now)
+	// The operator's event is the ONLY thing that may be printed, and waiting
+	// for it is what proves the batch carrying both was read rather than merely
+	// not delivered yet.
+	waitForOutput(t, out, " fsp.on by=operator\n")
+	if err := stop(); err != nil {
+		t.Fatalf("stream returned %v on cancel, want nil", err)
+	}
+	// Matched on "by=<author>" rather than the bare word: the banner line is
+	// itself "# hap stream orchestrator …".
+	got := out.String()
+	if strings.Contains(got, "by="+domain.OrchestratorAuthor) || strings.Contains(got, "pause.on") {
+		t.Fatalf("the stream echoed an event the orchestrator itself authored:\n%s", got)
+	}
+}
+
+// TestStreamOrchestratorIncludeSelfPrintsThem is the debugging opt-out, and
+// the control for the test above: without it that one would pass on a stream
+// that prints nothing at all.
+func TestStreamOrchestratorIncludeSelfPrintsThem(t *testing.T) {
+	app, log := streamApp(t)
+	now := time.Now()
+
+	out, stop := startStream(t, app, "--include-self")
+	waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
+	appendSelfEvent(t, log, domain.StreamPauseOn, now)
+	waitForOutput(t, out, " pause.on by="+domain.OrchestratorAuthor+"\n")
+	if err := stop(); err != nil {
+		t.Fatalf("stream returned %v on cancel, want nil", err)
+	}
+}
+
+// eventLines returns the event lines of a stream's output, dropping the "#"
+// notices — what a reader would actually have had to handle.
+func eventLines(out string) []string {
+	var lines []string
+	for _, l := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		if l != "" && !strings.HasPrefix(l, "#") {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// TestStreamResumeSpansARunOfSuppressedEvents: a resume whose window is mostly
+// the reader's own work must replay the rest of it and say nothing else. The
+// banner is the part most easily broken by a filter — head and floor describe
+// the LOG, so they count suppressed events like any other.
+func TestStreamResumeSpansARunOfSuppressedEvents(t *testing.T) {
+	app, log := streamApp(t)
+	now := time.Now()
+	appendEvent(t, log, domain.StreamPauseOn, now)                 // 1, before the cursor
+	appendSelfEvent(t, log, domain.StreamTaskUpdated, now)         // 2
+	appendSelfEvent(t, log, domain.StreamCorrection, now)          // 3
+	appendSelfEvent(t, log, domain.StreamEscalationDismissed, now) // 4
+	last := appendEvent(t, log, domain.StreamFSPOn, now)           // 5, the only line owed
+
+	out, stop := startStream(t, app, "--resume", "1")
+	waitForOutput(t, out, " fsp.on by=operator\n")
+	if err := stop(); err != nil {
+		t.Fatalf("stream returned %v on cancel, want nil", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "# hap stream orchestrator head=5 floor=1\n") {
+		t.Errorf("the banner stopped counting suppressed events — it describes the log, not the output:\n%s", got)
+	}
+	// A suppressed event is not a lost one: the cursor moves over it, so
+	// nothing may be reported as pruned or reset.
+	if strings.Contains(got, "# gap") || strings.Contains(got, "# reset") {
+		t.Errorf("a run of suppressed events was mistaken for missing sequence numbers:\n%s", got)
+	}
+	lines := eventLines(got)
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], fmt.Sprintf("%d ", last)) {
+		t.Errorf("--resume 1 over 3 self-authored events printed %v, want just seq %d", lines, last)
+	}
+}
+
+// cursorRecordingLog records the highest cursor the stream has read from. It
+// is the only way to watch the cursor cross a SUPPRESSED event: by
+// construction nothing is printed, so the output cannot witness it.
+type cursorRecordingLog struct {
+	*streamlog.Log
+	cursor atomic.Int64
+}
+
+func (l *cursorRecordingLog) Since(ctx context.Context, after int64, limit int) ([]domain.StreamEvent, error) {
+	for {
+		seen := l.cursor.Load()
+		if after <= seen || l.cursor.CompareAndSwap(seen, after) {
+			break
+		}
+	}
+	return l.Log.Since(ctx, after, limit)
+}
+
+// TestStreamNewestEventSuppressedStillAdvancesTheCursor: when the newest event
+// in the log is the reader's own, the stream prints nothing — and must still
+// move its cursor past it. Two things go wrong if it does not, and the second
+// is the visible one: the event is re-read on every poll forever, and once
+// retention removes it the stale cursor makes the prune check report a gap
+// that never happened, sending the reader off to re-survey for its own work.
+func TestStreamNewestEventSuppressedStillAdvancesTheCursor(t *testing.T) {
+	app, log := streamApp(t)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	appendEvent(t, log, domain.StreamPauseOn, old) // 1, before the cursor
+	appendSelfEvent(t, log, domain.StreamTaskUpdated, old)
+	newest := appendSelfEvent(t, log, domain.StreamTaskDeleted, old)
+	rec := &cursorRecordingLog{Log: log}
+	app.Stream = rec
+
+	out, _ := startStream(t, app, "--resume", "1")
+	waitForOutput(t, out, "# hap stream orchestrator head=3 floor=1\n")
+	deadline := time.Now().Add(5 * time.Second)
+	for rec.cursor.Load() < newest {
+		if time.Now().After(deadline) {
+			t.Fatalf("the cursor stalled at %d and never passed the suppressed seq %d — "+
+				"a suppressed event it does not step over is re-read on every poll forever",
+				rec.cursor.Load(), newest)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// The retention sweep now takes every event the cursor has passed, and a
+	// visible one arrives behind it. A cursor left at 1 reports
+	// "# gap missed=2..3" here; a correct one has nothing to report.
+	if _, err := log.Prune(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	appendEvent(t, log, domain.StreamFSPOn, time.Now())
+	waitForOutput(t, out, " fsp.on by=operator\n")
+	if got := out.String(); strings.Contains(got, "# gap") {
+		t.Errorf("suppressed events the cursor had passed were reported as pruned-unseen:\n%s", got)
 	}
 }
 
@@ -226,5 +389,86 @@ func TestStreamOrchestratorReportsAPruneDuringTheRead(t *testing.T) {
 	}
 	if !strings.Contains(got, "# gap missed=1..2 ") {
 		t.Fatalf("events pruned under the cursor mid-read were skipped silently:\n%s", got)
+	}
+}
+
+// closingWriter stands in for a pipe whose reader has gone: writes succeed
+// until closed is set, then fail as a closed pipe does — while still recording
+// what was ATTEMPTED, which is what the control assertion needs to see.
+type closingWriter struct {
+	syncBuffer
+	closed    atomic.Bool
+	attempted syncBuffer
+}
+
+func (w *closingWriter) Write(p []byte) (int, error) {
+	if w.closed.Load() {
+		_, _ = w.attempted.Write(p)
+		return 0, io.ErrClosedPipe
+	}
+	return w.syncBuffer.Write(p)
+}
+
+// TestStreamNoticesAVanishedReaderAcrossSuppressedEvents: a write is the only
+// signal that the reader went away, so a window in which the orchestrator
+// authored EVERY event — its Monitor died while the agent kept working — must
+// still produce one, or the stream follows a log nobody reads forever.
+func TestStreamNoticesAVanishedReaderAcrossSuppressedEvents(t *testing.T) {
+	app, log := streamApp(t)
+	t.Cleanup(cli.SetStreamPollInterval(5 * time.Millisecond))
+	t.Cleanup(cli.SetStreamProbeAfter(20 * time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	out := &closingWriter{}
+	done := make(chan error, 1)
+	go func() { done <- cli.Run(ctx, app, out, "stream", []string{"orchestrator"}) }()
+	waitForOutput(t, &out.syncBuffer, "# hap stream orchestrator head=0 floor=0\n")
+	out.closed.Store(true)
+	now := time.Now()
+	for _, kind := range []string{domain.StreamTaskUpdated, domain.StreamCorrection, domain.StreamEscalationDismissed} {
+		appendSelfEvent(t, log, kind, now)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("stream returned %v when its reader went away, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never noticed its reader was gone across a batch it suppressed entirely")
+	}
+	// The control: had the stream tried to print any of those events it would
+	// have noticed through that line, and the test would prove nothing about
+	// the probe. What ended it must be the notice.
+	if !strings.Contains(out.attempted.String(), "# suppressed ") {
+		t.Fatalf("the stream exited without attempting the suppressed notice:\n%s", out.attempted.String())
+	}
+	if lines := eventLines(out.attempted.String()); len(lines) != 0 {
+		t.Fatalf("a self-authored event was printed, so the reader was detected the old way: %v", lines)
+	}
+}
+
+// TestStreamProbeIsOneLinePerBurst is the other half: the probe must not undo
+// the suppression it guards. A live reader gets ONE notice for a burst of the
+// orchestrator's own work, not one per poll, and none at all while an event it
+// is owed keeps being printed.
+func TestStreamProbeIsOneLinePerBurst(t *testing.T) {
+	app, log := streamApp(t)
+	t.Cleanup(cli.SetStreamProbeAfter(50 * time.Millisecond))
+	out, stop := startStream(t, app)
+	waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
+	now := time.Now()
+	appendSelfEvent(t, log, domain.StreamTaskUpdated, now)
+	last := appendSelfEvent(t, log, domain.StreamCorrection, now)
+	waitForOutput(t, out, fmt.Sprintf("# suppressed 2 self-authored event(s) through seq=%d", last))
+	time.Sleep(200 * time.Millisecond) // several probe intervals with nothing new
+	appendEvent(t, log, domain.StreamFSPOn, now)
+	waitForOutput(t, out, " fsp.on by=operator\n")
+	time.Sleep(200 * time.Millisecond)
+	if err := stop(); err != nil {
+		t.Fatalf("stream returned %v on cancel, want nil", err)
+	}
+	if n := strings.Count(out.String(), "# suppressed"); n != 1 {
+		t.Fatalf("got %d suppressed notices, want exactly one for one burst:\n%s", n, out.String())
 	}
 }

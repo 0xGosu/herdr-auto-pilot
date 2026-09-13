@@ -227,8 +227,10 @@ func TestTheAgyPresetsTakeTheNarrowestGrantAgyOffers(t *testing.T) {
 				"does not control", key)
 		}
 	}
-	// The two keys agy CANNOT serve, asserted rather than left to the docs: an
-	// agy recipe appearing here would install argv that fails opaquely.
+	// The two keys agy CANNOT serve, asserted rather than left to the docs. The
+	// consult's blocker is that its MCP server and tool scoping live in
+	// machine-wide FILES an argv-only preset cannot write (see LLMPresetAgy),
+	// not that a hand-configured agy consult would fail.
 	for _, key := range []string{frontend.LLMCommandKey, frontend.FSPOrchestratorCommandFieldKey} {
 		if _, ok := frontend.LLMPreset(key, frontend.LLMPresetAgy); ok {
 			t.Errorf("%s gained an agy preset. The consult needs hap's MCP server and agy "+

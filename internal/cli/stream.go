@@ -30,18 +30,36 @@ var (
 // for the retained floor (see the settled flag in streamOrchestrator).
 var streamGapRecheck = time.Minute
 
+// streamProbeAfter is how long a stream that has suppressed events, and
+// written nothing since, waits before writing a "# suppressed" notice. The
+// notice is the probe that notices a vanished reader (see streamOrchestrator);
+// the wait keeps a burst of the orchestrator's own work to one line rather than
+// one per poll. A variable so tests can shorten it.
+var streamProbeAfter = 10 * time.Second
+
 // streamBatch is how many events one read returns; a full batch is followed by
 // another read at once rather than a poll wait, so a long replay is not paced.
 const streamBatch = 500
 
-// streamOrchestrator is `hap stream orchestrator [--resume N]`.
+// streamOrchestrator is `hap stream orchestrator [--resume N] [--include-self]`.
 //
 // It reads the machine-local event log only (app.Stream), so it needs no
 // running daemon and never touches herdr.
+//
+// The stream's reader is normally the orchestrator itself, and its OWN actions
+// are in the log beside everyone else's — so without a filter every task it
+// marks done, every escalation it answers and every config key it sets comes
+// straight back at it as an event it must recognize and ignore. That is pure
+// noise on the one surface whose whole job is to say what the orchestrator has
+// not yet seen, so events it authored (domain.OrchestratorAuthor, the author a
+// hap command carries under HAP_ACTOR=orchestrator) are suppressed by default.
+// --include-self prints them, for debugging the emitters.
 func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
-	const usage = "usage: hap stream orchestrator [--resume N]"
+	const usage = "usage: hap stream orchestrator [--resume N] [--include-self]"
 	fs := flag.NewFlagSet("stream orchestrator", flag.ContinueOnError)
 	resume := fs.Int64("resume", 0, "replay every event after N, then keep following")
+	includeSelf := fs.Bool("include-self", false,
+		"also print the events the orchestrator itself authored (suppressed by default)")
 	fs.SetOutput(out)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -87,6 +105,18 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 	}
 
 	var lastErr string
+	// A write is the ONLY way this loop learns its reader went away — a closed
+	// pipe answers the next write with EPIPE (or SIGPIPE on stdout), and nothing
+	// else. Suppressing self-authored events removed writes, so a window in which
+	// the orchestrator authored everything (its Monitor died while the agent kept
+	// working) would follow a log nobody reads, forever. suppressed counts the
+	// events skipped since the last write; once it is non-zero and
+	// streamProbeAfter has passed since that write, one "# suppressed" notice is
+	// owed, and its failure ends the stream exactly as an event line's does. A
+	// stream that is genuinely IDLE still cannot tell — that predates the filter,
+	// and closing it would mean a heartbeat on every quiet stream.
+	var suppressed int64
+	lastWriteAt := time.Now()
 	// settled means the previous read came back empty AND its gap check found
 	// nothing, so the cursor had reached the head. From there an empty read
 	// cannot hide a gap — only an event appended AND aged past the retention
@@ -125,11 +155,36 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		} else {
 			lastErr = ""
 		}
+		// The cursor advances over a SUPPRESSED event exactly as it does over a
+		// printed one, so a self-authored event is never re-delivered on the
+		// next resume and never reads as a gap. Everything else in this loop is
+		// accounted on the RAW batch — prunedUnder's batch[0].Seq, settled,
+		// lastEventAt and the full-batch continue above — because each answers a
+		// question about the LOG, not about what was printed: counting only
+		// printed events would re-query the floor forever on a log the
+		// orchestrator alone wrote, and would end the no-wait replay mid-stream
+		// on a full batch it happened to author.
 		for _, ev := range evs {
-			if _, err := fmt.Fprintln(out, ev.Line()); err != nil {
-				return nil // the reader went away
+			if *includeSelf || ev.Author != domain.OrchestratorAuthor {
+				if _, err := fmt.Fprintln(out, ev.Line()); err != nil {
+					return nil // the reader went away
+				}
+				suppressed, lastWriteAt = 0, time.Now()
+			} else {
+				suppressed++
 			}
 			cursor = ev.Seq
+		}
+		// Asked on every pass, not only after a batch: the owed probe must still
+		// be written on the idle ticks that follow the last suppressed event, and
+		// before the full-batch continue, so a long self-authored replay probes
+		// too.
+		if suppressed > 0 && time.Since(lastWriteAt) >= streamProbeAfter {
+			if _, err := fmt.Fprintf(out, "# suppressed %d self-authored event(s) through seq=%d (--include-self shows them)\n",
+				suppressed, cursor); err != nil {
+				return nil // the reader went away
+			}
+			suppressed, lastWriteAt = 0, time.Now()
 		}
 		if len(evs) == streamBatch {
 			continue

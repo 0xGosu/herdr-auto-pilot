@@ -160,14 +160,24 @@ const (
 //   - llm.command (the consult) NEEDS hap's MCP server, and agy has no
 //     per-invocation MCP flag at all — no --mcp-config, no `-c` override. Its
 //     only MCP surface is `agy mcp add`, which writes a MACHINE-WIDE registry
-//     (~/.gemini/config/mcp_config.json). A preset writes argv and nothing
-//     else, so it cannot reach that; and registering hap's server there would
-//     attach hap's tools to every interactive agy session the operator runs,
-//     which is not a thing a picker keystroke may do. Compounding it, agy has
-//     no --allowedTools equivalent either, so the consult prompt's own "Use
-//     ONLY get_context and submit_decision" would be unenforced in the
-//     monitored agent's project. An agy option here would install argv that
-//     fails opaquely with nothing staged, so there is none.
+//     (~/.gemini/config/mcp_config.json). The blocker is the MECHANISM, not a
+//     missing capability: set up by hand, an agy consult WORKS, and both
+//     halves that look like they should be argv's job are already covered.
+//     The server needs no per-request env — internal/llm puts HAP_REQUEST_ID,
+//     HAP_DB_PATH and HAP_CONTROL_PATH in the CHILD PROCESS environment, which
+//     an MCP server agy spawns inherits, so a registry entry naming `{self}
+//     mcp` and no env at all is complete. And agy does have an --allowedTools
+//     equivalent: `permissions.allow` entries spelled mcp(server/tool) in agy's
+//     settings.json — with only mcp(hap/get_context) and
+//     mcp(hap/submit_decision) granted, the consult ran while shell and file
+//     tools stayed denied, so the prompt's own "Use ONLY get_context and
+//     submit_decision" is enforceable after all.
+//     What a PRESET cannot do is set either of them up: it writes argv and
+//     nothing else, and both mechanisms are machine-wide FILES, so no picker
+//     keystroke can create them — and writing them would attach hap's tools to
+//     every agy session on that machine, which is not a thing a picker
+//     keystroke may do either. Hence no option here, and an operator who wants
+//     the consult on agy configures those two files themselves.
 //   - The orchestrator command is claude-only by construction, not by taste:
 //     argv[0] is the herdr agent KIND (domain.OrchestratorAgentKind ==
 //     "claude"), and domain.OrchestratorLaunch refuses anything else.
@@ -293,7 +303,7 @@ var llmCommandPresets = map[string]map[string][]string{
 		LLMPresetAgy: {
 			"agy",
 			"--model",
-			"gemini-3.1-pro-high",
+			"gemini-3.8-flash-high",
 			"--disable-slash-commands",
 			"-p",
 			llmTaskGeneratePrompt,
@@ -333,7 +343,7 @@ var llmCommandPresets = map[string]map[string][]string{
 		LLMPresetAgy: {
 			"agy",
 			"--model",
-			"gemini-3.1-pro-high",
+			"gemini-3.8-flash-high",
 			"--dangerously-skip-permissions",
 			"--disable-slash-commands",
 			"-p",
@@ -390,7 +400,7 @@ var llmCommandPresets = map[string]map[string][]string{
 		// no grant at all — agy's headless default soft-denies every tool, and
 		// a run that tried one would degrade to the cosine answer, which is
 		// the direction a judge failure is supposed to fall. This is also agy's
-		// only model split (flash-low against pro), mirroring why the claude
+		// only model split (flash-low against flash-high), mirroring why the claude
 		// and codex judges name a smaller model: the agent is parked for the
 		// whole run. Measured at 3.7-4.9s against the 30s
 		// reranking_timeout_seconds budget.

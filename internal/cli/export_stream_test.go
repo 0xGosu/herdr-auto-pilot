@@ -18,3 +18,12 @@ func SetStreamGapRecheck(d time.Duration) func() {
 	streamGapRecheck = d
 	return func() { streamGapRecheck = prev }
 }
+
+// SetStreamProbeAfter overrides how long a stream holding suppressed events
+// waits before writing its "# suppressed" probe. It returns a function
+// restoring it.
+func SetStreamProbeAfter(d time.Duration) func() {
+	prev := streamProbeAfter
+	streamProbeAfter = d
+	return func() { streamProbeAfter = prev }
+}
