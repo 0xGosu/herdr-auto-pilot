@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.43
+
+- `hap stream orchestrator` no longer prints the events the orchestrator itself authored — they were an echo of its own actions that it had to recognize and discard on every line. Their sequence numbers are still consumed, so `--resume` neither replays them nor reports them as a gap; pass `--include-self` to see them while debugging. After a run of them with nothing else printed, the stream writes one `# suppressed N self-authored event(s) through seq=S` notice (at most one per 10 seconds), so it still notices a reader that went away while only the orchestrator was acting.
+- Documented that an agy consult DOES work once set up by hand: hap's `HAP_*` variables reach an agy-spawned MCP server through the child environment (so the `agy mcp add` entry needs no `env`), and `permissions.allow` entries spelled `mcp(hap/get_context)`/`mcp(hap/submit_decision)` scope it the way claude's `--allowedTools` does. There is still no agy preset for `llm.command`, because a preset writes argv and both of those live in machine-wide files.
+- Moved the agy task-generate and learn-from-user presets onto `gemini-3.8-flash-high`, a newer and stronger model than the `gemini-3.1-pro-high` they named; the judge stays on `gemini-3.8-flash-low` for latency.
+
 ## 0.9.42
 
 - Added `database.turso_sync_paused` — take a machine off Turso Cloud without unpicking its URL and token. The node keeps the turso engine and its local replica; only the pulls, pushes and the shutdown push stop, and queued writes go out on the first push after you turn it off. It is the one `[database]` key the running daemon re-reads, so `hap config set database.turso_sync_paused true` applies on a reload rather than costing the herd a restart.
