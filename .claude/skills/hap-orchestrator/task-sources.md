@@ -46,7 +46,23 @@ approval menu, hap reads that as idle, and the hand-out is typed into the open
 menu.
 
 **`accept_generated_task=false`** keeps an exhausted list from being refilled
-with LLM-invented work. Check it before leaving a herd unattended.
+with LLM-invented work. Check it before leaving a herd unattended — generated
+tasks have proposed merging a change, deleting its branch and removing the
+worktree, and have named the wrong agent while doing it.
+
+## prompting an agent directly
+
+Sometimes the task list cannot say it — a coordination instruction, a
+correction. Then, and only then, prompt the pane. Two things bite:
+
+**A prompt to a busy agent is queued, not delivered.** It lands when the current
+turn ends. So a correction arrives alongside the thing it corrects, and must
+supersede it in its own words — *disregard my previous message* — rather than
+assuming the agent sees them in order.
+
+**Verify it landed.** Read the pane back. A queued message shows in the composer
+with a `Press up to edit queued messages` hint; nothing at all means it never
+arrived. Never assume delivery from the command's exit status alone.
 
 ## keeping a list honest
 

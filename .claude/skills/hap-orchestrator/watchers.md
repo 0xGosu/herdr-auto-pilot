@@ -15,15 +15,12 @@ anything stuck and unblock it; report only if something needed action.
 
 ## traps that made watchers lie
 
-- **Do not key a main-branch CI watcher on "the latest run."** Version-bump
-  commits produce `skipped` runs that arrive after the merge, so the watcher
-  reports green about a run that tested nothing. Key on the merge commit:
-
-  ```sh
-  sha=$(gh pr view <n> --json mergeCommit --jq .mergeCommit.oid)
-  gh run list --branch main --limit 12 --json headSha,status,conclusion \
-    --jq ".[] | select(.headSha==\"$sha\")"
-  ```
+- **Find out which builds actually run before keying a watcher on one.** A
+  watcher aimed at a build that does not exist for that ref reports whatever
+  unrelated job it happens to match. Some repos run their test workflow on
+  proposed changes only, so the default branch has no test build at all and
+  "the merge commit's own build" is an empty set. Check first, then key on
+  something real — [github.md](github.md) for the `gh` form.
 
 - **Do not use "number of completed tasks" as a progress proxy.** It cannot move
   during one long task, so it manufactures stalls. Key on whether hap has acted
@@ -34,6 +31,13 @@ anything stuck and unblock it; report only if something needed action.
   # parked + unchanged last-audit-id across two polls = genuinely stuck
   ```
 
+- **A waiting agent looks exactly like a wedged one.** An agent blocked on a
+  fifteen-minute build or a CI run is parked with no hap activity, which is the
+  same signature as hung. Before acting on a stall alert, check whether the
+  thing it is waiting for is alive — a running child process, a job still in
+  flight. Every stall alert in one session was a false positive, and false
+  alerts are how you learn to ignore the real one.
+
 - **Scope to your own node.** `hap agents` lists other machines' agents; alerting
   on them is noise you cannot act on. Filter on the node column.
 
@@ -43,14 +47,24 @@ anything stuck and unblock it; report only if something needed action.
 - **Retire a watcher when its subject is gone.** A lifecycle watcher on an exited
   agent emits errors forever.
 
+## watchers die, quietly
+
+Background watchers are the first thing killed under memory pressure — seven
+went in one session while builds ran, each without a sound until its output
+never arrived. A watcher you believe is armed may not be.
+
+So: while a build or any memory-hungry job is running, **do not re-arm
+watchers**. Take one-shot readings instead, and lean on the event stream, which
+runs in its own process and survives. See
+[machine-resources.md](machine-resources.md).
+
 ## patterns worth reusing
 
 ```sh
-# CI until final, reporting failures with their lines
-while true; do
-  out=$(gh pr checks <n> 2>/dev/null)
-  printf '%s' "$out" | grep -qiE "pending|queued|in_progress" || { printf '%s' "$out" | grep -iE 'fail' || echo "all green"; break; }
-  sleep 45
+# poll until a job reaches a terminal state, then report which
+for i in $(seq 1 25); do
+  s=$(<status command> 2>/dev/null)
+  case "$s" in *pending*|*running*|*queued*) sleep 90;; *) echo "$s"; break;; esac
 done
 
 # a file appearing (an agent's report, a capture)
