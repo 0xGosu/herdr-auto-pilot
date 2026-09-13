@@ -166,3 +166,58 @@ func TestAColdBootstrapIsOnlyAWarning(t *testing.T) {
 		t.Errorf("banner %q does not report the wait", h.Banner())
 	}
 }
+
+// TestADeliberatelyPausedSyncIsNeitherWarningNorError: the reporting half of
+// database.turso_sync_paused. The record is the hard one — failing and isolated
+// at the moment the operator paused it, and frozen there — because a pause
+// stops the timestamps advancing while the clock every banner reads does not.
+// Reported as a fault it would train the operator to ignore the banner that
+// means a real outage, which is the banner this feature is most likely to
+// discredit.
+func TestADeliberatelyPausedSyncIsNeitherWarningNorError(t *testing.T) {
+	now := time.Now()
+	h := syncHealth(t, &daemonhealth.FleetSyncHealth{
+		Engine: "turso", Bootstrapped: true, Paused: true,
+		LastError:           "tls: failed to verify certificate: SecPolicyCreateSSL error: 0",
+		LastErrorAt:         now.Add(-3 * time.Hour),
+		LastPullAt:          now.Add(-3 * time.Hour),
+		FirstFailureAt:      now.Add(-3 * time.Hour),
+		ConsecutiveFailures: 400,
+		PendingOps:          17,
+		FDSoft:              256, FDHard: 4096,
+	})
+	if !h.FleetSyncPaused {
+		t.Fatal("the pause did not reach the front end's assessment")
+	}
+	if h.FleetSyncDegraded || h.FleetSyncIsolated {
+		t.Errorf("a paused sync reported as degraded=%v isolated=%v", h.FleetSyncDegraded, h.FleetSyncIsolated)
+	}
+	if h.Severity() != DaemonOK {
+		t.Errorf("Severity = %v, want DaemonOK: the operator asked for this", h.Severity())
+	}
+	if h.Banner() != "" {
+		t.Errorf("a paused sync raised a banner: %q", h.Banner())
+	}
+	if len(h.FleetSyncDiagLines) != 0 {
+		t.Errorf("a paused sync produced failure evidence: %q", h.FleetSyncDiagLines)
+	}
+	// Silent is not the same as hidden: the status line must still say what is
+	// not happening, or an operator who set the key weeks ago reads a herd cut
+	// off from the fleet as a quiet one.
+	if !strings.Contains(h.FleetSyncLine, "PAUSED") {
+		t.Errorf("fleet sync line = %q, want it to read as PAUSED", h.FleetSyncLine)
+	}
+
+	// The control: the same record with the pause off is the error it was.
+	unpaused := syncHealth(t, &daemonhealth.FleetSyncHealth{
+		Engine: "turso", Bootstrapped: true,
+		LastError:           "tls: failed to verify certificate: SecPolicyCreateSSL error: 0",
+		LastErrorAt:         now.Add(-3 * time.Hour),
+		LastPullAt:          now.Add(-3 * time.Hour),
+		FirstFailureAt:      now.Add(-3 * time.Hour),
+		ConsecutiveFailures: 400,
+	})
+	if unpaused.Severity() != DaemonError || !unpaused.FleetSyncIsolated {
+		t.Fatalf("the same outage with the pause OFF must still be an error: %+v", unpaused.Severity())
+	}
+}

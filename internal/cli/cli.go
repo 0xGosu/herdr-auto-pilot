@@ -1051,6 +1051,14 @@ func status(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	if h.FleetSyncLine != "" {
 		fmt.Fprintf(out, "fleet sync:          %s\n", h.FleetSyncLine)
 	}
+	// A pause has the same CONSEQUENCE as isolation and a completely different
+	// remedy, so it says both: what is not happening, and the one key that
+	// ends it. Not a warning — the operator asked for this.
+	if h.FleetSyncPaused {
+		fmt.Fprintf(out, "  fleet sync PAUSED — the other nodes' escalations and agents are not visible here,\n"+
+			"                     and this node's are not reaching them. Resume with:\n"+
+			"                     hap config set database.turso_sync_paused false\n")
+	}
 	// What an isolated node means, not just that a handshake failed: every
 	// fleet read on this machine is silently incomplete while it lasts, and
 	// nothing else on this page says so.
@@ -1695,7 +1703,11 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 			shown = "(set)"
 		}
 		fmt.Fprintf(out, "%s set to %s%s\n", key, shown, reloadNote(reloaded))
-		if strings.HasPrefix(key, "database.") {
+		// turso_sync_paused is the one key in the section the running daemon
+		// re-reads (the sync loop asks the live snapshot before every
+		// operation), so telling the operator to restart for it would be
+		// false — and a restart is exactly what a pause exists to avoid.
+		if strings.HasPrefix(key, "database.") && key != "database.turso_sync_paused" {
 			// The store is opened once per process, so a reload cannot apply
 			// this; said on stderr like the other notes, since stdout is parsed.
 			// --ensure is the WRONG verb here and was, until --restart existed,

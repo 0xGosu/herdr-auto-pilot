@@ -2451,7 +2451,11 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"database.turso_database_url":          "libsql://hap-me.turso.io",
 		"database.turso_auth_token":            "eyJ.sample.token",
 		"database.turso_sync_interval_seconds": "20",
-		"database.node_label":                  "laptop",
+		// true and not the default false, for the same reason as the two above:
+		// the sample doubles as the SetField exercise, and the value that
+		// changes behaviour is the one worth round-tripping.
+		"database.turso_sync_paused": "true",
+		"database.node_label":        "laptop",
 		// Non-zero on purpose: 0 is a valid setting here ("never prune") but
 		// this sample also feeds the FieldValue round trip, and a real day
 		// count is the case worth exercising. The explicit-0 path has its own

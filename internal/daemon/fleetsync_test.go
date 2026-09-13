@@ -243,3 +243,176 @@ func TestFleetSyncShutdownIsNotHeldByAHungPull(t *testing.T) {
 	}
 	close(sync.pullBlock) // release the hung operation
 }
+
+// TestFleetSyncPauseStopsEveryCloudOpAndAppliesOnAReload is the feature's
+// central claim, and it asserts BOTH halves of it: while
+// database.turso_sync_paused is on nothing is pulled or pushed, and the toggle
+// arrives through a RELOAD rather than a restart — which is the whole point of
+// the key, since a restart costs the herd its in-flight work.
+//
+// The loop is proved still alive after the flip rather than merely quiet: a
+// version of this that returned from runFleetSync on seeing a pause would stop
+// pulling too, pass a test counting only operations, and then never resume when
+// the operator turned the key off. Hence the resume half at the end, which
+// needs no restart either.
+func TestFleetSyncPauseStopsEveryCloudOpAndAppliesOnAReload(t *testing.T) {
+	sync := &fakeFleetSync{}
+	writes := make(chan struct{}, 1)
+	h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
+		o.FleetSync = sync
+		o.FleetSyncInterval = 50 * time.Millisecond
+		o.FleetWrites = writes
+	})
+	// Baseline: unpaused, this daemon pulls on the ticker and pushes a write.
+	waitFor(t, 2*time.Second, func() bool { return sync.pulls.Load() >= 2 })
+	writes <- struct{}{}
+	waitFor(t, fleetPushDebounce+2*time.Second, func() bool { return sync.pushes.Load() >= 1 })
+
+	// The flip, delivered exactly as `hap config set` delivers it.
+	h.writeConfig(t, "[database]\nturso_sync_paused = true\n")
+	if err := control.Nudge(context.Background(), h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return h.daemon.fleetSyncPaused() })
+
+	// Let the in-flight tick land, then hold still: the counters must not move
+	// again, over many ticker periods and a write of our own.
+	time.Sleep(200 * time.Millisecond)
+	pulls, pushes := sync.pulls.Load(), sync.pushes.Load()
+	writes <- struct{}{}
+	if err := control.Nudge(context.Background(), h.ctlPath, control.KindFleetPush); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(fleetPushDebounce + 500*time.Millisecond)
+	if got := sync.pulls.Load(); got != pulls {
+		t.Errorf("pulled %d more times while paused; a pause must reach Turso Cloud not at all", got-pulls)
+	}
+	if got := sync.pushes.Load(); got != pushes {
+		t.Errorf("pushed %d more times while paused (a local write AND a fleet-push nudge)", got-pushes)
+	}
+
+	// The loop is still serving: turning the key off resumes it, again with no
+	// restart in between.
+	h.writeConfig(t, "[database]\nturso_sync_paused = false\n")
+	if err := control.Nudge(context.Background(), h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, func() bool { return sync.pulls.Load() > pulls })
+	if sync.pulls.Load() <= pulls {
+		t.Fatal("pulls did not resume after the pause was lifted; the loop stopped serving")
+	}
+	// And what accumulated during the pause goes out, with NO further local
+	// write: the write above armed a debounce timer that fired into the gate
+	// and was not re-armed, so without the resume's own nudge the queued rows
+	// would sit until some unrelated write happened along — on a quiet machine,
+	// the node heartbeat a minute later, and never the operator's own doing.
+	// Nothing writes to this channel but the test, so a push seen here can only
+	// be the resume's.
+	waitFor(t, 3*time.Second, func() bool { return sync.pushes.Load() > pushes })
+	if sync.pushes.Load() <= pushes {
+		t.Fatal("lifting the pause pushed nothing; the writes made during it are still queued")
+	}
+}
+
+// TestFleetSyncPausedStillCheckpointsTheLocalWAL: the pause stops the cloud
+// round trips, not the local ones. A sync database never checkpoints itself, so
+// gating the whole pull path would let the replica's write-ahead log grow for
+// the length of the pause — which is an engine change, and the one thing this
+// key promises not to be.
+func TestFleetSyncPausedStillCheckpointsTheLocalWAL(t *testing.T) {
+	sync := &fakeFleetSync{walBytes: fleetCheckpointWALBytes + 1}
+	h := newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
+		func(o *Options) {
+			o.FleetSync = sync
+			o.FleetSyncInterval = 50 * time.Millisecond
+		})
+	if !h.daemon.fleetSyncPaused() {
+		t.Fatal("the harness config did not pause sync")
+	}
+	waitFor(t, 2*time.Second, func() bool { return sync.checkpoints.Load() >= 1 })
+	if sync.checkpoints.Load() == 0 {
+		t.Fatal("a WAL past the bound was not checkpointed while paused")
+	}
+	if got := sync.pulls.Load(); got != 0 {
+		t.Errorf("pulled %d times while paused; the paused tick must be local only", got)
+	}
+	// Stats keeps running too, so the PAUSED status line's unpushed count is
+	// the live one rather than whatever it was when the pause began.
+	waitFor(t, 2*time.Second, func() bool {
+		fh := h.daemon.fleetHealth()
+		return fh != nil && fh.Revision == "r1"
+	})
+}
+
+// TestFleetSyncPausedSmallWALIsNotCheckpointedEveryTick is the control for the
+// test above, and it covers a specific trap: fleetPull's other checkpoint
+// trigger counts pulls, a counter that does not advance while paused and starts
+// at ZERO — so reusing that condition would make `pulls%fleetCheckpointEveryPulls
+// == 0` true on every tick of a daemon that started paused, checkpointing the
+// replica every interval forever.
+func TestFleetSyncPausedSmallWALIsNotCheckpointedEveryTick(t *testing.T) {
+	sync := &fakeFleetSync{}
+	newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
+		func(o *Options) {
+			o.FleetSync = sync
+			o.FleetSyncInterval = 20 * time.Millisecond
+		})
+	time.Sleep(400 * time.Millisecond) // many paused ticks
+	if got := sync.checkpoints.Load(); got != 0 {
+		t.Fatalf("checkpointed %d times with a small WAL while paused", got)
+	}
+}
+
+// TestFleetSyncPausedShutdownDoesNotPush: shutdown is a push like any other.
+// The final push is the one cloud call that does not go through the loop's
+// ordinary gate, so it needs its own — otherwise a paused node reaches Turso
+// Cloud exactly once, at the moment the operator is least expecting it.
+func TestFleetSyncPausedShutdownDoesNotPush(t *testing.T) {
+	sync := &fakeFleetSync{}
+	h := newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
+		func(o *Options) {
+			o.FleetSync = sync
+			o.FleetSyncInterval = 50 * time.Millisecond
+		})
+	waitFor(t, 2*time.Second, func() bool { return h.daemon.fleetSyncPaused() })
+	h.stop()
+	if got := sync.pushes.Load(); got != 0 {
+		t.Fatalf("the shutdown push ran %d times while paused", got)
+	}
+}
+
+// TestFleetSyncPausedHealthIsPausedNotDegraded: a deliberate pause must never
+// be reported as a failure. The state carried over from before the pause is
+// the hard case — lastError, the failure count and both timestamps are frozen
+// by the pause, so a reader that only looks at LastError says DEGRADED about a
+// node nobody is asking to sync.
+func TestFleetSyncPausedHealthIsPausedNotDegraded(t *testing.T) {
+	sync := &fakeFleetSync{pullErr: errors.New("remote unreachable")}
+	h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
+		o.FleetSync = sync
+		o.FleetSyncInterval = 50 * time.Millisecond
+	})
+	waitFor(t, 2*time.Second, func() bool {
+		fh := h.daemon.fleetHealth()
+		return fh != nil && fh.LastError != ""
+	})
+	h.writeConfig(t, "[database]\nturso_sync_paused = true\n")
+	if err := control.Nudge(context.Background(), h.ctlPath, control.KindReload); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool {
+		fh := h.daemon.fleetHealth()
+		return fh != nil && fh.Paused
+	})
+	fh := h.daemon.fleetHealth()
+	if fh.LastError == "" {
+		t.Fatal("this test needs the pre-pause failure still on the record to mean anything")
+	}
+	if fh.Degraded() {
+		t.Error("a paused sync reported DEGRADED; that is how an operator learns to ignore the banner")
+	}
+	if line := fh.Line(time.Now()); !strings.Contains(line, "PAUSED") ||
+		strings.Contains(line, "DEGRADED") || strings.Contains(line, "ISOLATED") {
+		t.Errorf("status line = %q, want it to read as PAUSED and nothing worse", line)
+	}
+}

@@ -83,6 +83,18 @@ type DaemonHealth struct {
 	// says "running" for a process doing nothing. Past the isolation window it
 	// is reported as the stuck install it almost certainly is.
 	FleetSyncBootstrapping bool
+	// FleetSyncPaused: the operator turned database.turso_sync_paused on, so
+	// this node deliberately exchanges no rows with Turso Cloud. It is a
+	// THIRD state, neither healthy nor failing, and it is reported rather than
+	// merely being silent: the consequence — the other nodes' escalations are
+	// not arriving and this one's are not leaving — is the same as isolation,
+	// and an operator who has forgotten the key set weeks ago would otherwise
+	// read a herd that looks quiet as a quiet herd. It never raises a banner
+	// and never counts towards Severity: a deliberate pause reported as a
+	// fault is how an operator learns to ignore the banner that means a real
+	// outage (daemonhealth.FleetSyncHealth.Degraded is where that is
+	// enforced, once, for every reader).
+	FleetSyncPaused bool
 	// FleetSyncDegraded: the last sync operation failed, at any age. This is
 	// the WARNING level and nothing more — a single failed tick is weather,
 	// and a banner that fires on one is a banner nobody reads by Friday.
@@ -163,6 +175,7 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 			h.BinaryReplaced = rec.BinaryReplaced
 			h.FleetSyncLine = rec.FleetSync.Line(now)
 			h.FleetSyncDegraded = rec.FleetSync.Degraded()
+			h.FleetSyncPaused = rec.FleetSync != nil && rec.FleetSync.Paused
 			h.FleetSyncBootstrapping = rec.FleetSync != nil && !rec.FleetSync.Bootstrapped
 			h.FleetSyncIsolated = rec.FleetSync.Isolated(now)
 			h.FleetSyncFor = rec.FleetSync.IsolatedFor(now)

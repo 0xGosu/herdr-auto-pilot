@@ -175,13 +175,20 @@ type FleetSyncHealth struct {
 	Engine string `json:"engine"`
 	// Bootstrapped is false while the first start is still waiting for the
 	// remote to hand over the initial database.
-	Bootstrapped bool      `json:"bootstrapped"`
-	LastPullAt   time.Time `json:"last_pull_at,omitempty"`
-	LastPushAt   time.Time `json:"last_push_at,omitempty"`
-	PendingOps   int64     `json:"pending_ops,omitempty"`
-	Revision     string    `json:"revision,omitempty"`
-	LastError    string    `json:"last_error,omitempty"`
-	LastErrorAt  time.Time `json:"last_error_at,omitempty"`
+	Bootstrapped bool `json:"bootstrapped"`
+	// Paused is the operator's own database.turso_sync_paused. It is the
+	// reason Degraded short-circuits to false: a sync nobody is attempting
+	// cannot be failing, and reporting a deliberate pause as DEGRADED or
+	// ISOLATED teaches an operator to ignore the banner that tells them about
+	// a real outage. The timestamps and LastError below are whatever they were
+	// when the pause began — rendered as history by Line, never as a fault.
+	Paused      bool      `json:"paused,omitempty"`
+	LastPullAt  time.Time `json:"last_pull_at,omitempty"`
+	LastPushAt  time.Time `json:"last_push_at,omitempty"`
+	PendingOps  int64     `json:"pending_ops,omitempty"`
+	Revision    string    `json:"revision,omitempty"`
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitempty"`
 	// ConsecutiveFailures counts sync operations that have failed in a row
 	// across BOTH directions, reset by any success. A node that pulls fine
 	// and cannot push is just as isolated as one that can do neither, so a
@@ -212,8 +219,13 @@ type FleetSyncHealth struct {
 }
 
 // Degraded reports that the last sync operation failed, at any age.
+//
+// A deliberate pause is never degraded, and this is the ONE place that has to
+// know it: IsolatedFor returns 0 for a sync that is not degraded, so Isolated,
+// DiagLines and both of the fleet-sync banners in frontend.DaemonHealth fall
+// silent from this clause alone. Only Line needs its own paused branch.
 func (f *FleetSyncHealth) Degraded() bool {
-	return f != nil && (!f.Bootstrapped || f.LastError != "")
+	return f != nil && !f.Paused && (!f.Bootstrapped || f.LastError != "")
 }
 
 // LastProgressAt is the most recent SUCCESSFUL sync in either direction, zero
@@ -278,6 +290,14 @@ func (f *FleetSyncHealth) Line(now time.Time) string {
 			return "never"
 		}
 		return now.Sub(t).Round(time.Second).String() + " ago"
+	}
+	// Above the failure branches on purpose: while paused there is nothing
+	// failing, and a stale LastError from before the pause must not be
+	// re-reported as a fault. The unpushed count is the number an operator
+	// deciding when to lift the pause actually wants.
+	if f.Paused {
+		return fmt.Sprintf("%s — PAUSED by database.turso_sync_paused (%d unpushed, last pull %s, last push %s)",
+			f.Engine, f.PendingOps, ago(f.LastPullAt), ago(f.LastPushAt))
 	}
 	if !f.Bootstrapped {
 		return fmt.Sprintf("%s — BOOTSTRAP PENDING: %s", f.Engine, f.LastError)

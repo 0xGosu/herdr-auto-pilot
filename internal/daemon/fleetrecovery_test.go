@@ -278,3 +278,39 @@ func TestFailuresCountBothDirections(t *testing.T) {
 		t.Error("a success on a healthy node must not report an outage ending, or the marker is unlinked every tick")
 	}
 }
+
+// TestAPausedSyncNeverRestartsTheDaemon: a pause freezes lastError, the failure
+// count and both timestamps while the outage's own clock keeps running, so a
+// node that happened to be failing when the operator paused it satisfies every
+// bound a few minutes later. Restarting there abandons the herd's in-flight
+// captures and consults, every fleetRecoveryRetryInterval, to fix something
+// nobody asked it to do — elapsed time is only evidence of an outage while
+// something is still trying.
+//
+// Driven directly, as the daemon's guards must be: an end-to-end test cannot
+// reach this decision.
+func TestAPausedSyncNeverRestartsTheDaemon(t *testing.T) {
+	d, calls := wedgedDaemon(t, "tls: failed to verify certificate: SecPolicyCreateSSL error: 0",
+		fleetRecoveryMinFailures*3, fleetRecoveryMinOutage*4)
+	// The same daemon restarts itself with the pause off — this is the control
+	// that makes the assertion below mean something.
+	if !d.checkFleetSyncWedged() {
+		t.Fatal("this fault must be one a restart clears, or the paused case proves nothing")
+	}
+	d.fleetRecoveryOrdered.Store(false)
+	clearFleetRecoveryMarker(d.opt.StateDir)
+	*calls = nil
+
+	d.mu.Lock()
+	d.cfg.Database.TursoSyncPaused = true
+	d.mu.Unlock()
+	if d.checkFleetSyncWedged() {
+		t.Error("restarted the daemon over a sync the operator deliberately paused")
+	}
+	if len(*calls) != 0 {
+		t.Errorf("RestartSelf calls = %d while paused, want 0", len(*calls))
+	}
+	if _, ok := readFleetRecoveryMarker(d.opt.StateDir); ok {
+		t.Error("a recovery marker was written for a paused node")
+	}
+}

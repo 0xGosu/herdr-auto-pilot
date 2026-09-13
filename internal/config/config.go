@@ -786,7 +786,8 @@ const TursoAuthTokenEnv = "TURSO_AUTH_TOKEN"
 //
 // The section is read once, when a process opens its store: a change needs
 // `hap daemon --restart` (and reopening the TUI) — --ensure leaves a daemon
-// that is already this binary alone. Config itself never enters
+// that is already this binary alone. TursoSyncPaused is the ONE exception and
+// deliberately so (see its own comment). Config itself never enters
 // the database — each machine keeps its own config.toml.
 type Database struct {
 	// Engine is one of ValidDatabaseEngines. Empty means sqlite. An
@@ -803,6 +804,25 @@ type Database struct {
 	// TursoSyncIntervalSeconds is how often the daemon pulls (0 = the
 	// built-in default, floored at MinTursoSyncIntervalSeconds).
 	TursoSyncIntervalSeconds int `toml:"turso_sync_interval_seconds,omitempty"`
+	// TursoSyncPaused stops this node talking to Turso Cloud while leaving
+	// everything else exactly as it was: the engine stays turso, the local
+	// replica stays the store, every process still goes through the daemon.
+	// Only the pulls, the pushes and the shutdown push are skipped — local
+	// WAL checkpointing continues, because an unbounded local file WOULD be
+	// an engine change. Unpushed writes accumulate in the replica's change
+	// log and travel on the first push after the pause is lifted.
+	//
+	// It is for an operator who needs this machine off the wire for a while —
+	// a metered or hostile network, a Turso incident, a node they do not want
+	// publishing its herd right now — without unpicking the URL and the token
+	// and putting them back afterwards. Default false, so an existing install
+	// behaves exactly as before.
+	//
+	// The ONE key in this section that applies on `hap daemon --reload`: the
+	// sync loop re-reads it before every operation rather than capturing it at
+	// loop start. A pause switch that needed a daemon restart — losing the
+	// herd's in-flight work — would defeat its own purpose.
+	TursoSyncPaused bool `toml:"turso_sync_paused,omitempty"`
 	// NodeLabel is how other machines see this one beside its agents
 	// ("name@label"). Empty means the hostname.
 	NodeLabel string `toml:"node_label,omitempty"`

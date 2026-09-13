@@ -6703,6 +6703,13 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 		return config.ValidTaskSourceProviders, true
 	case "database.engine":
 		return config.ValidDatabaseEngines, true
+	case "database.turso_sync_paused":
+		// A picker rather than the free-text box every other bool key gets,
+		// for the reason taskSourceBoolPrompt gives: this one decides whether
+		// the herd is on the wire at all, so it is chosen from a list instead
+		// of typed — and mistyped, which here would fail the SetField parse
+		// and leave the operator believing they had paused.
+		return []string{"false", "true"}, true
 	default:
 		return nil, false
 	}
@@ -7365,6 +7372,18 @@ func (m Model) View() string {
 	// the error itself. The banner says what it MEANS; these say what to do
 	// about it, and without them an operator's only route to either was to
 	// leave the TUI and run `hap status`.
+	// A deliberate pause, STATED rather than silent. It short-circuits
+	// FleetSyncDegraded and the banner above (a pause reported as failing is
+	// how an operator learns to ignore the banner that means a real outage),
+	// so without this line a paused node's TUI shows nothing at all while the
+	// other nodes' escalations and agents are missing from every tab — a herd
+	// off the wire looks exactly like a quiet one. The paused style, not warn:
+	// the operator asked for this, and the line names the key that ends it.
+	if m.data.daemonHealth.FleetSyncPaused {
+		fmt.Fprintf(&b, "%s\n", st.paused.Render(
+			"fleet sync PAUSED — other nodes' escalations and agents are not shown here, nor this node's there"+
+				" · resume: hap config set database.turso_sync_paused false"))
+	}
 	if m.data.daemonHealth.FleetSyncDegraded {
 		for _, line := range m.data.daemonHealth.FleetSyncDiagLines {
 			fmt.Fprintf(&b, "%s\n", st.warn.Render("  "+line))

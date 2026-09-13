@@ -2523,6 +2523,11 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "database.turso_database_url"},
 	{Key: "database.turso_auth_token", TUIHidden: true},
 	{Key: "database.turso_sync_interval_seconds", TUIEditable: true, TUIHidden: true},
+	// VISIBLE on the Config tab, unlike the interval beside it: a pause is
+	// something an operator reaches for deliberately (a metered network, a
+	// Turso incident) and then has to remember to lift, so hiding it behind
+	// `hap config fields` would hide a herd that is off the wire.
+	{Key: "database.turso_sync_paused", TUIEditable: true},
 	{Key: "database.node_label"},
 	// Palette roles are TUIHidden, not absent: eight color strings would bury
 	// the settings a TUI operator actually reaches for, but `hap config fields`
@@ -2932,6 +2937,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return "(none)"
 	case "database.turso_sync_interval_seconds":
 		return defaultedInt(cfg.Database.TursoSyncIntervalSeconds, config.DefaultTursoSyncIntervalSeconds)
+	case "database.turso_sync_paused":
+		return strconv.FormatBool(cfg.Database.TursoSyncPaused)
 	case "database.node_label":
 		if strings.TrimSpace(cfg.Database.NodeLabel) == "" {
 			return "(hostname)"
@@ -3534,6 +3541,13 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 					"integer (0 = the built-in %d), got %q", config.DefaultTursoSyncIntervalSeconds, value)
 			}
 			cfg.Database.TursoSyncIntervalSeconds = v
+			return nil
+		case "database.turso_sync_paused":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("database.turso_sync_paused must be true or false, got %q", value)
+			}
+			cfg.Database.TursoSyncPaused = v
 			return nil
 		case "database.node_label":
 			l := strings.TrimSpace(value)
