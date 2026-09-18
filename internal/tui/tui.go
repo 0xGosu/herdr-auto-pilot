@@ -6524,6 +6524,9 @@ func (m Model) editSelectedRule() (tea.Model, tea.Cmd) {
 	// them. `hap config set` still accepts every key.
 	if !frontend.FieldTUIEditable(item.key) {
 		m.message = fmt.Sprintf("%s is read-only in the TUI — edit config.toml or run: hap config set %s <value>", item.key, item.key)
+		if frontend.HasLLMPresets(item.key) {
+			m.message += " (x clears it to pick a preset)"
+		}
 		return m, nil
 	}
 	key := item.key
@@ -6884,6 +6887,46 @@ func (m Model) llmPresetPrompt(key string) (tea.Model, tea.Cmd) {
 			}
 		},
 	})
+	return m, nil
+}
+
+// clearLLMCommandPrompt asks before clearing a configured preset-backed LLM
+// command (x on its Config row). The template shown is the one cleared:
+// ClearLLMCommand refuses if config.toml changed underneath, and revalidate
+// catches a refresh that already shows the change.
+func (m Model) clearLLMCommandPrompt(key string) (tea.Model, tea.Cmd) {
+	expected := frontend.LLMCommandArgv(m.data.cfg, key)
+	if expected == nil {
+		m.message = key + " is not configured — press enter to install a preset"
+		return m, nil
+	}
+	consequence := "the feature turns off"
+	if key == frontend.FSPOrchestratorCommandFieldKey {
+		consequence = "the orchestrator session stops being kept alive"
+	}
+	app, ctx := m.app, m.ctx
+	m.confirm = &confirmation{
+		label: fmt.Sprintf("clear %s? %s until you pick a preset (enter) or edit config.toml", key, consequence),
+		revalidate: func(cur Model) (string, bool) {
+			if !slices.Equal(frontend.LLMCommandArgv(cur.data.cfg, key), expected) {
+				return key + " changed since it was listed — nothing cleared", false
+			}
+			return "", true
+		},
+		onConfirm: func() tea.Cmd {
+			return func() tea.Msg {
+				reloaded, err := app.ClearLLMCommand(ctx, key, expected)
+				if err != nil {
+					return actionResultMsg{err: err}
+				}
+				msg := key + " cleared — press enter on it to install a preset"
+				if !reloaded {
+					msg += " (saved — no daemon running)"
+				}
+				return actionResultMsg{message: msg}
+			}
+		},
+	}
 	return m, nil
 }
 
@@ -7455,6 +7498,16 @@ func (m Model) removeSelectedRule() (tea.Model, tea.Cmd) {
 		return m, nil
 	case "shortcut":
 		m.message = "quick shortcuts can't be removed"
+		return m, nil
+	case "field", "fsp":
+		// The preset-backed LLM commands are the one kind of field x may
+		// clear: editing a configured template stays a config.toml job
+		// (CR-036), but clearing types nothing, and it is what lets the
+		// operator re-bootstrap a different preset with enter.
+		if frontend.HasLLMPresets(item.key) {
+			return m.clearLLMCommandPrompt(item.key)
+		}
+		m.message = "config fields are edited (enter), not removed"
 		return m, nil
 	default:
 		m.message = "config fields are edited (enter), not removed"

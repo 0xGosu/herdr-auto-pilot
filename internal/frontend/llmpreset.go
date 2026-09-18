@@ -3,6 +3,7 @@ package frontend
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
@@ -533,6 +534,45 @@ func (a *App) ApplyLLMPreset(ctx context.Context, key, preset string) (bool, err
 			return fmt.Errorf("%s is already configured — a preset only bootstraps an unset command; edit config.toml to change it", key)
 		}
 		*argv = recipe
+		return nil
+	})
+}
+
+// LLMCommandArgv returns a copy of key's configured argv template, or nil for
+// an unset field or a key with no preset. The TUI captures it when it asks
+// "clear this?" so ClearLLMCommand can refuse a value that changed since.
+func LLMCommandArgv(cfg config.Config, key string) []string {
+	argv := llmCommandArgv(&cfg, key)
+	if argv == nil || len(*argv) == 0 {
+		return nil
+	}
+	return append([]string(nil), (*argv)...)
+}
+
+// ClearLLMCommand empties key's argv template, turning its feature off and
+// making the field eligible for ApplyLLMPreset again. It is the other half of
+// the TUI's preset bootstrap: CR-036 still forbids EDITING a configured
+// template from the one-line prompt, but clearing one types nothing, so the
+// mangling hazard never arises — and without it a TUI operator who picked the
+// wrong preset had no way back short of config.toml.
+//
+// expected is the template the caller showed the operator; the write is
+// refused unless the config freshly loaded under the lock still holds exactly
+// that, so a template edited in config.toml between the question and the
+// answer is never discarded unseen.
+func (a *App) ClearLLMCommand(ctx context.Context, key string, expected []string) (bool, error) {
+	if !HasLLMPresets(key) {
+		return false, fmt.Errorf("%s cannot be cleared here (clearable: %s)", key, strings.Join(LLMPresetKeys, ", "))
+	}
+	return a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
+		argv := llmCommandArgv(cfg, key)
+		if len(*argv) == 0 {
+			return fmt.Errorf("%s is already unset", key)
+		}
+		if !slices.Equal(*argv, expected) {
+			return fmt.Errorf("%s changed since it was listed — refresh and retry", key)
+		}
+		*argv = nil
 		return nil
 	})
 }
