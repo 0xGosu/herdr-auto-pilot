@@ -143,13 +143,18 @@ func TestTheBackstopIsMeasuredFromTheAsk(t *testing.T) {
 // lateWriteStore lands a write in the middle of a refresh — after the
 // escalations were read — the race the key's sample-before-read order exists
 // for. Revision is promoted from the embedded store.
+//
+// The write rides on ListTaskLists, read by FleetTaskGroups in the refresh's
+// SECOND wave, which starts only once the escalations are in. It used to ride
+// on KillEvents, which the sequential refresh happened to read after them; the
+// first wave now reads both concurrently, so that order no longer holds.
 type lateWriteStore struct {
 	*store.Store
 	armed bool
 	id    int64
 }
 
-func (s *lateWriteStore) KillEvents(ctx context.Context, limit int) ([]domain.KillEvent, error) {
+func (s *lateWriteStore) ListTaskLists(ctx context.Context) ([]domain.StoredTaskList, error) {
 	if s.armed {
 		s.armed = false
 		id, err := s.AppendAudit(ctx, domain.AuditRecord{AgentID: "a1", SituationType: domain.SituationApproval,
@@ -159,7 +164,7 @@ func (s *lateWriteStore) KillEvents(ctx context.Context, limit int) ([]domain.Ki
 		}
 		s.id = id
 	}
-	return s.Store.KillEvents(ctx, limit)
+	return s.Store.ListTaskLists(ctx)
 }
 
 // TestAWriteDuringARefreshIsNotLost: the key is sampled BEFORE the read, so a
