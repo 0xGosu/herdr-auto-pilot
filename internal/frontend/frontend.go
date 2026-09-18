@@ -264,18 +264,72 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 		opt(&o)
 	}
 	var st Status
-	kill, err := a.Store.LatestKillEvent(ctx)
-	if err != nil {
-		return st, err
+	// Every read below is independent of the others, so they are issued
+	// together (see Concurrently). Each writes only its own variables; the
+	// Status is assembled after the wait, in the order it always was.
+	var (
+		kill                *domain.KillEvent
+		killErr, pendingErr error
+		pending             int64
+		roster              []domain.RosterAgent
+		publishedAt         time.Time
+		rosterErr           error
+		wss                 map[string]domain.WorkspaceInfo
+		tabs                map[string]domain.TabInfo
+		locErr              error
+		names               map[string]string
+		namesErr            error
+		disabled            map[string]bool
+		disabledErr         error
+		stats               map[string]domain.AgentStats
+		statsErr            = errNotRead
+		cfg                 config.Config
+		cfgErr              error
+		embeddingCount      int64
+		embeddingCountErr   error
+		staleEmbeddings     int64
+		staleErr            error
+		fspBlocked          string
+		fleet               fleetReads
+	)
+	// Config is a local file read, and three of the queries depend on it.
+	cfg, cfgErr = a.Config()
+	reads := []func(){
+		func() { kill, killErr = a.Store.LatestKillEvent(ctx) },
+		func() { pending, pendingErr = a.Store.CountPendingEscalations(ctx) },
+		func() { roster, publishedAt, rosterErr = a.Store.LiveRoster(ctx) },
+		func() { wss, tabs, locErr = a.Store.HerdrLocations(ctx) },
+		func() { names, namesErr = a.Store.AgentNames(ctx) },
+		func() { disabled, disabledErr = a.Store.DisabledAgents(ctx) },
+		func() { fleet = a.readFleet(ctx, o) },
+	}
+	if !o.skipStats {
+		reads = append(reads, func() { stats, statsErr = a.Store.AgentStats(ctx) })
+	}
+	if cfgErr == nil && !cfg.Embedding.Disabled {
+		// ONE count serves both the status line and the drift check, which
+		// used to ask for it twice.
+		reads = append(reads,
+			func() { embeddingCount, embeddingCountErr = a.Store.CountSignatureEmbeddings(ctx) },
+			func() {
+				staleEmbeddings, staleErr = a.Store.CountStaleSignatureEmbeddings(ctx,
+					embedder.ModelIDFor(embedder.ResolveModelPath(cfg.Embedding)), cfg.Embedding.MinSalientChars)
+			})
+	}
+	if cfgErr == nil {
+		reads = append(reads, func() { fspBlocked = a.fspBlockedReason(ctx, cfg) })
+	}
+	Concurrently(reads...)
+
+	if killErr != nil {
+		return st, killErr
 	}
 	st.LatestKill = kill
 	st.Paused = domain.KillStateActive(kill)
-	pending, err := a.Store.CountPendingEscalations(ctx)
-	if err != nil {
-		return st, err
+	if pendingErr != nil {
+		return st, pendingErr
 	}
 	st.PendingEscalations = int(pending)
-	roster, publishedAt, rosterErr := a.Store.LiveRoster(ctx)
 	if rosterErr == nil {
 		// Freshness, not row count, is what makes the herd KNOWN. An empty
 		// roster from a daemon publishing every sweep means "nothing is
@@ -309,31 +363,29 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 			}
 		}
 	}
-	if wss, tabs, err := a.Store.HerdrLocations(ctx); err == nil {
+	if locErr == nil {
 		st.Workspaces, st.Tabs = wss, tabs
 	}
-	if names, err := a.Store.AgentNames(ctx); err == nil {
+	if namesErr == nil {
 		st.AgentNames, st.AgentNamesKnown = names, true
 	}
-	if disabled, err := a.Store.DisabledAgents(ctx); err == nil {
+	if disabledErr == nil {
 		st.DisabledAgents = disabled
 	}
 	// Best-effort, like AgentNames: a stats-query error just leaves it nil.
-	if !o.skipStats {
-		if stats, err := a.Store.AgentStats(ctx); err == nil {
-			st.AgentStats = stats
-		}
+	if statsErr == nil {
+		st.AgentStats = stats
 	}
 	// One config load serves both embedding summaries so they cannot
 	// disagree about a mid-edit config within a single status snapshot.
-	if cfg, err := a.Config(); err != nil {
+	if cfgErr != nil {
 		st.Embedding = "unknown (config unreadable)"
 	} else {
-		st.Embedding = a.embeddingStatus(ctx, cfg)
+		st.Embedding = embeddingStatusFrom(cfg, embeddingCount, embeddingCountErr)
 		// Best-effort: a drift-check failure must not break status.
-		st.Drift, _ = a.embeddingDrift(ctx, cfg)
+		st.Drift = embeddingDriftFrom(cfg, embeddingCount, embeddingCountErr, staleEmbeddings, staleErr)
 		st.FullSelfPrompting = cfg.FullSelfPrompting.Enabled
-		st.FullSelfPromptingBlocked = a.fspBlockedReason(ctx, cfg)
+		st.FullSelfPromptingBlocked = fspBlocked
 	}
 	// Name any live agent the daemon has not named yet (a brand-new agent,
 	// or one that predates the daemon): the operator should never have to
@@ -352,9 +404,12 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 			st.AgentNames[agent.AgentID] = name
 		}
 	}
-	a.fillFleet(ctx, &st, o)
+	a.fillFleet(&st, fleet)
 	return st, nil
 }
+
+// errNotRead marks a best-effort read GetStatus did not issue.
+var errNotRead = errors.New("not read")
 
 // AgentName returns the short name for an agent id ("" when unnamed).
 func (st Status) AgentName(agentID string) string { return st.AgentNames[agentID] }
@@ -426,14 +481,14 @@ func (st Status) AgentDisabled(agentID string) bool { return st.DisabledAgents[a
 // AgentStats when none are recorded).
 func (st Status) StatsFor(agentID string) domain.AgentStats { return st.AgentStats[agentID] }
 
-// embeddingStatus summarizes semantic-matching availability from config,
-// model presence on disk, and the persisted signature-embedding count.
-func (a *App) embeddingStatus(ctx context.Context, cfg config.Config) string {
+// embeddingStatusFrom summarizes semantic-matching availability from config,
+// model presence on disk, and the persisted signature-embedding count (read
+// by the caller, alongside its other reads).
+func embeddingStatusFrom(cfg config.Config, count int64, countErr error) string {
 	if cfg.Embedding.Disabled {
 		return "disabled"
 	}
 	modelPath := embedder.ResolveModelPath(cfg.Embedding)
-	count, countErr := a.Store.CountSignatureEmbeddings(ctx)
 	if _, statErr := os.Stat(modelPath); statErr != nil {
 		if countErr != nil {
 			return fmt.Sprintf("model missing (%s)", modelPath)
@@ -501,6 +556,32 @@ func (a *App) embeddingDrift(ctx context.Context, cfg config.Config) (EmbeddingD
 	}
 	d.Detected = d.Stale > 0
 	return d, nil
+}
+
+// embeddingDriftFrom is embeddingDrift over counts already read (GetStatus
+// reads them concurrently with everything else). A read error leaves the
+// drift undetected, as embeddingDrift's caller there always treated it.
+func embeddingDriftFrom(cfg config.Config, total int64, totalErr error, stale int64, staleErr error) EmbeddingDrift {
+	var d EmbeddingDrift
+	if cfg.Embedding.Disabled {
+		return d
+	}
+	modelPath := embedder.ResolveModelPath(cfg.Embedding)
+	d.ModelID = embedder.ModelIDFor(modelPath)
+	d.ModelName = filepath.Base(modelPath)
+	if _, err := os.Stat(modelPath); err != nil {
+		d.ModelMissing = true
+	}
+	if totalErr != nil {
+		return d
+	}
+	d.Total = total
+	if staleErr != nil {
+		return d
+	}
+	d.Stale = stale
+	d.Detected = d.Stale > 0
+	return d
 }
 
 // RequestReembed asks the running daemon to rebuild a fresh embedder and
@@ -5470,23 +5551,34 @@ func IndexSignatures(rows []SignatureRow) map[string]SignatureRow {
 // totals come from two bulk queries when the store implements
 // ports.BatchDecisionReader, and from the per-signature calls otherwise.
 func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]SignatureRow, error) {
-	states, err := a.Store.ListSignatures(ctx, f)
-	if err != nil {
-		return nil, err
+	// The rule list and every rule's last-used audit are independent, so they
+	// are read together (see Concurrently): under a remote store each is a
+	// round trip. The audit read is wasted on a store with no rules, which a
+	// local sqlite store answers in microseconds.
+	var (
+		states               []domain.SignatureState
+		lastAudits           map[string]*domain.AuditRecord
+		statesErr, auditsErr error
+	)
+	Concurrently(
+		func() { states, statesErr = a.Store.ListSignatures(ctx, f) },
+		// One batched query for every rule's last-used audit, instead of a
+		// per-signature LatestAuditForSignature call inside the loop (the Rules
+		// list refreshes every ~2s). Absent signatures map to nil → LAST shows "-".
+		func() { lastAudits, auditsErr = a.Store.LatestAuditsForSignatures(ctx) },
+	)
+	if statesErr != nil {
+		return nil, statesErr
 	}
-	// Nothing learned yet: skip the audit query and the config load below. On a
-	// fresh install this is every TUI refresh, and both are pure waste when
-	// there is no row to enrich.
+	// Nothing learned yet: skip the config load below — pure waste when there
+	// is no row to enrich.
 	if len(states) == 0 {
 		return []SignatureRow{}, nil
 	}
-	// One batched query for every rule's last-used audit, instead of a
-	// per-signature LatestAuditForSignature call inside the loop (the Rules
-	// list refreshes every ~2s). Absent signatures map to nil → LAST shows "-".
-	lastAudits, err := a.Store.LatestAuditsForSignatures(ctx)
-	if err != nil {
-		return nil, err
+	if auditsErr != nil {
+		return nil, auditsErr
 	}
+	var err error
 	// Resolved ONCE, outside the loop. confirmationWeight re-reads and re-parses
 	// config.toml on every call (App.Config has no cache), which costs ~9ms —
 	// three orders of magnitude more than the per-row queries beside it. Called
@@ -5514,11 +5606,16 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		for i, st := range states {
 			listed[i] = st.Signature
 		}
-		if histories, err = batch.DecisionsForSignatures(ctx, listed, 50); err != nil {
-			return nil, err
+		var historiesErr, totalsErr error
+		Concurrently(
+			func() { histories, historiesErr = batch.DecisionsForSignatures(ctx, listed, 50) },
+			func() { totals, totalsErr = batch.CountDecisionsForSignatures(ctx, listed) },
+		)
+		if historiesErr != nil {
+			return nil, historiesErr
 		}
-		if totals, err = batch.CountDecisionsForSignatures(ctx, listed); err != nil {
-			return nil, err
+		if totalsErr != nil {
+			return nil, totalsErr
 		}
 		batched = true
 	}

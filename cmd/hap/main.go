@@ -255,6 +255,7 @@ func run(verb string, args []string) error {
 		}
 		defer closeStore()
 		defer drainSubmitRetries(app)
+		widenTUIPool(paths, app)
 		// The TUI logs into the same file as the daemon, so it honours the same
 		// configured level. It used to be pinned to Info regardless, which is
 		// what made its 2s-tick warnings impossible to turn down.
@@ -521,7 +522,8 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		}
 		// The front ends draw their ids from this allocator too, so every
 		// process on the node shares one sequence.
-		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{NextID: ids.MustNext})
+		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{NextID: ids.MustNext,
+			MaxClients: storeMaxClients(engine)})
 		defer srv.Close()
 		fleet = tdb
 	} else {

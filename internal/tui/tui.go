@@ -106,6 +106,60 @@ type refreshMsg struct {
 	err      error
 }
 
+// loadTracker is the progress of the refresh in flight, shared by pointer
+// between the Model (which renders it) and the reading goroutines (which
+// report into it). Progress is PULLED by the render — the 1s clock tick
+// repaints — rather than pushed as messages, so a refresh stays exactly one
+// command yielding one refreshMsg.
+type loadTracker struct {
+	mu      sync.Mutex
+	active  bool
+	started time.Time
+	p       loadProgress
+}
+
+// begin marks a refresh started at now.
+func (t *loadTracker) begin(now time.Time) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.active, t.started, t.p = true, now, loadProgress{total: refreshSteps}
+}
+
+// report records a step landing. Nil-safe, so it can be passed as a callback.
+func (t *loadTracker) report(p loadProgress) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.active && p.done > t.p.done {
+		t.p = p
+	}
+}
+
+// end marks the refresh finished.
+func (t *loadTracker) end() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.active = false
+}
+
+// snapshot is the current progress, when a refresh is in flight.
+func (t *loadTracker) snapshot() (p loadProgress, started time.Time, active bool) {
+	if t == nil {
+		return loadProgress{}, time.Time{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.p, t.started, t.active
+}
+
 // probeMsg is a poll that found nothing changed (frontend.App.ChangeKey held
 // still), so none of the data was re-read: only what a poll reads besides it —
 // daemon health and the instance-limit sweep — comes back.
@@ -991,7 +1045,18 @@ type Model struct {
 	// ("" when there was none or the App cannot tell), and lastFullRefresh
 	// when it landed. A tick whose key still matches skips the re-read — see
 	// poll.
-	lastChangeKey   string
+	lastChangeKey string
+	// pollStarted is when the tick's poll in flight was issued, zero when
+	// none is (see tickMsg).
+	pollStarted time.Time
+	// refreshed is set by the first refresh result of any kind. Until then
+	// (on a Model with a load tracker) the body is the loading screen: an empty tab before the first read
+	// lands reads as "no agents", which over a far server is several seconds
+	// of a herd that looks gone.
+	refreshed bool
+	// load is the progress of the refresh in flight (loadTracker). nil only
+	// on a Model not built by New, which then renders as it always did.
+	load            *loadTracker
 	lastFullRefresh time.Time
 	// slowPoll records whether the LAST tick was scheduled at the slow
 	// interval, so a return to activity can refresh immediately instead of
@@ -1642,7 +1707,7 @@ func (m Model) visibleSignatures() []frontend.SignatureRow {
 
 // New creates the TUI model.
 func New(ctx context.Context, app *frontend.App) Model {
-	return Model{app: app, ctx: ctx, inflight: &sync.WaitGroup{}, notifier: app.Notifier}
+	return Model{app: app, ctx: ctx, inflight: &sync.WaitGroup{}, notifier: app.Notifier, load: &loadTracker{}}
 }
 
 // Init starts the refresh loop.
@@ -1769,9 +1834,12 @@ func (m Model) refreshAt(now time.Time) tea.Cmd {
 	// usually not on screen.
 	modeFor := m.detailAgentID()
 	groups := m.data.tasks
+	load := m.load
 	return func() tea.Msg {
+		load.begin(now)
+		defer load.end()
 		key, ok := app.ChangeKey(ctx, groups)
-		msg := refreshData(ctx, app, modeFor)
+		msg := refreshDataProgress(ctx, app, load.report, modeFor)
 		if ok {
 			msg.changeKey = key
 		}
@@ -1801,12 +1869,15 @@ func (m Model) poll(now time.Time) tea.Cmd {
 		return m.refreshAt(now)
 	}
 	app, ctx, groups, last := m.app, m.ctx, m.data.tasks, m.lastChangeKey
+	load := m.load
 	return func() tea.Msg {
 		key, ok := app.ChangeKey(ctx, groups)
 		if ok && key == last {
 			return probeMsg{health: app.AssessDaemonHealth(), tuiLimit: enforceTUILimit(app)}
 		}
-		msg := refreshData(ctx, app)
+		load.begin(now)
+		defer load.end()
+		msg := refreshDataProgress(ctx, app, load.report)
 		if ok {
 			msg.changeKey = key
 		}
@@ -1838,36 +1909,141 @@ func (m Model) detailAgentID() string {
 // omitting it means "no agent detail is open", which is precisely the case that
 // must NOT pay for a mode read.
 func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refreshMsg {
+	return refreshDataProgress(ctx, app, nil, modeFor...)
+}
+
+// loadProgress is one step of a refresh completing: done of total reads, and
+// the one that just landed.
+type loadProgress struct {
+	done, total int
+	label       string
+}
+
+// percent is how far the refresh is, 0-100.
+func (p loadProgress) percent() int {
+	if p.total <= 0 {
+		return 0
+	}
+	return min(100, p.done*100/p.total)
+}
+
+// pollInFlightLimit bounds how long the tick waits on a poll that has not
+// answered before issuing another anyway.
+const pollInFlightLimit = 2 * time.Minute
+
+// slowLoadAfter is how long a refresh runs before the header mentions it. A
+// local store answers well inside it, so the indicator never flickers there.
+const slowLoadAfter = 750 * time.Millisecond
+
+// loadBarWidth is the loading screen's progress bar, in cells.
+const loadBarWidth = 24
+
+// renderLoading is the body before the first refresh has landed: what is
+// being read, and how far along, instead of empty tabs that read as a herd
+// with nothing in it.
+func (m Model) renderLoading(b *strings.Builder) {
+	st := m.styles()
+	p, started, active := m.load.snapshot()
+	if !active {
+		p = loadProgress{total: refreshSteps}
+	}
+	filled := p.percent() * loadBarWidth / 100
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", loadBarWidth-filled)
+	line := fmt.Sprintf("loading… %3d%%  %s  %d/%d", p.percent(), bar, p.done, p.total)
+	if p.label != "" {
+		line += " · " + p.label
+	}
+	fmt.Fprintln(b, oneLine(line, m.contentWidth()))
+	if active {
+		if waited := time.Since(started); waited >= slowLoadAfter {
+			fmt.Fprintln(b, st.help.Render(oneLine(fmt.Sprintf(
+				"reading hap's database through the daemon (%s so far) — over a remote server each read is a network round trip",
+				waited.Round(100*time.Millisecond)), m.contentWidth())))
+		}
+	}
+}
+
+// refreshSteps is how many reads refreshDataProgress reports. Kept beside it:
+// a count that drifted from the calls would stall the bar short of 100%.
+const refreshSteps = 9
+
+// refreshDataProgress is refreshData reporting each read as it lands.
+//
+// The reads are issued CONCURRENTLY, in two waves: everything that needs
+// nothing, then everything that needs the status or the escalations. Under a
+// shared engine every read is a round trip — over the daemon's socket and,
+// under libsql, on to a remote server at ~200 ms apiece — and issued one
+// after another a first paint over a far server took ~12 s, during which the
+// screen said "no agents detected". progress (nil-safe) is how the TUI shows
+// that time instead of an empty herd; it is called from the reading
+// goroutines, so it must not touch the Model.
+//
+// The FIRST error in the old sequential order still wins, so a failing
+// refresh reports the same thing it always did.
+func refreshDataProgress(ctx context.Context, app *frontend.App, progress func(loadProgress), modeFor ...string) refreshMsg {
 	var msg refreshMsg
+	var mu sync.Mutex
+	done := 0
+	step := func(label string) {
+		if progress == nil {
+			return
+		}
+		mu.Lock()
+		done++
+		p := loadProgress{done: done, total: refreshSteps, label: label}
+		mu.Unlock()
+		progress(p)
+	}
 	// Daemon health is read from local state files (never errors), so assess it
 	// first — it stays meaningful even when GetStatus fails (e.g. daemon down).
 	msg.daemonHealth = app.AssessDaemonHealth()
 	msg.tuiLimit = enforceTUILimit(app)
-	msg.status, msg.err = app.GetStatus(ctx)
-	if msg.err != nil {
-		return msg
+
+	var statusErr, escErr, auditErr, killErr, sigErr, cfgErr error
+	msg.cfg, cfgErr = app.Config()
+	frontend.Concurrently(
+		func() { msg.status, statusErr = app.GetStatus(ctx); step("herd status") },
+		func() { msg.escalations, escErr = app.Escalations(ctx); step("escalations") },
+		func() { msg.audit, auditErr = app.Audit(ctx, 50); step("audit") },
+		// 200, not the 50 the other lists use: the tab now windows and filters,
+		// so the fetch is what bounds how far back `/` can look, not what fits
+		// a pane.
+		func() { msg.kills, killErr = app.KillHistory(ctx, 200); step("pause history") },
+		func() {
+			msg.signatures, sigErr = app.Signatures(ctx, domain.SignatureFilter{})
+			step("learned rules")
+		},
+	)
+	// A failed refresh replaces the TUI's data wholesale, so it carries
+	// exactly what the sequential version did: the reads BEFORE the failing
+	// one in that order, and nothing read after it.
+	resets := []func(){
+		func() { msg.status = frontend.Status{} },
+		func() { msg.escalations = nil },
+		func() { msg.audit = nil },
+		func() { msg.kills = nil },
+		func() { msg.signatures = nil },
+		func() { msg.cfg = config.Config{} },
 	}
-	// Agent working directories are an opt-in extra (one `herdr pane get` per
-	// agent, TTL-cached and time-bounded), so the TUI asks for them explicitly
-	// rather than making every GetStatus caller pay.
-	app.FillAgentCwds(ctx, &msg.status)
-	// The permission mode is read only for the agent whose detail overlay is
-	// open (see refresh): it is uncached by design, so filling every agent on
-	// every tick would spawn one herdr subprocess per agent per 2 seconds to
-	// paint a row nobody is looking at.
-	if len(modeFor) > 0 && modeFor[0] != "" {
-		app.FillAgentModes(ctx, &msg.status, modeFor[0])
+	for i, err := range []error{statusErr, escErr, auditErr, killErr, sigErr, cfgErr} {
+		if err != nil {
+			msg.err = err
+			for _, reset := range resets[i:] {
+				reset()
+			}
+			return msg
+		}
 	}
-	msg.escalations, msg.err = app.Escalations(ctx)
-	if msg.err != nil {
-		return msg
-	}
+
+	// Second wave: what needs the status, the escalations or the config.
 	// Gate "retry LLM" per agent: a consult already in flight disables it.
 	// Best-effort — a lookup error just leaves the key enabled (the daemon
 	// guards authoritatively before re-consulting).
 	// Keyed by (node, agent), not agent alone: pane ids repeat across
 	// machines, so a remote escalation must be judged by ITS node's consults.
 	msg.pendingConsult = map[string]bool{}
+	var consults []func()
+	var consultMu sync.Mutex
 	checked := map[string]bool{}
 	for i := range msg.escalations {
 		e := msg.escalations[i]
@@ -1876,30 +2052,35 @@ func refreshData(ctx context.Context, app *frontend.App, modeFor ...string) refr
 			continue
 		}
 		checked[key] = true
-		if pending, perr := app.HasPendingLLMConsultOn(ctx, e.NodeID, e.AgentID); perr == nil && pending {
-			msg.pendingConsult[key] = true
-		}
+		consults = append(consults, func() {
+			if pending, perr := app.HasPendingLLMConsultOn(ctx, e.NodeID, e.AgentID); perr == nil && pending {
+				consultMu.Lock()
+				msg.pendingConsult[key] = true
+				consultMu.Unlock()
+			}
+		})
 	}
-	msg.audit, msg.err = app.Audit(ctx, 50)
-	if msg.err != nil {
-		return msg
-	}
-	// 200, not the 50 the other lists use: the tab now windows and filters, so
-	// the fetch is what bounds how far back `/` can look, not what fits a pane.
-	msg.kills, msg.err = app.KillHistory(ctx, 200)
-	if msg.err != nil {
-		return msg
-	}
-	msg.signatures, msg.err = app.Signatures(ctx, domain.SignatureFilter{})
-	if msg.err != nil {
-		return msg
-	}
-	msg.cfg, msg.err = app.Config()
-	if msg.err != nil {
-		return msg
-	}
-	msg.tasks = app.TaskGroups(msg.cfg, msg.status)
-	msg.fleetTasks = app.FleetTaskGroups(ctx, msg.status)
+	status := msg.status
+	frontend.Concurrently(
+		func() {
+			// Agent working directories are an opt-in extra (one `herdr pane
+			// get` per agent, TTL-cached and time-bounded), so the TUI asks
+			// for them explicitly rather than making every GetStatus caller
+			// pay. The permission mode is read only for the agent whose detail
+			// overlay is open (see refresh): it is uncached by design, so
+			// filling every agent on every tick would spawn one herdr
+			// subprocess per agent per 2 seconds to paint a row nobody is
+			// looking at.
+			app.FillAgentCwds(ctx, &msg.status)
+			if len(modeFor) > 0 && modeFor[0] != "" {
+				app.FillAgentModes(ctx, &msg.status, modeFor[0])
+			}
+			step("agent details")
+		},
+		func() { frontend.Concurrently(consults...); step("LLM consults") },
+		func() { msg.tasks = app.TaskGroups(msg.cfg, status); step("task lists") },
+		func() { msg.fleetTasks = app.FleetTaskGroups(ctx, status); step("fleet task lists") },
+	)
 	// Both of these read the cached check file only — the fetch itself runs in
 	// updateCheckCmd, off this path, because refreshData runs on every tick.
 	msg.update = app.UpdateStatus(msg.cfg)
@@ -2154,6 +2335,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clampListViewport()
 		return m, nil
 	case refreshMsg:
+		m.refreshed = true
+		m.pollStarted = time.Time{}
 		if msg.err == nil {
 			if m.initialized {
 				// Either channel being on is enough to evaluate the triggers;
@@ -2356,6 +2539,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case openTaskSourceFieldMsg:
 		return m.openTaskSourceFieldPrompt(msg)
 	case probeMsg:
+		m.pollStarted = time.Time{}
 		// Nothing changed, so nothing is re-derived and the idle clock is
 		// left alone: a probe that finds no change IS the quiet the backoff
 		// waits for.
@@ -2365,7 +2549,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		now := time.Now()
 		m.slowPoll = m.idle(now)
-		cmds := []tea.Cmd{m.poll(now), tick(m.refreshInterval(now))}
+		cmds := []tea.Cmd{tick(m.refreshInterval(now))}
+		// One poll at a time. A tick used to start a new poll whatever was in
+		// flight, and over a remote server a full refresh outlasts the 2s
+		// tick several times over — so the first paint queued ~6 refreshes
+		// behind the store's two connections, each slowing the rest. The
+		// bound is a backstop: a poll that never answered must not stop the
+		// TUI polling for good.
+		if m.pollStarted.IsZero() || now.Sub(m.pollStarted) >= pollInFlightLimit {
+			m.pollStarted = now
+			cmds = append(cmds, m.poll(now))
+		}
 		if m.updateCheckAllowed(time.Now()) {
 			m.updateChecking = true
 			m.lastUpdateCheck = time.Now()
@@ -7309,6 +7503,11 @@ func (m Model) View() string {
 	if n := len(m.data.status.PausedNodes); n > 0 {
 		stateText += fmt.Sprintf(" +%d node(s) paused", n)
 	}
+	// A refresh that has been running a while says so beside the state: the
+	// data on screen is the previous read until it lands.
+	if p, started, active := m.load.snapshot(); m.refreshed && active && time.Since(started) >= slowLoadAfter {
+		stateText += fmt.Sprintf("  ↻ %d%%", p.percent())
+	}
 	state := stateStyle.Render(stateText)
 	// Unlike list rows the header is emitted unclamped, so a header too wide
 	// for the pane would wrap and push the body one row past the bottom,
@@ -7441,6 +7640,10 @@ func (m Model) View() string {
 			fmt.Sprintf("filter: %q — / to edit, backspace to clear", m.query[m.tab])))
 	}
 
+	if !m.refreshed && m.load != nil {
+		m.renderLoading(&b)
+		return b.String()
+	}
 	switch m.tab {
 	case tabAgents:
 		m.renderAgents(&b)

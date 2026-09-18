@@ -319,6 +319,15 @@ func (s *Store) MigrateWith(between func() error) error {
 // daemon serving it is reachable.
 func (s *Store) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
 
+// SetPoolSize caps how many connections this handle may hold at once — for a
+// proxied handle, how many daemon sessions. A front end that issues its reads
+// concurrently (the TUI's refresh) gains nothing from a fan-out wider than
+// its pool.
+func (s *Store) SetPoolSize(n int) {
+	s.db.SetMaxOpenConns(n)
+	s.db.SetMaxIdleConns(n)
+}
+
 // ErrNoRevision: this store cannot report a change token (see Revision).
 var ErrNoRevision = errors.New("store: no revision for this handle")
 
