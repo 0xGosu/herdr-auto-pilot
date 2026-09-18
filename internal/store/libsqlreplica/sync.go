@@ -357,7 +357,13 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 	if _, err := d.pushAll(ctx, r, tables); err != nil {
 		slog.Warn("libsql_replica: pushing before the re-seed failed; the unpushed rows are kept", "error", err)
 	}
-	head, err := r.Batch(ctx, []libsql.Statement{{SQL: `SELECT COALESCE(MAX(seq), 0) FROM hap_changelog`}})
+	// The cursor is never set below pruned_through: retention can empty the
+	// log entirely (every live cursor had read it), and a head of 0 under a
+	// non-zero floor would read as "fell behind" on every pull — a full
+	// re-seed per tick, forever.
+	head, err := r.Batch(ctx, []libsql.Statement{{SQL: `SELECT MAX(
+		COALESCE((SELECT MAX(seq) FROM hap_changelog), 0),
+		COALESCE((SELECT v FROM hap_sync_meta WHERE k = 'pruned_through'), 0))`}})
 	if err != nil {
 		return err
 	}

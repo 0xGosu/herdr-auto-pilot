@@ -394,6 +394,32 @@ func TestFallingBehindRetentionReseeds(t *testing.T) {
 	}
 }
 
+// A re-seed over a change log retention has EMPTIED must not leave the cursor
+// below pruned_through: every later pull would re-seed again, forever. The
+// same holds for a node joining after the log was emptied.
+func TestReseedOverAnEmptiedLogSettles(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'v1')`)
+	a.push(t)
+	if err := libsqlreplica.PruneChangelog(context.Background(), a.r.Remote(), time.Now().Add(2*libsqlreplica.ChangelogRetention)); err != nil {
+		t.Fatal(err)
+	}
+	if !b.pull(t) {
+		t.Fatal("control: b fell behind retention and should have re-seeded")
+	}
+	if b.pull(t) {
+		t.Fatal("b re-seeded again over an unchanged server")
+	}
+	c := newNode(t, srv, "cccccccccccccccc")
+	if c.pull(t) {
+		t.Fatal("a node seeded after the log was emptied re-seeds on its first pull")
+	}
+	if got, _ := c.label(t, "x"); got != "v1" {
+		t.Fatalf("c's seed missed a's row: %q", got)
+	}
+}
+
 // A change to a table the server does not have yet is HELD in the outbox, not
 // dropped, and goes once the server gains the table.
 func TestChangesToATableTheServerLacksAreHeld(t *testing.T) {
