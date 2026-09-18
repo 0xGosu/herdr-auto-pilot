@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.48
+
+- Changed the orchestrator's built-in brief and the `hap-orchestrator` skill to run every `hap` command as `HAP_ACTOR=orchestrator`, so the orchestrator's decisions are audited under its own name even when a command runs outside its pane
+
 ## 0.9.47
 
 - Fixed the escalation raised when an agent's task source cannot be read: it now carries its own `task_source_unusable` reason and names the source and the read error, instead of an untagged row claiming "generating a task suggestion" when no task was generated
