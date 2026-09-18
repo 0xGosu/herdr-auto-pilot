@@ -112,15 +112,74 @@ func (st Status) RemoteNodes(now time.Time) (total, stale int) {
 	return total, stale
 }
 
-// fillFleet adds the other nodes' view to a Status. Best effort throughout:
-// under the local engine there is one node and every fleet read is empty.
-func (a *App) fillFleet(ctx context.Context, st *Status, o statusOptions) {
+// fleetReads is everything fillFleet needs from the store, read by readFleet
+// so GetStatus can issue it alongside its own reads.
+type fleetReads struct {
+	nodes     []domain.NodeInfo
+	nodesErr  error
+	here      int64
+	hereErr   error
+	names     map[domain.NodeAgent]string
+	namesErr  error
+	disabled  map[domain.NodeAgent]bool
+	stats     map[domain.NodeAgent]domain.AgentStats
+	roster    []domain.RosterAgent
+	published map[string]time.Time
+	rosterErr error
+	// paused holds each OTHER node's pause state, read per node.
+	paused map[string]bool
+}
+
+// readFleet reads the other nodes' view. The node list comes first — under
+// the local engine there is one node and nothing else is asked — and then
+// every remaining read, the per-node pause lookups included, is issued at once.
+func (a *App) readFleet(ctx context.Context, o statusOptions) fleetReads {
+	var f fleetReads
+	f.nodes, f.nodesErr = a.Store.ListNodes(ctx)
+	if f.nodesErr != nil || len(f.nodes) < 2 {
+		return f
+	}
+	self := a.Store.NodeID()
+	reads := []func(){
+		func() { f.here, f.hereErr = a.Store.CountPendingEscalationsOn(ctx, self) },
+		func() { f.names, f.namesErr = a.Store.FleetAgentNames(ctx) },
+		func() { f.disabled, _ = a.Store.DisabledAgentsAll(ctx) },
+		func() { f.roster, f.published, f.rosterErr = a.Store.FleetRoster(ctx) },
+	}
+	if !o.skipStats {
+		reads = append(reads, func() { f.stats, _ = a.Store.FleetAgentStats(ctx) })
+	}
+	pausedAt := make([]bool, len(f.nodes))
+	for i, n := range f.nodes {
+		if n.ID == self {
+			continue
+		}
+		reads = append(reads, func() {
+			if k, err := a.Store.LatestKillEventOn(ctx, n.ID); err == nil && domain.KillStateActive(k) {
+				pausedAt[i] = true
+			}
+		})
+	}
+	Concurrently(reads...)
+	f.paused = map[string]bool{}
+	for i, n := range f.nodes {
+		if pausedAt[i] {
+			f.paused[n.ID] = true
+		}
+	}
+	return f
+}
+
+// fillFleet adds the other nodes' view to a Status from what readFleet read.
+// Best effort throughout: under the local engine there is one node and every
+// fleet read is empty.
+func (a *App) fillFleet(st *Status, f fleetReads) {
 	st.NodeID = a.Store.NodeID()
 	now := a.now()
-	nodes, err := a.Store.ListNodes(ctx)
-	if err != nil {
+	if f.nodesErr != nil {
 		return
 	}
+	nodes := f.nodes
 	st.Nodes = nodes
 	for _, n := range nodes {
 		if n.ID == st.NodeID {
@@ -131,21 +190,17 @@ func (a *App) fillFleet(ctx context.Context, st *Status, o statusOptions) {
 	if len(nodes) < 2 {
 		return
 	}
-	if here, err := a.Store.CountPendingEscalationsOn(ctx, st.NodeID); err == nil {
-		st.PendingEscalationsHere = int(here)
+	if f.hereErr == nil {
+		st.PendingEscalationsHere = int(f.here)
 	}
-	if names, err := a.Store.FleetAgentNames(ctx); err == nil {
-		st.FleetNames = names
+	if f.namesErr == nil {
+		st.FleetNames = f.names
 	}
-	disabled, _ := a.Store.DisabledAgentsAll(ctx)
-	var stats map[domain.NodeAgent]domain.AgentStats
-	if !o.skipStats {
-		stats, _ = a.Store.FleetAgentStats(ctx)
-	}
-	roster, published, err := a.Store.FleetRoster(ctx)
-	if err != nil {
+	disabled, stats := f.disabled, f.stats
+	if f.rosterErr != nil {
 		return
 	}
+	roster, published := f.roster, f.published
 	// Deliberately NO per-node LocationsOf lookup here. A remote agent's herdr
 	// "#<workspace>-<tab>" coordinate describes a screen on a machine the
 	// operator is not looking at, so no surface renders it: the Agents tab puts
@@ -172,15 +227,7 @@ func (a *App) fillFleet(ctx context.Context, st *Status, o statusOptions) {
 			Stats:       stats[key],
 		})
 	}
-	st.PausedNodes = map[string]bool{}
-	for _, n := range nodes {
-		if n.ID == st.NodeID {
-			continue
-		}
-		if k, err := a.Store.LatestKillEventOn(ctx, n.ID); err == nil && domain.KillStateActive(k) {
-			st.PausedNodes[n.ID] = true
-		}
-	}
+	st.PausedNodes = f.paused
 }
 
 // ErrRemoteAgent reports an operation that only the agent's own machine can

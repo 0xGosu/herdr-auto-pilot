@@ -1,0 +1,3 @@
+- The TUI shows a `loading… N%` screen with a progress bar and the step in progress until its first read lands. It used to show `no agents detected`, which over a remote database looked like the herd was gone. A later refresh that takes a while shows `↻ N%` next to the state in the header.
+- The TUI and `hap status`/`hap agents` load much faster over the `libsql` engine: independent reads now run concurrently instead of one after another. Against a remote server (~230 ms per round trip) the TUI's first paint went from ~10 s to ~2–3 s.
+- Fixed the TUI starting a new full refresh every 2 s while the previous one was still loading. On a slow store these refreshes piled up and slowed each other down.

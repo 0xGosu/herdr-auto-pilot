@@ -737,6 +737,16 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     paused branch. A deliberate pause reported as failing is how an operator learns to ignore the banner that
     means a real outage — but it is still SAID (`hap status`, `FleetSyncPaused`), because a herd off the wire
     looks exactly like a quiet one.
+  - **A front end's full refresh fans its reads out, and only ONE tick poll is ever in flight.** Under a
+    shared engine every read is a round trip (under libsql, on to a remote server), so `GetStatus`, the
+    rule listing and the TUI's `refreshDataProgress` issue independent reads together
+    (`frontend.Concurrently`; each writes only its own variables, assembled after the wait). A tick used to
+    start a poll regardless, which over a far server queued ~6 full refreshes behind the proxy's 2-connection
+    pool on the first paint alone (`pollStarted`, bounded by `pollInFlightLimit`). A FAILED refresh still
+    carries exactly the reads before the failing one in the old sequential order — the TUI replaces its data
+    wholesale. Progress is PULLED (`loadTracker`, repainted by the 1s clock tick) so a refresh stays one
+    command yielding one `refreshMsg`; until the first lands the body is the loading screen, never "no
+    agents detected". Under libsql the TUI's pool is `tuiLibSQLPool` and the socket serves `libsqlMaxClients`.
   - **A front end polls a change token, not the data** (`Store.Revision` → `ports.RevisionReporter`,
     `frontend.App.ChangeKey`, `tui.Model.poll`). Under turso it is the executor's counter
     (`sqlbridge.Executor.Revision`, a `rev` request over a POOLED connection), bumped AFTER every committed
