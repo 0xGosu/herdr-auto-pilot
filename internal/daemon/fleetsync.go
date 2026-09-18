@@ -610,6 +610,12 @@ func (d *Daemon) fleetRefreshStats(sync ports.FleetSyncPort) ports.FleetSyncStat
 // than cancelled — cancelling would wedge nothing that still matters, but
 // waiting forever would hold the daemon lock the successor is waiting for.
 func (d *Daemon) fleetFinalPush(sync ports.FleetSyncPort) {
+	if d.fleetEngine() != "turso" {
+		// Nothing is waiting to be published: a libsql write is on the server
+		// when it commits. Its Push is only a reachability check, and one at
+		// exit would buy a warning about a server this process is leaving.
+		return
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

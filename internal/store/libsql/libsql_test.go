@@ -324,3 +324,44 @@ func TestNormalizeURL(t *testing.T) {
 		}
 	}
 }
+
+// TestAStreamExpiredMidTransactionFailsCleanly: sqld drops a stream left idle
+// for ~10s, and with it the transaction it held. That must surface as an
+// error on the next statement — never a partial commit — read as a remote
+// fault rather than a reason to restart, and leave the pool usable.
+func TestAStreamExpiredMidTransactionFailsCleanly(t *testing.T) {
+	srv := newFake(t)
+	db := openOn(t, srv)
+	ctx := context.Background()
+	sdb := db.DB()
+	if _, err := sdb.ExecContext(ctx, "CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := sdb.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	srv.ExpireStreams()
+	_, err = tx.ExecContext(ctx, "INSERT INTO t (id) VALUES (2)")
+	var sc *libsql.StreamClosedError
+	if !errors.As(err, &sc) {
+		t.Fatalf("statement on an expired stream: err = %v, want a StreamClosedError", err)
+	}
+	if domain.SyncFailureProcessLocal(err.Error()) {
+		t.Fatalf("an expired stream (%v) reads as process-local", err)
+	}
+	_ = tx.Rollback()
+	if err := tx.Commit(); err == nil {
+		t.Fatal("a transaction whose stream expired committed")
+	}
+	var n int
+	if err := sdb.QueryRowContext(ctx, "SELECT count(*) FROM t").Scan(&n); err != nil {
+		t.Fatalf("the pool did not recover after the expired stream: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("%d rows survived a transaction whose stream expired, want 0", n)
+	}
+}

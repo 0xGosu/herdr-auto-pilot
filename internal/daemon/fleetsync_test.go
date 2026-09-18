@@ -462,3 +462,26 @@ func TestFleetSyncPauseStillAppliesUnderTurso(t *testing.T) {
 		h.stop()
 	}
 }
+
+// TestLibSQLShutdownSkipsTheFinalPush: under libsql there is nothing to
+// publish at exit — every write is already on the server — so the shutdown
+// push (a reachability probe there) is not made. The control is turso, where
+// it still is.
+func TestLibSQLShutdownSkipsTheFinalPush(t *testing.T) {
+	for _, tc := range []struct {
+		engine string
+		want   int32
+	}{{"libsql", 0}, {"turso", 1}} {
+		sync := &fakeFleetSync{}
+		h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
+			o.FleetSync = sync
+			o.FleetEngine = tc.engine
+			o.FleetSyncInterval = time.Hour
+		})
+		waitFor(t, 2*time.Second, func() bool { return h.daemon.fleetHealth() != nil })
+		h.stop()
+		if got := sync.pushes.Load(); got != tc.want {
+			t.Errorf("%s: %d pushes at shutdown, want %d", tc.engine, got, tc.want)
+		}
+	}
+}

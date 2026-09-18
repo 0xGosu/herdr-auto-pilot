@@ -637,8 +637,10 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     for NEARBY servers, and the per-request timeout (`libsql.DefaultTimeout`) is what bounds a hung server.
   - **Pull is a change check, Push a reachability check** — never no-ops. Pull compares the server's
     `replication_index` (own writes included: re-baselining on them could swallow a foreign write) and
-    answers "changed" when the server reports none, the direction a change token must fail in. A no-op Push
-    would clear the isolation banner while the server is down (`fleetPush` counts success as proof).
+    answers "changed" when the server reports none, the direction a change token must fail in. Pull drives
+    the isolation clock; Push runs only on the push-now nudge (a front end queueing a remote-agent action,
+    `FleetWrites` is nil) and is skipped at shutdown, but a no-op there would still clear the isolation
+    banner while the server is down (`fleetPush` counts success as proof).
   - **Every server error is prefixed `domain.LibSQLServerErrorPrefix`**, which `syncRemoteFaults` vetoes:
     sqld relays SQLite's own `database is locked`, a PROCESS-LOCAL shape, so without it a busy server
     restarts the daemon every cooldown.

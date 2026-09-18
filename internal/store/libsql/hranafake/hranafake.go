@@ -71,6 +71,18 @@ func (s *Server) OpenStreams() int {
 	return len(s.streams)
 }
 
+// ExpireStreams drops every open stream, rolling its transaction back, as
+// sqld does to a stream left idle past its timeout (~10s, STREAM_EXPIRED).
+func (s *Server) ExpireStreams() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, c := range s.streams {
+		_, _ = c.ExecContext(context.Background(), "ROLLBACK")
+		c.Close()
+		delete(s.streams, k)
+	}
+}
+
 // Close closes every stream and the database.
 func (s *Server) Close() error {
 	s.mu.Lock()

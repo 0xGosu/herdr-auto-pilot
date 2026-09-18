@@ -268,6 +268,14 @@ func runMigrateLibSQL(ctx context.Context, paths config.Paths, cfg config.Config
 			libsql.NormalizeURL(cfg.Database.LibSQLURL), ldb.ProbeRTT().Round(time.Millisecond))
 	}
 	rep, err := copyBetween(ctx, paths, shared, libsql.NormalizeURL(cfg.Database.LibSQLURL), opt)
+	var expired *libsql.StreamClosedError
+	if errors.As(err, &expired) {
+		// The copy is one transaction; the server dropped its stream (sqld
+		// expires one left idle ~10s) and rolled it back. Nothing was copied.
+		return fmt.Errorf("%w\nThe server dropped the copy's transaction before it committed, so NOTHING was "+
+			"copied and the destination is as it was. It is safe to run the command again; if it keeps "+
+			"happening, the link to the server is stalling — run it from a machine nearer the server", err)
+	}
 	if err != nil {
 		return err
 	}
