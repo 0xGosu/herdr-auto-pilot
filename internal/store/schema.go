@@ -20,7 +20,7 @@ const autoincPlaceholder = "{AUTOINC}"
 // schemaFor renders the schema for an engine.
 func schemaFor(engine Engine) string {
 	ai := " AUTOINCREMENT"
-	if engine == EngineTurso {
+	if engine.Shared() {
 		ai = ""
 	}
 	return strings.ReplaceAll(schema, autoincPlaceholder, ai)
@@ -738,7 +738,7 @@ func (s *Store) migrate(between func() error) error {
 	// same statement there would backfill the wrong situation_type silently. A
 	// turso database is created by builds that write the signatures row at
 	// decision time, so it never has the rows this repairs.
-	if s.engine == EngineSQLite {
+	if !s.engine.Shared() {
 		if err := step(); err != nil {
 			return err
 		}

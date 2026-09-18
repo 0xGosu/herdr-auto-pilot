@@ -1698,7 +1698,7 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 			return err
 		}
 		shown := value
-		if key == "database.turso_auth_token" {
+		if key == "database.turso_auth_token" || key == "database.libsql_auth_token" {
 			// A secret, and this line is what lands in a terminal scrollback.
 			shown = "(set)"
 		}
@@ -1807,17 +1807,25 @@ func printDatabaseLine(out io.Writer, cfg config.Config) {
 	if d.EngineOrDefault() == config.EngineSQLite {
 		return
 	}
-	token := "none"
-	if d.AuthToken() != "" {
+	token, urlKey, interval := "none", "database.turso_database_url", "sync"
+	hasToken := d.AuthToken() != ""
+	if d.IsLibSQL() {
+		urlKey, interval, hasToken = "database.libsql_url", "poll", d.LibSQLToken() != ""
+	}
+	if hasToken {
 		token = "set"
 	}
 	label := d.NodeLabel
 	if label == "" {
 		label = "(hostname)"
 	}
-	fmt.Fprintf(out, "database:   engine=%s url=%s token=%s sync=%s node_label=%s\n",
-		d.EngineOrDefault(), frontend.FieldValue(cfg, "database.turso_database_url"), token,
+	fmt.Fprintf(out, "database:   engine=%s url=%s token=%s %s=%s node_label=%s\n",
+		d.EngineOrDefault(), frontend.FieldValue(cfg, urlKey), token, interval,
 		d.SyncInterval(), label)
+	if d.IsLibSQL() && d.TursoSyncPaused {
+		fmt.Fprintln(out, "database:   database.turso_sync_paused is set but has NO effect under libsql "+
+			"(no local copy to fall back on)")
+	}
 	if err := config.ValidateDatabase(cfg); err != nil {
 		fmt.Fprintf(out, "database:   MISCONFIGURED — %v\n", err)
 	}

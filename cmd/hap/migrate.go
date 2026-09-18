@@ -13,12 +13,13 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/daemonlock"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsql"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/turso"
 )
 
 // runMigrate implements `hap migrate --to <engine>`: it copies this install's
-// hap data between the local sqlite file and the shared turso database, in
-// either direction, so switching engines is reversible.
+// hap data between the local sqlite file and a shared database (turso or
+// libsql), in either direction, so switching engines is reversible.
 //
 // It lives in cmd/hap, not internal/cli, for one reason: it is the only package
 // that may open BOTH store handles. Under turso every other process talks to
@@ -45,6 +46,12 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 			"    kill %d      # then re-run this command\n"+
 			"and start it again with `hap daemon --ensure` when the migration is done",
 			pid, daemonlock.VersionLabel(version), pid)
+	}
+	if opt.shared, err = resolveMigrateShared(opt, cfg); err != nil {
+		return err
+	}
+	if opt.shared == config.EngineLibSQL {
+		return runMigrateLibSQL(ctx, paths, cfg, out, opt)
 	}
 	if cfg.Database.TursoDatabaseURL == "" {
 		return errors.New("database.turso_database_url is not set, so there is no shared database to copy to or from.\n" +
@@ -138,25 +145,8 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 		}
 	}
 
-	sqliteStore, err := store.Open(paths.DBPath())
+	rep, err := copyBetween(ctx, paths, tursoStore, cfg.Database.TursoDatabaseURL, opt)
 	if err != nil {
-		return fmt.Errorf("open the local database: %w", err)
-	}
-	defer sqliteStore.Close()
-
-	mo := store.MigrateOptions{AllNodes: opt.allNodes, Force: opt.force}
-	if opt.toSQLite {
-		mo.Src, mo.Dst = tursoStore, sqliteStore
-		mo.SourceLabel = cfg.Database.TursoDatabaseURL
-	} else {
-		mo.Src, mo.Dst = sqliteStore, tursoStore
-		mo.SourceLabel = paths.DBPath()
-	}
-	rep, err := store.Migrate(ctx, mo)
-	if err != nil {
-		if errors.Is(err, store.ErrDestinationNotEmpty) {
-			return destinationNotEmptyError(err, opt)
-		}
 		return err
 	}
 
@@ -172,18 +162,142 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 	return nil
 }
 
+// copyBetween runs the copy between the local sqlite file and an opened
+// shared store, in the direction opt names. sharedLabel identifies the shared
+// side in the record the copy leaves (legacy_imports).
+func copyBetween(ctx context.Context, paths config.Paths, shared *store.Store, sharedLabel string,
+	opt migrateArgs) (*store.MigrateReport, error) {
+	sqliteStore, err := store.Open(paths.DBPath())
+	if err != nil {
+		return nil, fmt.Errorf("open the local database: %w", err)
+	}
+	defer sqliteStore.Close()
+
+	mo := store.MigrateOptions{AllNodes: opt.allNodes, Force: opt.force}
+	if opt.toSQLite {
+		mo.Src, mo.Dst = shared, sqliteStore
+		mo.SourceLabel = sharedLabel
+	} else {
+		mo.Src, mo.Dst = sqliteStore, shared
+		mo.SourceLabel = paths.DBPath()
+	}
+	rep, err := store.Migrate(ctx, mo)
+	if err != nil {
+		if errors.Is(err, store.ErrDestinationNotEmpty) {
+			return nil, destinationNotEmptyError(err, opt)
+		}
+		return nil, err
+	}
+	return rep, nil
+}
+
+// resolveMigrateShared names the shared engine on the other side of the copy.
+// Going up it is the target. Going to sqlite it is --from when given, else the
+// configured engine when that is shared, else whichever shared engine has a URL
+// — and refuses rather than guesses when both do.
+func resolveMigrateShared(opt migrateArgs, cfg config.Config) (string, error) {
+	if !opt.toSQLite || opt.shared != "" {
+		return opt.shared, nil
+	}
+	if cfg.Database.IsShared() {
+		return cfg.Database.Engine, nil
+	}
+	turso, lib := cfg.Database.TursoDatabaseURL != "", cfg.Database.LibSQLURL != ""
+	switch {
+	case turso && lib:
+		return "", errors.New("both database.turso_database_url and database.libsql_url are set, so it is not clear " +
+			"which shared database to copy out of: pass --from turso or --from libsql")
+	case lib:
+		return config.EngineLibSQL, nil
+	default:
+		// turso, or neither — the turso path reports the missing URL.
+		return config.EngineTurso, nil
+	}
+}
+
+// runMigrateLibSQL is runMigrate against a libsql server. It differs from the
+// turso path in what there is NOT: no local replica to back up (the server is
+// the only copy — it is said so, not implied), no pull or push to frame the
+// copy (every statement already runs on the server), and no pause to honour.
+func runMigrateLibSQL(ctx context.Context, paths config.Paths, cfg config.Config, out io.Writer, opt migrateArgs) error {
+	if cfg.Database.LibSQLURL == "" {
+		return errors.New("database.libsql_url is not set, so there is no shared database to copy to or from.\n" +
+			"Run `hap config set database.libsql_url <url>` (and the auth token) first")
+	}
+	if opt.toSQLite {
+		backup, err := backupBeforeMigrate(paths.DBPath())
+		if err != nil {
+			return err
+		}
+		if backup != "" {
+			fmt.Fprintf(out, "backed up the destination to %s\n", backup)
+		}
+	}
+	ldb, err := libsql.Open(ctx, libsql.Options{URL: cfg.Database.LibSQLURL, AuthToken: cfg.Database.LibSQLToken()})
+	if err != nil {
+		return fmt.Errorf("open the shared database: %w", err)
+	}
+	defer ldb.Close()
+	nodeID, err := store.LoadNodeID(paths.StateDir)
+	if err != nil {
+		return err
+	}
+	shared, err := store.OpenDB(ldb.DB(), store.Options{
+		NodeID: nodeID, Engine: store.EngineLibSQL,
+		IDs: store.NewTimeOrderedIDs(store.NodeBits(nodeID), nil),
+		// As the daemon does: DDL on a shared database only under the lease.
+		Migrate: false, AgentLockDir: filepath.Join(paths.StateDir, "agent-automation-locks"),
+	})
+	if err != nil {
+		return err
+	}
+	defer shared.Close()
+	if err := turso.PrepareSharedSchema(ctx, ldb, shared, time.Now); err != nil {
+		return fmt.Errorf("prepare the shared database's schema: %w", err)
+	}
+	if err := refuseNodeBitsCollision(ctx, shared, opt, paths.StateDir); err != nil {
+		return err
+	}
+	if !opt.toSQLite {
+		// Said BEFORE the copy, because it is a cost the operator may want to
+		// schedule: the copy is one transaction, one round trip per row, and
+		// the server holds its write lock for all of it.
+		fmt.Fprintf(out, "copying into the libsql server at %s (round trip ~%s): the copy is ONE transaction\n"+
+			"costing about one round trip per row, and other nodes' writes wait on it until it commits.\n"+
+			"The server is not backed up by this command.\n\n",
+			libsql.NormalizeURL(cfg.Database.LibSQLURL), ldb.ProbeRTT().Round(time.Millisecond))
+	}
+	rep, err := copyBetween(ctx, paths, shared, libsql.NormalizeURL(cfg.Database.LibSQLURL), opt)
+	var expired *libsql.StreamClosedError
+	if errors.As(err, &expired) {
+		// The copy is one transaction; the server dropped its stream (sqld
+		// expires one left idle ~10s) and rolled it back. Nothing was copied.
+		return fmt.Errorf("%w\nThe server dropped the copy's transaction before it committed, so NOTHING was "+
+			"copied and the destination is as it was. It is safe to run the command again; if it keeps "+
+			"happening, the link to the server is stalling — run it from a machine nearer the server", err)
+	}
+	if err != nil {
+		return err
+	}
+	printMigrateReport(out, rep, opt, false)
+	return nil
+}
+
 // migrateArgs is one parsed invocation.
 type migrateArgs struct {
 	// toSQLite is the DIRECTION: true copies the shared database into this
 	// machine's local file, false copies the local file into the shared one.
 	toSQLite bool
+	// shared names the shared engine on the other side: the target going up,
+	// --from going to sqlite ("" = decide from the config).
+	shared   string
 	allNodes bool
 	force    bool
 }
 
 func parseMigrateArgs(args []string) (migrateArgs, error) {
 	var out migrateArgs
-	target := ""
+	target, from := "", ""
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
 		case a == "--to" && i+1 < len(args):
@@ -191,6 +305,11 @@ func parseMigrateArgs(args []string) (migrateArgs, error) {
 			target = args[i]
 		case strings.HasPrefix(a, "--to="):
 			target = strings.TrimPrefix(a, "--to=")
+		case a == "--from" && i+1 < len(args):
+			i++
+			from = args[i]
+		case strings.HasPrefix(a, "--from="):
+			from = strings.TrimPrefix(a, "--from=")
 		case a == "--all-nodes":
 			out.allNodes = true
 		case a == "--force":
@@ -202,12 +321,22 @@ func parseMigrateArgs(args []string) (migrateArgs, error) {
 	switch target {
 	case config.EngineSQLite:
 		out.toSQLite = true
-	case config.EngineTurso:
-		out.toSQLite = false
+	case config.EngineTurso, config.EngineLibSQL:
+		out.shared = target
 	case "":
-		return out, errors.New("usage: hap migrate --to <sqlite|turso> (see: hap help migrate)")
+		return out, errors.New("usage: hap migrate --to <sqlite|turso|libsql> (see: hap help migrate)")
 	default:
-		return out, fmt.Errorf("--to must be %s or %s, got %q", config.EngineSQLite, config.EngineTurso, target)
+		return out, fmt.Errorf("--to must be %s, %s or %s, got %q",
+			config.EngineSQLite, config.EngineTurso, config.EngineLibSQL, target)
+	}
+	switch {
+	case from == "":
+	case !out.toSQLite:
+		return out, errors.New("--from only applies to `--to sqlite`: going up, the source is this machine's local database")
+	case from == config.EngineTurso || from == config.EngineLibSQL:
+		out.shared = from
+	default:
+		return out, fmt.Errorf("--from must be %s or %s, got %q", config.EngineTurso, config.EngineLibSQL, from)
 	}
 	if out.allNodes && !out.toSQLite {
 		// Going the other way there is only ever one node's data to send: the
@@ -277,7 +406,11 @@ func copyFileIfPresent(src, dst string) (bool, error) {
 func printMigrateReport(out io.Writer, rep *store.MigrateReport, opt migrateArgs, paused bool) {
 	dst, next := "the local sqlite database", config.EngineSQLite
 	if !opt.toSQLite {
-		dst, next = "the shared turso database", config.EngineTurso
+		next = opt.shared
+		if next == "" {
+			next = config.EngineTurso
+		}
+		dst = "the shared " + next + " database"
 	}
 	scope := "this node's rows"
 	if opt.allNodes {
@@ -352,6 +485,10 @@ func destinationNotEmptyError(err error, opt migrateArgs) error {
 		"have decided the duplication is acceptable"
 	if opt.toSQLite {
 		return fmt.Errorf(head+" (the backup above is the way back)", err)
+	}
+	if opt.shared == config.EngineLibSQL {
+		return fmt.Errorf(head+".\nGoing to libsql there is NO way back: a forced copy is written straight to the\n"+
+			"server every node reads, and this command takes no backup of it", err)
 	}
 	return fmt.Errorf(head+".\nGoing to turso there is NO way back: a forced copy is published to Turso Cloud\n"+
 		"(immediately, or on the first push after database.turso_sync_paused is lifted) and\n"+

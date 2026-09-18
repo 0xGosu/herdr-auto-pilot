@@ -10,6 +10,17 @@ import (
 	"time"
 )
 
+// SchemaSyncer is what the schema lease needs from a shared engine: the handle
+// and the two sync directions. The turso engine's *DB pulls and pushes its
+// replica; the libsql engine's (internal/store/libsql) has no replica — every
+// statement already lands on the server — so its Pull and Push are checks, and
+// the lease is simply judged by the one authoritative server.
+type SchemaSyncer interface {
+	DB() *sql.DB
+	Pull() (changed bool, err error)
+	Push() error
+}
+
 // SchemaOwner is what PrepareSharedSchema needs from the store.
 type SchemaOwner interface {
 	NodeID() string
@@ -23,7 +34,7 @@ type SchemaOwner interface {
 // node was migrating under. The migration stops before its next DDL: the
 // other node is (or will be) migrating, and two nodes' identical DDL is the
 // wedge the lease exists to prevent.
-var ErrSchemaLeaseLost = errors.New("turso: the schema lease was taken by another node during this node's migration")
+var ErrSchemaLeaseLost = errors.New("shared schema: the schema lease was taken by another node during this node's migration")
 
 // SchemaMigrationWait bounds how long a node waits for ANOTHER node's
 // migration to arrive before giving up. It fails closed: elapsed time alone
@@ -66,11 +77,11 @@ const createSchemaLease = `CREATE TABLE IF NOT EXISTS hap_schema_lease (
 // lease expires (the lead died mid-migration) and can be claimed. A node that
 // cannot establish the lease — offline, or the lead never finishes — returns
 // an error rather than migrating blind: elapsed time is not ownership.
-func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() time.Time) error {
+func PrepareSharedSchema(ctx context.Context, db SchemaSyncer, s SchemaOwner, now func() time.Time) error {
 	if _, err := db.Pull(); err != nil {
 		// Offline is not fatal for a node whose schema is already current: the
 		// local file is authoritative until the remote is back.
-		slog.Warn("turso: pull before schema check failed", "error", err)
+		slog.Warn("shared schema: pull before schema check failed", "error", err)
 	}
 	current, err := s.SchemaCurrent(ctx)
 	if err != nil {
@@ -80,13 +91,13 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 		return nil
 	}
 	if _, err := db.DB().ExecContext(ctx, createSchemaLease); err != nil {
-		return fmt.Errorf("turso: schema lease table: %w", err)
+		return fmt.Errorf("shared schema: schema lease table: %w", err)
 	}
 	deadline := now().Add(SchemaMigrationWait)
 	for {
 		owner, expires, err := readSchemaLease(ctx, db.DB())
 		if err != nil {
-			return fmt.Errorf("turso: read schema lease: %w", err)
+			return fmt.Errorf("shared schema: read schema lease: %w", err)
 		}
 		if owner == "" || owner == s.NodeID() || leaseExpired(expires, now()) {
 			got, err := AcquireSchemaLease(ctx, db, s.NodeID(), now)
@@ -94,7 +105,7 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 				return err
 			}
 			if got {
-				slog.Info("turso: this node leads the schema migration")
+				slog.Info("shared schema: this node leads the schema migration")
 				// Hold the lease for as long as the migration takes, and
 				// re-PROVE it between steps: a background renewal alone can
 				// be starved by a step's own write lock, so ownership is
@@ -116,19 +127,19 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 					return err
 				}
 				if err := releaseSchemaLease(ctx, db.DB(), s.NodeID()); err != nil {
-					slog.Warn("turso: schema lease not released; it expires on its own", "error", err)
+					slog.Warn("shared schema: schema lease not released; it expires on its own", "error", err)
 				}
 				if err := db.Push(); err != nil {
-					return fmt.Errorf("turso: push after migration: %w", err)
+					return fmt.Errorf("shared schema: push after migration: %w", err)
 				}
 				return nil
 			}
 			// Someone else won the claim; fall through to waiting.
 		} else {
-			slog.Info("turso: another node leads the schema migration; waiting for it", "node", owner)
+			slog.Info("shared schema: another node leads the schema migration; waiting for it", "node", owner)
 		}
 		if now().After(deadline) {
-			return fmt.Errorf("turso: the shared schema still needs migrating after %s and node %s holds the lease; "+
+			return fmt.Errorf("shared schema: the shared schema still needs migrating after %s and node %s holds the lease; "+
 				"refusing to migrate concurrently — check that node's daemon, or delete its hap_schema_lease row once it is gone",
 				SchemaMigrationWait, owner)
 		}
@@ -138,7 +149,7 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 		case <-time.After(schemaPollInterval):
 		}
 		if _, err := db.Pull(); err != nil {
-			slog.Warn("turso: pull while waiting for the schema failed", "error", err)
+			slog.Warn("shared schema: pull while waiting for the schema failed", "error", err)
 		}
 		current, err := s.SchemaCurrent(ctx)
 		if err != nil {
@@ -164,16 +175,16 @@ func PrepareSharedSchema(ctx context.Context, db *DB, s SchemaOwner, now func() 
 // holder's row is therefore only ever read fresh, and a lease counts as
 // expired only once it is a full renewal period past its expiry
 // (leaseExpired), so pull latency cannot make a renewing holder look dead.
-func AcquireSchemaLease(ctx context.Context, db *DB, self string, now func() time.Time) (bool, error) {
+func AcquireSchemaLease(ctx context.Context, db SchemaSyncer, self string, now func() time.Time) (bool, error) {
 	if _, err := db.DB().ExecContext(ctx, createSchemaLease); err != nil {
-		return false, fmt.Errorf("turso: schema lease table: %w", err)
+		return false, fmt.Errorf("shared schema: schema lease table: %w", err)
 	}
 	if _, err := db.Pull(); err != nil {
-		return false, fmt.Errorf("turso: pull before schema lease claim: %w", err)
+		return false, fmt.Errorf("shared schema: pull before schema lease claim: %w", err)
 	}
 	owner, expires, err := readSchemaLease(ctx, db.DB())
 	if err != nil {
-		return false, fmt.Errorf("turso: read schema lease: %w", err)
+		return false, fmt.Errorf("shared schema: read schema lease: %w", err)
 	}
 	if owner != "" && owner != self && !leaseExpired(expires, now()) {
 		return false, nil // held by a live node; nothing is written, nothing pushed
@@ -184,10 +195,10 @@ func AcquireSchemaLease(ctx context.Context, db *DB, self string, now func() tim
 		ON CONFLICT(id) DO UPDATE SET node_id = excluded.node_id, expires_at = excluded.expires_at
 		WHERE hap_schema_lease.expires_at + ? <= ? OR hap_schema_lease.node_id = excluded.node_id`,
 		self, t.Add(schemaLeaseTTL).UnixMilli(), schemaLeaseRenew.Milliseconds(), t.UnixMilli()); err != nil {
-		return false, fmt.Errorf("turso: claim schema lease: %w", err)
+		return false, fmt.Errorf("shared schema: claim schema lease: %w", err)
 	}
 	if err := db.Push(); err != nil {
-		return false, fmt.Errorf("turso: push schema lease claim: %w", err)
+		return false, fmt.Errorf("shared schema: push schema lease claim: %w", err)
 	}
 	select {
 	case <-ctx.Done():
@@ -195,11 +206,11 @@ func AcquireSchemaLease(ctx context.Context, db *DB, self string, now func() tim
 	case <-time.After(schemaPollInterval):
 	}
 	if _, err := db.Pull(); err != nil {
-		return false, fmt.Errorf("turso: pull after schema lease claim: %w", err)
+		return false, fmt.Errorf("shared schema: pull after schema lease claim: %w", err)
 	}
 	owner, expires, err = readSchemaLease(ctx, db.DB())
 	if err != nil {
-		return false, fmt.Errorf("turso: read schema lease: %w", err)
+		return false, fmt.Errorf("shared schema: read schema lease: %w", err)
 	}
 	return owner == self && expires > now().UnixMilli(), nil
 }
@@ -222,7 +233,7 @@ func leaseExpired(expiresMs int64, now time.Time) bool {
 // if the row no longer names this node (ErrSchemaLeaseLost) or if renewals have
 // been failing for longer than the lease can have survived.
 type leaseHold struct {
-	db     *DB
+	db     SchemaSyncer
 	self   string
 	now    func() time.Time
 	mu     sync.Mutex
@@ -231,7 +242,7 @@ type leaseHold struct {
 	done   chan struct{}
 }
 
-func newLeaseHold(db *DB, self string, now func() time.Time) *leaseHold {
+func newLeaseHold(db SchemaSyncer, self string, now func() time.Time) *leaseHold {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &leaseHold{db: db, self: self, now: now, lastOK: now(), cancel: cancel, done: make(chan struct{})}
 	go func() {
@@ -244,7 +255,7 @@ func newLeaseHold(db *DB, self string, now func() time.Time) *leaseHold {
 				return
 			case <-t.C:
 				if err := h.verify(); err != nil {
-					slog.Warn("turso: schema lease renewal", "error", err)
+					slog.Warn("shared schema: schema lease renewal", "error", err)
 				}
 			}
 		}
@@ -277,7 +288,7 @@ func (h *leaseHold) check(strict bool) error {
 	defer h.mu.Unlock()
 	fail := func(err error) error {
 		if strict {
-			return fmt.Errorf("turso: the schema lease could not be freshly proved before publishing the migration; "+
+			return fmt.Errorf("shared schema: the schema lease could not be freshly proved before publishing the migration; "+
 				"refusing to publish (start the daemon again once the remote answers): %w", err)
 		}
 		return h.tolerate(err)
@@ -303,10 +314,10 @@ func (h *leaseHold) check(strict bool) error {
 
 func (h *leaseHold) tolerate(err error) error {
 	if h.now().Sub(h.lastOK) < schemaLeaseTTL {
-		slog.Warn("turso: schema lease renewal failed; the lease still stands", "error", err)
+		slog.Warn("shared schema: schema lease renewal failed; the lease still stands", "error", err)
 		return nil
 	}
-	return fmt.Errorf("turso: the schema lease could not be renewed for %s and may have lapsed; refusing to continue the migration: %w",
+	return fmt.Errorf("shared schema: the schema lease could not be renewed for %s and may have lapsed; refusing to continue the migration: %w",
 		schemaLeaseTTL, err)
 }
 

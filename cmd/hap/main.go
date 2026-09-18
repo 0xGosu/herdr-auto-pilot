@@ -444,16 +444,19 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 	})
 	defer survived.Stop()
 
-	// The store, under the configured engine. turso: the daemon is the one
-	// process that opens the sync database; it serves it to every other hap
-	// process on this machine over the store socket, and syncs it with Turso
-	// Cloud from the fleet sync loop.
+	// The store, under the configured engine. turso and libsql are SHARED: the
+	// daemon is the one process that opens the database (turso's local sync
+	// replica, or libsql's connection to the server); it serves it to every
+	// other hap process on this machine over the store socket, and the fleet
+	// sync loop syncs the replica with Turso Cloud — or, under libsql, checks
+	// the server for other nodes' writes.
 	var st *store.Store
 	var fleet ports.FleetSyncPort
+	var fleetEngine store.Engine
 	var fleetWrites chan struct{}
 	var storeSocket string
 	var nodeID string
-	if bootCfg.Database.IsTurso() {
+	if bootCfg.Database.IsShared() {
 		if err := config.ValidateDatabase(bootCfg); err != nil {
 			return err
 		}
@@ -461,16 +464,21 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		if nodeID, err = store.LoadNodeID(paths.StateDir); err != nil {
 			return err
 		}
-		fleetWrites = make(chan struct{}, 1)
-		tdb, err := openTurso(ctx, paths, bootCfg, nodeID, fleetWrites, time.Now())
+		if bootCfg.Database.IsTurso() {
+			// Only turso's replica has anything to push; a libsql write is
+			// already on the server when it commits.
+			fleetWrites = make(chan struct{}, 1)
+		}
+		tdb, engine, err := openShared(ctx, paths, bootCfg, nodeID, fleetWrites, time.Now())
 		if err != nil {
-			return fmt.Errorf("turso: %w", err)
+			return fmt.Errorf("%s: %w", bootCfg.Database.Engine, err)
 		}
 		defer tdb.Close()
+		fleetEngine = engine
 		ids := store.NewTimeOrderedIDs(store.NodeBits(nodeID), nil)
 		st, err = store.OpenDB(tdb.DB(), store.Options{
 			NodeID:       nodeID,
-			Engine:       store.EngineTurso,
+			Engine:       engine,
 			IDs:          ids,
 			Migrate:      false,
 			AgentLockDir: filepath.Join(paths.StateDir, "agent-automation-locks"),
@@ -482,7 +490,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		// Pull, then migrate only as the schema lead: two nodes issuing the
 		// same DDL wedge the loser (see turso.PrepareSharedSchema).
 		if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
-			return fmt.Errorf("turso: prepare schema: %w", err)
+			return fmt.Errorf("%s: prepare schema: %w", engine, err)
 		}
 		// Ids carry 12 bits of the node id; two nodes sharing them would share
 		// an id space. Refuse now, before this node writes anything, rather
@@ -492,12 +500,18 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 			if label == "" {
 				label = other.ID
 			}
-			return fmt.Errorf("turso: this node's id bits collide with node %s (%s), so ids minted here could equal "+
+			return fmt.Errorf("%s: this node's id bits collide with node %s (%s), so ids minted here could equal "+
 				"that machine's — stop this daemon, move %s aside and start again on whichever of the two machines has "+
 				"never written to the shared store (its rows would otherwise stay filed under the old id)",
-				label, other.ID, filepath.Join(paths.StateDir, store.NodeIDFile))
+				engine, label, other.ID, filepath.Join(paths.StateDir, store.NodeIDFile))
 		}
-		if err := importLegacyStore(ctx, paths, st); err != nil {
+		if engine == store.EngineLibSQL {
+			// Never automatic under libsql: the copy is ONE transaction paying a
+			// server round trip per row, holding the server's write lock (every
+			// other node's writes wait) for as long as that takes. The operator
+			// runs it deliberately, with the daemon stopped.
+			noteLegacyStoreNotImported(paths)
+		} else if err := importLegacyStore(ctx, paths, st); err != nil {
 			slog.Warn("turso: importing the local sqlite database failed; continuing without it", "error", err)
 		}
 		storeSocket = paths.StoreSocketPath()
@@ -646,9 +660,11 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		SendTask:      fspApp.SendTaskForOperator,
 		MatchIndexDir: filepath.Join(paths.StateDir, "match-index"),
 		StateDir:      paths.StateDir,
-		// The shared database's sync engine and its write signal (turso only;
-		// both nil under sqlite, and the loop never runs).
+		// The shared database's sync engine and its write signal (both nil
+		// under sqlite, and the loop never runs; the write signal is nil under
+		// libsql too, which has nothing to push).
 		FleetSync:         fleet,
+		FleetEngine:       string(fleetEngine),
 		FleetSyncInterval: bootCfg.Database.SyncInterval(),
 		FleetWrites:       fleetWrites,
 		NodeLabel:         bootCfg.Database.NodeLabel,

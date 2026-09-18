@@ -217,3 +217,24 @@ func TestADeliberatePauseIsNeverAFailure(t *testing.T) {
 		t.Errorf("unpaused status line = %q, want ISOLATED", running.Line(now))
 	}
 }
+
+// TestTheLibSQLLineSpeaksOfAServerNotAReplica: the libsql engine has no
+// replica, so "unpushed" and "last pull" describe nothing there; its line
+// says what a check actually proves.
+func TestTheLibSQLLineSpeaksOfAServerNotAReplica(t *testing.T) {
+	now := time.Now()
+	ok := &FleetSyncHealth{Engine: EngineLibSQL, Bootstrapped: true, LastPullAt: now.Add(-3 * time.Second)}
+	if line := ok.Line(now); !strings.Contains(line, "ok") || !strings.Contains(line, "server last answered 3s ago") ||
+		strings.Contains(line, "unpushed") {
+		t.Errorf("healthy libsql line = %q", line)
+	}
+	down := &FleetSyncHealth{Engine: EngineLibSQL, Bootstrapped: true, LastError: "connection refused",
+		LastPullAt: now.Add(-10 * time.Minute), ConsecutiveFailures: 40}
+	if line := down.Line(now); !strings.Contains(line, "ISOLATED") || !strings.Contains(line, "connection refused") {
+		t.Errorf("isolated libsql line = %q", line)
+	}
+	waiting := &FleetSyncHealth{Engine: EngineLibSQL, Bootstrapped: false, LastError: "unauthorized"}
+	if line := waiting.Line(now); !strings.Contains(line, "NOT REACHED") || strings.Contains(line, "BOOTSTRAP") {
+		t.Errorf("unreached libsql line = %q", line)
+	}
+}

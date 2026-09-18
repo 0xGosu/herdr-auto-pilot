@@ -1,14 +1,18 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	_ "turso.tech/database/tursogo"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsql"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsql/hranafake"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
@@ -37,22 +41,101 @@ func TestMain(m *testing.M) {
 	// remote), through the gate the daemon uses. This is what proves every
 	// statement the store issues is one Turso accepts and answers like SQLite.
 	_ = os.Setenv(storeTestModeEnv, "turso")
+	if code := m.Run(); code != 0 {
+		os.Exit(code)
+	}
+	// Fourth pass: the libsql ENGINE — every statement a Hrana pipeline to a
+	// server (an in-process fake over SQLite), through the same gate and
+	// driver the daemon uses. This proves every statement survives the
+	// protocol: one statement per execute, integers as strings, transactions
+	// on batons, and the schema's batches as sequences.
+	_ = os.Setenv(storeTestModeEnv, "libsql")
 	os.Exit(m.Run())
 }
 
-func proxyMode() bool { return os.Getenv(storeTestModeEnv) == "proxy" }
-func tursoMode() bool { return os.Getenv(storeTestModeEnv) == "turso" }
+func proxyMode() bool  { return os.Getenv(storeTestModeEnv) == "proxy" }
+func tursoMode() bool  { return os.Getenv(storeTestModeEnv) == "turso" }
+func libsqlMode() bool { return os.Getenv(storeTestModeEnv) == "libsql" }
 
-// openTestStoreTurso opens a store on the Turso engine: a local database file
-// opened by the SDK's driver, behind the sqlbridge gate, with allocated ids and
-// the AUTOINCREMENT-free schema — the daemon's shape minus the sync engine.
-func openTestStoreTurso(t *testing.T, path string) *Store {
+// sharedMode is a pass on a SHARED engine: ids allocated, the schema without
+// AUTOINCREMENT, and no SQLite driver to reopen the file with.
+func sharedMode() bool { return tursoMode() || libsqlMode() }
+
+// fakeServers holds one fake libsql server per database file, so every handle
+// a test opens on that file — a second process, a second node — talks to the
+// same server, as machines sharing one database do.
+var (
+	fakeServersMu sync.Mutex
+	fakeServers   = map[string]*hranafake.Server{}
+)
+
+func fakeServerFor(t *testing.T, path string) *hranafake.Server {
+	t.Helper()
+	fakeServersMu.Lock()
+	defer fakeServersMu.Unlock()
+	if srv, ok := fakeServers[path]; ok {
+		return srv
+	}
+	srv, err := hranafake.New(path)
+	if err != nil {
+		t.Fatalf("fake libsql server: %v", err)
+	}
+	fakeServers[path] = srv
+	t.Cleanup(func() {
+		fakeServersMu.Lock()
+		delete(fakeServers, path)
+		fakeServersMu.Unlock()
+		srv.Close()
+	})
+	return srv
+}
+
+// openLibSQLHandle is one libsql-engine handle on the fake server for path, as
+// the given node: the daemon's shape (gate, pool, allocated ids) minus HTTP.
+func openLibSQLHandle(t *testing.T, path, nodeID string, migrate bool) *Store {
+	t.Helper()
+	db, err := libsql.Open(context.Background(), libsql.Options{
+		URL: "https://fake.invalid", Transport: fakeServerFor(t, path), Connections: 6,
+	})
+	if err != nil {
+		t.Fatalf("open libsql engine: %v", err)
+	}
+	s, err := OpenDB(db.DB(), Options{
+		NodeID:       nodeID,
+		Engine:       EngineLibSQL,
+		IDs:          NewTimeOrderedIDs(NodeBits(nodeID), nil),
+		Migrate:      migrate,
+		AgentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks-"+nodeID),
+	})
+	if err != nil {
+		db.Close()
+		t.Fatalf("open store on libsql: %v", err)
+	}
+	t.Cleanup(func() {
+		s.Close()
+		db.Close()
+	})
+	return s
+}
+
+// openSharedHandle opens a handle in whichever shared engine the pass runs.
+func openSharedHandle(t *testing.T, path, nodeID string, migrate bool) *Store {
+	t.Helper()
+	if libsqlMode() {
+		return openLibSQLHandle(t, path, nodeID, migrate)
+	}
+	return openTursoHandle(t, path, nodeID, migrate)
+}
+
+// openTestStoreShared opens the first handle on path in the pass's shared
+// engine, as this machine's node.
+func openTestStoreShared(t *testing.T, path string) *Store {
 	t.Helper()
 	nodeID, err := LoadNodeID(filepath.Dir(path))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return openTursoHandle(t, path, nodeID, true)
+	return openSharedHandle(t, path, nodeID, true)
 }
 
 // openTursoHandle is one Turso-engine handle on path as the given node. Two
@@ -91,14 +174,14 @@ func openTursoHandle(t *testing.T, path, nodeID string, migrate bool) *Store {
 // another process on this machine would — in the engine the pass runs on.
 func openStoreAt(t *testing.T, path string) *Store {
 	t.Helper()
-	if tursoMode() {
+	if sharedMode() {
 		nodeID, err := LoadNodeID(filepath.Dir(path))
 		if err != nil {
 			t.Fatal(err)
 		}
 		// Migration is idempotent, and a test may open its FIRST handle this
 		// way (Open itself migrates on the sqlite path).
-		return openTursoHandle(t, path, nodeID, true)
+		return openSharedHandle(t, path, nodeID, true)
 	}
 	s, err := Open(path)
 	if err != nil {
@@ -112,8 +195,8 @@ func openStoreAt(t *testing.T, path string) *Store {
 // second machine sharing a store would see it.
 func openSecondNode(t *testing.T, path, nodeID string) *Store {
 	t.Helper()
-	if tursoMode() {
-		return openTursoHandle(t, path, nodeID, false)
+	if sharedMode() {
+		return openSharedHandle(t, path, nodeID, false)
 	}
 	s, err := OpenAs(path, nodeID)
 	if err != nil {
@@ -126,7 +209,7 @@ func openSecondNode(t *testing.T, path, nodeID string) *Store {
 // skipUnlessSQLite marks a test that inspects the SQLite driver itself.
 func skipUnlessSQLite(t *testing.T) {
 	t.Helper()
-	if tursoMode() {
+	if sharedMode() {
 		t.Skip("sqlite-engine specific")
 	}
 }

@@ -374,10 +374,37 @@ Two things to expect when checking a migration:
   to double. Below any threshold hap compares against; do not read it as
   corruption.
 
+## the libsql engine (any libsql server)
+
+`turso` only works with servers speaking Turso's sync protocol (Turso Cloud,
+`tursodb --sync-server`); a plain `sqld` — self-hosted or a provider such as
+Layerbase — answers 404 to it. `engine = "libsql"` shares the same store
+through ANY libsql server over Hrana (HTTP):
+
+```bash
+hap config set database.libsql_url libsql://<db>.<provider>   # or https://…, http://host:8080
+hap config set database.libsql_auth_token '<token>'            # or export LIBSQL_AUTH_TOKEN
+hap config set database.engine libsql
+hap daemon --restart
+```
+
+- **No local copy**: every store statement is a server round trip, and the
+  daemon warns at start when the server is far (>100 ms). Prefer a nearby server.
+- Other nodes' writes are picked up by a change check every
+  `libsql_poll_interval_seconds`; `turso_sync_paused` has no effect.
+- `hap status` → `fleet sync: libsql — ok (server last answered …)`; while the
+  server cannot be reached it reads `SERVER NOT REACHED YET` (start) or
+  `DEGRADED`/`ISOLATED`, and every store read/write on that machine fails.
+- The local database is **never imported automatically**. With the daemon
+  stopped: `hap migrate --to libsql` (one transaction, a round trip per row —
+  run it before other machines join), and `hap migrate --to sqlite --from libsql`
+  to go back.
+- Same schema as turso: a Turso Cloud database can be served by either engine.
+
 ## several machines (fleet)
 
-With `[database] engine = "turso"` (see above) every machine pointed at the same
-Turso Cloud database shares one hap. From any of them:
+With `[database] engine = "turso"` or `"libsql"` (see above) every machine
+pointed at the same database shares one hap. From any of them:
 
 ```bash
 hap status                        # fleet sync: …, other nodes: <label> (fresh|stale)
@@ -590,10 +617,13 @@ tab-separated stdout is unaffected.
 | `task_source_provider.timeout_seconds` | 20 | per remote store call |
 | `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |
 | `task_source_provider.github_gist.gist_id` | (none) | the gist hex id |
-| `database.engine` | sqlite | `sqlite` (local file) or `turso` (central database several machines share) |
+| `database.engine` | sqlite | `sqlite` (local file), `turso` (central database, local replica synced with Turso Cloud) or `libsql` (central database on any libsql server, over Hrana, no local copy) |
 | `database.turso_database_url` | (none) | the Turso Cloud database, from `turso db show <db>` |
 | `database.turso_auth_token` | (none) | its token; rendered `(set)`, never printed; empty = `$TURSO_AUTH_TOKEN` |
 | `database.turso_sync_interval_seconds` | 15 | how often the daemon pulls from Turso Cloud (min 5) |
+| `database.libsql_url` | (none) | the libsql server for `engine = libsql`: `libsql://…`, `https://…` or `http://host:port` |
+| `database.libsql_auth_token` | (none) | its token; rendered `(set)`, never printed; empty = `$LIBSQL_AUTH_TOKEN` (a server without auth needs none) |
+| `database.libsql_poll_interval_seconds` | 15 | how often the daemon checks the server for other nodes' writes (min 5) |
 | `database.node_label` | (hostname) | how other machines see this one beside its agents |
 | `tui.palette.<role>` | theme default | `title`, `section`, `error`, `ok`, `paused`, `running`, `warn`, `help` |
 

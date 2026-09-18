@@ -2528,6 +2528,11 @@ var ConfigFields = []ConfigFieldDef{
 	// Turso incident) and then has to remember to lift, so hiding it behind
 	// `hap config fields` would hide a herd that is off the wire.
 	{Key: "database.turso_sync_paused", TUIEditable: true},
+	// The libsql engine's three, shaped like turso's: the URL read-only in the
+	// TUI, the token redacted and off the Config tab, the poll interval hidden.
+	{Key: "database.libsql_url"},
+	{Key: "database.libsql_auth_token", TUIHidden: true},
+	{Key: "database.libsql_poll_interval_seconds", TUIEditable: true, TUIHidden: true},
 	{Key: "database.node_label"},
 	// Palette roles are TUIHidden, not absent: eight color strings would bury
 	// the settings a TUI operator actually reaches for, but `hap config fields`
@@ -2939,6 +2944,19 @@ func FieldValue(cfg config.Config, key string) string {
 		return defaultedInt(cfg.Database.TursoSyncIntervalSeconds, config.DefaultTursoSyncIntervalSeconds)
 	case "database.turso_sync_paused":
 		return strconv.FormatBool(cfg.Database.TursoSyncPaused)
+	case "database.libsql_url":
+		return pathFieldValue(cfg.Database.LibSQLURL)
+	case "database.libsql_auth_token":
+		// Never the value, as for turso_auth_token.
+		if strings.TrimSpace(cfg.Database.LibSQLAuthToken) != "" {
+			return "(set)"
+		}
+		if os.Getenv(config.LibSQLAuthTokenEnv) != "" {
+			return "(from " + config.LibSQLAuthTokenEnv + ")"
+		}
+		return "(none)"
+	case "database.libsql_poll_interval_seconds":
+		return defaultedInt(cfg.Database.LibSQLPollIntervalSeconds, config.DefaultLibSQLPollIntervalSeconds)
 	case "database.node_label":
 		if strings.TrimSpace(cfg.Database.NodeLabel) == "" {
 			return "(hostname)"
@@ -3548,6 +3566,31 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("database.turso_sync_paused must be true or false, got %q", value)
 			}
 			cfg.Database.TursoSyncPaused = v
+			return nil
+		case "database.libsql_url":
+			// Shape only, and not against the engine (order-independent keys).
+			// A WebSocket URL is refused here rather than at daemon start: this
+			// engine speaks Hrana over HTTP only.
+			u := strings.TrimSpace(value)
+			if strings.ContainsAny(u, " \t\r\n") {
+				return fmt.Errorf("database.libsql_url must be a single URL, got %q", value)
+			}
+			if u != "" && !strings.HasPrefix(u, "libsql://") && !strings.HasPrefix(u, "https://") &&
+				!strings.HasPrefix(u, "http://") {
+				return fmt.Errorf("database.libsql_url must start with libsql://, https:// or http://, got %q", value)
+			}
+			cfg.Database.LibSQLURL = u
+			return nil
+		case "database.libsql_auth_token":
+			cfg.Database.LibSQLAuthToken = strings.TrimSpace(value)
+			return nil
+		case "database.libsql_poll_interval_seconds":
+			v, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || v < 0 {
+				return fmt.Errorf("database.libsql_poll_interval_seconds must be a non-negative "+
+					"integer (0 = the built-in %d), got %q", config.DefaultLibSQLPollIntervalSeconds, value)
+			}
+			cfg.Database.LibSQLPollIntervalSeconds = v
 			return nil
 		case "database.node_label":
 			l := strings.TrimSpace(value)

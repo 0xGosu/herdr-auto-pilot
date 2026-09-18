@@ -57,7 +57,19 @@ const (
 	// created without AUTOINCREMENT — and nothing else: every statement is the
 	// same, node-scoped, on both engines.
 	EngineTurso Engine = "turso"
+	// EngineLibSQL is the opt-in central database reached over Hrana: no local
+	// file at all, every statement a round trip to a libsql server (Turso
+	// Cloud, a self-hosted sqld, any Hrana provider). The daemon alone holds
+	// the connection and serves it to the other processes, exactly as under
+	// turso, and it is SHARED in the same two ways.
+	EngineLibSQL Engine = "libsql"
 )
+
+// Shared reports whether the engine is one several machines write into —
+// turso or libsql. Both allocate ids (never AUTOINCREMENT) and create the
+// schema without AUTOINCREMENT, so one remote database can be served by either
+// engine and a `hap migrate` round trip holds across them.
+func (e Engine) Shared() bool { return e == EngineTurso || e == EngineLibSQL }
 
 // Store is the implementation of ports.StorePort over a SQLite-shaped
 // database — the embedded SQLite file or a Turso sync database.
@@ -264,9 +276,9 @@ func OpenDB(db *sql.DB, opts Options) (*Store, error) {
 	if engine == "" {
 		engine = EngineSQLite
 	}
-	if engine == EngineTurso && opts.IDs == nil {
+	if engine.Shared() && opts.IDs == nil {
 		db.Close()
-		return nil, errors.New("open store: the turso engine needs an id allocator — " +
+		return nil, errors.New("open store: a shared engine needs an id allocator — " +
 			"AUTOINCREMENT ids collide across machines")
 	}
 	lockDir := opts.AgentLockDir
