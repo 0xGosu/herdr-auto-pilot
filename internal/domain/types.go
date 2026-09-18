@@ -197,6 +197,14 @@ const (
 	// it, and the list is never refilled automatically: rewriting a list the
 	// operator wrote is their call.
 	ReasonTaskSourceExhausted EscalateReason = "task_source_exhausted"
+	// ReasonTaskSourceUnusable: a declared task source selects this agent but
+	// its list could not be resolved or read (a list missing from the store it
+	// names, an unreachable provider, a bad credential). Task generation is
+	// withheld — inventing work for an agent whose real list may be full of it
+	// is the opposite of what the operator asked for — so this row is the only
+	// place the failure surfaces. There is nothing to confirm; the remedy is the
+	// source.
+	ReasonTaskSourceUnusable EscalateReason = "task_source_unusable"
 	// ReasonNoopVsPendingTasks: the learned plurality says "do nothing" but
 	// the agent's declared task source still has pending items. The source
 	// state is not part of the idle signature, so a noop learned on
@@ -238,6 +246,13 @@ const (
 // CLI invocation is spelled out here: the source's own selector is an index or a
 // name this package cannot know, and the escalation line prints its own hints.
 const TaskSourceExhaustedRationale = "the task list is finished; queue more work to send any"
+
+// TaskSourceUnusableRationale is the rationale on a ReasonTaskSourceUnusable
+// escalation: what was withheld, then the failure verbatim, which names the
+// source's index and list.
+func TaskSourceUnusableRationale(err error) string {
+	return "not generating tasks: " + err.Error()
+}
 
 // LatchedPerParkedEpisode reports whether an escalation reason is raised at most
 // ONCE per parked episode, per agent (daemon.escalate's episode latch).
