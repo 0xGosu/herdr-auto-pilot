@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.47
+
+- Fixed the escalation raised when an agent's task source cannot be read: it now carries its own `task_source_unusable` reason and names the source and the read error, instead of an untagged row claiming "generating a task suggestion" when no task was generated
+
 ## 0.9.46
 
 - Added `x` on the TUI Config tab to clear a configured `llm.command`, `llm.task_generate_command`, `llm.learn_from_user_command`, `llm.reranking_command` or `full_self_prompting.orchestrator_agent_command` (after a confirm), so you can switch to a different preset without leaving the TUI — editing the template itself is still a `config.toml` job

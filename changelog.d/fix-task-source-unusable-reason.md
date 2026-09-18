@@ -1,1 +1,0 @@
-- Fixed the escalation raised when an agent's task source cannot be read: it now carries its own `task_source_unusable` reason and names the source and the read error, instead of an untagged row claiming "generating a task suggestion" when no task was generated
