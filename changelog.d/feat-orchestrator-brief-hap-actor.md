@@ -1,1 +1,0 @@
-- Changed the orchestrator's built-in brief and the `hap-orchestrator` skill to run every `hap` command as `HAP_ACTOR=orchestrator`, so the orchestrator's decisions are audited under its own name even when a command runs outside its pane
