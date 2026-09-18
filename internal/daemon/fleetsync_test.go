@@ -443,9 +443,10 @@ func TestFleetSyncPauseIsIgnoredUnderLibSQL(t *testing.T) {
 }
 
 // TestFleetSyncPauseStillAppliesUnderTurso is the control: the same config on
-// the turso engine (and on an unnamed one, which reads as turso) does pause.
+// the turso engine (and on an unnamed one, which reads as turso) does pause —
+// and so does libsql_replica, whose local replica serves through a pause.
 func TestFleetSyncPauseStillAppliesUnderTurso(t *testing.T) {
-	for _, engine := range []string{"turso", ""} {
+	for _, engine := range []string{"turso", "", "libsql_replica"} {
 		sync := &fakeFleetSync{}
 		h := newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
 			func(o *Options) {
@@ -456,8 +457,12 @@ func TestFleetSyncPauseStillAppliesUnderTurso(t *testing.T) {
 		if !h.daemon.fleetSyncPaused() {
 			t.Fatalf("engine %q: turso_sync_paused did not pause", engine)
 		}
-		if fh := h.daemon.fleetHealth(); fh.Engine != "turso" {
-			t.Errorf("engine %q: health engine = %q, want turso", engine, fh.Engine)
+		want := engine
+		if want == "" {
+			want = "turso"
+		}
+		if fh := h.daemon.fleetHealth(); fh.Engine != want {
+			t.Errorf("engine %q: health engine = %q, want %s", engine, fh.Engine, want)
 		}
 		h.stop()
 	}
@@ -465,13 +470,14 @@ func TestFleetSyncPauseStillAppliesUnderTurso(t *testing.T) {
 
 // TestLibSQLShutdownSkipsTheFinalPush: under libsql there is nothing to
 // publish at exit — every write is already on the server — so the shutdown
-// push (a reachability probe there) is not made. The control is turso, where
-// it still is.
+// push (a reachability probe there) is not made. The controls are the two
+// replica engines, turso and libsql_replica, where it still is: their
+// unpushed changes are what it publishes.
 func TestLibSQLShutdownSkipsTheFinalPush(t *testing.T) {
 	for _, tc := range []struct {
 		engine string
 		want   int32
-	}{{"libsql", 0}, {"turso", 1}} {
+	}{{"libsql", 0}, {"turso", 1}, {"libsql_replica", 1}} {
 		sync := &fakeFleetSync{}
 		h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
 			o.FleetSync = sync

@@ -985,6 +985,42 @@ differs:
   with the daemon stopped. `hap migrate --to sqlite --from libsql` goes back.
 - A Turso Cloud database can be used by either engine; the schema is identical.
 
+### Any libsql server, offline-capable (`engine = "libsql_replica"`)
+
+`libsql_replica` talks to the same libsql server with the same three keys, but
+keeps the store in a **local replica** (`<state-dir>/libsql_replica/hap.db`) the
+way `turso` does. Reads never leave the machine and writes commit even while the
+server is unreachable; the daemon pushes local changes a couple of seconds after
+each write and pulls other nodes' changes every
+`database.libsql_poll_interval_seconds`:
+
+```sh
+hap config set database.engine libsql_replica
+hap config set database.libsql_url libsql://<db>.<provider>
+hap config set database.libsql_auth_token <token>              # or export LIBSQL_AUTH_TOKEN
+hap daemon --restart
+```
+
+- **The first start needs the server**: it seeds the replica from it (and
+  migrates the server's schema if this build is newer). After that the daemon
+  starts and monitors with the server down.
+- Sync is by **row**: the server logs every changed key in a `hap_changelog`
+  table (via triggers it installs), and a replica fetches those rows. Conflicts
+  are last-push-wins per row, as under `turso`. A replica never overwrites a
+  local change it has not pushed yet.
+- **Mix freely**: nodes on `libsql` and `libsql_replica` can share one database.
+  The server's triggers log every writer, so a replica also sees the rows an
+  online `libsql` node writes directly.
+- `database.turso_sync_paused` **does** apply: it stops the round trips while
+  the replica keeps serving, and unpushed changes wait in the replica's outbox.
+- The change log keeps entries until every replica that synced in the last
+  7 days has read them, and never longer than 7 days. A node offline longer
+  re-seeds from the tables on its next pull, pushing its own unpushed changes
+  first.
+- `hap migrate` goes through the server: `--to libsql` fills it, and each
+  replica pulls the rows from there. `--to sqlite` copies the **server's**
+  rows, so let a replica that was offline sync first.
+
 ## Health and disk usage
 
 `hap status` and the TUI share one health assessment: a stale or hung daemon, a

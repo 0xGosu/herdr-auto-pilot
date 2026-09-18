@@ -1,0 +1,282 @@
+// Package libsqlreplica is hap's adapter for the libsql_replica engine: a LOCAL
+// SQLite replica of the shared store, synced with any libsql server (Turso
+// Cloud, a self-hosted sqld, any Hrana provider) by LOGICAL ROW REPLAY.
+//
+// It exists because neither sibling gives a far or flaky libsql server a
+// usable store. The libsql engine keeps no local copy, so every statement is a
+// round trip on the daemon's event loop and an unreachable server is a dead
+// store. The turso engine keeps a replica, but its SDK pulls over Turso's own
+// protocol (/pull-updates, /export), which a plain sqld answers with 404 — so
+// its offline behaviour is rebuilt here over the one protocol every libsql
+// server speaks, /v2/pipeline (internal/store/libsql, which stays this
+// package's only route to the network).
+//
+// The design, and the invariant each part carries:
+//
+//   - The local file is the AUTHORITY. The daemon's store and the socket it
+//     serves run on it; reads never leave the machine, and writes commit
+//     whether or not the server answers.
+//
+//   - Local writes are CAPTURED by triggers into hap_outbox — the key of every
+//     touched row, never its image. Push reads each key's CURRENT row and
+//     replays it (an upsert, or a delete when the row is gone), then drops the
+//     outbox entries it covered. A row changed while a push is in flight has a
+//     newer entry and goes on the next one, so a push is idempotent.
+//
+//   - The server's own triggers write every change to hap_changelog, WHOEVER
+//     made it — a replica's push, an online libsql node, `hap migrate`. That
+//     is what lets the two libsql engines share one database. Pull tails the
+//     log from this node's cursor and fetches each key's CURRENT server row.
+//
+//   - Pulled rows are applied with capture SUPPRESSED (hap_sync_applying).
+//     Without it every pulled row is re-pushed, and two nodes echo each other
+//     through the server forever. A push also tags the log entries it caused
+//     with this node's id, so the pull does not fetch its own writes back.
+//
+//   - A key with an unpushed local change is NOT overwritten by a pull (the
+//     rebase turso's engine does): the local change is pushed next and wins.
+//     Row-level last-push-wins, the semantics the turso engine already has.
+//     Push and pull are serialized, or a push landing between a pull's fetch
+//     and its apply would let the stale fetched row overwrite the pushed one.
+//
+//   - DDL does not ride the replay. The local file is migrated by the store as
+//     a sqlite file is; the server by the schema lease as under libsql
+//     (PrepareServer). Columns are replayed by the INTERSECTION of the two
+//     sides, so an older node and a newer server — or the reverse — keep
+//     syncing through an additive migration.
+package libsqlreplica
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsql"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
+
+	_ "modernc.org/sqlite"
+)
+
+var _ ports.FleetSyncPort = (*DB)(nil)
+
+// Options configures Open.
+type Options struct {
+	// Path is the local replica file (<state>/libsql/hap.db).
+	Path string
+	// DSN opens Path with the sqlite driver — store.SQLiteDSN(Path), passed in
+	// because the store's own tests open replicas, and this package importing
+	// the store would make that a cycle.
+	DSN string
+	// NodeID is this node's id: it tags the log entries this node's pushes
+	// cause, and names its cursor on the server.
+	NodeID string
+	// Remote reaches the server. Its OnWrite is ignored.
+	Remote libsql.Options
+	// OnWrite is reported after every committed LOCAL write through the
+	// executor — the daemon debounces a push on it. The sync's own writes (a
+	// pull applying rows, a push clearing its outbox) never report.
+	OnWrite func()
+	// PrepareServer brings the server's schema up to this build (the schema
+	// lease, as under libsql). Called once, the first time the server answers.
+	// nil skips it (tests whose server is already current).
+	PrepareServer func(ctx context.Context, remote *libsql.DB) error
+	// Now is the clock (tests). nil = time.Now.
+	Now func() time.Time
+}
+
+// localConnections is the local pool: the executor's sessions (the daemon's
+// own two plus the socket server's clients) and the sync's own connections.
+const localConnections = 2 + sqlbridge.DefaultMaxClients*2 + 4
+
+// DB is an open replica.
+type DB struct {
+	path   string
+	nodeID string
+	now    func() time.Time
+
+	raw  *sql.DB
+	exec *sqlbridge.Executor
+	db   *sql.DB
+
+	remoteOpts libsql.Options
+	prepare    func(ctx context.Context, remote *libsql.DB) error
+
+	// syncMu serializes Push, Pull and a re-seed (see the package doc).
+	syncMu sync.Mutex
+
+	mu         sync.Mutex
+	remote     *libsql.DB
+	tables     map[string]*table
+	lastPull   time.Time
+	lastPush   time.Time
+	lastCursor time.Time
+	lastPrune  time.Time
+}
+
+// Open opens (creating if needed) the local replica. Nothing is sent: a node
+// that has bootstrapped before is fully usable offline. The store's own
+// migration runs next (store.OpenDB on DB()), and then Prepare.
+func Open(ctx context.Context, opts Options) (*DB, error) {
+	if opts.Path == "" || opts.DSN == "" || opts.NodeID == "" {
+		return nil, errors.New("libsql_replica: a replica path, its DSN and a node id are required")
+	}
+	if !libsql.ValidURL(opts.Remote.URL) && opts.Remote.Transport == nil {
+		return nil, fmt.Errorf("libsql_replica: %q is not a libsql URL (want libsql://, https:// or http://)", opts.Remote.URL)
+	}
+	if err := os.MkdirAll(filepath.Dir(opts.Path), 0o700); err != nil {
+		return nil, fmt.Errorf("libsql_replica: %w", err)
+	}
+	raw, err := sql.Open("sqlite", opts.DSN)
+	if err != nil {
+		return nil, fmt.Errorf("libsql_replica: open %s: %w", opts.Path, err)
+	}
+	raw.SetMaxOpenConns(localConnections)
+	raw.SetMaxIdleConns(4)
+	if err := raw.PingContext(ctx); err != nil {
+		raw.Close()
+		return nil, fmt.Errorf("libsql_replica: open %s: %w", opts.Path, err)
+	}
+	for _, ddl := range localDDL {
+		if _, err := raw.ExecContext(ctx, ddl); err != nil {
+			raw.Close()
+			return nil, fmt.Errorf("libsql_replica: local sync tables: %w", err)
+		}
+	}
+	now := opts.Now
+	if now == nil {
+		now = time.Now
+	}
+	remote := opts.Remote
+	remote.OnWrite = nil
+	d := &DB{path: opts.Path, nodeID: opts.NodeID, now: now, raw: raw,
+		remoteOpts: remote, prepare: opts.PrepareServer}
+	d.exec = sqlbridge.NewExecutor(raw, opts.OnWrite)
+	d.db = sqlbridge.OpenGated(d.exec, 2)
+	return d, nil
+}
+
+// DB is the gated handle the store runs on.
+func (d *DB) DB() *sql.DB { return d.db }
+
+// Executor is what the socket server serves.
+func (d *DB) Executor() *sqlbridge.Executor { return d.exec }
+
+// Path is the local replica file.
+func (d *DB) Path() string { return d.path }
+
+// Close closes the local handles. Unpushed changes stay in the outbox and go
+// on the next start's first push.
+func (d *DB) Close() error {
+	return errors.Join(d.db.Close(), d.raw.Close())
+}
+
+// Prepare installs the capture triggers over the store's (already migrated)
+// tables. Call after every local migration: a table the migration created has
+// no trigger until this runs, and its writes would never leave the machine.
+func (d *DB) Prepare(ctx context.Context) error {
+	tables, err := localTables(ctx, d.raw)
+	if err != nil {
+		return err
+	}
+	if err := installCapture(ctx, d.raw, tables); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.tables = tables
+	d.mu.Unlock()
+	return nil
+}
+
+// Bootstrapped reports whether this replica has ever been seeded from the
+// server. Until it has, it holds none of the fleet's rows — the rules other
+// nodes learned among them — so the daemon waits for Bootstrap first.
+func (d *DB) Bootstrapped(ctx context.Context) (bool, error) {
+	v, ok, err := d.state(ctx, d.raw, stateBootstrapped)
+	return ok && v == 1, err
+}
+
+// Pending is how many local changes wait to be pushed.
+func (d *DB) Pending(ctx context.Context) (int64, error) {
+	var n int64
+	err := d.raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM hap_outbox`).Scan(&n)
+	return n, err
+}
+
+// Checkpoint folds the local WAL into the file.
+func (d *DB) Checkpoint() error {
+	_, err := d.raw.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	return err
+}
+
+// Stats reports the outbox, the WAL and the last successful syncs. Revision
+// is the change-log cursor.
+func (d *DB) Stats(ctx context.Context) (ports.FleetSyncStats, error) {
+	var st ports.FleetSyncStats
+	n, err := d.Pending(ctx)
+	if err != nil {
+		return st, err
+	}
+	st.PendingOps = n
+	if fi, err := os.Stat(d.path + "-wal"); err == nil {
+		st.MainWALBytes = fi.Size()
+	}
+	if cur, ok, err := d.state(ctx, d.raw, stateCursor); err == nil && ok {
+		st.Revision = strconv.FormatInt(cur, 10)
+	}
+	d.mu.Lock()
+	st.LastPull, st.LastPush = d.lastPull, d.lastPush
+	d.mu.Unlock()
+	return st, nil
+}
+
+// remoteDB connects to the server the first time it answers and prepares its
+// schema and change log; every later call returns that connection. A libsql
+// connection holds nothing between requests, so one that once answered is
+// reused through any outage.
+func (d *DB) remoteDB(ctx context.Context) (*libsql.DB, map[string]*table, error) {
+	d.mu.Lock()
+	r, tables := d.remote, d.tables
+	d.mu.Unlock()
+	if tables == nil {
+		return nil, nil, errors.New("libsql_replica: Prepare has not run")
+	}
+	if r != nil {
+		return r, tables, nil
+	}
+	r, err := libsql.Open(ctx, d.remoteOpts)
+	if err != nil {
+		return nil, nil, err
+	}
+	if d.prepare != nil {
+		if err := d.prepare(ctx, r); err != nil {
+			_ = r.Close()
+			return nil, nil, fmt.Errorf("prepare the server's schema: %w", err)
+		}
+	}
+	if err := resolveRemoteColumns(ctx, r, tables); err != nil {
+		_ = r.Close()
+		return nil, nil, err
+	}
+	if err := installChangelog(ctx, r, tables); err != nil {
+		_ = r.Close()
+		return nil, nil, err
+	}
+	d.mu.Lock()
+	d.remote = r
+	d.mu.Unlock()
+	return r, tables, nil
+}
+
+// Remote is the server connection, once one has been made (nil before).
+func (d *DB) Remote() *libsql.DB {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.remote
+}

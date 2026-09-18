@@ -63,3 +63,37 @@ func TestValidateLibSQLDatabase(t *testing.T) {
 		t.Error("control: the pause is not in effect under turso")
 	}
 }
+
+// TestLibSQLReplicaDatabaseSettings: the replica engine shares the libsql
+// server's three keys, and — unlike libsql, like turso — honours the pause,
+// because its local replica serves while the round trips are skipped.
+func TestLibSQLReplicaDatabaseSettings(t *testing.T) {
+	cfg := Config{Database: Database{Engine: EngineLibSQLReplica}}
+	d := cfg.Database
+	if !d.IsLibSQLReplica() || !d.UsesLibSQLServer() || !d.IsShared() || d.IsLibSQL() || d.IsTurso() {
+		t.Fatalf("predicates wrong: replica=%v server=%v shared=%v libsql=%v turso=%v",
+			d.IsLibSQLReplica(), d.UsesLibSQLServer(), d.IsShared(), d.IsLibSQL(), d.IsTurso())
+	}
+	if err := ValidateDatabase(cfg); err == nil || !strings.Contains(err.Error(), "libsql_url") {
+		t.Fatalf("missing URL: err = %v", err)
+	}
+	cfg.Database.LibSQLURL = "http://sqld.lan:8080"
+	cfg.Database.LibSQLPollIntervalSeconds, cfg.Database.TursoSyncIntervalSeconds = 30, 60
+	if err := ValidateDatabase(cfg); err != nil {
+		t.Fatalf("valid replica config refused: %v", err)
+	}
+	if got := cfg.Database.SyncInterval(); got != 30*time.Second {
+		t.Errorf("poll = %s, want libsql_poll_interval_seconds", got)
+	}
+	cfg.Database.TursoSyncPaused = true
+	if !cfg.Database.SyncPausedEffective() {
+		t.Error("the pause is not in effect under libsql_replica")
+	}
+	found := false
+	for _, e := range ValidDatabaseEngines {
+		found = found || e == EngineLibSQLReplica
+	}
+	if !found {
+		t.Error("libsql_replica is not a settable engine")
+	}
+}

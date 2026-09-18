@@ -51,6 +51,11 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 		return err
 	}
 	if opt.shared == config.EngineLibSQL {
+		if opt.toSQLite && cfg.Database.IsLibSQLReplica() {
+			fmt.Fprintln(out, "note: this copies the libsql SERVER's rows. Changes this node made while it could not "+
+				"reach the server, and has not pushed yet, are only in its local replica — start the daemon and let it "+
+				"sync first if there may be any")
+		}
 		return runMigrateLibSQL(ctx, paths, cfg, out, opt)
 	}
 	if cfg.Database.TursoDatabaseURL == "" {
@@ -199,6 +204,12 @@ func resolveMigrateShared(opt migrateArgs, cfg config.Config) (string, error) {
 	if !opt.toSQLite || opt.shared != "" {
 		return opt.shared, nil
 	}
+	if cfg.Database.IsLibSQLReplica() {
+		// The replica's server IS a libsql database: copying out of it is the
+		// libsql path. (What this node has not pushed yet is not on it —
+		// runMigrate says so.)
+		return config.EngineLibSQL, nil
+	}
 	if cfg.Database.IsShared() {
 		return cfg.Database.Engine, nil
 	}
@@ -323,6 +334,12 @@ func parseMigrateArgs(args []string) (migrateArgs, error) {
 		out.toSQLite = true
 	case config.EngineTurso, config.EngineLibSQL:
 		out.shared = target
+	case config.EngineLibSQLReplica:
+		// Not a separate destination: a replica seeds itself from its server,
+		// and the rows `--to libsql` writes there reach it through the
+		// server's change log.
+		return out, fmt.Errorf("--to %s is not a destination of its own: run `hap migrate --to %s` to copy into the "+
+			"libsql server, and every %s node picks the rows up from there", target, config.EngineLibSQL, target)
 	case "":
 		return out, errors.New("usage: hap migrate --to <sqlite|turso|libsql> (see: hap help migrate)")
 	default:
@@ -335,6 +352,8 @@ func parseMigrateArgs(args []string) (migrateArgs, error) {
 		return out, errors.New("--from only applies to `--to sqlite`: going up, the source is this machine's local database")
 	case from == config.EngineTurso || from == config.EngineLibSQL:
 		out.shared = from
+	case from == config.EngineLibSQLReplica:
+		out.shared = config.EngineLibSQL
 	default:
 		return out, fmt.Errorf("--from must be %s or %s, got %q", config.EngineTurso, config.EngineLibSQL, from)
 	}

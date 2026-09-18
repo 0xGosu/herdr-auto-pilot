@@ -401,9 +401,24 @@ hap daemon --restart
   to go back.
 - Same schema as turso: a Turso Cloud database can be served by either engine.
 
+### `engine = "libsql_replica"` (same server, local replica, works offline)
+
+Same three keys as `libsql`, plus `hap config set database.engine libsql_replica`.
+The store lives in `<state>/libsql_replica/hap.db`. Local writes are pushed a
+couple of seconds after each write, and other nodes' rows are pulled every
+`libsql_poll_interval_seconds`. The first start must reach the server to seed
+the replica; after that the daemon runs with the server down.
+
+- `hap status` → `fleet sync: libsql_replica — ok (last pull …, last push …, N unpushed)`.
+  `N unpushed` growing while `DEGRADED`/`ISOLATED` means local changes are
+  queued; they go on the next push that reaches the server.
+- `turso_sync_paused` applies, as under turso.
+- It can share a database with `libsql` nodes. `hap migrate --to libsql` fills
+  the server, and each replica picks the rows up from there.
+
 ## several machines (fleet)
 
-With `[database] engine = "turso"` or `"libsql"` (see above) every machine
+With `[database] engine = "turso"`, `"libsql"` or `"libsql_replica"` (see above) every machine
 pointed at the same database shares one hap. From any of them:
 
 ```bash

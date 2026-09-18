@@ -1290,6 +1290,8 @@ func buildCommands() {
 				"transaction paying a server round trip per row, and other nodes' writes wait on it\n" +
 				"until it commits: run it before the other machines join, or when the herd is quiet.\n" +
 				"The libsql engine never imports the local database on its own (turso does, once).\n" +
+				"Under `libsql_replica` the shared database IS the libsql server: `--to libsql` (and\n" +
+				"`--to sqlite`) go through it, and every replica picks the rows up from its change log.\n" +
 				"Nothing switches engines: run `hap config set database.engine <engine>` and\n" +
 				"`hap daemon --ensure` when the copy reports what you expected.",
 			Examples: []string{"hap migrate --to sqlite", "hap config set database.engine sqlite", "hap daemon --ensure"},

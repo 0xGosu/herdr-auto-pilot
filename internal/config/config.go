@@ -760,13 +760,21 @@ const (
 	// sync protocol, and it wants a NEARBY server: the daemon's store calls
 	// sit on its event loop.
 	EngineLibSQL = "libsql"
+	// EngineLibSQLReplica is libsql with a LOCAL REPLICA: the daemon keeps the
+	// store in a local SQLite file and syncs it with the same libsql server
+	// (libsql_url, libsql_auth_token) by logical row replay — push on every
+	// local write, pull every libsql_poll_interval_seconds. Reads never leave
+	// the machine and writes commit while the server is unreachable, which is
+	// what turso's engine offers, over a protocol any libsql server speaks.
+	// Nodes on either libsql engine can share one database.
+	EngineLibSQLReplica = "libsql_replica"
 )
 
 // ValidDatabaseEngines are the values database.engine accepts. Mirrors
 // ValidTaskSourceProviders: `hap config set` and the TUI picker validate
 // against it, while a hand-edited config.toml still LOADS an unrecognized
 // value and fails at use time (ValidateDatabase).
-var ValidDatabaseEngines = []string{EngineSQLite, EngineTurso, EngineLibSQL}
+var ValidDatabaseEngines = []string{EngineSQLite, EngineTurso, EngineLibSQL, EngineLibSQLReplica}
 
 // DefaultTursoSyncIntervalSeconds is how often the daemon pulls from Turso
 // Cloud when the key is 0. Short enough that a remote confirm lands while the
@@ -827,7 +835,8 @@ type Database struct {
 	// TursoSyncIntervalSeconds is how often the daemon pulls (0 = the
 	// built-in default, floored at MinTursoSyncIntervalSeconds).
 	TursoSyncIntervalSeconds int `toml:"turso_sync_interval_seconds,omitempty"`
-	// TursoSyncPaused stops this node talking to Turso Cloud while leaving
+	// TursoSyncPaused (named for the engine it came with; it applies to
+	// libsql_replica too) stops this node talking to Turso Cloud while leaving
 	// everything else exactly as it was: the engine stays turso, the local
 	// replica stays the store, every process still goes through the daemon.
 	// Only the pulls, the pushes and the shutdown push are skipped — local
@@ -877,18 +886,29 @@ func (d Database) IsTurso() bool { return d.Engine == EngineTurso }
 // IsLibSQL reports whether the remote libsql engine is selected.
 func (d Database) IsLibSQL() bool { return d.Engine == EngineLibSQL }
 
-// SyncPausedEffective reports whether the turso sync pause is in force. Only
-// the turso engine can pause: it keeps a local replica that serves while the
-// cloud round trips are skipped. The libsql engine keeps no local copy, so
-// honouring the key would mean refusing every statement — the herd stops dead
-// — and it is IGNORED there instead (the daemon says so once).
-func (d Database) SyncPausedEffective() bool { return d.TursoSyncPaused && d.IsTurso() }
+// IsLibSQLReplica reports whether the replicated libsql engine is selected.
+func (d Database) IsLibSQLReplica() bool { return d.Engine == EngineLibSQLReplica }
 
-// IsShared reports whether a SHARED engine is selected — turso or libsql. Both
-// put the store behind the daemon (front ends reach it over the store socket)
-// and allocate node-scoped ids; what differs is only how the daemon reaches
-// the remote.
-func (d Database) IsShared() bool { return d.IsTurso() || d.IsLibSQL() }
+// UsesLibSQLServer reports whether a libsql server is configured for — either
+// libsql engine, which share libsql_url, libsql_auth_token and
+// libsql_poll_interval_seconds.
+func (d Database) UsesLibSQLServer() bool { return d.IsLibSQL() || d.IsLibSQLReplica() }
+
+// SyncPausedEffective reports whether the sync pause is in force. Only an
+// engine with a local replica can pause — turso and libsql_replica — since the
+// replica serves while the server round trips are skipped. The libsql engine
+// keeps no local copy, so honouring the key would mean refusing every
+// statement — the herd stops dead — and it is IGNORED there instead (the
+// daemon says so once).
+func (d Database) SyncPausedEffective() bool {
+	return d.TursoSyncPaused && (d.IsTurso() || d.IsLibSQLReplica())
+}
+
+// IsShared reports whether a SHARED engine is selected — turso, libsql or
+// libsql_replica. All put the store behind the daemon (front ends reach it
+// over the store socket) and allocate node-scoped ids; what differs is only
+// how the daemon reaches the remote.
+func (d Database) IsShared() bool { return d.IsTurso() || d.UsesLibSQLServer() }
 
 // LibSQLToken is the libsql token in force: the config value, else the
 // LIBSQL_AUTH_TOKEN environment variable. Empty is legal (an unauthenticated
@@ -913,7 +933,7 @@ func (d Database) AuthToken() string {
 // change-poll interval, which drives the same loop.
 func (d Database) SyncInterval() time.Duration {
 	s, def, floor := d.TursoSyncIntervalSeconds, DefaultTursoSyncIntervalSeconds, MinTursoSyncIntervalSeconds
-	if d.IsLibSQL() {
+	if d.UsesLibSQLServer() {
 		s, def, floor = d.LibSQLPollIntervalSeconds, DefaultLibSQLPollIntervalSeconds, MinLibSQLPollIntervalSeconds
 	}
 	if s <= 0 {
@@ -945,10 +965,10 @@ func ValidateDatabase(cfg Config) error {
 				"`hap config set database.turso_auth_token <token>` or export %s", EngineTurso, TursoAuthTokenEnv)
 		}
 		return nil
-	case EngineLibSQL:
+	case EngineLibSQL, EngineLibSQLReplica:
 		if strings.TrimSpace(d.LibSQLURL) == "" {
 			return fmt.Errorf("database.engine is %q but database.libsql_url is not set: "+
-				"`hap config set database.libsql_url <libsql://… or https://…>`", EngineLibSQL)
+				"`hap config set database.libsql_url <libsql://… or https://…>`", d.Engine)
 		}
 		// turso_sync_paused is deliberately NOT refused here: it has no effect
 		// under libsql (SyncPausedEffective), and refusing to start over it
@@ -1938,6 +1958,14 @@ func (p Paths) TursoDir() string { return filepath.Join(p.StateDir, "turso") }
 // local sqlite database was folded into the shared one. The engine keeps no
 // database file.
 func (p Paths) LibSQLDir() string { return filepath.Join(p.StateDir, "libsql") }
+
+// LibSQLReplicaDir is where the libsql_replica engine keeps its local replica.
+// Unlike TursoDir it is NOT disposable while the daemon has unpushed changes:
+// they live in the replica's outbox until a push reaches the server.
+func (p Paths) LibSQLReplicaDir() string { return filepath.Join(p.StateDir, "libsql_replica") }
+
+// LibSQLReplicaDBPath is the libsql_replica engine's local database file.
+func (p Paths) LibSQLReplicaDBPath() string { return filepath.Join(p.LibSQLReplicaDir(), "hap.db") }
 
 // TursoDBPath is the turso engine's local database file.
 func (p Paths) TursoDBPath() string { return filepath.Join(p.TursoDir(), "hap.db") }

@@ -38,6 +38,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/profiling"
 	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsqlreplica"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/turso"
 	"github.com/0xGosu/herdr-auto-pilot/internal/streamlog"
@@ -465,9 +466,9 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		if nodeID, err = store.LoadNodeID(paths.StateDir); err != nil {
 			return err
 		}
-		if bootCfg.Database.IsTurso() {
-			// Only turso's replica has anything to push; a libsql write is
-			// already on the server when it commits.
+		if bootCfg.Database.IsTurso() || bootCfg.Database.IsLibSQLReplica() {
+			// Only a replica has anything to push; a libsql write is already
+			// on the server when it commits.
 			fleetWrites = make(chan struct{}, 1)
 		}
 		tdb, engine, err := openShared(ctx, paths, bootCfg, nodeID, fleetWrites, time.Now())
@@ -488,9 +489,16 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 			return err
 		}
 		defer st.Close()
-		// Pull, then migrate only as the schema lead: two nodes issuing the
-		// same DDL wedge the loser (see turso.PrepareSharedSchema).
-		if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
+		if rdb, ok := tdb.(*libsqlreplica.DB); ok {
+			// The replica is a local file this daemon alone migrates; the
+			// SERVER's schema goes through the lease when the server is first
+			// reached (openLibSQLReplica's PrepareServer).
+			if err := prepareLibSQLReplica(ctx, paths, bootCfg, rdb, st, time.Now()); err != nil {
+				return fmt.Errorf("%s: prepare the local replica: %w", engine, err)
+			}
+		} else if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
+			// Pull, then migrate only as the schema lead: two nodes issuing the
+			// same DDL wedge the loser (see turso.PrepareSharedSchema).
 			return fmt.Errorf("%s: prepare schema: %w", engine, err)
 		}
 		// Ids carry 12 bits of the node id; two nodes sharing them would share
@@ -506,7 +514,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 				"never written to the shared store (its rows would otherwise stay filed under the old id)",
 				engine, label, other.ID, filepath.Join(paths.StateDir, store.NodeIDFile))
 		}
-		if engine == store.EngineLibSQL {
+		if engine == store.EngineLibSQL || engine == store.EngineLibSQLReplica {
 			// Never automatic under libsql: the copy is ONE transaction paying a
 			// server round trip per row, holding the server's write lock (every
 			// other node's writes wait) for as long as that takes. The operator

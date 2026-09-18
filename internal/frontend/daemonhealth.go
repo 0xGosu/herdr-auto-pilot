@@ -274,7 +274,7 @@ func (h DaemonHealth) Banner() string {
 	// not the sync engine). Named separately from the "still starting" case
 	// below so a cold start does not read as a broken install.
 	case h.FleetSyncBootstrapping && h.FleetSyncFor >= daemonhealth.FleetSyncIsolatedAfter:
-		if h.FleetSyncEngine == daemonhealth.EngineLibSQL {
+		if h.FleetSyncEngine == daemonhealth.EngineLibSQL || h.FleetSyncEngine == daemonhealth.EngineLibSQLReplica {
 			return fmt.Sprintf("⚠ DAEMON NOT MONITORING — still waiting %s for the libsql server to answer; "+
 				"nothing is being watched. Check database.libsql_url and the auth token", formatAge(h.FleetSyncFor))
 		}

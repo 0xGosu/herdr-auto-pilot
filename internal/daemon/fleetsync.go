@@ -188,7 +188,7 @@ func (d *Daemon) adoptFleetRecoveryMarker() {
 // engine change, not a pause.
 func (d *Daemon) fleetSyncPaused() bool {
 	cfg, _, _ := d.snapshot()
-	if d.fleetEngine() != "turso" {
+	if !d.fleetHasReplica() {
 		// Only a replica can pause (config.Database.SyncPausedEffective): the
 		// libsql engine keeps no local copy, so a pause there would stop the
 		// store itself. Ignored — and said so, once per daemon.
@@ -200,6 +200,15 @@ func (d *Daemon) fleetSyncPaused() bool {
 		return false
 	}
 	return cfg.Database.TursoSyncPaused
+}
+
+// fleetHasReplica reports whether the shared engine keeps a LOCAL replica —
+// turso, libsql_replica — which is what makes a pause meaningful and a final
+// push necessary. The libsql engine's writes are on the server when they
+// commit.
+func (d *Daemon) fleetHasReplica() bool {
+	e := d.fleetEngine()
+	return e == "turso" || e == "libsql_replica"
 }
 
 // fleetEngine is the shared engine's name, "turso" when unset.
@@ -610,7 +619,7 @@ func (d *Daemon) fleetRefreshStats(sync ports.FleetSyncPort) ports.FleetSyncStat
 // than cancelled — cancelling would wedge nothing that still matters, but
 // waiting forever would hold the daemon lock the successor is waiting for.
 func (d *Daemon) fleetFinalPush(sync ports.FleetSyncPort) {
-	if d.fleetEngine() != "turso" {
+	if !d.fleetHasReplica() {
 		// Nothing is waiting to be published: a libsql write is on the server
 		// when it commits. Its Push is only a reachability check, and one at
 		// exit would buy a warning about a server this process is leaving.

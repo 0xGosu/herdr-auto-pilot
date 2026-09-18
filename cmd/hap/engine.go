@@ -16,12 +16,14 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsql"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsqlreplica"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/turso"
 )
 
 // sharedDB is what the daemon needs from a SHARED engine's handle, whichever
-// it is: turso's synced replica or libsql's remote connection. The store runs
+// it is: turso's synced replica, libsql's remote connection, or
+// libsql_replica's local replica. The store runs
 // on DB(), the socket server serves Executor(), the fleet loop drives the
 // FleetSyncPort, and the schema lease uses Pull/Push (turso.SchemaSyncer).
 type sharedDB interface {
@@ -34,11 +36,19 @@ type sharedDB interface {
 var (
 	_ sharedDB = (*turso.DB)(nil)
 	_ sharedDB = (*libsql.DB)(nil)
+	_ sharedDB = (*libsqlreplica.DB)(nil)
 )
 
 // openShared opens the daemon's handle on the configured shared engine.
 func openShared(ctx context.Context, paths config.Paths, cfg config.Config, nodeID string,
 	writes chan<- struct{}, startedAt time.Time) (sharedDB, store.Engine, error) {
+	if cfg.Database.IsLibSQLReplica() {
+		db, err := openLibSQLReplica(ctx, paths, cfg, nodeID, writes)
+		if err != nil {
+			return nil, "", err
+		}
+		return db, store.EngineLibSQLReplica, nil
+	}
 	if cfg.Database.IsLibSQL() {
 		db, err := openLibSQL(ctx, paths, cfg, startedAt)
 		if err != nil {
@@ -166,6 +176,9 @@ func openProcessStore(paths config.Paths) (*store.Store, error) {
 
 // sharedEngineOf is the store engine for a shared config.
 func sharedEngineOf(cfg config.Config) store.Engine {
+	if cfg.Database.IsLibSQLReplica() {
+		return store.EngineLibSQLReplica
+	}
 	if cfg.Database.IsLibSQL() {
 		return store.EngineLibSQL
 	}
@@ -228,17 +241,19 @@ func mcpStore(ctx context.Context, paths config.Paths, dbPath string) (*store.St
 
 // mcpEngineIsShared reports whether this install runs a shared engine, from
 // either signal a sanitized environment may leave: the config file, or the
-// turso state dir a turso daemon creates beside the database. (The libsql
-// engine keeps no such dir — it has no local database — so only the config
-// or HAP_STORE_SOCKET_PATH can say so.)
+// replica dir a turso or libsql_replica daemon creates beside the database.
+// (The libsql engine keeps no such dir — it has no local database — so only
+// the config or HAP_STORE_SOCKET_PATH can say so.)
 func mcpEngineIsShared(paths config.Paths, stateDir string) bool {
 	if paths.ConfigDir != "" {
 		if cfg, err := config.Load(paths.File()); err == nil && cfg.Database.IsShared() {
 			return true
 		}
 	}
-	if _, err := os.Stat(filepath.Join(stateDir, filepath.Base(paths.TursoDir()))); err == nil {
-		return true
+	for _, dir := range []string{paths.TursoDir(), paths.LibSQLReplicaDir()} {
+		if _, err := os.Stat(filepath.Join(stateDir, filepath.Base(dir))); err == nil {
+			return true
+		}
 	}
 	return false
 }
@@ -294,6 +309,95 @@ func openTurso(ctx context.Context, paths config.Paths, cfg config.Config, nodeI
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-time.After(cfg.Database.SyncInterval()):
+		}
+	}
+}
+
+// openLibSQLReplica opens the libsql_replica engine's local replica. Nothing
+// is sent: the server is first reached by prepareLibSQLReplica's bootstrap (a
+// brand-new replica) or by the first push or pull (one seeded before), so a
+// seeded node starts — and monitors — with the server unreachable.
+func openLibSQLReplica(ctx context.Context, paths config.Paths, cfg config.Config, nodeID string,
+	writes chan<- struct{}) (*libsqlreplica.DB, error) {
+	url := cfg.Database.LibSQLURL
+	if !libsql.ValidURL(url) {
+		return nil, fmt.Errorf("database.libsql_url %q is not a libsql URL (want libsql://, https:// or http://)", url)
+	}
+	path := paths.LibSQLReplicaDBPath()
+	return libsqlreplica.Open(ctx, libsqlreplica.Options{
+		Path:   path,
+		DSN:    store.SQLiteDSN(path),
+		NodeID: nodeID,
+		Remote: libsql.Options{URL: url, AuthToken: cfg.Database.LibSQLToken()},
+		OnWrite: func() {
+			select {
+			case writes <- struct{}{}:
+			default:
+			}
+		},
+		PrepareServer: func(ctx context.Context, remote *libsql.DB) error {
+			// The server's schema goes through the same lease every libsql
+			// node takes: this build may be the one that has to migrate it.
+			// The store is deliberately never closed — closing it would close
+			// remote's handle, which the replica keeps for its life.
+			rs, err := store.OpenDB(remote.DB(), store.Options{
+				NodeID: nodeID, Engine: store.EngineLibSQL,
+				IDs:          store.NewTimeOrderedIDs(store.NodeBits(nodeID), nil),
+				AgentLockDir: filepath.Join(paths.StateDir, "agent-automation-locks"),
+			})
+			if err != nil {
+				return err
+			}
+			return turso.PrepareSharedSchema(ctx, remote, rs, time.Now)
+		},
+	})
+}
+
+// prepareLibSQLReplica migrates the local replica, installs its change
+// capture, and — for a replica never seeded — waits for the server to hand
+// over the fleet's rows. The wait is unbounded for the reason openTurso's is:
+// a node with none of the fleet's rules would act on nothing it has learned,
+// and the heartbeat is what tells `hap status` what it is waiting for.
+func prepareLibSQLReplica(ctx context.Context, paths config.Paths, cfg config.Config, db *libsqlreplica.DB,
+	st *store.Store, startedAt time.Time) error {
+	if err := st.Migrate(); err != nil {
+		return err
+	}
+	if err := db.Prepare(ctx); err != nil {
+		return err
+	}
+	var firstFailure time.Time
+	attempts := 0
+	for {
+		ok, err := db.Bootstrapped(ctx)
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		err = db.Bootstrap(ctx)
+		if err == nil {
+			slog.Info("libsql_replica: seeded the local replica from the server", "path", db.Path())
+			return nil
+		}
+		now := time.Now()
+		if firstFailure.IsZero() {
+			firstFailure = now
+		}
+		attempts++
+		slog.Warn("libsql_replica: seeding the local replica from the server failed; retrying", "error", err,
+			"in", cfg.Database.SyncInterval(), "waiting_for", now.Sub(firstFailure).Round(time.Second))
+		_ = daemonhealth.Write(paths.StateDir, daemonhealth.Health{
+			PID: os.Getpid(), Version: buildinfo.Version, StartedAt: startedAt, HeartbeatAt: now,
+			FleetSync: &daemonhealth.FleetSyncHealth{Engine: daemonhealth.EngineLibSQLReplica, Bootstrapped: false,
+				LastError: err.Error(), LastErrorAt: now,
+				FirstFailureAt: firstFailure, ConsecutiveFailures: attempts},
+		})
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-time.After(cfg.Database.SyncInterval()):
 		}
 	}

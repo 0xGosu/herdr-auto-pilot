@@ -1809,7 +1809,7 @@ func printDatabaseLine(out io.Writer, cfg config.Config) {
 	}
 	token, urlKey, interval := "none", "database.turso_database_url", "sync"
 	hasToken := d.AuthToken() != ""
-	if d.IsLibSQL() {
+	if d.UsesLibSQLServer() {
 		urlKey, interval, hasToken = "database.libsql_url", "poll", d.LibSQLToken() != ""
 	}
 	if hasToken {

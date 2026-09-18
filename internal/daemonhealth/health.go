@@ -321,6 +321,11 @@ func (f *FleetSyncHealth) Line(now time.Time) string {
 // EngineLibSQL is the libsql engine's name in FleetSyncHealth.Engine.
 const EngineLibSQL = "libsql"
 
+// EngineLibSQLReplica is the libsql_replica engine's name. It reports like
+// turso — a replica with unpushed changes that can be isolated from the fleet
+// while still serving this node — so only its bootstrap remedy differs.
+const EngineLibSQLReplica = "libsql_replica"
+
 // libsqlLine is Line for the libsql engine, which has no replica: nothing is
 // ever "unpushed", and a pull or push is a check that the server answers. It
 // says so in those words rather than borrowing the replica's.

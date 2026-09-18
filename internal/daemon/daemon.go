@@ -176,12 +176,14 @@ type Options struct {
 	// FleetSync is set and this is nil, New creates the channel the fleet
 	// sync loop signals.
 	SyncEvents <-chan struct{}
-	// FleetSync is the shared database's sync engine (turso or libsql). nil
-	// under the local engine: no loop runs and nothing here changes.
+	// FleetSync is the shared database's sync engine (turso, libsql or
+	// libsql_replica). nil under the local engine: no loop runs and nothing
+	// here changes.
 	FleetSync ports.FleetSyncPort
-	// FleetEngine names the shared engine behind FleetSync ("turso" or
-	// "libsql"), for the health record and for the one behaviour that differs:
-	// only turso can pause (database.turso_sync_paused). "" reads as turso.
+	// FleetEngine names the shared engine behind FleetSync ("turso", "libsql"
+	// or "libsql_replica"), for the health record and for the one behaviour
+	// that differs: only an engine with a local replica (turso,
+	// libsql_replica) can pause and has a final push to make. "" reads as turso.
 	FleetEngine string
 	// FleetSyncInterval paces pulls (0 = 15s).
 	FleetSyncInterval time.Duration

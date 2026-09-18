@@ -619,7 +619,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   (`store.TimeOrderedIDs` via `s.nextID()` — NULL under sqlite so AUTOINCREMENT still assigns). Every
   OPERATIONAL statement filters `node_id = self`; FLEET reads span nodes and return `node_id`.
   `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by AST walk with an exemption map that must stay
-  live; the store suite runs FOUR times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql`; libsql runs on
+  live; the store suite runs FIVE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql|libsql_replica`; libsql runs on
   `hranafake`, an in-process Hrana server over SQLite). Two-node sync tests in
   `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` +
   `HAP_TURSO_TEST_TOKEN` point them at a REAL database instead — its hap tables must start empty, so run
@@ -694,6 +694,39 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     folded in), and it honours `database.turso_sync_paused` by skipping the framing pull/push — ONLY those:
     `PrepareSharedSchema` still pulls (and pushes when it leads a schema migration), deliberately, since that
     pull is what the collision check reads peers from. Never tell the operator nothing went over the wire.
+- **`libsql_replica` is turso's offline behaviour rebuilt over Hrana, by LOGICAL row replay**
+  (`internal/store/libsqlreplica`). The local SQLite file is the authority, and the network is still
+  reached only through `internal/store/libsql` (`Batch`/`Tx`, which pipeline many statements into
+  one or two round trips). Every rule below fails silently:
+  - **Capture is suppressed while pulled rows are applied** (`hap_sync_applying`, checked in each
+    `hap_ob_*` trigger's WHEN). Without it, every pulled row is re-captured and re-pushed, and two
+    nodes echo each other through the server forever. A push also TAGS the change-log entries it
+    caused with its node id (the marker row + `temp.hap_push_mark`), so the node does not pull its
+    own writes back. Both halves are covered by `TestPulledRowsAreNotRePushed`.
+  - **The server's change log is written by TRIGGERS, not by the push** (`hap_cl_*`). That is what
+    makes an online `libsql` node's or `hap migrate`'s direct writes visible to replicas. Both logs
+    carry KEYS only, and each side fetches the current row. That is why the log needs no BLOB
+    encoding and why several changes to one row cost one fetch.
+  - **A key with unpushed local changes is skipped by a pull** (the rebase), and Push and Pull hold
+    `syncMu`. A push landing between a pull's fetch and its apply would let the stale fetched row
+    overwrite the pushed one, and the tagged entry means nothing ever corrects it.
+  - **Every table not named `sqlite_*` or `hap_*` replicates, keyed by its PRIMARY KEY** (never the
+    rowid). A table with no primary key is REFUSED at `Prepare`. Keep the `hap_` prefix for anything
+    that must stay local.
+  - **DDL does not ride the replay.** The local file is migrated by the store. The server is migrated
+    through the schema lease by `PrepareServer`, the first time the server answers. Columns replay
+    by the INTERSECTION of the two sides (`table.shared`), so an additive migration on either side
+    keeps both syncing.
+  - **A re-seed is a VERBATIM mirror, deliberately not `store.importer.copyAll`.** That copier
+    re-allocates ids and scopes by node for a move BETWEEN engines, and every later change-log key
+    would miss. It pushes first and keeps outbox keys.
+  - **A cursor is published at seed time, not just on the throttle.** Retention prunes below the
+    cursors it can SEE, so an unregistered node had its entries pruned by the first peer to tidy up,
+    and re-seeded.
+  - Accepted limits: a table created on the server by an online node before any replica installed
+    its trigger misses those rows until a re-seed; and retention runs only on replica nodes, so a
+    fleet that later drops every replica keeps its triggers writing a log nothing prunes (drop `hap_cl_*`
+    and `hap_changelog` by hand).
   - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a
     `database/sql` driver over `<state>/store.sock` (`internal/store/sqlbridge`), lazily dialled so
     `hap config` works with no daemon.
@@ -1314,6 +1347,7 @@ where the behaviour could revert.
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
+| `internal/store/libsqlreplica` | the libsql_replica engine: local replica, capture triggers + outbox, change-log pull, re-seed, retention |
 | `internal/store/libsql` | the libsql engine: Hrana client (`hrana.go`, its only HTTP), `database/sql` streams over `sqlbridge.Backend`; `hranafake` is the in-process test server |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
 | `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |

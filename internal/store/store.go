@@ -63,13 +63,22 @@ const (
 	// the connection and serves it to the other processes, exactly as under
 	// turso, and it is SHARED in the same two ways.
 	EngineLibSQL Engine = "libsql"
+	// EngineLibSQLReplica is libsql with a LOCAL REPLICA: every statement runs
+	// against a local SQLite file the daemon alone opens, and the fleet loop
+	// syncs it with the libsql server by logical row replay
+	// (internal/store/libsqlreplica) — the offline behaviour turso has, over
+	// the Hrana protocol any libsql server speaks. SHARED exactly as the other
+	// two are, which is what makes a replayed INSERT collision-free.
+	EngineLibSQLReplica Engine = "libsql_replica"
 )
 
 // Shared reports whether the engine is one several machines write into —
-// turso or libsql. Both allocate ids (never AUTOINCREMENT) and create the
+// turso, libsql or libsql_replica. All allocate ids (never AUTOINCREMENT) and create the
 // schema without AUTOINCREMENT, so one remote database can be served by either
 // engine and a `hap migrate` round trip holds across them.
-func (e Engine) Shared() bool { return e == EngineTurso || e == EngineLibSQL }
+func (e Engine) Shared() bool {
+	return e == EngineTurso || e == EngineLibSQL || e == EngineLibSQLReplica
+}
 
 // Store is the implementation of ports.StorePort over a SQLite-shaped
 // database — the embedded SQLite file or a Turso sync database.
@@ -194,6 +203,10 @@ func sqliteDSN(path string) string {
 		},
 	}.Encode()
 }
+
+// SQLiteDSN is sqliteDSN for another package that opens a SQLite file the way
+// this one does — the libsql_replica engine's local replica.
+func SQLiteDSN(path string) string { return sqliteDSN(path) }
 
 // Open opens (creating if needed) the SQLite database at path with WAL mode
 // and a busy timeout, resolves the node id from the file beside it, and applies
