@@ -672,6 +672,10 @@ func TestOrchestratorBriefShape(t *testing.T) {
 		// The stream leaves out the orchestrator's own events; a brief that
 		// does not say so disagrees with the binary it drives.
 		"`--include-self`", "`# suppressed`",
+		// The pane check alone attributes only commands run in the
+		// orchestrator's own pane; the brief declares the actor explicitly so
+		// every command it runs is audited as the orchestrator's.
+		"`HAP_ACTOR=orchestrator hap escalations`",
 	} {
 		if !strings.Contains(orchestratorBrief, want) {
 			t.Errorf("the brief does not mention %s", want)
