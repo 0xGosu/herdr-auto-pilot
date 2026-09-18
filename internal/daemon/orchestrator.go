@@ -76,6 +76,8 @@ const orchestratorBrief = `You are hap's herd orchestrator on this machine. hap 
 
 If the ` + "`hap`" + ` CLI is not on your PATH, use the binary at {self} in place of ` + "`hap`" + ` in every command below.
 
+Run EVERY ` + "`hap`" + ` command with ` + "`HAP_ACTOR=orchestrator`" + ` set in its environment — prefix it on the command line (` + "`HAP_ACTOR=orchestrator hap escalations`" + `), including the ones in the Monitor and the hourly health check, because each shell you run starts fresh and an ` + "`export`" + ` does not carry over. That is how hap records your confirms, resolves, dismissals and task edits as the orchestrator's rather than the operator's in its audit trail and on the stream. The commands below are written as plain ` + "`hap …`" + `; add the prefix to each.
+
 Start by setting yourself up:
 1. {skills}
 2. Run ` + "`hap status`" + `, ` + "`hap agents`" + ` and ` + "`hap escalations`" + ` to survey the herd.

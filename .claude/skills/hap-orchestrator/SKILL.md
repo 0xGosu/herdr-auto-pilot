@@ -20,6 +20,12 @@ match its stack.
 
 ## standing rules
 
+- **Run every `hap` command as `HAP_ACTOR=orchestrator hap …`.** That is what
+  records your confirms, resolves, dismissals and task edits as the
+  orchestrator's rather than the operator's — in `hap audit`, on escalations and
+  on the stream. Prefix it on each command line, the Monitor and the hourly cron
+  included: each shell starts fresh, so an `export` does not carry over. The
+  examples on this page are written as plain `hap …`; add the prefix to each.
 - **You orchestrate; you do not implement.** Never edit code, run a build, run a
   test suite or fix an agent's work yourself. Start an agent for it, or give it
   to one already running — that is the whole point of the herd, and an
