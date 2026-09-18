@@ -1,0 +1,1 @@
+- Added `x` on the TUI Config tab to clear a configured `llm.command`, `llm.task_generate_command`, `llm.learn_from_user_command`, `llm.reranking_command` or `full_self_prompting.orchestrator_agent_command` (after a confirm), so you can switch to a different preset without leaving the TUI — editing the template itself is still a `config.toml` job

@@ -682,7 +682,9 @@ therefore take no permission flag at all, and every agy recipe carries
 
 A preset only ever bootstraps a field **nobody has configured** — once one is
 set, tuning it is a `config.toml` edit (or the TUI Config tab's `e` on a
-`(disabled)` row). `sample/config.toml` carries the full annotated argv.
+`(disabled)` row). To switch presets from the TUI, press `x` on the configured row to
+clear it (it asks first), then `e` to pick again — the TUI never edits the
+template itself. `sample/config.toml` carries the full annotated argv.
 
 ### capture delay
 

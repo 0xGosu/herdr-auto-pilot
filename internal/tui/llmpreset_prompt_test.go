@@ -165,3 +165,97 @@ func TestPresetPickerEscapeWritesNothing(t *testing.T) {
 		t.Errorf("esc still wrote a recipe: %#v", cfg.LLM.Command)
 	}
 }
+
+// TestConfiguredLLMCommandClearsOnXThenReBootstraps: x on a configured
+// preset-backed command asks, clears it in config.toml, and leaves the row
+// eligible for the preset picker again — the round trip a TUI operator needs
+// to swap presets without ever editing the template in the TUI.
+func TestConfiguredLLMCommandClearsOnXThenReBootstraps(t *testing.T) {
+	for _, key := range frontend.LLMPresetKeys {
+		t.Run(key, func(t *testing.T) {
+			m, app := presetModel(t)
+			ctx := context.Background()
+			if _, err := app.ApplyLLMPreset(ctx, key, frontend.LLMPresetClaude); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.data.cfg = cfg
+			m = selectConfigField(t, m, key)
+			m = press(t, m, "x")
+			if m.confirm == nil {
+				t.Fatalf("x on a configured %s asked nothing (message %q)", key, m.message)
+			}
+			upd, cmd := m.Update(pressKeyMsg("y"))
+			m = upd.(Model)
+			if cmd == nil {
+				t.Fatal("confirm returned no command")
+			}
+			if msg, ok := cmd().(actionResultMsg); !ok || msg.err != nil {
+				t.Fatalf("clear failed: %#v", msg)
+			}
+			cfg, err = app.Config()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if unset, _ := frontend.LLMCommandUnset(cfg, key); !unset {
+				t.Fatalf("%s still set after confirm: %q", key, frontend.FieldValue(cfg, key))
+			}
+			m.data.cfg = cfg
+			m = selectConfigField(t, m, key)
+			m = press(t, m, "e")
+			if m.prompt == nil || len(m.prompt.options) == 0 {
+				t.Fatalf("cleared %s did not reopen the preset picker", key)
+			}
+		})
+	}
+}
+
+// TestClearLLMCommandCancelKeepsTemplate: n leaves the template untouched.
+func TestClearLLMCommandCancelKeepsTemplate(t *testing.T) {
+	m, app := presetModel(t)
+	ctx := context.Background()
+	if _, err := app.ApplyLLMPreset(ctx, frontend.LLMCommandKey, frontend.LLMPresetClaude); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := app.Config()
+	m.data.cfg = cfg
+	m = selectConfigField(t, m, frontend.LLMCommandKey)
+	m = press(t, m, "x", "n")
+	cfg, _ = app.Config()
+	if len(cfg.LLM.Command) == 0 {
+		t.Fatal("cancel still cleared llm.command")
+	}
+}
+
+// TestClearLLMCommandRefusesAChangedTemplate: a template rewritten in
+// config.toml after the operator was asked is never discarded unseen.
+func TestClearLLMCommandRefusesAChangedTemplate(t *testing.T) {
+	_, app := presetModel(t)
+	ctx := context.Background()
+	if _, err := app.ApplyLLMPreset(ctx, frontend.LLMCommandKey, frontend.LLMPresetClaude); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.ClearLLMCommand(ctx, frontend.LLMCommandKey, []string{"something", "else"}); err == nil {
+		t.Fatal("cleared a template that did not match the one shown")
+	}
+	cfg, _ := app.Config()
+	if len(cfg.LLM.Command) == 0 {
+		t.Fatal("a refused clear still wrote")
+	}
+	if _, err := app.ClearLLMCommand(ctx, "llm.timeout_seconds", nil); err == nil {
+		t.Fatal("cleared a key with no presets")
+	}
+}
+
+// TestXOnOrdinaryFieldStillRefuses: the clear is scoped to preset-backed keys.
+func TestXOnOrdinaryFieldStillRefuses(t *testing.T) {
+	m, _ := presetModel(t)
+	m = selectConfigField(t, m, "llm.timeout_seconds")
+	m = press(t, m, "x")
+	if m.confirm != nil || !strings.Contains(m.message, "not removed") {
+		t.Fatalf("x on an ordinary field: confirm=%v message=%q", m.confirm != nil, m.message)
+	}
+}
