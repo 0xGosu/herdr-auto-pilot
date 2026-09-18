@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.46
+
+- Added `x` on the TUI Config tab to clear a configured `llm.command`, `llm.task_generate_command`, `llm.learn_from_user_command`, `llm.reranking_command` or `full_self_prompting.orchestrator_agent_command` (after a confirm), so you can switch to a different preset without leaving the TUI — editing the template itself is still a `config.toml` job
+
 ## 0.9.45
 
 - The TUI shows a `loading… N%` screen with a progress bar and the step in progress until its first read lands. It used to show `no agents detected`, which over a remote database looked like the herd was gone. A later refresh that takes a while shows `↻ N%` next to the state in the header.
