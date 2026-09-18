@@ -127,7 +127,7 @@ func buildCommands() {
 				"which is why a settings change needs one of the two below instead.\n\n" +
 				"--reload vs --restart: most config is re-read on a reload (every `hap config` write\n" +
 				"sends the same nudge). [database] and [logging] are NOT — they are read once, when a\n" +
-				"process opens its store, so switching engine, pointing at a different Turso database,\n" +
+				"process opens its store, so switching engine, pointing at a different shared database,\n" +
 				"rotating its token, changing node_label or the log level takes effect only in a NEW\n" +
 				"process. Front ends read their store once too, so reopen `hap tui` after a restart.\n" +
 				"The ONE exception is database.turso_sync_paused, which applies on a --reload (every\n" +
@@ -289,7 +289,7 @@ func buildCommands() {
 				"`hap disable`); \"mode\" is the agent's own permission mode (see `hap mode`); cwd\n" +
 				"is the agent's working directory. Either is \"-\" when it could not be read, so\n" +
 				"the field count stays constant for parsers. The last field is the node the\n" +
-				"agent runs on: under a shared database (`database.engine = turso`) other\n" +
+				"agent runs on: under a shared database (`database.engine = turso` or `libsql`) other\n" +
 				"machines' agents follow this machine's, with \"(stale)\" in the status when\n" +
 				"that machine's daemon has stopped reporting. Give an agent a short name with\n" +
 				"`hap rename` — task sources and `hap task <agent>` address agents by that name.",
@@ -316,7 +316,7 @@ func buildCommands() {
 			Details: "Asks the running daemon to classify that agent's pane right now, as if herdr\n" +
 				"had raised an attention event. Use it when an agent looks blocked but nothing\n" +
 				"showed up in `hap escalations`. Requires a running, current daemon.\n" +
-				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"Under a shared database (`[database] engine = \"turso\"` or `\"libsql\"`) `--node` acts on an\n" +
 				"agent on another machine: the request is queued and that machine's daemon runs\n" +
 				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
 				"only on another node is refused rather than guessed — every herdr has a pane 1.",
@@ -339,7 +339,7 @@ func buildCommands() {
 				"task sources (`--agent`) and `hap task <agent> …` select an agent, so renaming\n" +
 				"an agent re-points those selectors at it. A name is unique per MACHINE, so a\n" +
 				"remote rename can come back with a different name than you asked for.\n" +
-				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"Under a shared database (`[database] engine = \"turso\"` or `\"libsql\"`) `--node` acts on an\n" +
 				"agent on another machine: the request is queued and that machine's daemon runs\n" +
 				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
 				"only on another node is refused rather than guessed — every herdr has a pane 1.",
@@ -399,7 +399,7 @@ func buildCommands() {
 			},
 			Details: "Per-agent switch. hap keeps watching and escalating, but never answers that\n" +
 				"agent on its own. `hap pause` is the global equivalent.\n" +
-				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"Under a shared database (`[database] engine = \"turso\"` or `\"libsql\"`) `--node` acts on an\n" +
 				"agent on another machine: the request is queued and that machine's daemon runs\n" +
 				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
 				"only on another node is refused rather than guessed — every herdr has a pane 1.",
@@ -421,7 +421,7 @@ func buildCommands() {
 				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
 			},
 			Details: "Undoes `hap disable`. New agents are enabled by default.\n" +
-				"Under a shared database (`[database] engine = \"turso\"`) `--node` acts on an\n" +
+				"Under a shared database (`[database] engine = \"turso\"` or `\"libsql\"`) `--node` acts on an\n" +
 				"agent on another machine: the request is queued and that machine's daemon runs\n" +
 				"it, so it lands when that node next syncs. Without --node an agent that exists\n" +
 				"only on another node is refused rather than guessed — every herdr has a pane 1.",
@@ -451,7 +451,7 @@ func buildCommands() {
 				"Answer a row with `confirm` (accept the suggestion), `resolve` (supply the right\n" +
 				"answer), or `dismiss` (drop it). `prune` dismisses everything older than N minutes\n" +
 				"(default 360); audit rows are kept and nothing is sent or learned.\n" +
-				"Under a shared database (`[database] engine = \"turso\"`) the list spans every\n" +
+				"Under a shared database (`[database] engine = \"turso\"` or `\"libsql\"`) the list spans every\n" +
 				"machine, and so does `prune` — it retires exactly what you are looking at.\n" +
 				"Pass `--node` to prune one machine instead.\n" +
 				"`retry` re-invokes the operator LLM on an escalation whose consult failed or\n" +
@@ -1250,18 +1250,19 @@ func buildCommands() {
 		{
 			Name:    "migrate",
 			Group:   groupData,
-			Summary: "copy hap's data between the local sqlite database and the shared turso one",
-			Usage: []string{"hap migrate --to sqlite", "hap migrate --to turso",
-				"hap migrate --to sqlite --all-nodes"},
+			Summary: "copy hap's data between the local sqlite database and a shared one (turso or libsql)",
+			Usage: []string{"hap migrate --to sqlite", "hap migrate --to turso", "hap migrate --to libsql",
+				"hap migrate --to sqlite --from libsql", "hap migrate --to sqlite --all-nodes"},
 			Flags: []FlagDoc{
-				{Name: "--to", Arg: "ENGINE", Desc: "required: `sqlite` copies the shared database into this machine's local file, `turso` copies the local file into the shared database. The other engine is the source"},
+				{Name: "--to", Arg: "ENGINE", Desc: "required: `sqlite` copies the shared database into this machine's local file; `turso` or `libsql` copies the local file into that shared database"},
+				{Name: "--from", Arg: "ENGINE", Desc: "with `--to sqlite`: which shared database to copy out of, `turso` or `libsql`. Defaults to the configured engine, else whichever one has a URL set"},
 				{Name: "--all-nodes", Desc: "with `--to sqlite`: copy EVERY node's rows, not just this machine's. For consolidating a herd that is being retired — they arrive stamped as THIS machine's, so a herdr pane id that repeats on every machine collapses into one agent, and two machines' agent names collide (the second is dropped)"},
-				{Name: "--force", Desc: "copy into a destination that already holds history. It does NOT merge: every id is re-allocated, so a second run duplicates every row. With `--to turso` the duplicates are pushed to every node and no local backup undoes them"},
+				{Name: "--force", Desc: "copy into a destination that already holds history. It does NOT merge: every id is re-allocated, so a second run duplicates every row. Going to a shared database the duplicates reach every node and no local backup undoes them"},
 			},
 			Details: "Switching `database.engine` does not move anything — it points hap at a different\n" +
 				"database, and the old one's history stays where it is. This is how the data\n" +
 				"follows, in either direction, so trying the shared database is reversible.\n\n" +
-				"Stop the daemon first. Under turso it holds the only handle to the sync database,\n" +
+				"Stop the daemon first. Under a shared engine it holds the only handle to the database,\n" +
 				"and under either engine a running daemon would be writing into a database being\n" +
 				"copied; the command refuses rather than racing it, and names the pid to kill.\n\n" +
 				"What comes over: learned signatures with their embeddings and snapshots, decisions,\n" +
@@ -1284,7 +1285,11 @@ func buildCommands() {
 				"destination that already holds history is refused unless you pass --force.\n" +
 				"With `--to turso` that backup is only this machine's local replica: the copy is\n" +
 				"pushed to Turso Cloud and pulled by every node, so a forced duplicate cannot be\n" +
-				"rolled back from it.\n" +
+				"rolled back from it. With `--to libsql` there is no local copy at all — the rows go\n" +
+				"straight to the server, which this command does not back up. The copy is ONE\n" +
+				"transaction paying a server round trip per row, and other nodes' writes wait on it\n" +
+				"until it commits: run it before the other machines join, or when the herd is quiet.\n" +
+				"The libsql engine never imports the local database on its own (turso does, once).\n" +
 				"Nothing switches engines: run `hap config set database.engine <engine>` and\n" +
 				"`hap daemon --ensure` when the copy reports what you expected.",
 			Examples: []string{"hap migrate --to sqlite", "hap config set database.engine sqlite", "hap daemon --ensure"},

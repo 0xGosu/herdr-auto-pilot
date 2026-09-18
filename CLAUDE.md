@@ -204,12 +204,14 @@ APIs. Assets can 504 for a minute after publishing; install.sh retries through t
 - **Don't stall the main loop** — the select loop serves all agents; anything shelling out repeatedly
   (LLM CLI, deep pane reads) belongs in a goroutine funnelling results back through a channel
   (`consultLLM` / `llmResults`).
-- **Egress has exactly three exceptions, all opt-in and off by default** — `internal/updatecheck`,
-  the `github_gist` task backend (task text only), and the `turso` engine (syncs the WHOLE store to
-  the operator's Turso Cloud database). `internal/privacy` bans the GitHub and Turso SDKs by import
-  path as well as `net/http`, because the walker checks DIRECT imports — an adapter using only an SDK
-  would egress while passing, and the Turso SDK's network code is native so nothing else could catch
-  it. The gist adapter must keep using `github.WithURLs` and `github.WithTimeout` (not a `*url.URL`
+- **Egress has exactly four exceptions, all opt-in and off by default** — `internal/updatecheck`,
+  the `github_gist` task backend (task text only), the `turso` engine (syncs the WHOLE store to
+  the operator's Turso Cloud database) and the `libsql` engine (the WHOLE store on the operator's own
+  libsql server; its HTTP is `internal/store/libsql/hrana.go` ALONE — the protocol types, the stream
+  and `hranafake` stay HTTP-free so the store suite can import them). `internal/privacy` bans the
+  GitHub and Turso SDKs by import path as well as `net/http`, because the walker checks DIRECT
+  imports — an adapter using only an SDK would egress while passing (the Turso SDK does its HTTP
+  inside the SDK, so no first-party import betrays it). The gist adapter must keep using `github.WithURLs` and `github.WithTimeout` (not a `*url.URL`
   or a hand-built transport), or `net/url` and the no-remote-dial scan need widening.
 
 ### Config surface
@@ -617,10 +619,37 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   (`store.TimeOrderedIDs` via `s.nextID()` — NULL under sqlite so AUTOINCREMENT still assigns). Every
   OPERATIONAL statement filters `node_id = self`; FLEET reads span nodes and return `node_id`.
   `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by AST walk with an exemption map that must stay
-  live; the store suite runs THREE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso`). Two-node sync tests in
+  live; the store suite runs FOUR times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql`; libsql runs on
+  `hranafake`, an in-process Hrana server over SQLite). Two-node sync tests in
   `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` +
   `HAP_TURSO_TEST_TOKEN` point them at a REAL database instead — its hap tables must start empty, so run
-  them one at a time and wipe between.
+  them one at a time and wipe between. The libsql live tests (`HAP_LIBSQL_TEST_URL` + `HAP_LIBSQL_TEST_TOKEN`)
+  are NON-DESTRUCTIVE by design — a scratch table, created and dropped — because the only real servers a
+  developer has hold live data.
+- **`libsql` is a SEPARATE engine from `turso`, not a transport of it** (`internal/store/libsql`). turso's
+  replica syncs over Turso's own protocol (`/pull-updates`, `/export`), which a plain sqld answers with 404
+  (verified against sqld 0.24); libsql speaks Hrana (`/v2/pipeline`), which every libsql server — Turso
+  Cloud included — serves. Everything above the connection is shared (`store.Engine.Shared()`, the daemon
+  owns the handle and serves `store.sock`, node-bit ids, identical schema, the lease in
+  `turso.PrepareSharedSchema` over the `SchemaSyncer` interface). What differs, each load-bearing:
+  - **No local copy, so every statement is a round trip** on the daemon's event loop (~230 ms to a remote
+    provider: a ~20 s start, seconds per `hap` verb). `openLibSQL` warns past `libsqlSlowRTT`; the engine is
+    for NEARBY servers, and the per-request timeout (`libsql.DefaultTimeout`) is what bounds a hung server.
+  - **Pull is a change check, Push a reachability check** — never no-ops. Pull compares the server's
+    `replication_index` (own writes included: re-baselining on them could swallow a foreign write) and
+    answers "changed" when the server reports none, the direction a change token must fail in. A no-op Push
+    would clear the isolation banner while the server is down (`fleetPush` counts success as proof).
+  - **Every server error is prefixed `domain.LibSQLServerErrorPrefix`**, which `syncRemoteFaults` vetoes:
+    sqld relays SQLite's own `database is locked`, a PROCESS-LOCAL shape, so without it a busy server
+    restarts the daemon every cooldown.
+  - `turso_sync_paused` is IGNORED (`SyncPausedEffective`, `fleetSyncPaused`), never refused at start:
+    honouring it would stop the store, refusing would leave the herd unmonitored.
+  - **The legacy import never runs automatically** — it is ONE transaction paying a round trip per row
+    while the server holds its write lock; `hap migrate --to libsql` does it deliberately.
+  - Hrana's execute takes ONE statement; the schema's batches are resent as a `sequence` on sqld's
+    `SQL_MANY_STATEMENTS` (asking the server, never splitting SQL here). Integers travel as STRINGS and are
+    parsed with `ParseInt` — node-bit ids live past 2^53. An idle stream expires in ~10 s (`STREAM_EXPIRED`),
+    harmless because a connection holds a baton only inside a transaction.
   - `hasOpenEscalation` asks the store, never filters the fleet queue by agent id in Go — that would let
     another machine's pane `1` block this one's reconcile.
   - **There is ONE copier between the two engines** (`store.importer.copyAll`), and both the automatic
@@ -1273,6 +1302,7 @@ where the behaviour could revert.
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
+| `internal/store/libsql` | the libsql engine: Hrana client (`hrana.go`, its only HTTP), `database/sql` streams over `sqlbridge.Backend`; `hranafake` is the in-process test server |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
 | `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |
 | `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `sqlite` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |
@@ -1280,6 +1310,6 @@ where the behaviour could revert.
 | `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
 | `internal/streamlog` | machine-local SQLite event log behind `hap stream orchestrator` (its own file, NOT a store table) |
 | `internal/profiling` | opt-in rolling CPU/heap profiles (`HAP_PROFILE_DIR`); files only, no listener |
-| `internal/updatecheck` | GitHub release check — one of exactly TWO `net/http` importers (NFR-007 allowlist) |
+| `internal/updatecheck` | GitHub release check — one of the allowlisted `net/http` importers (NFR-007) |
 | `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
 | `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |

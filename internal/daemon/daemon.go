@@ -176,9 +176,13 @@ type Options struct {
 	// FleetSync is set and this is nil, New creates the channel the fleet
 	// sync loop signals.
 	SyncEvents <-chan struct{}
-	// FleetSync is the shared database's sync engine (turso). nil under the
-	// local engine: no loop runs and nothing here changes.
+	// FleetSync is the shared database's sync engine (turso or libsql). nil
+	// under the local engine: no loop runs and nothing here changes.
 	FleetSync ports.FleetSyncPort
+	// FleetEngine names the shared engine behind FleetSync ("turso" or
+	// "libsql"), for the health record and for the one behaviour that differs:
+	// only turso can pause (database.turso_sync_paused). "" reads as turso.
+	FleetEngine string
 	// FleetSyncInterval paces pulls (0 = 15s).
 	FleetSyncInterval time.Duration
 	// FleetWrites is signalled by the store after a committed write; the sync
@@ -239,6 +243,9 @@ type Daemon struct {
 	// from ever both spawning a successor. See checkFleetSyncWedged.
 	lastFleetRecovery     atomic.Int64
 	fleetRecoveryDeclined atomic.Bool
+	// fleetPauseIgnored latches the one warning that turso_sync_paused has no
+	// effect under a non-turso shared engine (fleetSyncPaused).
+	fleetPauseIgnored atomic.Bool
 	// fleetRecoveryOrdered latches once a restart has been ORDERED. It is a
 	// separate latch from handedOff because the two mean different things: a
 	// handoff is this process stepping aside for a successor it started,

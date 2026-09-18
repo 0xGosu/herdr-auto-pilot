@@ -299,6 +299,9 @@ func (f *FleetSyncHealth) Line(now time.Time) string {
 		return fmt.Sprintf("%s — PAUSED by database.turso_sync_paused (%d unpushed, last pull %s, last push %s)",
 			f.Engine, f.PendingOps, ago(f.LastPullAt), ago(f.LastPushAt))
 	}
+	if f.Engine == EngineLibSQL {
+		return f.libsqlLine(now, ago)
+	}
 	if !f.Bootstrapped {
 		return fmt.Sprintf("%s — BOOTSTRAP PENDING: %s", f.Engine, f.LastError)
 	}
@@ -313,6 +316,28 @@ func (f *FleetSyncHealth) Line(now time.Time) string {
 	}
 	return fmt.Sprintf("%s — ok (last pull %s, last push %s, %d unpushed)",
 		f.Engine, ago(f.LastPullAt), ago(f.LastPushAt), f.PendingOps)
+}
+
+// EngineLibSQL is the libsql engine's name in FleetSyncHealth.Engine.
+const EngineLibSQL = "libsql"
+
+// libsqlLine is Line for the libsql engine, which has no replica: nothing is
+// ever "unpushed", and a pull or push is a check that the server answers. It
+// says so in those words rather than borrowing the replica's.
+func (f *FleetSyncHealth) libsqlLine(now time.Time, ago func(time.Time) string) string {
+	last := f.LastProgressAt()
+	if !f.Bootstrapped {
+		return fmt.Sprintf("%s — SERVER NOT REACHED YET (store unavailable): %s", f.Engine, f.LastError)
+	}
+	if f.LastError != "" {
+		state := "DEGRADED"
+		if f.Isolated(now) {
+			state = "ISOLATED"
+		}
+		return fmt.Sprintf("%s — %s for %s (%d consecutive failures): %s (server last answered %s)",
+			f.Engine, state, f.IsolatedFor(now).Round(time.Second), f.ConsecutiveFailures, f.LastError, ago(last))
+	}
+	return fmt.Sprintf("%s — ok (server last answered %s; every write goes straight to the server)", f.Engine, ago(last))
 }
 
 // DiagLines is the evidence behind a degraded sync, as indented detail lines:

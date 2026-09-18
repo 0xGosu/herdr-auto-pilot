@@ -83,6 +83,9 @@ type DaemonHealth struct {
 	// says "running" for a process doing nothing. Past the isolation window it
 	// is reported as the stuck install it almost certainly is.
 	FleetSyncBootstrapping bool
+	// FleetSyncEngine names the shared engine ("turso" or "libsql"): the
+	// remedies differ (the keys to check), and so does what isolation means.
+	FleetSyncEngine string
 	// FleetSyncPaused: the operator turned database.turso_sync_paused on, so
 	// this node deliberately exchanges no rows with Turso Cloud. It is a
 	// THIRD state, neither healthy nor failing, and it is reported rather than
@@ -182,6 +185,7 @@ func (a *App) AssessDaemonHealth() DaemonHealth {
 			h.FleetSyncDiagLines = rec.FleetSync.DiagLines(now)
 			if rec.FleetSync != nil {
 				h.FleetSyncError = rec.FleetSync.LastError
+				h.FleetSyncEngine = rec.FleetSync.Engine
 			}
 			if o := rec.Orchestrator; o != nil {
 				h.OrchestratorFailing = o.Failing()
@@ -270,11 +274,20 @@ func (h DaemonHealth) Banner() string {
 	// not the sync engine). Named separately from the "still starting" case
 	// below so a cold start does not read as a broken install.
 	case h.FleetSyncBootstrapping && h.FleetSyncFor >= daemonhealth.FleetSyncIsolatedAfter:
+		if h.FleetSyncEngine == daemonhealth.EngineLibSQL {
+			return fmt.Sprintf("⚠ DAEMON NOT MONITORING — still waiting %s for the libsql server to answer; "+
+				"nothing is being watched. Check database.libsql_url and the auth token", formatAge(h.FleetSyncFor))
+		}
 		return fmt.Sprintf("⚠ DAEMON NOT MONITORING — still waiting %s for the shared database to bootstrap; "+
 			"nothing is being watched. Check database.turso_database_url and the auth token", formatAge(h.FleetSyncFor))
 	// Leads with the CONSEQUENCE, not the fault: an operator needs to know
 	// that what this screen shows is only half the fleet. The error text is a
 	// detail line (FleetSyncDiagLines / the status line), not this.
+	case h.FleetSyncIsolated && h.FleetSyncEngine == daemonhealth.EngineLibSQL:
+		// No replica to fall back on: an unreachable server is not "out of
+		// step", it is every read and write failing.
+		return fmt.Sprintf("⚠ SHARED DATABASE UNREACHABLE for %s — the libsql server is not answering, so every "+
+			"store read and write on this machine is failing", formatAge(h.FleetSyncFor))
 	case h.FleetSyncIsolated:
 		return fmt.Sprintf("⚠ FLEET SYNC ISOLATED for %s — this machine is NOT exchanging rows with the other nodes; "+
 			"their escalations and agents are not shown here and this node's are not reaching them", formatAge(h.FleetSyncFor))

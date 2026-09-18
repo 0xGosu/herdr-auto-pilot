@@ -416,3 +416,49 @@ func TestFleetSyncPausedHealthIsPausedNotDegraded(t *testing.T) {
 		t.Errorf("status line = %q, want it to read as PAUSED and nothing worse", line)
 	}
 }
+
+// TestFleetSyncPauseIsIgnoredUnderLibSQL: the libsql engine keeps no local
+// copy, so honouring turso_sync_paused would stop the store itself. The key is
+// ignored there — the loop keeps checking the server, and the health record
+// neither reads PAUSED nor stops reporting an outage.
+func TestFleetSyncPauseIsIgnoredUnderLibSQL(t *testing.T) {
+	sync := &fakeFleetSync{}
+	h := newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
+		func(o *Options) {
+			o.FleetSync = sync
+			o.FleetEngine = "libsql"
+			o.FleetSyncInterval = 20 * time.Millisecond
+		})
+	if h.daemon.fleetSyncPaused() {
+		t.Fatal("turso_sync_paused paused a libsql node")
+	}
+	waitFor(t, 2*time.Second, func() bool { return sync.pulls.Load() >= 2 })
+	if sync.pulls.Load() < 2 {
+		t.Fatal("the change check did not run under a (meaningless) pause")
+	}
+	fh := h.daemon.fleetHealth()
+	if fh == nil || fh.Engine != "libsql" || fh.Paused {
+		t.Fatalf("health = %+v, want engine libsql and not paused", fh)
+	}
+}
+
+// TestFleetSyncPauseStillAppliesUnderTurso is the control: the same config on
+// the turso engine (and on an unnamed one, which reads as turso) does pause.
+func TestFleetSyncPauseStillAppliesUnderTurso(t *testing.T) {
+	for _, engine := range []string{"turso", ""} {
+		sync := &fakeFleetSync{}
+		h := newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
+			func(o *Options) {
+				o.FleetSync = sync
+				o.FleetEngine = engine
+				o.FleetSyncInterval = 20 * time.Millisecond
+			})
+		if !h.daemon.fleetSyncPaused() {
+			t.Fatalf("engine %q: turso_sync_paused did not pause", engine)
+		}
+		if fh := h.daemon.fleetHealth(); fh.Engine != "turso" {
+			t.Errorf("engine %q: health engine = %q, want turso", engine, fh.Engine)
+		}
+		h.stop()
+	}
+}

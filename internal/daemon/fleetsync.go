@@ -123,7 +123,7 @@ func (d *Daemon) fleetHealth() *daemonhealth.FleetSyncHealth {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return &daemonhealth.FleetSyncHealth{
-		Engine:              "turso",
+		Engine:              d.fleetEngine(),
 		Bootstrapped:        true,
 		Paused:              paused,
 		LastPullAt:          s.lastPull,
@@ -188,7 +188,26 @@ func (d *Daemon) adoptFleetRecoveryMarker() {
 // engine change, not a pause.
 func (d *Daemon) fleetSyncPaused() bool {
 	cfg, _, _ := d.snapshot()
+	if d.fleetEngine() != "turso" {
+		// Only a replica can pause (config.Database.SyncPausedEffective): the
+		// libsql engine keeps no local copy, so a pause there would stop the
+		// store itself. Ignored — and said so, once per daemon.
+		if cfg.Database.TursoSyncPaused && d.fleetPauseIgnored.CompareAndSwap(false, true) {
+			slog.Warn("fleet sync: database.turso_sync_paused is set but has no effect under the " +
+				d.fleetEngine() + " engine, which keeps no local copy to fall back on; every statement still " +
+				"goes to the server")
+		}
+		return false
+	}
 	return cfg.Database.TursoSyncPaused
+}
+
+// fleetEngine is the shared engine's name, "turso" when unset.
+func (d *Daemon) fleetEngine() string {
+	if d.opt.FleetEngine == "" {
+		return "turso"
+	}
+	return d.opt.FleetEngine
 }
 
 // notePausedSkip says that an operation was skipped, at Debug: it happens on

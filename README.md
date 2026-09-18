@@ -603,7 +603,7 @@ reaches the store, and never enters `config.toml`.
 
 The default provider, **`sqlite`**, keeps a source's checklist **inside hap's own
 database** instead of a file. Nothing leaves the machine under the default
-engine; under the [central database](#central-database-turso) those lists sync
+engine; under the [central database](#central-database-turso-or-any-libsql-server) those lists sync
 with everything else, so the Tasks tab and `hap task --node <machine> <agent> …`
 on any machine show and edit every other machine's queues. `path` is a list
 name inside the store exactly as under `github_gist` (leave it out for one list
@@ -885,7 +885,7 @@ Deprecated but still loading, migrated on the next config save:
 `safety.disable_never_auto_seed_patterns`; `irreversible_indicators` and
 `[[safety.indicator_rules]]` → `[[safety.never_auto_rules]]`.
 
-## Central database (Turso)
+## Central database (Turso or any libsql server)
 
 hap keeps everything in one SQLite file per machine. If you run agents on
 **several machines**, `[database] engine = "turso"` moves that store into a
@@ -954,6 +954,36 @@ during that machine's hand-out.
   network; until it succeeds `hap status` shows `bootstrap pending`. Switching
   an existing install imports its local database once, then leaves the old
   file in place.
+
+### Any libsql server (`engine = "libsql"`)
+
+The `turso` engine syncs a local replica over Turso's own protocol, which only
+Turso Cloud (and `tursodb --sync-server`) serve. To share the store through
+**any libsql server** — Turso Cloud, a hosted provider such as Layerbase, or your
+own `sqld` — use `libsql`, which talks Hrana (HTTP) to the server directly:
+
+```sh
+hap config set database.engine libsql
+hap config set database.libsql_url libsql://<db>.<provider>   # or https://…, http://host:8080
+hap config set database.libsql_auth_token <token>              # or export LIBSQL_AUTH_TOKEN
+hap daemon --restart
+```
+
+Everything above about sharing, conflicts and privacy applies unchanged. What
+differs:
+
+- **No local replica.** Every statement is a round trip to the server, so use
+  a server **near** the machines: at ~200 ms a round trip the daemon takes ~20 s
+  to start and a `hap` verb a few seconds; on a LAN it is as quick as `turso`.
+  The daemon warns at start when the server is far.
+- Other nodes' writes are noticed by a cheap change check every
+  `database.libsql_poll_interval_seconds` (default 15 s); your own writes land
+  on the server immediately.
+- Nothing to pause: `database.turso_sync_paused` has no effect.
+- The local database is **not** imported automatically (the copy would hold the
+  server's write lock for a round trip per row): run `hap migrate --to libsql`
+  with the daemon stopped. `hap migrate --to sqlite --from libsql` goes back.
+- A Turso Cloud database can be used by either engine; the schema is identical.
 
 ## Health and disk usage
 

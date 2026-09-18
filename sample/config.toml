@@ -810,6 +810,22 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 #                                         # `hap daemon --reload` (so `hap config set` is enough) —
 #                                         # the rest are read when a process opens its store.
 # node_label = ""                         # how other machines see this one (default: hostname)
+#
+# "libsql" is the same central database for ANY libsql server — Turso Cloud, a
+# hosted provider (Layerbase, …) or your own `sqld` — reached over Hrana, the
+# HTTP protocol every libsql server speaks. Pick it when the server does not
+# speak Turso's sync protocol (a plain sqld answers 404 to it). There is NO
+# local replica: every statement is a round trip to the server, so it wants a
+# NEARBY server — at ~200 ms per round trip the daemon starts in ~20 s and a
+# `hap` verb takes seconds. Nothing is imported automatically: bring a local
+# history over with `hap migrate --to libsql` (daemon stopped).
+# [database]
+# engine = "libsql"
+# libsql_url = "libsql://<db>.<provider>"  # or https://…, or http://host:8080 for a private sqld
+# libsql_auth_token = ""                  # empty = read LIBSQL_AUTH_TOKEN; a server without auth needs none
+# libsql_poll_interval_seconds = 15       # how often the daemon checks for other nodes' writes (min 5)
+# node_label = ""
+# turso_sync_paused has no effect under libsql (there is no local copy to fall back on).
 
 # ── Where task lists are stored: the DEFAULT (per-source overridable) ──
 # This section supplies the DEFAULT storage for the checklists below. Each

@@ -2454,8 +2454,11 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		// true and not the default false, for the same reason as the two above:
 		// the sample doubles as the SetField exercise, and the value that
 		// changes behaviour is the one worth round-tripping.
-		"database.turso_sync_paused": "true",
-		"database.node_label":        "laptop",
+		"database.turso_sync_paused":            "true",
+		"database.libsql_url":                   "libsql://hap-me.example.dev",
+		"database.libsql_auth_token":            "eyJ.sample.libsql",
+		"database.libsql_poll_interval_seconds": "30",
+		"database.node_label":                   "laptop",
 		// Non-zero on purpose: 0 is a valid setting here ("never prune") but
 		// this sample also feeds the FieldValue round trip, and a real day
 		// count is the case worth exercising. The explicit-0 path has its own
@@ -2599,6 +2602,8 @@ func TestFieldTUIEditableClassification(t *testing.T) {
 		// hidden, but the declared flag is what this test pins.
 		"database.turso_database_url": true,
 		"database.turso_auth_token":   true,
+		"database.libsql_url":         true,
+		"database.libsql_auth_token":  true,
 		"database.node_label":         true,
 	}
 	for _, f := range frontend.ConfigFields {
@@ -2663,8 +2668,10 @@ func TestTUIHiddenConfigFields(t *testing.T) {
 		"task_source_provider.refresh_seconds": true,
 		// The token is a secret (rendered redacted, but not a row to show at
 		// all); the interval is tuned once if ever.
-		"database.turso_auth_token":            true,
-		"database.turso_sync_interval_seconds": true,
+		"database.turso_auth_token":             true,
+		"database.turso_sync_interval_seconds":  true,
+		"database.libsql_auth_token":            true,
+		"database.libsql_poll_interval_seconds": true,
 		// Eight color strings would bury the settings a TUI operator actually
 		// reaches for, but they stay registered so `hap config set` reaches them.
 		"tui.palette.title":   true,

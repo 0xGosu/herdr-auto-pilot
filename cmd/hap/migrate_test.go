@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0xGosu/herdr-auto-pilot/internal/config"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
@@ -26,14 +27,20 @@ func TestParseMigrateArgs(t *testing.T) {
 		args     []string
 		wantErr  string
 		toSQLite bool
+		shared   string
 		all      bool
 		force    bool
 	}{
 		{name: "to sqlite", args: []string{"--to", "sqlite"}, toSQLite: true},
-		{name: "to turso", args: []string{"--to", "turso"}},
+		{name: "to turso", args: []string{"--to", "turso"}, shared: "turso"},
+		{name: "to libsql", args: []string{"--to", "libsql"}, shared: "libsql"},
+		{name: "from libsql", args: []string{"--to", "sqlite", "--from", "libsql"}, toSQLite: true, shared: "libsql"},
+		{name: "from equals form", args: []string{"--to=sqlite", "--from=turso"}, toSQLite: true, shared: "turso"},
+		{name: "from going up", args: []string{"--to", "libsql", "--from", "turso"}, wantErr: "--from only applies"},
+		{name: "bad from", args: []string{"--to", "sqlite", "--from", "sqlite"}, wantErr: "--from must be"},
 		{name: "equals form", args: []string{"--to=sqlite"}, toSQLite: true},
 		{name: "all nodes", args: []string{"--to", "sqlite", "--all-nodes"}, toSQLite: true, all: true},
-		{name: "force", args: []string{"--to", "turso", "--force"}, force: true},
+		{name: "force", args: []string{"--to", "turso", "--force"}, shared: "turso", force: true},
 		{name: "no direction", args: nil, wantErr: "usage:"},
 		{name: "bad engine", args: []string{"--to", "postgres"}, wantErr: "--to must be"},
 		{name: "unknown flag", args: []string{"--to", "sqlite", "--wat"}, wantErr: `unknown argument "--wat"`},
@@ -50,9 +57,9 @@ func TestParseMigrateArgs(t *testing.T) {
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
-			if got.toSQLite != tc.toSQLite || got.allNodes != tc.all || got.force != tc.force {
-				t.Errorf("parsed %+v, want toSQLite=%v allNodes=%v force=%v",
-					got, tc.toSQLite, tc.all, tc.force)
+			if got.toSQLite != tc.toSQLite || got.shared != tc.shared || got.allNodes != tc.all || got.force != tc.force {
+				t.Errorf("parsed %+v, want toSQLite=%v shared=%q allNodes=%v force=%v",
+					got, tc.toSQLite, tc.shared, tc.all, tc.force)
 			}
 		})
 	}
@@ -223,5 +230,42 @@ func TestPausedMigrateNoteDoesNotClaimSilenceOnTheWire(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestResolveMigrateSharedPicksTheOtherSide: going to sqlite the source is the
+// configured shared engine, else the one with a URL — and when both have one
+// and neither is configured, the command asks rather than guesses.
+func TestResolveMigrateSharedPicksTheOtherSide(t *testing.T) {
+	down := migrateArgs{toSQLite: true}
+	for _, tc := range []struct {
+		name    string
+		db      config.Database
+		want    string
+		wantErr string
+	}{
+		{name: "configured libsql", db: config.Database{Engine: "libsql", TursoDatabaseURL: "x"}, want: "libsql"},
+		{name: "configured turso", db: config.Database{Engine: "turso", LibSQLURL: "x"}, want: "turso"},
+		{name: "only libsql url", db: config.Database{LibSQLURL: "https://x"}, want: "libsql"},
+		{name: "only turso url", db: config.Database{TursoDatabaseURL: "libsql://x"}, want: "turso"},
+		{name: "both urls", db: config.Database{TursoDatabaseURL: "a", LibSQLURL: "b"}, wantErr: "--from"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveMigrateShared(down, config.Config{Database: tc.db})
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("err = %v, want one naming %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil || got != tc.want {
+				t.Fatalf("got %q, %v; want %q", got, err, tc.want)
+			}
+		})
+	}
+	// --from wins over everything.
+	if got, _ := resolveMigrateShared(migrateArgs{toSQLite: true, shared: "turso"},
+		config.Config{Database: config.Database{Engine: "libsql"}}); got != "turso" {
+		t.Errorf("--from turso resolved to %q", got)
 	}
 }
