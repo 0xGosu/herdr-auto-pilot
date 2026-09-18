@@ -14,6 +14,7 @@ said when it was raised; by the time you read it the agent may have moved on.
 | `never_auto_match` | a safety rule forced a human | operator-only. Do not bypass, do not rephrase into the agent |
 | `suspected_irreversible` | heuristic matched the pane | read the screen: it often matched the agent's own prose |
 | `no_task_source` | the agent has no list | register a source, or dismiss if it is not your node |
+| `task_source_unusable` | a source owns the agent but its list could not be read, so no task was generated | fix the source the rationale names (`hap config task-source list`), then dismiss |
 | `task_source_exhausted`, `noop_vs_pending_tasks` | bookkeeping notices about a queue | dismiss; latched once per parked episode on current builds |
 | `unclassifiable` | hap cannot read the screen | often a vendor form — [agy.md](agy.md) |
 

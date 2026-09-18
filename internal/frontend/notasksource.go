@@ -31,10 +31,9 @@ import (
 //     outcomes in daemon.handleTaskGenOutcome, all stamp the same tag with a
 //     confirmable suggestion.
 //   - The one other empty-suggestion producer, the daemon's "task source is
-//     configured but unusable" escalate, passes a Decision whose Reason is
-//     UNSET, so its rationale is "[] idle with no task source…" and
-//     domain.EscalationReasonTag returns "" — it keeps the ordinary error, and
-//     rightly so: the fix there is the broken source, not this advice.
+//     configured but unusable" escalate, is tagged [task_source_unusable]
+//     with the read failure in its rationale — it keeps the ordinary error,
+//     and rightly so: the fix there is the broken source, not this advice.
 //
 // That is why the guidance can name llm.task_generate_command unconditionally
 // without reading config. Note the precise claim: the key was unset when this

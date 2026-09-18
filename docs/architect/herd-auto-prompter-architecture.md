@@ -978,7 +978,7 @@ Exactly two tools:
 `never_auto_match`, `suspected_irreversible`, `rate_limited`, `retry_exhausted`,
 `daemon_paused`, `llm_timeout`, `llm_no_submit`, `llm_low_confidence`,
 `herdr_unreachable`, `persistence_failed`, `shadow_mode`, `no_task_source`,
-`task_source_exhausted`, `noop_vs_pending_tasks`, `unfamiliar_options`,
+`task_source_exhausted`, `task_source_unusable`, `noop_vs_pending_tasks`, `unfamiliar_options`,
 `no_history`, `graduation_pending`, `task_gen_failed`, `llm_retry`.
 
 Two of them are NOTICES ABOUT A QUEUE rather than questions about a screen, and

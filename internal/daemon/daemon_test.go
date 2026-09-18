@@ -3082,6 +3082,48 @@ func TestIdleGeneratesTaskSuggestionEscalation(t *testing.T) {
 	}
 }
 
+// TestIdleUnusableSourceEscalatesWithItsOwnReason: a declared source whose list
+// cannot be read withholds task generation (inventing work for an agent whose
+// real list may be full of it is the wrong answer), and the row must SAY so.
+// It used to reuse the generate decision, so it read "[] idle with no task
+// source; generating a task suggestion" — no reason tag, no source, no error,
+// and a claim that generation was under way when it had been refused.
+// TestIdleGeneratesTaskSuggestionEscalation is the control: the same harness
+// with no source at all does reach the generator.
+func TestIdleUnusableSourceEscalatesWithItsOwnReason(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "gone.md")
+	cfg := fmt.Sprintf("[[task_sources]]\nagent = \"agent-20\"\npath = %q\n", missing)
+	h, tg := newHarnessTaskGen(t, cfg, func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "Invent some work", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	h.push("agent-20", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if got := domain.EscalationReasonTag(esc[0].Rationale); got != string(domain.ReasonTaskSourceUnusable) {
+		t.Errorf("reason tag = %q, want %q (rationale %q)", got, domain.ReasonTaskSourceUnusable, esc[0].Rationale)
+	}
+	for _, want := range []string{"not generating tasks", "task source #0", "gone.md"} {
+		if !strings.Contains(esc[0].Rationale, want) {
+			t.Errorf("rationale %q does not mention %q", esc[0].Rationale, want)
+		}
+	}
+	if strings.Contains(esc[0].Rationale, "generating a task suggestion") {
+		t.Errorf("rationale still claims a generation was under way: %q", esc[0].Rationale)
+	}
+	if esc[0].Suggestion != "" {
+		t.Errorf("an unusable source must not carry a suggestion, got %q", esc[0].Suggestion)
+	}
+	if calls := tg.genCalls(); len(calls) != 0 {
+		t.Errorf("the generator must not run for an agent with an unreadable source, ran %d time(s)", len(calls))
+	}
+}
+
 func TestIdleTaskGenListModeCapturesRationale(t *testing.T) {
 	// When the model wraps a bullet list in prose, the list items become the
 	// confirmable tasks (RAW, in the suggestion) and the ignored non-list prose

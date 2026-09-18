@@ -2854,12 +2854,20 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 		// would write invented tasks for an agent whose real list is full of
 		// pending work, which is the opposite of what the operator asked for.
 		// Escalate instead: the operator can see the source is broken.
+		//
+		// With its OWN reason and the failure itself, never the generate
+		// decision as it stands: that one carries no reason and the rationale
+		// "generating a task suggestion", so the row used to read as a
+		// generation that produced nothing — the opposite of what happened —
+		// and nothing on it named the source or why it could not be read.
 		if declared == nil {
 			if _, _, unusable := d.matchTaskSource(ctx, cfg, tr.AgentID, tr.AgentType,
-				tr.WorkspaceID, agentName); unusable {
+				tr.WorkspaceID, agentName); unusable != nil {
 				slog.Warn("task source is configured but unusable; escalating instead of generating tasks",
-					"agent", situation.AgentID)
-				d.escalate(ctx, situation, sig, decision, tr, now)
+					"agent", situation.AgentID, "error", unusable)
+				d.escalate(ctx, situation, sig, domain.Decision{Action: domain.ActionEscalate,
+					Reason: domain.ReasonTaskSourceUnusable, Confidence: decision.Confidence,
+					Rationale: domain.TaskSourceUnusableRationale(unusable)}, tr, now)
 				return
 			}
 		}
@@ -6144,13 +6152,14 @@ func (d *Daemon) sourceSelectsAgent(ctx context.Context, src config.TaskSource,
 	return domain.MatchWorkspace(src.Workspace, target)
 }
 
-// matchTaskSource returns the source serving this agent. The third result
-// reports that a source SELECTED this agent but could not be resolved or read,
-// which callers must not confuse with "this agent has no task source" — the
-// latter is what licenses inventing one.
-func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool, bool) {
+// matchTaskSource returns the source serving this agent. The third result is
+// non-nil when a source SELECTED this agent but could not be resolved or read
+// (the first such failure, naming the source's index and list), which callers
+// must not confuse with "this agent has no task source" — the latter is what
+// licenses inventing one.
+func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID, agentType, workspaceID, agentName string) (taskSourceMatch, bool, error) {
 	var completed *taskSourceMatch
-	unusable := false
+	var unusable error
 	for i, src := range cfg.TaskSources {
 		if !d.sourceSelectsAgent(ctx, src, agentID, agentType, workspaceID, agentName) {
 			continue
@@ -6163,17 +6172,21 @@ func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID
 			// provider would have hap INVENTING tasks for an agent whose real
 			// list is full of pending work.
 			slog.Warn("task source unresolvable", "agent", agentID, "error", err)
-			unusable = true
+			if unusable == nil {
+				unusable = fmt.Errorf("task source #%d: %w", i, err)
+			}
 			continue
 		}
 		data, err := d.opt.ReadTaskFile(res.Locator)
 		if err != nil {
 			slog.Warn("task source unreadable", "locator", res.Locator, "error", err)
-			unusable = true
+			if unusable == nil {
+				unusable = fmt.Errorf("task source #%d (%s): %w", i, res.Display, err)
+			}
 			continue
 		}
 		if domain.NextDeclaredTask(string(data)) != "" {
-			return taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, index: i, data: data}, true, false
+			return taskSourceMatch{src: src, locator: res.Locator, display: res.Display, remote: res.Remote, index: i, data: data}, true, nil
 		}
 		// Only a real checklist with every item checked counts as completed;
 		// an empty or non-checklist file must not suppress tier-2 inference.
@@ -6182,7 +6195,7 @@ func (d *Daemon) matchTaskSource(ctx context.Context, cfg config.Config, agentID
 		}
 	}
 	if completed != nil {
-		return *completed, true, false
+		return *completed, true, nil
 	}
 	return taskSourceMatch{}, false, unusable
 }
