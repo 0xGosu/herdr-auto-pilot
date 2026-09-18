@@ -8,9 +8,10 @@ import (
 	"io"
 )
 
-// backend is what a driver connection talks to: the in-process Session, or a
-// remote one over the socket. Both take plain values and return eager rows.
-type backend interface {
+// Backend is what a driver connection talks to: the in-process Session, a
+// remote one over the socket, or a stream to a libsql server over Hrana
+// (internal/store/libsql). All take plain values and return eager rows.
+type Backend interface {
 	Exec(ctx context.Context, query string, args []any) (lastID, affected int64, err error)
 	Query(ctx context.Context, query string, args []any) (cols []string, rows [][]driver.Value, err error)
 	Begin(ctx context.Context) error
@@ -94,6 +95,36 @@ func OpenGated(e *Executor, maxOpen int) *sql.DB {
 	return db
 }
 
+// BackendConnector is a driver.Connector whose every connection is a Backend
+// opened by open — how an adapter outside this package (the libsql engine's
+// Hrana streams) gets database/sql's pool, transactions and bad-connection
+// handling without reimplementing them. A Backend error wrapped by
+// TransportError marks its connection bad, exactly as a socket failure does.
+type BackendConnector struct {
+	Open func(ctx context.Context) (Backend, error)
+}
+
+// Connect opens one Backend.
+func (c *BackendConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	b, err := c.Open(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &conn{b: b}, nil
+}
+
+// Driver implements driver.Connector.
+func (c *BackendConnector) Driver() driver.Driver { return bridgeDriver{} }
+
+// TransportError wraps err as a transport failure: the connection it came
+// from is discarded by the pool rather than reused. nil stays nil.
+func TransportError(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &transportError{err: err}
+}
+
 // bridgeDriver only exists to satisfy driver.Connector.Driver; connections are
 // always made through a Connector.
 type bridgeDriver struct{}
@@ -104,7 +135,7 @@ func (bridgeDriver) Open(string) (driver.Conn, error) {
 
 // conn adapts a backend to database/sql's driver interfaces.
 type conn struct {
-	b   backend
+	b   Backend
 	bad bool
 }
 

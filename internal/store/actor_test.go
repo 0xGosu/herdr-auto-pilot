@@ -117,7 +117,7 @@ func TestSettlingAnEscalationNamesTheActor(t *testing.T) {
 // column appears the SAME handle attributes again: the negative answer is not
 // cached, so a TUI left open across the handoff recovers on its own.
 func TestAStoreOverAPreActorSchemaDegradesToUnattributed(t *testing.T) {
-	if proxyMode() || tursoMode() {
+	if proxyMode() || sharedMode() {
 		t.Skip("drives a raw sqlite file to reproduce the older daemon's schema")
 	}
 	ctx := context.Background()

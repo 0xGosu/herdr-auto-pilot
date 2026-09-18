@@ -1,6 +1,6 @@
 // Package privacy holds the no-telemetry verification (NFR-007, SC-6): the
 // plugin sends no telemetry and makes no outbound network call beyond the
-// local Herdr socket, the operator-configured local LLM CLI, and THREE
+// local Herdr socket, the operator-configured local LLM CLI, and FOUR
 // allowlisted exceptions, all operator opt-in and all off by default:
 //
 //  1. internal/updatecheck/fetch.go — the opt-out release check, which asks
@@ -17,6 +17,10 @@
 //     rules) with a Turso Cloud database the operator owns, with a token the
 //     operator supplies, so several of their machines share one hap view. Used
 //     only when [database] engine = "turso"; the default is sqlite, a local file.
+//  4. internal/store/libsql/hrana.go — the libsql store engine, which keeps the
+//     WHOLE store on a libsql server the operator names (Turso Cloud, a hosted
+//     provider, or their own sqld), with a token the operator supplies, over
+//     Hrana (HTTP). Used only when [database] engine = "libsql".
 //
 // The files are allowlisted BY NAME below; net/http, the GitHub SDK or the
 // Turso SDK from anywhere else still fails.
@@ -48,9 +52,10 @@ var forbiddenImports = map[string]string{
 	// adapter that used only the SDK — never naming net/http itself — would
 	// egress while passing this test. Passing is not compliance.
 	"github.com/google/go-github/v90/github": "GitHub REST egress",
-	// The Turso SDK is purego over an embedded native library: its network
-	// I/O happens in Rust, so no Go import of net/http would ever betray it.
-	// Banning the SDK's own path (and the library loader's) is the only gate.
+	// The Turso SDK is purego over an embedded native library. Its HTTP is
+	// done in Go inside the SDK (driver_sync.go), on requests the native
+	// engine issues — so no first-party import of net/http betrays it, and
+	// banning the SDK's own path (and the library loader's) is the only gate.
 	"turso.tech/database/tursogo":                     "Turso Cloud sync egress",
 	"github.com/tursodatabase/turso-go-platform-libs": "Turso native library (the SDK's network code)",
 }
@@ -62,7 +67,7 @@ var allowedNetURLFiles = map[string]bool{
 
 // allowedEgressFiles maps a forbidden import to the files permitted to use it.
 //
-// Exactly two files egress, both operator opt-in and both off by default. Every
+// Every file here is operator opt-in and off by default. Every
 // addition widens a promise the README makes to users, so it must be a
 // deliberate edit here — TestHTTPAllowlistStaysMinimal pins the exact set.
 //
@@ -76,6 +81,7 @@ var allowedEgressFiles = map[string]map[string]string{
 	"net/http": {
 		"internal/updatecheck/fetch.go":   "opt-out GitHub release check (version numbers only)",
 		"internal/taskstore/gist/gist.go": "opt-in github_gist task-list backend (task text only)",
+		"internal/store/libsql/hrana.go":  "opt-in libsql store engine (the whole store, to the operator's own libsql server)",
 	},
 	"github.com/google/go-github/v90/github": {
 		"internal/taskstore/gist/gist.go": "opt-in github_gist task-list backend (task text only)",
@@ -176,10 +182,12 @@ func TestNetUsageIsLocalOnly(t *testing.T) {
 // Widening it changes what the README promises users, so it must be a
 // deliberate edit here — never a quiet addition.
 //
-// Two files egress, both operator opt-in and both off by default:
+// Every egress file is operator opt-in and off by default:
 //   - the release check, off with [tui] disable_check_for_update;
 //   - the github_gist task-list backend, used only when a task source's
-//     effective provider selects it, which no config does by default.
+//     effective provider selects it, which no config does by default;
+//   - the turso and libsql store engines, used only when [database] engine
+//     selects one.
 //
 // The name is unchanged so a reviewer grepping for it still lands here.
 func TestHTTPAllowlistStaysMinimal(t *testing.T) {
@@ -187,6 +195,7 @@ func TestHTTPAllowlistStaysMinimal(t *testing.T) {
 		"net/http": {
 			"internal/updatecheck/fetch.go":   true,
 			"internal/taskstore/gist/gist.go": true,
+			"internal/store/libsql/hrana.go":  true,
 		},
 		"github.com/google/go-github/v90/github": {
 			"internal/taskstore/gist/gist.go": true,
@@ -260,6 +269,21 @@ func TestTursoImportIsAllowlistedToOneFile(t *testing.T) {
 	}
 	if _, forbidden := forbiddenImports[sdk]; !forbidden {
 		t.Error("the Turso SDK must stay in forbiddenImports — its network I/O is native, so nothing else can catch it")
+	}
+}
+
+// TestLibSQLHTTPIsConfinedToOneFile keeps the libsql engine's network code in
+// its transport file: the protocol types, the stream logic and the fake server
+// the store suite runs on are all reachable without HTTP, and must stay so.
+func TestLibSQLHTTPIsConfinedToOneFile(t *testing.T) {
+	var libsqlFiles []string
+	for rel := range allowedEgressFiles["net/http"] {
+		if strings.HasPrefix(rel, "internal/store/libsql/") {
+			libsqlFiles = append(libsqlFiles, rel)
+		}
+	}
+	if !slices.Equal(libsqlFiles, []string{"internal/store/libsql/hrana.go"}) {
+		t.Fatalf("net/http is allowlisted for %v under internal/store/libsql, want only hrana.go", libsqlFiles)
 	}
 }
 

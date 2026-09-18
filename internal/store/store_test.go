@@ -20,8 +20,8 @@ func openTestStore(t *testing.T) (*Store, string) {
 	if proxyMode() {
 		return openTestStoreProxy(t, path), path
 	}
-	if tursoMode() {
-		return openTestStoreTurso(t, path), path
+	if sharedMode() {
+		return openTestStoreShared(t, path), path
 	}
 	s, err := Open(path)
 	if err != nil {

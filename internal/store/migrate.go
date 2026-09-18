@@ -164,7 +164,7 @@ var ErrDestinationNotEmpty = errors.New("the destination already holds hap histo
 // under other node ids, which a self-scoped count would walk straight past.
 func (im *importer) destinationHistory(tx *sql.Tx) (int, error) {
 	var n int
-	if im.dst.engine == EngineTurso {
+	if im.dst.engine.Shared() {
 		err := tx.QueryRowContext(im.ctx, `SELECT count(*) FROM audit_log WHERE node_id = ?`, im.dst.self).Scan(&n)
 		return n, err
 	}

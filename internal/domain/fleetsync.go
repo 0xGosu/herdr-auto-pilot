@@ -47,6 +47,10 @@ func SyncFailureProcessLocal(msg string) bool {
 	return false
 }
 
+// LibSQLServerErrorPrefix marks an error the libsql SERVER reported, as
+// opposed to one raised in this process. See syncRemoteFaults.
+const LibSQLServerErrorPrefix = "libsql server error"
+
 // syncRemoteFaults are the shapes that mean the far end, the link or the
 // credentials — never this process. Checked first, so they veto.
 var syncRemoteFaults = []string{
@@ -68,6 +72,12 @@ var syncRemoteFaults = []string{
 	"service unavailable",
 	"gateway timeout",
 	"unexpected eof",
+	// The libsql engine prefixes every error the SERVER returned with this
+	// (internal/store/libsql). sqld relays SQLite's own wording, so a remote
+	// SQLITE_BUSY reads "database is locked" — a process-local shape below —
+	// and without this veto a busy server would restart the daemon every
+	// cooldown for a fault no fresh process can clear.
+	LibSQLServerErrorPrefix,
 }
 
 // syncProcessLocalFaults are the shapes a fresh process is known to clear.
