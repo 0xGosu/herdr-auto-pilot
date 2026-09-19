@@ -48,15 +48,17 @@ func TestValidateLibSQLDatabase(t *testing.T) {
 	if err := ValidateDatabase(cfg); err != nil {
 		t.Fatalf("valid libsql config refused: %v", err)
 	}
-	// A pause is ignored under libsql, never a reason to refuse starting —
-	// refusing would leave the herd unmonitored over a key that changes
-	// nothing.
+	// libsql keeps a local replica, so the pause applies exactly as under
+	// turso: the replica serves while the round trips are skipped.
 	cfg.Database.TursoSyncPaused = true
 	if err := ValidateDatabase(cfg); err != nil {
 		t.Fatalf("turso_sync_paused refused a libsql start: %v", err)
 	}
-	if cfg.Database.SyncPausedEffective() {
-		t.Error("the pause is in effect under libsql")
+	if !cfg.Database.SyncPausedEffective() {
+		t.Error("the pause is not in effect under libsql")
+	}
+	if (Database{Engine: EngineSQLite, TursoSyncPaused: true}).SyncPausedEffective() {
+		t.Error("the pause is in effect under sqlite, which has nothing to sync")
 	}
 	turso := Database{Engine: EngineTurso, TursoSyncPaused: true}
 	if !turso.SyncPausedEffective() {

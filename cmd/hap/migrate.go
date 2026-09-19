@@ -51,6 +51,11 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 		return err
 	}
 	if opt.shared == config.EngineLibSQL {
+		if opt.toSQLite && cfg.Database.IsLibSQL() {
+			fmt.Fprintln(out, "note: this copies the libsql SERVER's rows. Changes this node made while it could not "+
+				"reach the server, and has not pushed yet, are only in its local replica — start the daemon and let it "+
+				"sync first if there may be any")
+		}
 		return runMigrateLibSQL(ctx, paths, cfg, out, opt)
 	}
 	if cfg.Database.TursoDatabaseURL == "" {

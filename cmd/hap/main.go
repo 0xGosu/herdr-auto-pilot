@@ -38,6 +38,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/profiling"
 	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsqlreplica"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/sqlbridge"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/turso"
 	"github.com/0xGosu/herdr-auto-pilot/internal/streamlog"
@@ -255,7 +256,6 @@ func run(verb string, args []string) error {
 		}
 		defer closeStore()
 		defer drainSubmitRetries(app)
-		widenTUIPool(paths, app)
 		// The TUI logs into the same file as the daemon, so it honours the same
 		// configured level. It used to be pinned to Info regardless, which is
 		// what made its 2s-tick warnings impossible to turn down.
@@ -465,11 +465,8 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		if nodeID, err = store.LoadNodeID(paths.StateDir); err != nil {
 			return err
 		}
-		if bootCfg.Database.IsTurso() {
-			// Only turso's replica has anything to push; a libsql write is
-			// already on the server when it commits.
-			fleetWrites = make(chan struct{}, 1)
-		}
+		// Both shared engines keep a local replica with changes to push.
+		fleetWrites = make(chan struct{}, 1)
 		tdb, engine, err := openShared(ctx, paths, bootCfg, nodeID, fleetWrites, time.Now())
 		if err != nil {
 			return fmt.Errorf("%s: %w", bootCfg.Database.Engine, err)
@@ -488,9 +485,16 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 			return err
 		}
 		defer st.Close()
-		// Pull, then migrate only as the schema lead: two nodes issuing the
-		// same DDL wedge the loser (see turso.PrepareSharedSchema).
-		if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
+		if rdb, ok := tdb.(*libsqlreplica.DB); ok {
+			// The replica is a local file this daemon alone migrates; the
+			// SERVER's schema goes through the lease when the server is first
+			// reached (openLibSQL's PrepareServer).
+			if err := prepareLibSQL(ctx, paths, bootCfg, rdb, st, time.Now()); err != nil {
+				return fmt.Errorf("%s: prepare the local replica: %w", engine, err)
+			}
+		} else if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
+			// Pull, then migrate only as the schema lead: two nodes issuing the
+			// same DDL wedge the loser (see turso.PrepareSharedSchema).
 			return fmt.Errorf("%s: prepare schema: %w", engine, err)
 		}
 		// Ids carry 12 bits of the node id; two nodes sharing them would share
@@ -523,7 +527,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		// The front ends draw their ids from this allocator too, so every
 		// process on the node shares one sequence.
 		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{NextID: ids.MustNext,
-			MaxClients: storeMaxClients(engine)})
+			MaxClients: sqlbridge.DefaultMaxClients})
 		defer srv.Close()
 		fleet = tdb
 	} else {

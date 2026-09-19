@@ -25,6 +25,10 @@ type fakeFleetSync struct {
 	// pullBlock, when set, makes every Pull hang until it is closed — a
 	// native call stuck on the network.
 	pullBlock chan struct{}
+	// pending is the unpushed count Stats reports; a successful Push clears
+	// it. pushFails makes that many Pushes fail first.
+	pending   int64
+	pushFails int
 }
 
 func (f *fakeFleetSync) Pull() (bool, error) {
@@ -36,12 +40,22 @@ func (f *fakeFleetSync) Pull() (bool, error) {
 	defer f.mu.Unlock()
 	return f.changed, f.pullErr
 }
-func (f *fakeFleetSync) Push() error       { f.pushes.Add(1); return nil }
+func (f *fakeFleetSync) Push() error {
+	f.pushes.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pushFails > 0 {
+		f.pushFails--
+		return errors.New("dial tcp: connection refused")
+	}
+	f.pending = 0
+	return nil
+}
 func (f *fakeFleetSync) Checkpoint() error { f.checkpoints.Add(1); return nil }
 func (f *fakeFleetSync) Stats(context.Context) (ports.FleetSyncStats, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return ports.FleetSyncStats{MainWALBytes: f.walBytes, Revision: "r1"}, nil
+	return ports.FleetSyncStats{MainWALBytes: f.walBytes, Revision: "r1", PendingOps: f.pending}, nil
 }
 
 // TestFleetSyncPullThatChangedWakesTheDrains: a pull that brought rows in
@@ -417,35 +431,11 @@ func TestFleetSyncPausedHealthIsPausedNotDegraded(t *testing.T) {
 	}
 }
 
-// TestFleetSyncPauseIsIgnoredUnderLibSQL: the libsql engine keeps no local
-// copy, so honouring turso_sync_paused would stop the store itself. The key is
-// ignored there — the loop keeps checking the server, and the health record
-// neither reads PAUSED nor stops reporting an outage.
-func TestFleetSyncPauseIsIgnoredUnderLibSQL(t *testing.T) {
-	sync := &fakeFleetSync{}
-	h := newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
-		func(o *Options) {
-			o.FleetSync = sync
-			o.FleetEngine = "libsql"
-			o.FleetSyncInterval = 20 * time.Millisecond
-		})
-	if h.daemon.fleetSyncPaused() {
-		t.Fatal("turso_sync_paused paused a libsql node")
-	}
-	waitFor(t, 2*time.Second, func() bool { return sync.pulls.Load() >= 2 })
-	if sync.pulls.Load() < 2 {
-		t.Fatal("the change check did not run under a (meaningless) pause")
-	}
-	fh := h.daemon.fleetHealth()
-	if fh == nil || fh.Engine != "libsql" || fh.Paused {
-		t.Fatalf("health = %+v, want engine libsql and not paused", fh)
-	}
-}
-
-// TestFleetSyncPauseStillAppliesUnderTurso is the control: the same config on
-// the turso engine (and on an unnamed one, which reads as turso) does pause.
-func TestFleetSyncPauseStillAppliesUnderTurso(t *testing.T) {
-	for _, engine := range []string{"turso", ""} {
+// TestFleetSyncPauseAppliesUnderEveryEngine: both shared engines keep a local
+// replica that serves through a pause, so the key pauses either (and an
+// unnamed engine, which reads as turso).
+func TestFleetSyncPauseAppliesUnderEveryEngine(t *testing.T) {
+	for _, engine := range []string{"turso", "", "libsql"} {
 		sync := &fakeFleetSync{}
 		h := newHarnessCore(t, "[database]\nturso_sync_paused = true\n", nil, &fakeLLM{}, &fakeLLM{}, nil,
 			func(o *Options) {
@@ -456,32 +446,94 @@ func TestFleetSyncPauseStillAppliesUnderTurso(t *testing.T) {
 		if !h.daemon.fleetSyncPaused() {
 			t.Fatalf("engine %q: turso_sync_paused did not pause", engine)
 		}
-		if fh := h.daemon.fleetHealth(); fh.Engine != "turso" {
-			t.Errorf("engine %q: health engine = %q, want turso", engine, fh.Engine)
+		want := engine
+		if want == "" {
+			want = "turso"
+		}
+		if fh := h.daemon.fleetHealth(); fh.Engine != want {
+			t.Errorf("engine %q: health engine = %q, want %s", engine, fh.Engine, want)
 		}
 		h.stop()
 	}
 }
 
-// TestLibSQLShutdownSkipsTheFinalPush: under libsql there is nothing to
-// publish at exit — every write is already on the server — so the shutdown
-// push (a reachability probe there) is not made. The control is turso, where
-// it still is.
-func TestLibSQLShutdownSkipsTheFinalPush(t *testing.T) {
-	for _, tc := range []struct {
-		engine string
-		want   int32
-	}{{"libsql", 0}, {"turso", 1}} {
+// TestShutdownPushesUnderEveryEngine: both shared engines keep a local
+// replica, so unpushed changes are published at exit under either.
+func TestShutdownPushesUnderEveryEngine(t *testing.T) {
+	for _, engine := range []string{"libsql", "turso"} {
 		sync := &fakeFleetSync{}
 		h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
 			o.FleetSync = sync
-			o.FleetEngine = tc.engine
+			o.FleetEngine = engine
 			o.FleetSyncInterval = time.Hour
 		})
 		waitFor(t, 2*time.Second, func() bool { return h.daemon.fleetHealth() != nil })
 		h.stop()
-		if got := sync.pushes.Load(); got != tc.want {
-			t.Errorf("%s: %d pushes at shutdown, want %d", tc.engine, got, tc.want)
+		if got := sync.pushes.Load(); got != 1 {
+			t.Errorf("%s: %d pushes at shutdown, want 1", engine, got)
 		}
+	}
+}
+
+// TestFleetSyncPushesWhatAPreviousProcessLeft: a replica that starts with
+// unpushed changes (a push that failed before the last exit) pushes them at
+// once — the debounce is armed only by a NEW write, and an idle node may
+// never make one. Paused, it does not; with nothing unpushed, there is
+// nothing to send.
+func TestFleetSyncPushesWhatAPreviousProcessLeft(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cfg     string
+		pending int64
+		want    bool
+	}{
+		{"pending", "", 3, true},
+		{"pending but paused", "[database]\nturso_sync_paused = true\n", 3, false},
+		{"nothing pending", "", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sync := &fakeFleetSync{pending: tc.pending}
+			h := newHarnessCore(t, tc.cfg, nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
+				o.FleetSync = sync
+				o.FleetEngine = "libsql"
+				o.FleetSyncInterval = time.Hour
+			})
+			if tc.want {
+				waitFor(t, 2*time.Second, func() bool { return sync.pushes.Load() >= 1 })
+			} else {
+				time.Sleep(200 * time.Millisecond)
+			}
+			got := sync.pushes.Load() >= 1
+			h.stop()
+			if got != tc.want {
+				t.Fatalf("pushed at start = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFleetSyncRetriesAFailedPushOnThePullCadence: a push that failed is
+// retried on the next pull tick while anything is still unpushed, rather
+// than waiting for the next local write.
+func TestFleetSyncRetriesAFailedPushOnThePullCadence(t *testing.T) {
+	sync := &fakeFleetSync{pending: 2, pushFails: 1}
+	h := newHarnessCore(t, "", nil, &fakeLLM{}, &fakeLLM{}, nil, func(o *Options) {
+		o.FleetSync = sync
+		o.FleetEngine = "libsql"
+		o.FleetSyncInterval = 20 * time.Millisecond
+	})
+	defer h.stop()
+	waitFor(t, 2*time.Second, func() bool { return sync.pushes.Load() >= 2 })
+	sync.mu.Lock()
+	pending := sync.pending
+	sync.mu.Unlock()
+	if pending != 0 {
+		t.Fatalf("still %d unpushed after the retry", pending)
+	}
+	// Once paid, pull ticks stop pushing.
+	settled := sync.pushes.Load()
+	waitFor(t, 2*time.Second, func() bool { return sync.pulls.Load() >= 5 })
+	if got := sync.pushes.Load(); got != settled {
+		t.Fatalf("%d further pushes after the owed one was paid", got-settled)
 	}
 }

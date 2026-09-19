@@ -57,11 +57,13 @@ const (
 	// created without AUTOINCREMENT — and nothing else: every statement is the
 	// same, node-scoped, on both engines.
 	EngineTurso Engine = "turso"
-	// EngineLibSQL is the opt-in central database reached over Hrana: no local
-	// file at all, every statement a round trip to a libsql server (Turso
-	// Cloud, a self-hosted sqld, any Hrana provider). The daemon alone holds
-	// the connection and serves it to the other processes, exactly as under
-	// turso, and it is SHARED in the same two ways.
+	// EngineLibSQL is the opt-in central database on a libsql server (Turso
+	// Cloud, a self-hosted sqld, any Hrana provider). The daemon's store is a
+	// LOCAL REPLICA it alone opens, synced with the server by logical row
+	// replay (internal/store/libsqlreplica); the same engine names a handle
+	// straight onto the server over Hrana (internal/store/libsql), which the
+	// replica's schema preparation and `hap migrate` use. SHARED in the same
+	// two ways as turso, which is what makes a replayed INSERT collision-free.
 	EngineLibSQL Engine = "libsql"
 )
 
@@ -194,6 +196,10 @@ func sqliteDSN(path string) string {
 		},
 	}.Encode()
 }
+
+// SQLiteDSN is sqliteDSN for another package that opens a SQLite file the way
+// this one does — the libsql engine's local replica.
+func SQLiteDSN(path string) string { return sqliteDSN(path) }
 
 // Open opens (creating if needed) the SQLite database at path with WAL mode
 // and a busy timeout, resolves the node id from the file beside it, and applies

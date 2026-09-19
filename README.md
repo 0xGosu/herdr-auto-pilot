@@ -957,10 +957,10 @@ during that machine's hand-out.
 
 ### Any libsql server (`engine = "libsql"`)
 
-The `turso` engine syncs a local replica over Turso's own protocol, which only
-Turso Cloud (and `tursodb --sync-server`) serve. To share the store through
-**any libsql server** — Turso Cloud, a hosted provider such as Layerbase, or your
-own `sqld` — use `libsql`, which talks Hrana (HTTP) to the server directly:
+The `turso` engine syncs over Turso's own protocol, which only Turso Cloud (and
+`tursodb --sync-server`) serve. To share the store through **any libsql server**
+— Turso Cloud, a hosted provider such as Layerbase, or your own `sqld` — use
+`libsql`, which syncs over Hrana (HTTP), the protocol every libsql server speaks:
 
 ```sh
 hap config set database.engine libsql
@@ -969,20 +969,37 @@ hap config set database.libsql_auth_token <token>              # or export LIBSQ
 hap daemon --restart
 ```
 
-Everything above about sharing, conflicts and privacy applies unchanged. What
-differs:
+Like `turso`, the daemon keeps the store in a **local replica**
+(`<state-dir>/libsql/hap.db`). Reads never leave the machine, and writes commit
+even while the server is unreachable. Local changes are pushed a couple of
+seconds after each write, and other nodes' changes are pulled every
+`database.libsql_poll_interval_seconds` (default 15 s). Everything above about
+sharing, conflicts and privacy applies unchanged. What differs:
 
-- **No local replica.** Every statement is a round trip to the server, so use
-  a server **near** the machines: at ~200 ms a round trip the daemon takes ~20 s
-  to start and a `hap` verb a few seconds; on a LAN it is as quick as `turso`.
-  The daemon warns at start when the server is far.
-- Other nodes' writes are noticed by a cheap change check every
-  `database.libsql_poll_interval_seconds` (default 15 s); your own writes land
-  on the server immediately.
-- Nothing to pause: `database.turso_sync_paused` has no effect.
-- The local database is **not** imported automatically (the copy would hold the
-  server's write lock for a round trip per row): run `hap migrate --to libsql`
-  with the daemon stopped. `hap migrate --to sqlite --from libsql` goes back.
+- **The first start needs the server.** It copies the server's rows into the
+  replica, and migrates the server's schema if this build is newer. After that
+  the daemon starts and monitors with the server down.
+- Sync is by **row**. The server logs every changed key in a `hap_changelog`
+  table (through triggers hap installs on it), and each replica fetches those
+  rows. **Conflicts go to the latest edit, column by column**: every edit is
+  time-stamped, a push only overwrites a column the server last changed
+  earlier, and a pull only takes a column the server changed later. A machine
+  back from a spell offline does not overwrite what others changed meanwhile,
+  two machines editing different fields of one row both keep theirs, and a
+  delete and an edit of the same row resolve to whichever came later.
+  **Escalation outcomes and queued agent actions are the exception**: acting
+  on either has already touched a pane, so they go to the machine that pushed
+  last, as before — and only a machine that actually changed them pushes them.
+- Nodes still running an older hap, which wrote straight to the server, can
+  share the database: the server's triggers log every writer.
+- The change log keeps entries until every node that synced in the last 7 days
+  has read them, and never longer than 7 days. A node offline for longer
+  re-copies the tables on its next pull, pushing its own unpushed changes first.
+- The local database is **not** imported automatically. Run
+  `hap migrate --to libsql` with the daemon stopped; it writes straight to the
+  server, and every node's replica picks the rows up from there.
+  `hap migrate --to sqlite --from libsql` goes back. It copies the **server's**
+  rows, so let a node that was offline sync first.
 - A Turso Cloud database can be used by either engine; the schema is identical.
 
 ## Health and disk usage

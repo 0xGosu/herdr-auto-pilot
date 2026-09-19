@@ -619,7 +619,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   (`store.TimeOrderedIDs` via `s.nextID()` — NULL under sqlite so AUTOINCREMENT still assigns). Every
   OPERATIONAL statement filters `node_id = self`; FLEET reads span nodes and return `node_id`.
   `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by AST walk with an exemption map that must stay
-  live; the store suite runs FOUR times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql`; libsql runs on
+  live; the store suite runs FIVE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql|libsql_replica` — `libsql` is the direct server handle, `libsql_replica` the daemon's replica; both run on
   `hranafake`, an in-process Hrana server over SQLite). Two-node sync tests in
   `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` +
   `HAP_TURSO_TEST_TOKEN` point them at a REAL database instead — its hap tables must start empty, so run
@@ -632,22 +632,21 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   Cloud included — serves. Everything above the connection is shared (`store.Engine.Shared()`, the daemon
   owns the handle and serves `store.sock`, node-bit ids, identical schema, the lease in
   `turso.PrepareSharedSchema` over the `SchemaSyncer` interface). What differs, each load-bearing:
-  - **No local copy, so every statement is a round trip** on the daemon's event loop (~230 ms to a remote
-    provider: a ~20 s start, seconds per `hap` verb). `openLibSQL` warns past `libsqlSlowRTT`; the engine is
-    for NEARBY servers, and the per-request timeout (`libsql.DefaultTimeout`) is what bounds a hung server.
-  - **Pull is a change check, Push a reachability check** — never no-ops. Pull compares the server's
-    `replication_index` (own writes included: re-baselining on them could swallow a foreign write) and
-    answers "changed" when the server reports none, the direction a change token must fail in. Pull drives
-    the isolation clock; Push runs only on the push-now nudge (a front end queueing a remote-agent action,
-    `FleetWrites` is nil) and is skipped at shutdown, but a no-op there would still clear the isolation
-    banner while the server is down (`fleetPush` counts success as proof).
+  - **The daemon's store is a LOCAL REPLICA** (`internal/store/libsqlreplica`, below). It replaced an
+    engine with no local copy, where every statement was a round trip on the daemon's event loop (~230 ms
+    to a remote provider: a ~20 s start, seconds per `hap` verb) and an unreachable server was a dead store.
+    `internal/store/libsql` is now its transport (`Batch`/`Tx`), plus a `database/sql` handle straight onto
+    the server that the SERVER's schema lease (`PrepareServer`) and `hap migrate` use. The per-request
+    timeout (`libsql.DefaultTimeout`) is what bounds a hung server.
+  - **That direct handle's Pull is a change check and its Push a reachability check** — never no-ops, because
+    the schema lease reads them as proof. Pull compares the server's `replication_index` and answers
+    "changed" when the server reports none, the direction a change token must fail in.
   - **Every server error is prefixed `domain.LibSQLServerErrorPrefix`**, which `syncRemoteFaults` vetoes:
     sqld relays SQLite's own `database is locked`, a PROCESS-LOCAL shape, so without it a busy server
     restarts the daemon every cooldown.
-  - `turso_sync_paused` is IGNORED (`SyncPausedEffective`, `fleetSyncPaused`), never refused at start:
-    honouring it would stop the store, refusing would leave the herd unmonitored.
-  - **The legacy import never runs automatically** — it is ONE transaction paying a round trip per row
-    while the server holds its write lock; `hap migrate --to libsql` does it deliberately.
+  - **The legacy import never runs automatically** — an install upgraded from the old no-copy engine had
+    deliberately NOT folded its local file in, and doing it on upgrade would publish a history the operator
+    chose to keep; `hap migrate --to libsql` does it deliberately, straight into the server.
   - Hrana's execute takes ONE statement; the schema's batches are resent as a `sequence` on sqld's
     `SQL_MANY_STATEMENTS` (asking the server, never splitting SQL here). Integers travel as STRINGS and are
     parsed with `ParseInt` — node-bit ids live past 2^53. An idle stream expires in ~10 s (`STREAM_EXPIRED`),
@@ -694,6 +693,103 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     folded in), and it honours `database.turso_sync_paused` by skipping the framing pull/push — ONLY those:
     `PrepareSharedSchema` still pulls (and pushes when it leads a schema migration), deliberately, since that
     pull is what the collision check reads peers from. Never tell the operator nothing went over the wire.
+- **The libsql engine's replica is turso's offline behaviour rebuilt over Hrana, by LOGICAL row replay**
+  (`internal/store/libsqlreplica`). The local SQLite file is the authority, and the network is still
+  reached only through `internal/store/libsql` (`Batch`/`Tx`, which pipeline many statements into
+  one or two round trips). Every rule below fails silently:
+  - **Capture is suppressed while pulled rows are applied** (`hap_sync_applying`, checked in each
+    `hap_ob_*` trigger's WHEN). Without it, every pulled row is re-captured and re-pushed, and two
+    nodes echo each other through the server forever. A push also TAGS the change-log entries it
+    caused with its node id (the marker row + `temp.hap_push_mark`), so the node does not pull its
+    own writes back. Both halves are covered by `TestPulledRowsAreNotRePushed`.
+  - **A push tags ONLY the keys it sent** (`temp.hap_push_keys`, rendered by the server's own `json_array`),
+    never "every entry after my marker". The bare range relies on the server serializing the whole
+    transaction; one that let another node's writes commit inside it would get them tagged as this node's,
+    and that node's pull would skip them for good. `hranafake` serializes everything, so no test there can
+    tell the two apart — the narrowing is the guarantee, not a test.
+  - **Conflicts resolve by LATEST EDIT, per column — never by push order** (`clock.go`, `merge.go`). Every
+    edit is stamped with a hybrid logical clock (`hap_hlc`: ms << 16 plus a counter, never below a clock
+    already seen) into `hap_clock` — per (table, key, column), plus a row register (`col = ''`) that an
+    insert and a delete stamp. A column's effective clock is the later of its own and the row's; a tie goes
+    to the node id, and on a pull to the server. Four rules, each load-bearing:
+    - **The comparison runs INSIDE the server's transaction** (`pushStmts`: `CASE WHEN … NOT EXISTS (a
+      server clock >= mine)`), so two replicas pushing one row concurrently resolve the same way whichever
+      commits first. Deciding client-side from a prior read is the race this avoids.
+    - **A push READS BACK its keys in the same transaction and merges them** (`pushItems`/`mergeBack`). The
+      pull skips the entries a push tagged as its own, so a column the push LOST would otherwise stay at
+      this replica's value forever.
+    - **The server stamps writes that did not come through a push** (`hap_ck_*`, standing aside while
+      `hap_sync_pushing` holds a row) — an older hap's or `hap migrate`'s writes take part with the
+      server's time instead of reading as "never edited".
+    - **Pruned clocks read as the FLOOR** (`clock_floor`, raised by `PruneChangelog`): a machine back after
+      longer than retention cannot win with an edit older than every clock the fleet still keeps.
+    - **Clocks are corrected to the SERVER's time and bounded by `MaxClockLead`.** "Latest edit wins" is only
+      as honest as the clocks: one machine an hour fast would win every conflict for an hour, and — since a
+      pull lifts the HLC to what it saw — drag every peer's clock along. So each pull measures this node's
+      offset from the server (`noteServerClock`, stored as `hap_hlc.off`, warned about past 30 s) and every
+      stamp uses corrected time — except inside a 2 s DEADBAND, since the measurement carries up to half a
+      round trip of noise and correcting by it would reorder edits on machines whose clocks agree; a pulled clock lifts the HLC no further than corrected now + the lead; the
+      server stores no pushed clock beyond ITS now + the lead; and a pushed key's local clocks take what the
+      server stored (the replica's own ceiling cannot do that — it is computed from the clock in doubt).
+      Remaining limit: a clock that jumps ahead while the node is OFFLINE stamps those edits ahead until the
+      next pull, and they win against everything up to the reconnect.
+    - **An escalation's OUTCOME and every `agent_actions` column are the exception: LAST PUSH wins**
+      (`pushWins`: `audit_log.status`, `actor`, `suggestion`, `rationale`, `while_fsp_mode_on`;
+      `pushWinsTables`: `agent_actions`, table-wide so a new column is covered unlisted). Acting on an escalation has already touched
+      a live pane, so the outcome a node pushed must be what the fleet keeps; an older decision whose edit
+      merely stamped later must not roll it back. A push writes such a column only when this replica
+      CHANGED it and has not pushed that yet (`hap_clock.pushed = 0`, replica-only) — writing it on every
+      push of the row would let an unrelated edit (retention blanking `pane_excerpt`) push a stale status
+      over another node's dismiss. A pull takes the server's value unless the column is changed-here.
+      `TestPushWinsCoversEveryEscalationTransition` scans the store's SQL: a statement that moves
+      `audit_log.status` may set only these columns, or it would pair one node's status with another's
+      actor. The `AND status = 'escalated'` guards still only see the local replica.
+  - **The server's change log is written by TRIGGERS, not by the push** (`hap_cl_*`). That is what
+    makes `hap migrate`'s and an older hap's direct writes visible to replicas. Both logs
+    carry KEYS only, and each side fetches the current row. That is why the log needs no BLOB
+    encoding and why several changes to one row cost one fetch.
+  - **Push and Pull hold `syncMu`.** A push landing between a pull's fetch and its apply would merge
+    against clocks the fetch did not see.
+  - **Every table not named `sqlite_*` or `hap_*` replicates, keyed by its PRIMARY KEY** (never the
+    rowid). A table with no primary key is REFUSED at `Prepare`. Keep the `hap_` prefix for anything
+    that must stay local.
+  - **DDL does not ride the replay.** The local file is migrated by the store. The server is migrated
+    through the schema lease by `PrepareServer`, the first time the server answers. Columns replay
+    by the INTERSECTION of the two sides (`table.shared`), so an additive migration on either side
+    keeps both syncing.
+  - **A re-seed is a VERBATIM mirror, deliberately not `store.importer.copyAll`.** That copier
+    re-allocates ids and scopes by node for a move BETWEEN engines, and every later change-log key
+    would miss. It pushes first and keeps outbox keys.
+  - **A cursor is published at seed time, not just on the throttle.** Retention prunes below the
+    cursors it can SEE, so an unregistered node had its entries pruned by the first peer to tidy up,
+    and re-seeded.
+  - **A missing logging trigger is a LOGGING GAP, not just a missing trigger** (`ensureChangelog`, also
+    checked on every pull in the same round trip). A table REBUILT by a migration (create/copy/drop/
+    rename — the drop takes its triggers) or created by a node that does not install them has writes in
+    no log, and recreating the trigger cannot recover them. The repair raises `pruned_through` past
+    everything logged, so EVERY replica re-seeds, including those that never saw the gap.
+  - **A table the replica was never seeded with is seeded on the next pull** (`seeded:<table>` in
+    `hap_sync_state`): an older build skips log entries for a table it lacks, and its cursor moves past them.
+  - **A replay never uses INSERT OR REPLACE** (it resets every column the replaying side does not know). A
+    UNIQUE collision is handled by PARKING the batch's own rows (a suffix on their unique values), then a
+    key upsert, then a real DELETE of any conflicting row outside the batch. A pulled row blocked by an
+    unpushed local change is decided BEFORE any parking, or its park suffix is stranded in the replica.
+  - **A push is OWED at start and after every failed push** (`runFleetSync`'s `payOwed`, on the pull tick). The
+    debounce is armed only by a NEW write, so outbox rows a previous process or a failed push left behind would
+    otherwise wait for the next write — on an idle node, indefinitely. Paused, nothing is paid; the resume nudge
+    covers it.
+  - **A replica is bound to ONE server** (`checkServerIdentity`: a random `hap_sync_meta.server_id`, recorded at
+    seed). Meeting a different one — `libsql_url` changed, state dir kept — drops the outbox, clocks and sync
+    state (said loudly, with the unpushed count) and re-seeds; replaying server A's outbox into server B, or
+    skipping B's seed because of A's bootstrapped marker, is what this prevents. A seeded replica with no
+    recorded identity is treated the same. Pull and Push therefore seed an unseeded replica themselves.
+  - **A push's UNIQUE conflict-delete runs only where the push's value for that constraint WINS**
+    (`winsCond`, the same clock test the column UPDATE applies). Unconditional, a stale edit proposing a value
+    another row holds deleted that row and then lost the UPDATE anyway.
+  - **Trigger repair re-reads the server's tables first** — a trigger missing because its table was DROPPED
+    would otherwise be recreated on a table that does not exist, failing every pull forever.
+  - Accepted limit: retention runs only on replica nodes, so a fleet that later drops every replica keeps
+    its triggers writing a log nothing prunes (drop `hap_cl_*` and `hap_changelog` by hand).
   - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a
     `database/sql` driver over `<state>/store.sock` (`internal/store/sqlbridge`), lazily dialled so
     `hap config` works with no daemon.
@@ -738,7 +834,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     means a real outage — but it is still SAID (`hap status`, `FleetSyncPaused`), because a herd off the wire
     looks exactly like a quiet one.
   - **A front end's full refresh fans its reads out, and only ONE tick poll is ever in flight.** Under a
-    shared engine every read is a round trip (under libsql, on to a remote server), so `GetStatus`, the
+    shared engine every read is a round trip over the daemon's socket, so `GetStatus`, the
     rule listing and the TUI's `refreshDataProgress` issue independent reads together
     (`frontend.Concurrently`; each writes only its own variables, assembled after the wait). A tick used to
     start a poll regardless, which over a far server queued ~6 full refreshes behind the proxy's 2-connection
@@ -746,7 +842,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     carries exactly the reads before the failing one in the old sequential order — the TUI replaces its data
     wholesale. Progress is PULLED (`loadTracker`, repainted by the 1s clock tick) so a refresh stays one
     command yielding one `refreshMsg`; until the first lands the body is the loading screen, never "no
-    agents detected". Under libsql the TUI's pool is `tuiLibSQLPool` and the socket serves `libsqlMaxClients`.
+    agents detected".
   - **A front end polls a change token, not the data** (`Store.Revision` → `ports.RevisionReporter`,
     `frontend.App.ChangeKey`, `tui.Model.poll`). Under turso it is the executor's counter
     (`sqlbridge.Executor.Revision`, a `rev` request over a POOLED connection), bumped AFTER every committed
@@ -1314,7 +1410,8 @@ where the behaviour could revert.
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
-| `internal/store/libsql` | the libsql engine: Hrana client (`hrana.go`, its only HTTP), `database/sql` streams over `sqlbridge.Backend`; `hranafake` is the in-process test server |
+| `internal/store/libsqlreplica` | the libsql engine's store: local replica, capture triggers + outbox, change-log pull, re-seed, retention |
+| `internal/store/libsql` | the libsql engine's transport: Hrana client (`hrana.go`, its only HTTP), `Batch`/`Tx` pipelines, a direct `database/sql` handle over `sqlbridge.Backend`; `hranafake` is the in-process test server |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
 | `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |
 | `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `sqlite` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |

@@ -188,17 +188,7 @@ func (d *Daemon) adoptFleetRecoveryMarker() {
 // engine change, not a pause.
 func (d *Daemon) fleetSyncPaused() bool {
 	cfg, _, _ := d.snapshot()
-	if d.fleetEngine() != "turso" {
-		// Only a replica can pause (config.Database.SyncPausedEffective): the
-		// libsql engine keeps no local copy, so a pause there would stop the
-		// store itself. Ignored — and said so, once per daemon.
-		if cfg.Database.TursoSyncPaused && d.fleetPauseIgnored.CompareAndSwap(false, true) {
-			slog.Warn("fleet sync: database.turso_sync_paused is set but has no effect under the " +
-				d.fleetEngine() + " engine, which keeps no local copy to fall back on; every statement still " +
-				"goes to the server")
-		}
-		return false
-	}
+	// Both shared engines keep a local replica that serves while paused.
 	return cfg.Database.TursoSyncPaused
 }
 
@@ -263,6 +253,34 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 		d.notePausedSkip(op)
 		return true
 	}
+	// A push is OWED at start and after every failed one: the debounce is
+	// armed only by a NEW write, so unpushed changes a previous process left
+	// in the replica — or that a failed push left behind — would otherwise
+	// wait for whatever write happens next, on an idle node indefinitely.
+	// payOwed pushes when one is owed and the replica reports something
+	// unpushed; the pull tick calls it, so a failure is retried on the pull
+	// cadence rather than on the next write. It reports false when ctx ended.
+	owed := true
+	push := func(op string) bool {
+		ok := false
+		if !d.fleetRun(ctx, op, func() { ok = d.fleetPush(sync) }) {
+			return false
+		}
+		owed = !ok
+		return true
+	}
+	payOwed := func() bool {
+		if !owed || d.fleetPendingOps() == 0 {
+			return true
+		}
+		return push("push-owed")
+	}
+	if !d.fleetSyncPaused() {
+		// While paused the resume nudge covers it (see paused above).
+		if !d.fleetRun(ctx, "stats", func() { d.fleetRefreshStats(sync) }) || !payOwed() {
+			return
+		}
+	}
 	pull := time.NewTicker(interval)
 	defer pull.Stop()
 	var pushTimer *time.Timer
@@ -308,7 +326,7 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 			if paused("push-now") {
 				continue
 			}
-			if !d.fleetRun(ctx, "push", func() { d.fleetPush(sync) }) {
+			if !push("push") {
 				return
 			}
 		case <-pushC:
@@ -316,7 +334,7 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 			if paused("push") {
 				continue
 			}
-			if !d.fleetRun(ctx, "push", func() { d.fleetPush(sync) }) {
+			if !push("push") {
 				return
 			}
 		case <-pull.C:
@@ -329,7 +347,7 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 				}
 				continue
 			}
-			if !d.fleetRun(ctx, "pull", func() { d.fleetPull(sync) }) {
+			if !d.fleetRun(ctx, "pull", func() { d.fleetPull(sync) }) || !payOwed() {
 				return
 			}
 		}
@@ -357,7 +375,7 @@ func (d *Daemon) fleetRun(ctx context.Context, name string, op func()) bool {
 	}
 }
 
-func (d *Daemon) fleetPush(sync ports.FleetSyncPort) {
+func (d *Daemon) fleetPush(sync ports.FleetSyncPort) (ok bool) {
 	_ = logging.Guard("fleet-push", func() error {
 		now := d.opt.Clock.Now()
 		if err := sync.Push(); err != nil {
@@ -365,6 +383,7 @@ func (d *Daemon) fleetPush(sync ports.FleetSyncPort) {
 			d.fleet.fail(now, err)
 			return nil
 		}
+		ok = true
 		d.fleet.mu.Lock()
 		d.fleet.lastPush = now
 		d.fleet.mu.Unlock()
@@ -372,6 +391,14 @@ func (d *Daemon) fleetPush(sync ports.FleetSyncPort) {
 		d.fleetRefreshStats(sync)
 		return nil
 	})
+	return ok
+}
+
+// fleetPendingOps is the unpushed count from the last stats refresh.
+func (d *Daemon) fleetPendingOps() int64 {
+	d.fleet.mu.Lock()
+	defer d.fleet.mu.Unlock()
+	return d.fleet.pendingOps
 }
 
 // fleetPausedTick is the pull tick's LOCAL half, run in place of a pull while
@@ -610,12 +637,6 @@ func (d *Daemon) fleetRefreshStats(sync ports.FleetSyncPort) ports.FleetSyncStat
 // than cancelled — cancelling would wedge nothing that still matters, but
 // waiting forever would hold the daemon lock the successor is waiting for.
 func (d *Daemon) fleetFinalPush(sync ports.FleetSyncPort) {
-	if d.fleetEngine() != "turso" {
-		// Nothing is waiting to be published: a libsql write is on the server
-		// when it commits. Its Push is only a reachability check, and one at
-		// exit would buy a warning about a server this process is leaving.
-		return
-	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

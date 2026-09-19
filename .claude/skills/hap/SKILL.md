@@ -388,17 +388,19 @@ hap config set database.engine libsql
 hap daemon --restart
 ```
 
-- **No local copy**: every store statement is a server round trip, and the
-  daemon warns at start when the server is far (>100 ms). Prefer a nearby server.
-- Other nodes' writes are picked up by a change check every
-  `libsql_poll_interval_seconds`; `turso_sync_paused` has no effect.
-- `hap status` → `fleet sync: libsql — ok (server last answered …)`; while the
-  server cannot be reached it reads `SERVER NOT REACHED YET` (start) or
-  `DEGRADED`/`ISOLATED`, and every store read/write on that machine fails.
+- **Local replica**, as under turso: the store lives in `<state>/libsql/hap.db`.
+  Local writes are pushed a couple of seconds after each write, and other nodes'
+  rows are pulled every `libsql_poll_interval_seconds`. `turso_sync_paused`
+  applies here too.
+- The first start must reach the server to copy its rows into the replica. After
+  that the daemon runs with the server down.
+- `hap status` shows `fleet sync: libsql — ok (last pull …, last push …, N unpushed)`.
+  If `N unpushed` grows while the line says `DEGRADED` or `ISOLATED`, local
+  changes are queued and go on the next push that reaches the server.
 - The local database is **never imported automatically**. With the daemon
-  stopped: `hap migrate --to libsql` (one transaction, a round trip per row —
-  run it before other machines join), and `hap migrate --to sqlite --from libsql`
-  to go back.
+  stopped, run `hap migrate --to libsql` (it writes straight to the server, and
+  every replica picks the rows up). `hap migrate --to sqlite --from libsql`
+  goes back, and copies the SERVER's rows.
 - Same schema as turso: a Turso Cloud database can be served by either engine.
 
 ## several machines (fleet)
@@ -617,7 +619,7 @@ tab-separated stdout is unaffected.
 | `task_source_provider.timeout_seconds` | 20 | per remote store call |
 | `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |
 | `task_source_provider.github_gist.gist_id` | (none) | the gist hex id |
-| `database.engine` | sqlite | `sqlite` (local file), `turso` (central database, local replica synced with Turso Cloud) or `libsql` (central database on any libsql server, over Hrana, no local copy) |
+| `database.engine` | sqlite | `sqlite` (local file), `turso` (central database, local replica synced with Turso Cloud) or `libsql` (central database on any libsql server, local replica synced over Hrana) |
 | `database.turso_database_url` | (none) | the Turso Cloud database, from `turso db show <db>` |
 | `database.turso_auth_token` | (none) | its token; rendered `(set)`, never printed; empty = `$TURSO_AUTH_TOKEN` |
 | `database.turso_sync_interval_seconds` | 15 | how often the daemon pulls from Turso Cloud (min 5) |

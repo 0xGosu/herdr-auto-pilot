@@ -218,23 +218,24 @@ func TestADeliberatePauseIsNeverAFailure(t *testing.T) {
 	}
 }
 
-// TestTheLibSQLLineSpeaksOfAServerNotAReplica: the libsql engine has no
-// replica, so "unpushed" and "last pull" describe nothing there; its line
-// says what a check actually proves.
-func TestTheLibSQLLineSpeaksOfAServerNotAReplica(t *testing.T) {
+// TestTheLibSQLLineReportsItsReplica: the libsql engine keeps a local
+// replica, so its line reports what turso's does — the unpushed changes an
+// outage leaves queued — and a failure isolates it rather than stopping it.
+func TestTheLibSQLLineReportsItsReplica(t *testing.T) {
 	now := time.Now()
-	ok := &FleetSyncHealth{Engine: EngineLibSQL, Bootstrapped: true, LastPullAt: now.Add(-3 * time.Second)}
-	if line := ok.Line(now); !strings.Contains(line, "ok") || !strings.Contains(line, "server last answered 3s ago") ||
-		strings.Contains(line, "unpushed") {
+	ok := &FleetSyncHealth{Engine: EngineLibSQL, Bootstrapped: true, LastPullAt: now.Add(-3 * time.Second),
+		LastPushAt: now.Add(-3 * time.Second), PendingOps: 2}
+	if line := ok.Line(now); !strings.Contains(line, "ok") || !strings.Contains(line, "2 unpushed") {
 		t.Errorf("healthy libsql line = %q", line)
 	}
 	down := &FleetSyncHealth{Engine: EngineLibSQL, Bootstrapped: true, LastError: "connection refused",
-		LastPullAt: now.Add(-10 * time.Minute), ConsecutiveFailures: 40}
-	if line := down.Line(now); !strings.Contains(line, "ISOLATED") || !strings.Contains(line, "connection refused") {
+		LastPullAt: now.Add(-10 * time.Minute), ConsecutiveFailures: 40, PendingOps: 7}
+	if line := down.Line(now); !strings.Contains(line, "ISOLATED") || !strings.Contains(line, "connection refused") ||
+		!strings.Contains(line, "7 unpushed") {
 		t.Errorf("isolated libsql line = %q", line)
 	}
 	waiting := &FleetSyncHealth{Engine: EngineLibSQL, Bootstrapped: false, LastError: "unauthorized"}
-	if line := waiting.Line(now); !strings.Contains(line, "NOT REACHED") || strings.Contains(line, "BOOTSTRAP") {
-		t.Errorf("unreached libsql line = %q", line)
+	if line := waiting.Line(now); !strings.Contains(line, "BOOTSTRAP PENDING") {
+		t.Errorf("unseeded libsql line = %q", line)
 	}
 }
