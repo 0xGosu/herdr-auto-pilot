@@ -809,7 +809,7 @@ const MinLibSQLPollIntervalSeconds = 5
 //
 // The section is read once, when a process opens its store: a change needs
 // `hap daemon --restart` (and reopening the TUI) — --ensure leaves a daemon
-// that is already this binary alone. TursoSyncPaused is the ONE exception and
+// that is already this binary alone. SyncPaused is the ONE exception and
 // deliberately so (see its own comment). Config itself never enters
 // the database — each machine keeps its own config.toml.
 type Database struct {
@@ -827,17 +827,19 @@ type Database struct {
 	// TursoSyncIntervalSeconds is how often the daemon pulls (0 = the
 	// built-in default, floored at MinTursoSyncIntervalSeconds).
 	TursoSyncIntervalSeconds int `toml:"turso_sync_interval_seconds,omitempty"`
-	// TursoSyncPaused (named for the engine it came with; it applies to
-	// libsql too) stops this node talking to the server while leaving
-	// everything else exactly as it was: the engine stays turso, the local
-	// replica stays the store, every process still goes through the daemon.
-	// Only the pulls, the pushes and the shutdown push are skipped — local
-	// WAL checkpointing continues, because an unbounded local file WOULD be
-	// an engine change. Unpushed writes accumulate in the replica's change
-	// log and travel on the first push after the pause is lifted.
+	// SyncPaused stops this node talking to the shared server (turso or
+	// libsql) while leaving everything else exactly as it was: the engine
+	// stays shared, the local replica stays the store, every process still
+	// goes through the daemon. Only the pulls, the pushes and the shutdown push
+	// are skipped — local WAL checkpointing continues, because an unbounded
+	// local file WOULD be an engine change. Unpushed writes accumulate in the
+	// replica's change log and travel on the first push after the pause is
+	// lifted. `hap migrate` honours it too: under turso it skips the pull or
+	// push framing the copy, and under libsql — whose copy runs on the server
+	// itself — it refuses.
 	//
 	// It is for an operator who needs this machine off the wire for a while —
-	// a metered or hostile network, a Turso incident, a node they do not want
+	// a metered or hostile network, a server incident, a node they do not want
 	// publishing its herd right now — without unpicking the URL and the token
 	// and putting them back afterwards. Default false, so an existing install
 	// behaves exactly as before.
@@ -846,7 +848,14 @@ type Database struct {
 	// sync loop re-reads it before every operation rather than capturing it at
 	// loop start. A pause switch that needed a daemon restart — losing the
 	// herd's in-flight work — would defeat its own purpose.
-	TursoSyncPaused bool `toml:"turso_sync_paused,omitempty"`
+	SyncPaused bool `toml:"sync_paused,omitempty"`
+	// DeprecatedTursoSyncPaused is the renamed `turso_sync_paused` key (named
+	// for the engine it came with, though it always applied to libsql too),
+	// kept only to migrate existing configs: on Load it seeds SyncPaused when
+	// the file does not also write `sync_paused`, then it is cleared so the
+	// next Save rewrites the file under the new name. A pointer, so the
+	// operator having written it is visible for the warning.
+	DeprecatedTursoSyncPaused *bool `toml:"turso_sync_paused,omitempty"`
 	// LibSQLURL is the libsql server for engine = "libsql": libsql://…,
 	// https://… or http://… (a self-hosted sqld on a private network). Any
 	// server answering Hrana over HTTP (`/v2/pipeline`) works.
@@ -881,7 +890,7 @@ func (d Database) IsLibSQL() bool { return d.Engine == EngineLibSQL }
 // SyncPausedEffective reports whether the sync pause is in force: under
 // either shared engine, since both keep a local replica that serves while
 // the server round trips are skipped.
-func (d Database) SyncPausedEffective() bool { return d.TursoSyncPaused && d.IsShared() }
+func (d Database) SyncPausedEffective() bool { return d.SyncPaused && d.IsShared() }
 
 // IsShared reports whether a SHARED engine is selected — turso or libsql.
 // Both put the store behind the daemon (front ends reach it over the store
@@ -1996,7 +2005,14 @@ type legacyKeys struct {
 	// `[escalations.full_self_prompting] enabled = true`, and comparing the
 	// decoded bool to its zero value cannot tell those apart.
 	FullSelfPrompting *any `toml:"full_self_prompting"`
-	LLM               struct {
+	Database          struct {
+		// The canonical key for the deprecated `database.turso_sync_paused`:
+		// an explicit canonical `sync_paused = false` must beat a stale
+		// legacy `true` — otherwise the rename would silently keep a node
+		// off the wire — and the decoded bool cannot tell false from absent.
+		SyncPaused *any `toml:"sync_paused"`
+	} `toml:"database"`
+	LLM struct {
 		AutoActConfidenceThreshold *any `toml:"auto_act_confidence_threshold"`
 		RewriteCommand             *any `toml:"rewrite_command"`
 		RewriteCommandStart        *any `toml:"rewrite_command_start"`
@@ -2179,6 +2195,21 @@ func Load(path string) (Config, error) {
 				"path", path)
 		}
 		cfg.Safety.DeprecatedDisableSeed = nil
+	}
+	// Renamed `database.turso_sync_paused` → `database.sync_paused`: migrate
+	// only when the canonical key is absent from the raw file, so an explicit
+	// canonical false beats a stale legacy true. Clearing the pointer makes
+	// the next Save drop the old key.
+	if cfg.Database.DeprecatedTursoSyncPaused != nil {
+		if legacy.Database.SyncPaused == nil {
+			cfg.Database.SyncPaused = *cfg.Database.DeprecatedTursoSyncPaused
+			warnOnce("config key `database.turso_sync_paused` is deprecated; use `database.sync_paused`",
+				"path", path)
+		} else {
+			warnOnce("deprecated config key `database.turso_sync_paused` ignored because `database.sync_paused` is also set",
+				"path", path)
+		}
+		cfg.Database.DeprecatedTursoSyncPaused = nil
 	}
 	// Deprecated `[escalations.full_self_prompting]`: migrate it only when the
 	// canonical top-level table is absent, probing the raw file for presence

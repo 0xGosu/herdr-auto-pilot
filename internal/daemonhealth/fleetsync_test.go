@@ -162,7 +162,7 @@ func TestDiagLinesSayWhenTheAutomaticRecoveryIsSpent(t *testing.T) {
 }
 
 // TestADeliberatePauseIsNeverAFailure: the whole reporting contract for
-// database.turso_sync_paused, on the hardest input — a record that was failing,
+// database.sync_paused, on the hardest input — a record that was failing,
 // and isolated, at the moment the operator paused it. The pause freezes
 // LastError, the failure count and both timestamps, so every clock-derived
 // answer would go on aging; reported as DEGRADED or ISOLATED it teaches an
@@ -193,7 +193,7 @@ func TestADeliberatePauseIsNeverAFailure(t *testing.T) {
 		t.Errorf("a paused sync produced failure evidence: %q", paused.DiagLines(now))
 	}
 	line := paused.Line(now)
-	if !strings.Contains(line, "PAUSED") || !strings.Contains(line, "turso_sync_paused") {
+	if !strings.Contains(line, "PAUSED") || !strings.Contains(line, "sync_paused") {
 		t.Errorf("status line %q must name the pause and the key that ends it", line)
 	}
 	// The unpushed count is how an operator judges when to lift the pause.

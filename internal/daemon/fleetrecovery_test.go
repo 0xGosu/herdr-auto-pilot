@@ -302,7 +302,7 @@ func TestAPausedSyncNeverRestartsTheDaemon(t *testing.T) {
 	*calls = nil
 
 	d.mu.Lock()
-	d.cfg.Database.TursoSyncPaused = true
+	d.cfg.Database.SyncPaused = true
 	d.mu.Unlock()
 	if d.checkFleetSyncWedged() {
 		t.Error("restarted the daemon over a sync the operator deliberately paused")

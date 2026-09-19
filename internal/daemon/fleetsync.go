@@ -172,7 +172,7 @@ func (d *Daemon) adoptFleetRecoveryMarker() {
 }
 
 // fleetSyncPaused reports whether the operator has deliberately taken this
-// node off the wire (database.turso_sync_paused).
+// node off the wire (database.sync_paused).
 //
 // Read from the LIVE config snapshot on every operation rather than captured
 // at loop start like FleetSyncInterval, which is what makes this the one
@@ -189,7 +189,7 @@ func (d *Daemon) adoptFleetRecoveryMarker() {
 func (d *Daemon) fleetSyncPaused() bool {
 	cfg, _, _ := d.snapshot()
 	// Both shared engines keep a local replica that serves while paused.
-	return cfg.Database.TursoSyncPaused
+	return cfg.Database.SyncPaused
 }
 
 // fleetEngine is the shared engine's name, "turso" when unset.
@@ -206,7 +206,7 @@ func (d *Daemon) fleetEngine() string {
 // at Info once, by the loop's own `paused` gate, on the tick that first sees
 // it — and again when it is lifted.
 func (d *Daemon) notePausedSkip(op string) {
-	slog.Debug("fleet sync: skipped; sync is paused by database.turso_sync_paused", "op", op)
+	slog.Debug("fleet sync: skipped; sync is paused by database.sync_paused", "op", op)
 }
 
 // runFleetSync is the loop. It returns when ctx is done.
@@ -224,7 +224,7 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 		if !d.fleetSyncPaused() {
 			if announced {
 				announced = false
-				slog.Info("fleet sync: resumed; database.turso_sync_paused is off, " +
+				slog.Info("fleet sync: resumed; database.sync_paused is off, " +
 					"pushing what accumulated while it was on")
 				// Nothing else would. Every write during the pause armed a
 				// debounce timer that then fired into the gate and was NOT
@@ -247,8 +247,8 @@ func (d *Daemon) runFleetSync(ctx context.Context) {
 		}
 		if !announced {
 			announced = true
-			slog.Info("fleet sync: PAUSED by database.turso_sync_paused; this node keeps using its " +
-				"local replica but exchanges no rows with Turso Cloud until the key is turned off")
+			slog.Info("fleet sync: PAUSED by database.sync_paused; this node keeps using its " +
+				"local replica but exchanges no rows with the shared server until the key is turned off")
 		}
 		d.notePausedSkip(op)
 		return true

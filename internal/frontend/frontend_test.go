@@ -2454,7 +2454,7 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		// true and not the default false, for the same reason as the two above:
 		// the sample doubles as the SetField exercise, and the value that
 		// changes behaviour is the one worth round-tripping.
-		"database.turso_sync_paused":            "true",
+		"database.sync_paused":                  "true",
 		"database.libsql_url":                   "libsql://hap-me.example.dev",
 		"database.libsql_auth_token":            "eyJ.sample.libsql",
 		"database.libsql_poll_interval_seconds": "30",
@@ -5175,6 +5175,7 @@ var configKeysExemptFromRegistry = map[string]string{
 	"llm.rewrite_fallback_template":           "deprecated alias for llm.rewrite_action_fallback_template",
 	"llm.auto_act":                            "deprecated alias for llm.auto_act_confidence_threshold",
 	"safety.disable_seed":                     "deprecated alias for safety.disable_never_auto_seed_patterns",
+	"database.turso_sync_paused":              "deprecated alias for database.sync_paused",
 	"escalations.full_self_prompting.enabled": "deprecated alias for full_self_prompting.enabled",
 	// The deprecated table decodes into the SAME struct, so every field added to
 	// FullSelfPrompting surfaces under both spellings. These two are reachable

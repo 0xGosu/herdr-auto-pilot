@@ -165,7 +165,7 @@ func TestConfigTopicHelpResolvesToTheTopic(t *testing.T) {
 
 // TestTursoSyncPauseDoesNotTellTheOperatorToRestart: every other [database]
 // key is read when a process opens its store, so `hap config set` prints a
-// "run `hap daemon --restart`" note. turso_sync_paused is the one the running
+// "run `hap daemon --restart`" note. sync_paused is the one the running
 // daemon re-reads, and a restart is exactly what a pause exists to avoid — so
 // printing that note here would be false advice, and advice that costs the herd
 // its in-flight work when followed.
@@ -177,11 +177,11 @@ func TestTursoSyncPauseDoesNotTellTheOperatorToRestart(t *testing.T) {
 	var notes bytes.Buffer
 	defer cli.SetDeprecationOutput(&notes)()
 
-	out, err := run(t, app, "config", "set", "database.turso_sync_paused", "true")
+	out, err := run(t, app, "config", "set", "database.sync_paused", "true")
 	if err != nil {
-		t.Fatalf("hap config set database.turso_sync_paused: %v", err)
+		t.Fatalf("hap config set database.sync_paused: %v", err)
 	}
-	if !strings.Contains(out, "database.turso_sync_paused set to true") {
+	if !strings.Contains(out, "database.sync_paused set to true") {
 		t.Errorf("the write was not confirmed:\n%s", out)
 	}
 	if strings.Contains(notes.String(), "--restart") {

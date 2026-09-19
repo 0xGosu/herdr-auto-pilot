@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -206,7 +210,7 @@ func TestDestinationNotEmptyErrorOnlyPromisesAWayBackGoingToSQLite(t *testing.T)
 }
 
 // TestPausedMigrateNoteDoesNotClaimSilenceOnTheWire: under
-// database.turso_sync_paused the copy's own pull or push is skipped, but the
+// database.sync_paused the copy's own pull or push is skipped, but the
 // schema check before it still pulls. The note must say which round trip was
 // skipped for the direction taken, and must not tell an operator on a metered
 // link that nothing was pulled or pushed.
@@ -228,6 +232,54 @@ func TestPausedMigrateNoteDoesNotClaimSilenceOnTheWire(t *testing.T) {
 				if !strings.Contains(note, want) {
 					t.Errorf("%q does not say %q", note, want)
 				}
+			}
+		})
+	}
+}
+
+// TestMigrateLibSQLRefusesWhilePausedWithoutContactingTheServer: a libsql
+// migration's copy runs on the server itself, so database.sync_paused cannot
+// trim it the way it trims turso's framing pull/push — it refuses, in BOTH
+// directions, before the server is opened (the schema lease and the collision
+// check would otherwise reach it first). The unpaused control proves the
+// counting server is really where the command goes, or the paused half would
+// pass on a command that never dials anything.
+func TestMigrateLibSQLRefusesWhilePausedWithoutContactingTheServer(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		http.Error(w, "not a libsql server", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	stateDir := t.TempDir()
+	if _, err := store.LoadNodeID(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	paths := config.Paths{StateDir: stateDir}
+	cfg := func(paused bool) config.Config {
+		return config.Config{Database: config.Database{Engine: config.EngineLibSQL, LibSQLURL: srv.URL, SyncPaused: paused}}
+	}
+	for _, tc := range []struct {
+		name string
+		opt  migrateArgs
+	}{
+		{"to libsql", migrateArgs{shared: config.EngineLibSQL}},
+		{"to sqlite", migrateArgs{toSQLite: true, shared: config.EngineLibSQL}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits.Store(0)
+			err := runMigrateLibSQL(context.Background(), paths, cfg(true), io.Discard, tc.opt)
+			if err == nil || !strings.Contains(err.Error(), "database.sync_paused") {
+				t.Fatalf("paused: err = %v, want a refusal naming database.sync_paused", err)
+			}
+			if n := hits.Load(); n != 0 {
+				t.Errorf("paused: the server was contacted %d times", n)
+			}
+			// Control: unpaused, the same command does reach the server (and
+			// fails there, since it is not one).
+			_ = runMigrateLibSQL(context.Background(), paths, cfg(false), io.Discard, tc.opt)
+			if hits.Load() == 0 {
+				t.Error("control: unpaused, the command never reached the server, so the paused half proves nothing")
 			}
 		})
 	}

@@ -2608,7 +2608,7 @@ var ConfigFields = []ConfigFieldDef{
 	// something an operator reaches for deliberately (a metered network, a
 	// Turso incident) and then has to remember to lift, so hiding it behind
 	// `hap config fields` would hide a herd that is off the wire.
-	{Key: "database.turso_sync_paused", TUIEditable: true},
+	{Key: "database.sync_paused", TUIEditable: true},
 	// The libsql engine's three, shaped like turso's: the URL read-only in the
 	// TUI, the token redacted and off the Config tab, the poll interval hidden.
 	{Key: "database.libsql_url"},
@@ -3023,8 +3023,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return "(none)"
 	case "database.turso_sync_interval_seconds":
 		return defaultedInt(cfg.Database.TursoSyncIntervalSeconds, config.DefaultTursoSyncIntervalSeconds)
-	case "database.turso_sync_paused":
-		return strconv.FormatBool(cfg.Database.TursoSyncPaused)
+	case "database.sync_paused":
+		return strconv.FormatBool(cfg.Database.SyncPaused)
 	case "database.libsql_url":
 		return pathFieldValue(cfg.Database.LibSQLURL)
 	case "database.libsql_auth_token":
@@ -3641,12 +3641,12 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			}
 			cfg.Database.TursoSyncIntervalSeconds = v
 			return nil
-		case "database.turso_sync_paused":
+		case "database.sync_paused":
 			v, err := strconv.ParseBool(value)
 			if err != nil {
-				return fmt.Errorf("database.turso_sync_paused must be true or false, got %q", value)
+				return fmt.Errorf("database.sync_paused must be true or false, got %q", value)
 			}
-			cfg.Database.TursoSyncPaused = v
+			cfg.Database.SyncPaused = v
 			return nil
 		case "database.libsql_url":
 			// Shape only, and not against the engine (order-independent keys).
