@@ -57,6 +57,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
@@ -122,6 +123,8 @@ type DB struct {
 	lastPrune  time.Time
 	// serverID is the connected server's identity (checkServerIdentity).
 	serverID int64
+	// pushSeq makes each push's bookkeeping token unique (tagged).
+	pushSeq atomic.Uint64
 	// lastSkewWarn throttles the clock-disagreement warning.
 	lastSkewWarn time.Time
 }
@@ -321,6 +324,8 @@ func (d *DB) checkServerIdentity(ctx context.Context, r *libsql.DB) error {
 		{SQL: `CREATE TABLE IF NOT EXISTS hap_sync_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)`},
 		{SQL: `INSERT OR IGNORE INTO hap_sync_meta (k, v) VALUES ('server_id', abs(random()))`},
 		{SQL: `SELECT v FROM hap_sync_meta WHERE k = 'server_id'`},
+		{SQL: pushMarksDDL},
+		{SQL: pushKeysDDL},
 	})
 	if err != nil {
 		return fmt.Errorf("libsql: read the server's identity: %w", err)

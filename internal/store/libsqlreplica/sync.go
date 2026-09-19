@@ -198,8 +198,8 @@ type pushedKey struct {
 // this node's id, which is what lets its pull skip its own writes. A marker
 // entry records where this transaction's entries start, and the tail tags
 // the entries after it — but ONLY those naming a key this push sent
-// (temp.hap_push_keys, rendered by the server's own json_array so the text
-// matches the triggers' exactly). A bare "every entry after my marker" relies
+// (hap_push_keys, rendered by the server's own json_array so the text matches
+// the triggers' exactly). A bare "every entry after my marker" relies
 // on the server serializing the whole transaction; a server that let another
 // node's writes commit inside that range would have them tagged as this
 // node's, and that node would then skip them on its own pull — rows lost for
@@ -211,30 +211,38 @@ type pushedKey struct {
 // The marker INSERT stays the FIRST statement after Tx's BEGIN, so the write
 // lock is taken there (a read ahead of it would start the transaction as a
 // reader and could fail with SQLITE_BUSY_SNAPSHOT; see store.sqliteDSN).
+//
+// The push's bookkeeping lives in ORDINARY tables (hap_push_marks,
+// hap_push_keys) under a token unique to this push, written and deleted
+// inside its own transaction — never TEMP tables: sqld classifies every
+// statement before SQLite sees it and refuses CREATE TEMP TABLE outright
+// ("unsupported statement"), which failed every push in production while an
+// in-process SQLite accepted it (hranafake now refuses it too). Nothing else
+// ever observes these rows: they commit and vanish in the same transaction,
+// and a failed one rolls them back.
 func (d *DB) tagged(stmts []libsql.Statement, keys []pushedKey) []libsql.Statement {
+	tok := d.nodeID + ":" + strconv.FormatInt(d.now().UnixNano(), 36) + ":" + strconv.FormatUint(d.pushSeq.Add(1), 36)
 	out := make([]libsql.Statement, 0, len(stmts)+len(keys)+8)
 	out = append(out,
 		libsql.Statement{SQL: `INSERT INTO hap_changelog (tbl, pk, origin, at) VALUES ('', '', ?, 0)`, Args: []any{d.nodeID}},
-		libsql.Statement{SQL: `CREATE TEMP TABLE IF NOT EXISTS hap_push_mark (seq INTEGER)`},
-		libsql.Statement{SQL: `DELETE FROM temp.hap_push_mark`},
-		libsql.Statement{SQL: `INSERT INTO temp.hap_push_mark (seq) VALUES (last_insert_rowid())`},
+		libsql.Statement{SQL: `INSERT INTO hap_push_marks (tok, seq) VALUES (?, last_insert_rowid())`, Args: []any{tok}},
 		// The server's own clock stamping stands aside while a push writes:
 		// the push records the EDIT's clocks itself (pushStmts).
 		libsql.Statement{SQL: `INSERT INTO hap_sync_pushing (x) VALUES (1)`},
-		libsql.Statement{SQL: `CREATE TEMP TABLE IF NOT EXISTS hap_push_keys (tbl TEXT NOT NULL, pk TEXT NOT NULL)`},
-		libsql.Statement{SQL: `DELETE FROM temp.hap_push_keys`},
 	)
 	for _, k := range keys {
 		out = append(out, libsql.Statement{
-			SQL:  `INSERT INTO temp.hap_push_keys (tbl, pk) VALUES (?, json_array(` + placeholders(len(k.key)) + `))`,
-			Args: append([]any{k.t.name}, k.key...),
+			SQL:  `INSERT INTO hap_push_keys (tok, tbl, pk) VALUES (?, ?, json_array(` + placeholders(len(k.key)) + `))`,
+			Args: append([]any{tok, k.t.name}, k.key...),
 		})
 	}
 	out = append(out, stmts...)
 	return append(out,
-		libsql.Statement{SQL: `UPDATE hap_changelog SET origin = ? WHERE seq > (SELECT seq FROM temp.hap_push_mark)
-			AND (tbl, pk) IN (SELECT tbl, pk FROM temp.hap_push_keys)`, Args: []any{d.nodeID}},
-		libsql.Statement{SQL: `DELETE FROM hap_changelog WHERE seq = (SELECT seq FROM temp.hap_push_mark)`},
+		libsql.Statement{SQL: `UPDATE hap_changelog SET origin = ? WHERE seq > (SELECT seq FROM hap_push_marks WHERE tok = ?)
+			AND (tbl, pk) IN (SELECT tbl, pk FROM hap_push_keys WHERE tok = ?)`, Args: []any{d.nodeID, tok, tok}},
+		libsql.Statement{SQL: `DELETE FROM hap_changelog WHERE seq = (SELECT seq FROM hap_push_marks WHERE tok = ?)`, Args: []any{tok}},
+		libsql.Statement{SQL: `DELETE FROM hap_push_keys WHERE tok = ?`, Args: []any{tok}},
+		libsql.Statement{SQL: `DELETE FROM hap_push_marks WHERE tok = ?`, Args: []any{tok}},
 		libsql.Statement{SQL: `DELETE FROM hap_sync_pushing`},
 	)
 }

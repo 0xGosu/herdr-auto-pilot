@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -197,6 +198,9 @@ func (s *Server) execute(ctx context.Context, conn *sql.Conn, st *libsql.Stmt) l
 	if st == nil {
 		return errResult("execute without a statement", "INVALID")
 	}
+	if r, refused := refusedLikeSQLD(st.SQL); refused {
+		return r
+	}
 	if manyStatements(st.SQL) {
 		return errResult("SQL string contains more than one statement", "SQL_MANY_STATEMENTS")
 	}
@@ -255,6 +259,9 @@ func (s *Server) execute(ctx context.Context, conn *sql.Conn, st *libsql.Stmt) l
 }
 
 func (s *Server) sequence(ctx context.Context, conn *sql.Conn, sqlText string) libsql.StreamResult {
+	if r, refused := refusedLikeSQLD(sqlText); refused {
+		return r
+	}
 	before, _ := counters(ctx, conn)
 	if _, err := conn.ExecContext(ctx, sqlText); err != nil {
 		return errResult(err.Error(), "SQLITE_ERROR")
@@ -262,6 +269,27 @@ func (s *Server) sequence(ctx context.Context, conn *sql.Conn, sqlText string) l
 	after, _ := counters(ctx, conn)
 	s.noteWrite(sqlText, before, after)
 	return libsql.StreamResult{Type: "ok", Response: &libsql.StreamResponse{Type: "sequence"}}
+}
+
+// sqldRefuses are statement shapes a real sqld refuses before SQLite ever sees
+// them — it parses every statement itself to route it — while an in-process
+// SQLite accepts them happily. Each was found against a real server; the fake
+// refuses them the same way, or a test passes on SQL production cannot run.
+// CREATE TEMP TABLE failed every libsql push in production (v0.9.49), and
+// the `temp.` schema only exists through one.
+var sqldRefuses = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^\s*CREATE\s+TEMP(ORARY)?\s`),
+	regexp.MustCompile(`(?i)\btemp\.`),
+}
+
+// refusedLikeSQLD answers a refused shape with sqld's own error.
+func refusedLikeSQLD(q string) (libsql.StreamResult, bool) {
+	for _, re := range sqldRefuses {
+		if re.MatchString(q) {
+			return errResult("SQL string could not be parsed: unsupported statement: "+q, "SQL_PARSE_ERROR"), true
+		}
+	}
+	return libsql.StreamResult{}, false
 }
 
 // manyStatements approximates sqld's single-statement check closely enough
