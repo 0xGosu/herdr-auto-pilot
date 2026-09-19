@@ -37,9 +37,6 @@ const (
 	ChangelogRetention = 7 * 24 * time.Hour
 )
 
-// ErrNotBootstrapped is returned by Pull before the replica was seeded.
-var ErrNotBootstrapped = errors.New("libsql: the replica has not been seeded from the server yet")
-
 // Push sends every local change the outbox holds. With nothing to send it
 // still makes one round trip: the daemon counts a successful push as proof
 // the node is on the wire, and a no-op success would clear an outage banner
@@ -51,6 +48,16 @@ func (d *DB) Push() error {
 	r, tables, err := d.remoteDB(ctx)
 	if err != nil {
 		return err
+	}
+	if ok, err := d.Bootstrapped(ctx); err != nil {
+		return err
+	} else if !ok {
+		// Seed before pushing anything into a server this replica has not
+		// been seeded from (the seed pushes what is unpushed first).
+		if err := d.reseed(ctx, r, tables); err != nil {
+			return err
+		}
+		d.exec.NoteChanged()
 	}
 	sent, err := d.pushAll(ctx, r, tables)
 	if err != nil {
@@ -245,7 +252,13 @@ func (d *DB) Pull() (changed bool, err error) {
 	if ok, err := d.Bootstrapped(ctx); err != nil {
 		return false, err
 	} else if !ok {
-		return false, ErrNotBootstrapped
+		// Not seeded — a fresh replica, or one whose sync state was dropped
+		// on meeting a different server (checkServerIdentity). Seed now.
+		if err := d.reseed(ctx, r, tables); err != nil {
+			return false, err
+		}
+		d.exec.NoteChanged()
+		return true, nil
 	}
 	if unseeded, err := d.unseededTables(ctx, tables); err != nil {
 		return false, err
@@ -312,10 +325,20 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		}
 	}
 	if len(missingTriggers(tables, present)) > 0 {
-		if _, err := ensureChangelog(ctx, r, tables); err != nil {
+		// Re-read the server's tables FIRST: a trigger can be missing because
+		// its table is gone (dropped by a newer build's migration), and
+		// repairing from the cached table set would CREATE TRIGGER on a table
+		// that no longer exists — failing every pull, forever. A table the
+		// server lacks is simply held until it has it again.
+		if err := resolveRemoteColumns(ctx, r, tables); err != nil {
 			return false, false, err
 		}
-		return false, true, nil
+		if len(missingTriggers(tables, present)) > 0 {
+			if _, err := ensureChangelog(ctx, r, tables); err != nil {
+				return false, false, err
+			}
+			return false, true, nil
+		}
 	}
 	if len(res[1].Rows) == 1 {
 		if pruned, ok := res[1].Rows[0][0].(int64); ok && pruned > cursor {
@@ -627,6 +650,12 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 		if err := setState(ctx, tx, stateCursor, cursor); err != nil {
 			return err
 		}
+		d.mu.Lock()
+		id := d.serverID
+		d.mu.Unlock()
+		if err := setState(ctx, tx, stateServerID, id); err != nil {
+			return err
+		}
 		return setState(ctx, tx, stateBootstrapped, 1)
 	})
 	if err != nil {
@@ -898,6 +927,8 @@ func upsertSQL(t *table, cols []string) string {
 type conflict struct {
 	sql  string
 	args []any
+	// cols is the UNIQUE constraint the statement enforces (conflictDeletes).
+	cols []string
 }
 
 // parkStmt moves a row that is about to be replayed OUT of the way of its own
@@ -986,6 +1017,7 @@ func conflictDeletes(t *table, cols []string, row []any) []conflict {
 			sql: `DELETE FROM ` + ident(t.name) + ` WHERE ` + strings.Join(where, " AND ") +
 				` AND NOT (` + strings.Join(notKey, " AND ") + `)`,
 			args: args,
+			cols: u,
 		})
 	}
 	return out

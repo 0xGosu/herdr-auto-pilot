@@ -275,7 +275,14 @@ func pushStmts(it pushItem) []libsql.Statement {
 	}
 	cols := t.shared()
 	for _, c := range conflictDeletes(t, cols, it.row) {
-		out = append(out, libsql.Statement{SQL: c.sql, Args: c.args})
+		// Only where this push's value for the constraint WINS: a stale edit
+		// that then loses to the server's newer value must not have deleted
+		// the row that legitimately holds it.
+		cond, cargs, ok := winsCond(it, c.cols)
+		if !ok {
+			continue
+		}
+		out = append(out, libsql.Statement{SQL: c.sql + cond, Args: append(append([]any{}, c.args...), cargs...)})
 	}
 	m := it.clocks.latest()
 	out = append(out, libsql.Statement{
@@ -317,6 +324,31 @@ func pushStmts(it pushItem) []libsql.Statement {
 		})
 	}
 	return append(out, clockUpsert(it)...)
+}
+
+// winsCond is the SQL condition (with its arguments) under which this push's
+// values for cols win on the server — the same test the column UPDATE applies,
+// ANDed over every non-key column of the constraint. ok is false when one of
+// them cannot win at all (a last-push column not changed here).
+func winsCond(it pushItem, cols []string) (cond string, args []any, ok bool) {
+	t, key := it.t, it.key
+	kx := keyExpr(key)
+	for _, c := range cols {
+		if t.isPK(c) {
+			continue
+		}
+		if lastPush(t.name, c) {
+			if !it.clocks.changedHere(c) {
+				return "", nil, false
+			}
+			continue
+		}
+		e := it.clocks.eff(c)
+		cond += ` AND ? > ` + floorExpr + ` AND NOT EXISTS (SELECT 1 FROM hap_clock WHERE tbl = ? AND pk = ` + kx +
+			` AND col IN (?, '') AND (hlc, node) >= (?, ?))`
+		args = append(args, concat([]any{e.hlc, t.name}, key, []any{c, e.hlc, e.node})...)
+	}
+	return cond, args, true
 }
 
 // clockUpsert records a pushed key's clocks on the server wherever they are

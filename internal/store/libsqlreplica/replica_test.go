@@ -3,7 +3,6 @@ package libsqlreplica_test
 import (
 	"bytes"
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -393,11 +392,9 @@ func TestBootstrappedReplicaOpensOffline(t *testing.T) {
 	if ok, _ := r.Bootstrapped(ctx); ok {
 		t.Fatal("a fresh replica claims to be seeded")
 	}
-	if _, err := r.Pull(); !errors.Is(err, libsqlreplica.ErrNotBootstrapped) {
-		t.Fatalf("pull before the seed: %v", err)
-	}
-	if err := r.Bootstrap(ctx); err != nil {
-		t.Fatal(err)
+	// A pull on an unseeded replica seeds it.
+	if changed, err := r.Pull(); err != nil || !changed {
+		t.Fatalf("pull before the seed: changed=%v err=%v, want it to seed", changed, err)
 	}
 	st.Close()
 	r.Close()
@@ -1048,5 +1045,123 @@ func TestAgentActionsAreLastPushWins(t *testing.T) {
 		if status != "done" || result != `{"ok":true}` || side != 1 {
 			t.Fatalf("%s: status %q result %q side_effect %d, want the last push's", n.id, status, result, side)
 		}
+	}
+}
+
+// A stale edit proposing a UNIQUE value another row holds must not delete
+// that row when the edit then loses to a newer one.
+func TestAStaleUniqueEditDeletesNothing(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, 'p1', 'one', 1), (?, 'p2', 'two', 1)`,
+		nodeA, nodeA)
+	a.push(t)
+	b.pull(t)
+	srv.SetDown(true)
+	b.exec(t, `UPDATE agent_names SET name = 'x' WHERE agent_id = 'p2'`)   // frees 'two' locally...
+	b.exec(t, `UPDATE agent_names SET name = 'two' WHERE agent_id = 'p1'`) // ...stale: p1 -> 'two'
+	srv.SetDown(false)
+	tick()
+	a.exec(t, `UPDATE agent_names SET name = 'uno' WHERE agent_id = 'p1'`) // newer, for p1 only
+	a.push(t)
+	// b pushes only p1's stale edit: p2's rename is discarded first, so the
+	// push collides with the server's p2 still named 'two'.
+	b.exec(t, `DELETE FROM hap_outbox WHERE pk LIKE '%p2%'`)
+	b.push(t)
+	a.pull(t)
+	var n int
+	online := onlineHandle(t, srv)
+	if err := online.DB().QueryRow(`SELECT COUNT(*) FROM agent_names WHERE agent_id = 'p2'`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("p2 rows on the server: %d (%v) — a losing stale edit deleted it", n, err)
+	}
+	var name string
+	if err := a.r.DB().QueryRow(`SELECT name FROM agent_names WHERE agent_id = 'p1'`).Scan(&name); err != nil || name != "uno" {
+		t.Fatalf("p1 is %q (%v), want the newer edit", name, err)
+	}
+}
+
+// A replicated table dropped on the server after this replica connected
+// takes its triggers with it. The pull must notice the table is GONE rather
+// than try to reinstall triggers on it — that fails every pull, forever —
+// and keep syncing the rest.
+func TestATableDroppedOnTheServerDoesNotWedgeThePull(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	online := onlineHandle(t, srv)
+	if _, err := online.DB().Exec(`DROP TABLE operator`); err != nil {
+		t.Fatal(err)
+	}
+	a.exec(t, `INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, 'p1', 'one', 1)`, nodeA)
+	a.push(t)
+	b.pull(t) // must not fail
+	var name string
+	if err := b.r.DB().QueryRow(`SELECT name FROM agent_names WHERE agent_id = 'p1'`).Scan(&name); err != nil || name != "one" {
+		t.Fatalf("b did not keep syncing the other tables: %q (%v)", name, err)
+	}
+	b.exec(t, `INSERT INTO operator (id, label) VALUES ('held', 'waits')`)
+	b.push(t) // held, not an error
+	if b.pending(t) == 0 {
+		t.Fatal("a change to the dropped table was lost instead of held")
+	}
+}
+
+// A replica pointed at a DIFFERENT server (database.libsql_url changed, state
+// dir kept) must not replay the old server's unpushed rows into the new one,
+// nor skip the new one's seed: it drops its sync state and mirrors the new
+// server.
+func TestAReplicaMovedToAnotherServerReseedsWithoutReplay(t *testing.T) {
+	ctx := context.Background()
+	srvA, srvB := newServer(t), newServer(t)
+	seedB := newNode(t, srvB, nodeB)
+	seedB.exec(t, `INSERT INTO operator (id, label) VALUES ('onB', 'b')`)
+	seedB.push(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hap.db")
+	open := func(srv *hranafake.Server) (*libsqlreplica.DB, *store.Store) {
+		r, err := libsqlreplica.Open(ctx, libsqlreplica.Options{Path: path, DSN: store.SQLiteDSN(path), NodeID: nodeA,
+			Remote: libsql.Options{URL: "https://fake.invalid", Transport: srv}, PrepareServer: prepareServer(nodeA)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		st, err := store.OpenDB(r.DB(), store.Options{NodeID: nodeA, Engine: store.EngineLibSQL,
+			IDs: store.NewTimeOrderedIDs(store.NodeBits(nodeA), nil), Migrate: true, AgentLockDir: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Prepare(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return r, st
+	}
+	r, st := open(srvA)
+	if err := r.Bootstrap(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.DB().Exec(`INSERT INTO operator (id, label) VALUES ('fromA', 'unpushed')`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	r.Close()
+
+	r, st = open(srvB) // the operator changed libsql_url
+	defer func() { st.Close(); r.Close() }()
+	if err := r.Push(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Pull(); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	online := onlineHandle(t, srvB)
+	if err := online.DB().QueryRow(`SELECT COUNT(*) FROM operator WHERE id = 'fromA'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("server A's unpushed row reached server B: %d (%v)", n, err)
+	}
+	var label string
+	if err := r.DB().QueryRow(`SELECT label FROM operator WHERE id = 'onB'`).Scan(&label); err != nil || label != "b" {
+		t.Fatalf("the replica was not seeded from the new server: %q (%v)", label, err)
+	}
+	if err := r.DB().QueryRow(`SELECT COUNT(*) FROM operator WHERE id = 'fromA'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("server A's row survived the move: %d (%v)", n, err)
 	}
 }

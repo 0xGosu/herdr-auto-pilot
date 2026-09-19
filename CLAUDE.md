@@ -778,6 +778,16 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     debounce is armed only by a NEW write, so outbox rows a previous process or a failed push left behind would
     otherwise wait for the next write — on an idle node, indefinitely. Paused, nothing is paid; the resume nudge
     covers it.
+  - **A replica is bound to ONE server** (`checkServerIdentity`: a random `hap_sync_meta.server_id`, recorded at
+    seed). Meeting a different one — `libsql_url` changed, state dir kept — drops the outbox, clocks and sync
+    state (said loudly, with the unpushed count) and re-seeds; replaying server A's outbox into server B, or
+    skipping B's seed because of A's bootstrapped marker, is what this prevents. A seeded replica with no
+    recorded identity is treated the same. Pull and Push therefore seed an unseeded replica themselves.
+  - **A push's UNIQUE conflict-delete runs only where the push's value for that constraint WINS**
+    (`winsCond`, the same clock test the column UPDATE applies). Unconditional, a stale edit proposing a value
+    another row holds deleted that row and then lost the UPDATE anyway.
+  - **Trigger repair re-reads the server's tables first** — a trigger missing because its table was DROPPED
+    would otherwise be recreated on a table that does not exist, failing every pull forever.
   - Accepted limit: retention runs only on replica nodes, so a fleet that later drops every replica keeps
     its triggers writing a log nothing prunes (drop `hap_cl_*` and `hap_changelog` by hand).
   - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a

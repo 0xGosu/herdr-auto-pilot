@@ -140,13 +140,20 @@ func mcpStore(ctx context.Context, paths config.Paths, dbPath string) (*store.St
 	return st, nil
 }
 
-// mcpEngineIsShared reports whether this install runs a shared engine, from
-// either signal a sanitized environment may leave: the config file, or the
-// replica dir a turso or libsql daemon creates beside the database.
+// mcpEngineIsShared reports whether this install runs a shared engine: the
+// config file when one exists and loads, else — a sanitized environment that
+// left no readable config — the replica dir a turso or libsql daemon creates
+// beside the database.
 func mcpEngineIsShared(paths config.Paths, stateDir string) bool {
 	if paths.ConfigDir != "" {
-		if cfg, err := config.Load(paths.File()); err == nil && cfg.Database.IsShared() {
-			return true
+		if _, statErr := os.Stat(paths.File()); statErr == nil {
+			// A config file that exists and loads is AUTHORITATIVE: a replica
+			// dir left behind by an engine the operator has since switched
+			// away from must not send an explicit sqlite install to a daemon
+			// socket that is not serving.
+			if cfg, err := config.Load(paths.File()); err == nil {
+				return cfg.Database.IsShared()
+			}
 		}
 	}
 	for _, dir := range []string{paths.TursoDir(), paths.LibSQLDir()} {

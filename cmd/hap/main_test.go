@@ -244,6 +244,23 @@ func TestMCPNeverOpensLocalSQLiteUnderTurso(t *testing.T) {
 		}
 	})
 
+	// An operator who switched BACK to sqlite keeps a stale replica dir; an
+	// explicit, readable config must win over it.
+	t.Run("explicit sqlite config beats a stale replica dir", func(t *testing.T) {
+		paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
+		if err := os.WriteFile(paths.File(), []byte("[database]\nengine = \"sqlite\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(paths.LibSQLDir(), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		st, err := mcpStore(ctx, paths, paths.DBPath())
+		if err != nil {
+			t.Fatalf("an explicit sqlite config went to the proxy: %v", err)
+		}
+		st.Close()
+	})
+
 	t.Run("sqlite install opens the local file", func(t *testing.T) {
 		paths := config.Paths{ConfigDir: t.TempDir(), StateDir: t.TempDir()}
 		st, err := mcpStore(ctx, paths, paths.DBPath())

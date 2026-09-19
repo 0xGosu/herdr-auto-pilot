@@ -52,6 +52,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -119,6 +120,8 @@ type DB struct {
 	lastPush   time.Time
 	lastCursor time.Time
 	lastPrune  time.Time
+	// serverID is the connected server's identity (checkServerIdentity).
+	serverID int64
 	// lastSkewWarn throttles the clock-disagreement warning.
 	lastSkewWarn time.Time
 }
@@ -287,10 +290,73 @@ func (d *DB) remoteDB(ctx context.Context) (*libsql.DB, map[string]*table, error
 		_ = r.Close()
 		return nil, nil, err
 	}
+	if err := d.checkServerIdentity(ctx, r); err != nil {
+		_ = r.Close()
+		return nil, nil, err
+	}
 	d.mu.Lock()
 	d.remote = r
 	d.mu.Unlock()
 	return r, tables, nil
+}
+
+// stateServerID is the hap_sync_state key holding the identity of the server
+// this replica was seeded from.
+const stateServerID = "server_id"
+
+// checkServerIdentity binds the replica to ONE server. The server carries a
+// random identity (hap_sync_meta.server_id, minted by whichever node first
+// asks); a seed records it. A replica that meets a DIFFERENT server — the
+// operator pointed database.libsql_url somewhere else and kept the state dir —
+// holds another database's cursor, clocks and unpushed outbox, and pushing
+// that outbox would replay server A's rows into server B while its
+// bootstrapped marker skipped B's seed. So the replica's sync state is
+// dropped (its unpushed changes with it, said loudly) and it re-seeds from the
+// new server, which then mirrors it: rows with no clocks that the server
+// lacks are removed by the seed's merge. The rows themselves are never
+// replayed across servers. A seeded replica with no recorded identity is
+// treated the same way — it cannot prove which server it came from.
+func (d *DB) checkServerIdentity(ctx context.Context, r *libsql.DB) error {
+	res, err := r.Batch(ctx, []libsql.Statement{
+		{SQL: `CREATE TABLE IF NOT EXISTS hap_sync_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)`},
+		{SQL: `INSERT OR IGNORE INTO hap_sync_meta (k, v) VALUES ('server_id', abs(random()))`},
+		{SQL: `SELECT v FROM hap_sync_meta WHERE k = 'server_id'`},
+	})
+	if err != nil {
+		return fmt.Errorf("libsql: read the server's identity: %w", err)
+	}
+	if len(res[2].Rows) != 1 {
+		return fmt.Errorf("libsql: the server has no identity")
+	}
+	id, _ := res[2].Rows[0][0].(int64)
+	d.mu.Lock()
+	d.serverID = id
+	d.mu.Unlock()
+	seeded, err := d.Bootstrapped(ctx)
+	if err != nil || !seeded {
+		return err
+	}
+	have, ok, err := d.state(ctx, d.raw, stateServerID)
+	if err != nil || ok && have == id {
+		return err
+	}
+	var dropped int64
+	_ = d.raw.QueryRowContext(ctx, `SELECT COUNT(*) FROM hap_outbox`).Scan(&dropped)
+	slog.Warn("libsql: this replica was seeded from a DIFFERENT server than the one database.libsql_url names "+
+		"now; discarding its sync state and re-seeding from the new server — its unpushed changes are NOT sent there",
+		"unpushed_dropped", dropped)
+	tx, err := d.raw.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, q := range []string{`DELETE FROM hap_outbox`, `DELETE FROM hap_clock`, `DELETE FROM hap_sync_state`,
+		`UPDATE hap_hlc SET off = 0`} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // Remote is the server connection, once one has been made (nil before).
