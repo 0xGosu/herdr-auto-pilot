@@ -191,26 +191,149 @@ func TestPulledRowsAreNotRePushed(t *testing.T) {
 	}
 }
 
-// An unpushed local change survives a pull of an older remote value, and is
-// pushed next and wins: row-level last-push-wins, as under turso.
-func TestUnpushedLocalChangeWinsOverPull(t *testing.T) {
+// tick separates two edits made on different machines by more than one
+// clock millisecond, so which is LATER is not a tie broken by node id.
+func tick() { time.Sleep(3 * time.Millisecond) }
+
+// The LATEST EDIT wins, not the latest push: b's older unpushed edit neither
+// survives a's newer one on pull nor overwrites it on push; and b's edit made
+// after a's survives the pull of a's and wins on push.
+func TestLatestEditWinsNotLatestPush(t *testing.T) {
 	srv := newServer(t)
 	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
 	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'a1')`)
 	a.push(t)
 	b.pull(t)
 
-	b.exec(t, `UPDATE operator SET label = 'b-local' WHERE id = 'x'`) // not pushed
-	a.exec(t, `UPDATE operator SET label = 'a2' WHERE id = 'x'`)
+	b.exec(t, `UPDATE operator SET label = 'b-older' WHERE id = 'x'`) // not pushed yet
+	tick()
+	a.exec(t, `UPDATE operator SET label = 'a-newer' WHERE id = 'x'`)
 	a.push(t)
 	b.pull(t)
-	if got, _ := b.label(t, "x"); got != "b-local" {
-		t.Fatalf("a pull overwrote an unpushed local change: b sees %q", got)
+	if got, _ := b.label(t, "x"); got != "a-newer" {
+		t.Fatalf("b kept its older edit over a's newer one: %q", got)
 	}
 	b.push(t)
 	a.pull(t)
-	if got, _ := a.label(t, "x"); got != "b-local" {
-		t.Fatalf("a sees %q, want b's later push to win", got)
+	if got, _ := a.label(t, "x"); got != "a-newer" {
+		t.Fatalf("b's older edit, pushed later, overwrote a's newer one: a sees %q", got)
+	}
+
+	a.exec(t, `UPDATE operator SET label = 'a-old' WHERE id = 'x'`)
+	a.push(t)
+	tick()
+	b.exec(t, `UPDATE operator SET label = 'b-new' WHERE id = 'x'`) // not pushed yet
+	b.pull(t)
+	if got, _ := b.label(t, "x"); got != "b-new" {
+		t.Fatalf("a pull overwrote b's LATER unpushed edit: %q", got)
+	}
+	b.push(t)
+	a.pull(t)
+	if got, _ := a.label(t, "x"); got != "b-new" {
+		t.Fatalf("a sees %q, want b's later edit", got)
+	}
+}
+
+// A machine back from a spell offline does not overwrite what others changed
+// while it was away with the older edits it made then.
+func TestAStaleOfflineEditDoesNotOverwriteANewerOne(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'v1')`)
+	a.push(t)
+	b.pull(t)
+	srv.SetDown(true)
+	b.exec(t, `UPDATE operator SET label = 'offline edit' WHERE id = 'x'`)
+	if err := b.r.Push(); err == nil {
+		t.Fatal("control: the push to a down server succeeded")
+	}
+	srv.SetDown(false)
+	tick()
+	a.exec(t, `UPDATE operator SET label = 'while b was away' WHERE id = 'x'`)
+	a.push(t)
+	b.push(t) // b comes back
+	b.pull(t)
+	a.pull(t)
+	for _, n := range []*node{a, b} {
+		if got, _ := n.label(t, "x"); got != "while b was away" {
+			t.Fatalf("%s sees %q, want the newer edit", n.id, got)
+		}
+	}
+}
+
+// Two machines editing DIFFERENT columns of one row both keep their change.
+func TestEditsToDifferentColumnsBothSurvive(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, 'p1', 'one', 1)`, nodeA)
+	a.push(t)
+	b.pull(t)
+	a.exec(t, `UPDATE agent_names SET disabled = 1 WHERE agent_id = 'p1'`)
+	tick()
+	b.exec(t, `UPDATE agent_names SET terminal_id = 't9' WHERE agent_id = 'p1'`)
+	a.push(t)
+	b.push(t)
+	a.pull(t)
+	b.pull(t)
+	for _, n := range []*node{a, b} {
+		var disabled int
+		var term string
+		if err := n.r.DB().QueryRow(`SELECT disabled, terminal_id FROM agent_names WHERE agent_id = 'p1'`).
+			Scan(&disabled, &term); err != nil {
+			t.Fatal(err)
+		}
+		if disabled != 1 || term != "t9" {
+			t.Fatalf("%s: disabled %d terminal %q, want both edits", n.id, disabled, term)
+		}
+	}
+}
+
+// A delete and an edit of the same row: the later one wins, either way round.
+func TestDeleteAndEditLaterWins(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'v1'), ('y', 'v1')`)
+	a.push(t)
+	b.pull(t)
+
+	a.exec(t, `DELETE FROM operator WHERE id = 'x'`)
+	tick()
+	b.exec(t, `UPDATE operator SET label = 'edited after the delete' WHERE id = 'x'`)
+	b.exec(t, `UPDATE operator SET label = 'edited before the delete' WHERE id = 'y'`)
+	tick()
+	a.exec(t, `DELETE FROM operator WHERE id = 'y'`)
+	a.push(t)
+	b.push(t)
+	a.pull(t)
+	b.pull(t)
+	for _, n := range []*node{a, b} {
+		if got, ok := n.label(t, "x"); !ok || got != "edited after the delete" {
+			t.Fatalf("%s: x is %q (%v), want the edit made after the delete", n.id, got, ok)
+		}
+		if _, ok := n.label(t, "y"); ok {
+			t.Fatalf("%s: y survived a delete made after its edit", n.id)
+		}
+	}
+}
+
+// A write made straight on the server (an older hap, `hap migrate`) is
+// stamped by the server, so it takes part: later than a replica's edit, it
+// wins; earlier, it loses.
+func TestServerSideWritesAreStamped(t *testing.T) {
+	srv := newServer(t)
+	a := newNode(t, srv, nodeA)
+	online := onlineHandle(t, srv)
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'a1')`)
+	a.push(t)
+	a.exec(t, `UPDATE operator SET label = 'a-older' WHERE id = 'x'`) // not pushed
+	tick()
+	if _, err := online.DB().Exec(`UPDATE operator SET label = 'server-newer' WHERE id = 'x'`); err != nil {
+		t.Fatal(err)
+	}
+	a.push(t)
+	a.pull(t)
+	if got, _ := a.label(t, "x"); got != "server-newer" {
+		t.Fatalf("a sees %q, want the newer direct write", got)
 	}
 }
 
@@ -672,5 +795,34 @@ func TestABlockedPulledRowIsLeftUntouched(t *testing.T) {
 	var name string
 	if err := b.r.DB().QueryRow(`SELECT name FROM agent_names WHERE agent_id = 'p1'`).Scan(&name); err != nil || name != "one" {
 		t.Fatalf("p1 is %q (%v), want it untouched at 'one'", name, err)
+	}
+}
+
+// Clocks older than retention are pruned, and a pruned edit reads as the
+// FLOOR: an edit older than it — a machine back after longer than retention —
+// can never win, while the replica's clock table stays bounded.
+func TestAnEditOlderThanTheClockFloorLoses(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'v1')`)
+	a.push(t)
+	b.pull(t)
+	b.exec(t, `UPDATE operator SET label = 'ancient' WHERE id = 'x'`) // stays unpushed
+	tick()
+	a.exec(t, `UPDATE operator SET label = 'current' WHERE id = 'x'`)
+	a.push(t)
+	// Everything is past retention now: the server prunes every clock, and
+	// the floor lands above both edits.
+	if err := libsqlreplica.PruneChangelog(context.Background(), a.r.Remote(),
+		time.Now().Add(2*libsqlreplica.ChangelogRetention)); err != nil {
+		t.Fatal(err)
+	}
+	b.push(t)
+	a.pull(t)
+	b.pull(t)
+	for _, n := range []*node{a, b} {
+		if got, _ := n.label(t, "x"); got != "current" {
+			t.Fatalf("%s sees %q: an edit below the floor won", n.id, got)
+		}
 	}
 }

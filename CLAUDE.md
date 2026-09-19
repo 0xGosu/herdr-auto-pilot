@@ -707,19 +707,31 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     transaction; one that let another node's writes commit inside it would get them tagged as this node's,
     and that node's pull would skip them for good. `hranafake` serializes everything, so no test there can
     tell the two apart — the narrowing is the guarantee, not a test.
-  - **Conflicts resolve as row-level last-PUSH-wins, as under turso — and most tables cannot conflict**:
-    node-scoped tables are single-writer by construction, `agent_actions` is claimed and finished only by
-    its owning node, and `decisions` is append-only on node-bit ids (the denormalized `signatures` row
-    races, but is recomputable from it). The genuine cross-machine case is an `audit_log` status set from
-    two machines at once: each `AND status = 'escalated'` guard passes on its own replica and the later push
-    wins — identical under turso.
+  - **Conflicts resolve by LATEST EDIT, per column — never by push order** (`clock.go`, `merge.go`). Every
+    edit is stamped with a hybrid logical clock (`hap_hlc`: ms << 16 plus a counter, never below a clock
+    already seen) into `hap_clock` — per (table, key, column), plus a row register (`col = ''`) that an
+    insert and a delete stamp. A column's effective clock is the later of its own and the row's; a tie goes
+    to the node id, and on a pull to the server. Four rules, each load-bearing:
+    - **The comparison runs INSIDE the server's transaction** (`pushStmts`: `CASE WHEN … NOT EXISTS (a
+      server clock >= mine)`), so two replicas pushing one row concurrently resolve the same way whichever
+      commits first. Deciding client-side from a prior read is the race this avoids.
+    - **A push READS BACK its keys in the same transaction and merges them** (`pushItems`/`mergeBack`). The
+      pull skips the entries a push tagged as its own, so a column the push LOST would otherwise stay at
+      this replica's value forever.
+    - **The server stamps writes that did not come through a push** (`hap_ck_*`, standing aside while
+      `hap_sync_pushing` holds a row) — an older hap's or `hap migrate`'s writes take part with the
+      server's time instead of reading as "never edited".
+    - **Pruned clocks read as the FLOOR** (`clock_floor`, raised by `PruneChangelog`): a machine back after
+      longer than retention cannot win with an edit older than every clock the fleet still keeps.
+    What this cannot give is a state machine: an escalation dismissed on one machine and claimed by its
+    owner's daemon on another resolves to whichever edit is later, and the `AND status = 'escalated'`
+    guards only ever see the local replica.
   - **The server's change log is written by TRIGGERS, not by the push** (`hap_cl_*`). That is what
     makes `hap migrate`'s and an older hap's direct writes visible to replicas. Both logs
     carry KEYS only, and each side fetches the current row. That is why the log needs no BLOB
     encoding and why several changes to one row cost one fetch.
-  - **A key with unpushed local changes is skipped by a pull** (the rebase), and Push and Pull hold
-    `syncMu`. A push landing between a pull's fetch and its apply would let the stale fetched row
-    overwrite the pushed one, and the tagged entry means nothing ever corrects it.
+  - **Push and Pull hold `syncMu`.** A push landing between a pull's fetch and its apply would merge
+    against clocks the fetch did not see.
   - **Every table not named `sqlite_*` or `hap_*` replicates, keyed by its PRIMARY KEY** (never the
     rowid). A table with no primary key is REFUSED at `Prepare`. Keep the `hap_` prefix for anything
     that must stay local.

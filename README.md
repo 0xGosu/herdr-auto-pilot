@@ -981,8 +981,12 @@ sharing, conflicts and privacy applies unchanged. What differs:
   the daemon starts and monitors with the server down.
 - Sync is by **row**. The server logs every changed key in a `hap_changelog`
   table (through triggers hap installs on it), and each replica fetches those
-  rows. Conflicts are last-push-wins per row, as under `turso`. A replica never
-  overwrites a local change it has not pushed yet.
+  rows. **Conflicts go to the latest edit, column by column**: every edit is
+  time-stamped, a push only overwrites a column the server last changed
+  earlier, and a pull only takes a column the server changed later. A machine
+  back from a spell offline does not overwrite what others changed meanwhile,
+  two machines editing different fields of one row both keep theirs, and a
+  delete and an edit of the same row resolve to whichever came later.
 - Nodes still running an older hap, which wrote straight to the server, can
   share the database: the server's triggers log every writer.
 - The change log keeps entries until every node that synced in the last 7 days

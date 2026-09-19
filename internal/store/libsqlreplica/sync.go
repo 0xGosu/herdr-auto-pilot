@@ -80,24 +80,17 @@ func (d *DB) pushAll(ctx context.Context, r *libsql.DB, tables map[string]*table
 }
 
 // pushOnce replays up to pushBatch outbox entries in one server transaction
-// and drops them locally once it committed.
+// (pushItems), merges back what the server kept, and drops the entries.
 func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*table) (int, error) {
-	type entry struct {
-		t   *table
-		key []any
-	}
 	var (
-		maxSeq  int64
-		n       int
-		entries []entry
-		seen    = map[string]bool{}
-		stmts   []libsql.Statement
+		maxSeq int64
+		n      int
+		items  []pushItem
+		seen   = map[string]bool{}
 	)
 	// Entries for a table the server does not have yet are HELD, never read
-	// and never cleared: dropping them would lose the change for good — and a
-	// pull that skipped that key as pending (the rebase) would leave it
-	// diverged with nothing left to correct it. They go once the server has
-	// the table (refreshRemote).
+	// and never cleared: dropping them would lose the change for good. They
+	// go once the server has the table (refreshRemote).
 	held := heldTables(tables)
 	notHeld, heldArgs := "", make([]any, 0, len(held))
 	if len(held) > 0 {
@@ -106,20 +99,30 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			heldArgs = append(heldArgs, h)
 		}
 	}
-	// Read the entries and the rows they name in ONE local transaction, so the
-	// images pushed together are a consistent state (two rows swapping a
-	// UNIQUE value must not be pushed half-swapped).
-	err := d.readTx(ctx, func(tx *sql.Tx) error {
+	floor, _, err := d.state(ctx, d.raw, stateFloor)
+	if err != nil {
+		return 0, err
+	}
+	// Read the entries, the rows and their clocks in ONE local transaction,
+	// so the images pushed together are a consistent state (two rows swapping
+	// a UNIQUE value must not be pushed half-swapped).
+	err = d.readTx(ctx, func(tx *sql.Tx) error {
 		rows, err := tx.QueryContext(ctx, `SELECT seq, tbl, pk FROM hap_outbox`+notHeld+` ORDER BY seq LIMIT ?`,
 			append(append([]any{}, heldArgs...), pushBatch)...)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
+		type entry struct {
+			t   *table
+			pk  string
+			key []any
+		}
+		var entries []entry
 		for rows.Next() {
 			var seq int64
 			var tbl, pk string
 			if err := rows.Scan(&seq, &tbl, &pk); err != nil {
+				rows.Close()
 				return err
 			}
 			n++
@@ -140,28 +143,24 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 				continue
 			}
 			seen[ck] = true
-			entries = append(entries, entry{t, key})
+			entries = append(entries, entry{t, pk, key})
 		}
-		if err := rows.Err(); err != nil {
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
 			return err
 		}
-		rows.Close()
-		var parks []libsql.Statement
 		for _, e := range entries {
 			row, err := readRow(ctx, tx, e.t, e.key)
 			if err != nil {
 				return err
 			}
-			if row == nil {
-				stmts = append(stmts, deleteStmt(e.t, e.key))
-				continue
+			c, err := localClocks(ctx, tx, e.t.name, e.pk)
+			if err != nil {
+				return err
 			}
-			if p, ok := parkStmt(e.t, e.t.shared(), e.key); ok {
-				parks = append(parks, libsql.Statement{SQL: p.sql, Args: p.args})
-			}
-			stmts = append(stmts, upsertStmts(e.t, row)...)
+			items = append(items, pushItem{t: e.t, key: e.key, row: row, clocks: c})
 		}
-		stmts = append(parks, stmts...)
 		return nil
 	})
 	if err != nil {
@@ -170,19 +169,13 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	if n == 0 {
 		return 0, nil
 	}
-	if len(stmts) > 0 {
-		pushed := make([]pushedKey, len(entries))
-		for i, e := range entries {
-			pushed[i] = pushedKey(e)
-		}
-		if _, err := r.Tx(ctx, d.tagged(stmts, pushed)); err != nil {
-			return 0, err
-		}
+	if err := d.pushItems(ctx, r, items, floor); err != nil {
+		return 0, err
 	}
 	if _, err := d.raw.ExecContext(ctx, `DELETE FROM hap_outbox WHERE seq <= ?`+strings.Replace(notHeld, "WHERE", "AND", 1),
 		append([]any{maxSeq}, heldArgs...)...); err != nil {
 		// The server has the rows; the next push replays them again, which
-		// an upsert makes harmless.
+		// the clock comparison makes harmless.
 		return 0, fmt.Errorf("libsql: clear the pushed outbox: %w", err)
 	}
 	return n, nil
@@ -218,6 +211,9 @@ func (d *DB) tagged(stmts []libsql.Statement, keys []pushedKey) []libsql.Stateme
 		libsql.Statement{SQL: `CREATE TEMP TABLE IF NOT EXISTS hap_push_mark (seq INTEGER)`},
 		libsql.Statement{SQL: `DELETE FROM temp.hap_push_mark`},
 		libsql.Statement{SQL: `INSERT INTO temp.hap_push_mark (seq) VALUES (last_insert_rowid())`},
+		// The server's own clock stamping stands aside while a push writes:
+		// the push records the EDIT's clocks itself (pushStmts).
+		libsql.Statement{SQL: `INSERT INTO hap_sync_pushing (x) VALUES (1)`},
 		libsql.Statement{SQL: `CREATE TEMP TABLE IF NOT EXISTS hap_push_keys (tbl TEXT NOT NULL, pk TEXT NOT NULL)`},
 		libsql.Statement{SQL: `DELETE FROM temp.hap_push_keys`},
 	)
@@ -232,6 +228,7 @@ func (d *DB) tagged(stmts []libsql.Statement, keys []pushedKey) []libsql.Stateme
 		libsql.Statement{SQL: `UPDATE hap_changelog SET origin = ? WHERE seq > (SELECT seq FROM temp.hap_push_mark)
 			AND (tbl, pk) IN (SELECT tbl, pk FROM temp.hap_push_keys)`, Args: []any{d.nodeID}},
 		libsql.Statement{SQL: `DELETE FROM hap_changelog WHERE seq = (SELECT seq FROM temp.hap_push_mark)`},
+		libsql.Statement{SQL: `DELETE FROM hap_sync_pushing`},
 	)
 }
 
@@ -294,6 +291,7 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			Args: []any{cursor, int64(pullBatch)}},
 		{SQL: `SELECT v FROM hap_sync_meta WHERE k = 'pruned_through'`},
 		{SQL: listTriggersSQL},
+		{SQL: `SELECT v FROM hap_sync_meta WHERE k = 'clock_floor'`},
 	})
 	if err != nil {
 		return false, false, err
@@ -326,9 +324,13 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			return true, false, nil
 		}
 	}
+	var floor int64
+	if len(res[3].Rows) == 1 {
+		floor, _ = res[3].Rows[0][0].(int64)
+	}
 	log := res[0].Rows
 	if len(log) == 0 {
-		return false, false, nil
+		return false, false, d.setFloor(ctx, floor)
 	}
 	maxSeq := cursor
 	type key struct {
@@ -357,11 +359,12 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			keys = append(keys, key{t, k})
 		}
 	}
-	// The CURRENT server row of every key, in one round trip: the log names
-	// keys, never images, so several changes to one row cost one fetch.
-	stmts := make([]libsql.Statement, len(keys))
-	for i, k := range keys {
-		stmts[i] = selectByKey(k.t, k.key)
+	// The CURRENT server row and clocks of every key, in one round trip: the
+	// log names keys, never images, so several changes to one row cost one
+	// fetch.
+	var stmts []libsql.Statement
+	for _, k := range keys {
+		stmts = append(stmts, fetchStmts(k.t, k.key)...)
 	}
 	var fetched []libsql.Rows
 	if len(stmts) > 0 {
@@ -371,30 +374,21 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	}
 	n := 0
 	err = d.applyTx(ctx, func(tx *sql.Tx, pending map[string]bool) error {
-		var upserts []pulledRow
+		acts := make([]mergeAct, 0, len(keys))
 		for i, k := range keys {
-			if pending[canonKey(k.t.name, k.key)] {
-				// An unpushed local change: it is pushed next and wins.
-				continue
+			a, err := planMerge(ctx, tx, k.t, k.key, serverRowOf(fetched[2*i], fetched[2*i+1]), floor, false)
+			if err != nil {
+				return err
 			}
-			if len(fetched[i].Rows) == 0 {
-				if _, err := tx.ExecContext(ctx, deleteSQL(k.t), k.key...); err != nil {
-					return fmt.Errorf("apply delete on %s: %w", k.t.name, err)
-				}
-				n++
-				continue
-			}
-			upserts = append(upserts, pulledRow{k.t, fetched[i].Cols, fetched[i].Rows[0], k.key})
+			acts = append(acts, a)
 		}
-		ready, err := preparePulled(ctx, tx, upserts, pending)
+		m, err := applyMerges(ctx, tx, acts, pending)
 		if err != nil {
 			return err
 		}
-		for _, r := range ready {
-			if _, err := applyRow(ctx, tx, r.t, r.cols, r.row, pending); err != nil {
-				return err
-			}
-			n++
+		n = m
+		if err := setState(ctx, tx, stateFloor, floor); err != nil {
+			return err
 		}
 		return setState(ctx, tx, stateCursor, maxSeq)
 	})
@@ -402,6 +396,19 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		return false, false, fmt.Errorf("libsql: apply pulled rows: %w", err)
 	}
 	return n > 0, len(log) == pullBatch, nil
+}
+
+// setFloor records the server's clock floor locally.
+func (d *DB) setFloor(ctx context.Context, floor int64) error {
+	tx, err := d.raw.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := setState(ctx, tx, stateFloor, floor); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // Bootstrap seeds the replica from the server: every replicated table copied
@@ -417,8 +424,8 @@ func (d *DB) Bootstrap(ctx context.Context) error {
 	return d.reseed(ctx, r, tables)
 }
 
-// reseed replaces the replica's rows with the server's, keeping every row
-// with an unpushed local change (after first trying to push them). A VERBATIM
+// reseed re-copies the replica from the server, merging every row by its
+// clocks (after first trying to push what is unpushed). A key-for-key
 // mirror, deliberately not store's importer: that copier re-allocates ids and
 // scopes by node for a move BETWEEN engines, where this must reproduce the
 // server's rows exactly or every later change-log key misses. Caller holds
@@ -431,16 +438,19 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 	// log entirely (every live cursor had read it), and a head of 0 under a
 	// non-zero floor would read as "fell behind" on every pull — a full
 	// re-seed per tick, forever.
-	head, err := r.Batch(ctx, []libsql.Statement{{SQL: `SELECT MAX(
+	head, err := r.Batch(ctx, []libsql.Statement{
+		{SQL: `SELECT MAX(
 		COALESCE((SELECT MAX(seq) FROM hap_changelog), 0),
-		COALESCE((SELECT v FROM hap_sync_meta WHERE k = 'pruned_through'), 0))`}})
+		COALESCE((SELECT v FROM hap_sync_meta WHERE k = 'pruned_through'), 0))`},
+		{SQL: `SELECT ` + floorExpr},
+	})
 	if err != nil {
 		return err
 	}
 	cursor, _ := head[0].Rows[0][0].(int64)
+	floor, _ := head[1].Rows[0][0].(int64)
 	type page struct {
 		t    *table
-		cols []string
 		rows [][]any
 	}
 	var pages []page
@@ -448,8 +458,7 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 		if len(t.remote) == 0 {
 			continue
 		}
-		cols := t.shared()
-		q := `SELECT rowid AS "hap_rowid", ` + identList(cols) + ` FROM ` + ident(t.name) +
+		q := `SELECT rowid AS "hap_rowid", ` + identList(t.shared()) + ` FROM ` + ident(t.name) +
 			` WHERE rowid > ? ORDER BY rowid LIMIT ?`
 		var after int64
 		for {
@@ -466,35 +475,53 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 				for i, row := range rows {
 					trimmed[i] = row[1:]
 				}
-				pages = append(pages, page{t, cols, trimmed})
+				pages = append(pages, page{t, trimmed})
 			}
 			if len(rows) < seedPage {
 				break
 			}
 		}
 	}
+	// Every clock the server holds, grouped by key.
+	clocks := map[string][][]any{}
+	var after int64
+	for {
+		res, err := r.Batch(ctx, []libsql.Statement{{SQL: `SELECT rowid, tbl, pk, col, hlc, node, alive FROM hap_clock
+			WHERE rowid > ? ORDER BY rowid LIMIT ?`, Args: []any{after, int64(seedPage)}}})
+		if err != nil {
+			return fmt.Errorf("libsql: copy the clocks: %w", err)
+		}
+		for _, row := range res[0].Rows {
+			after, _ = row[0].(int64)
+			tbl, _ := row[1].(string)
+			pk, _ := row[2].(string)
+			clocks[tbl+"\x00"+pk] = append(clocks[tbl+"\x00"+pk], row[3:])
+		}
+		if len(res[0].Rows) < seedPage {
+			break
+		}
+	}
 	// Only now, with every row in hand, is the local file touched — in one
-	// transaction, so a failed copy leaves the replica as it was. Rows are
-	// UPSERTED by key and only the rows the server no longer has are deleted:
-	// a delete-and-reinsert would reset every column this build has and the
-	// server does not yet (an additive migration mid-rollout) to its default.
+	// transaction, so a failed copy leaves the replica as it was. Each row is
+	// MERGED by its clocks, exactly as a pull merges one: a later local edit
+	// survives, and a row the server no longer has goes unless the replica
+	// edited it after the server's delete.
 	err = d.applyTx(ctx, func(tx *sql.Tx, pending map[string]bool) error {
+		var acts []mergeAct
 		onServer := map[string]bool{}
-		var rows []pulledRow
 		for _, p := range pages {
 			for _, row := range p.rows {
-				key := keyOf(p.t, p.cols, row)
+				key := keyOf(p.t, p.t.shared(), row)
 				onServer[canonKey(p.t.name, key)] = true
-				rows = append(rows, pulledRow{p.t, p.cols, row, key})
-			}
-		}
-		ready, err := preparePulled(ctx, tx, rows, pending)
-		if err != nil {
-			return err
-		}
-		for _, r := range ready {
-			if _, err := applyRow(ctx, tx, r.t, r.cols, r.row, pending); err != nil {
-				return err
+				pk, err := localKeyText(ctx, tx, key)
+				if err != nil {
+					return err
+				}
+				a, err := planMerge(ctx, tx, p.t, key, serverRow{row: row, clocks: clocksFromRows(clocks[p.t.name+"\x00"+pk])}, floor, false)
+				if err != nil {
+					return err
+				}
+				acts = append(acts, a)
 			}
 		}
 		for _, t := range sortedTables(tables) {
@@ -506,17 +533,33 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 				return err
 			}
 			for _, key := range local {
-				ck := canonKey(t.name, key)
-				if onServer[ck] || pending[ck] {
+				if onServer[canonKey(t.name, key)] {
 					continue
 				}
-				if _, err := tx.ExecContext(ctx, deleteSQL(t), key...); err != nil {
-					return fmt.Errorf("clear %s: %w", t.name, err)
+				pk, err := localKeyText(ctx, tx, key)
+				if err != nil {
+					return err
 				}
+				a, err := planMerge(ctx, tx, t, key, serverRow{clocks: clocksFromRows(clocks[t.name+"\x00"+pk])}, floor, false)
+				if err != nil {
+					return err
+				}
+				acts = append(acts, a)
+			}
+		}
+		if _, err := applyMerges(ctx, tx, acts, pending); err != nil {
+			return err
+		}
+		for _, t := range sortedTables(tables) {
+			if len(t.remote) == 0 {
+				continue
 			}
 			if err := setState(ctx, tx, seededKey(t.name), 1); err != nil {
 				return err
 			}
+		}
+		if err := setState(ctx, tx, stateFloor, floor); err != nil {
+			return err
 		}
 		if err := setState(ctx, tx, stateCursor, cursor); err != nil {
 			return err
@@ -596,9 +639,26 @@ func (d *DB) housekeep(ctx context.Context, r *libsql.DB) {
 		slog.Warn("libsql: change-log retention failed", "error", err)
 		return
 	}
+	if err := d.pruneLocalClocks(ctx); err != nil {
+		slog.Warn("libsql: pruning the replica's clocks failed", "error", err)
+	}
 	d.mu.Lock()
 	d.lastPrune = now
 	d.mu.Unlock()
+}
+
+// pruneLocalClocks drops the replica's clocks below the server's floor: a
+// missing clock already reads as the floor, so they can decide nothing. A
+// key still waiting in the outbox keeps its clocks — they are what its push
+// is judged by.
+func (d *DB) pruneLocalClocks(ctx context.Context) error {
+	f, _, err := d.state(ctx, d.raw, stateFloor)
+	if err != nil || f == 0 {
+		return err
+	}
+	_, err = d.raw.ExecContext(ctx, `DELETE FROM hap_clock WHERE hlc < ? AND NOT EXISTS
+		(SELECT 1 FROM hap_outbox o WHERE o.tbl = hap_clock.tbl AND o.pk = hap_clock.pk)`, f)
+	return err
 }
 
 // PruneChangelog deletes the change-log entries every live replica has read,
@@ -613,6 +673,13 @@ func PruneChangelog(ctx context.Context, r *libsql.DB, now time.Time) error {
 			(SELECT MAX(seq) AS m FROM hap_changelog WHERE ` + cond + `) WHERE m IS NOT NULL
 			ON CONFLICT (k) DO UPDATE SET v = MAX(v, excluded.v)`, Args: []any{horizon, horizon}},
 		{SQL: `DELETE FROM hap_changelog WHERE ` + cond, Args: []any{horizon, horizon}},
+		// Clocks older than the horizon go too; the newest of them becomes the
+		// floor, which a missing clock reads as — so an edit that old can
+		// never win against anything.
+		{SQL: `INSERT INTO hap_sync_meta (k, v) SELECT 'clock_floor', m FROM
+			(SELECT MAX(hlc) AS m FROM hap_clock WHERE hlc < ?) WHERE m IS NOT NULL
+			ON CONFLICT (k) DO UPDATE SET v = MAX(v, excluded.v)`, Args: []any{horizon * 1000 * 65536}},
+		{SQL: `DELETE FROM hap_clock WHERE hlc < ?`, Args: []any{horizon * 1000 * 65536}},
 	})
 	return err
 }
@@ -721,10 +788,6 @@ func deleteSQL(t *table) string {
 	return `DELETE FROM ` + ident(t.name) + ` WHERE ` + whereKey(t)
 }
 
-func deleteStmt(t *table, key []any) libsql.Statement {
-	return libsql.Statement{SQL: deleteSQL(t), Args: key}
-}
-
 func selectByKey(t *table, key []any) libsql.Statement {
 	return libsql.Statement{SQL: `SELECT ` + identList(t.shared()) + ` FROM ` + ident(t.name) +
 		` WHERE ` + whereKey(t), Args: key}
@@ -747,19 +810,6 @@ func readRow(ctx context.Context, tx *sql.Tx, t *table, key []any) ([]any, error
 		return nil, fmt.Errorf("read %s: %w", t.name, err)
 	}
 	return vals, nil
-}
-
-// upsertStmts replays a row onto the server: first clearConflicts, then an
-// upsert by key that sets only the columns both sides have — never INSERT OR
-// REPLACE, which would reset every column this build does not know (a newer
-// node's, mid-rollout) to its default.
-func upsertStmts(t *table, row []any) []libsql.Statement {
-	cols := t.shared()
-	var out []libsql.Statement
-	for _, c := range conflictDeletes(t, cols, row) {
-		out = append(out, libsql.Statement{SQL: c.sql, Args: c.args})
-	}
-	return append(out, libsql.Statement{SQL: upsertSQL(t, cols), Args: row})
 }
 
 // upsertSQL inserts a row by key, or updates only cols of the row already
@@ -927,15 +977,12 @@ type pulledRow struct {
 }
 
 // preparePulled parks every row that will really be applied and returns
-// them; a row whose key or UNIQUE value is held by an unpushed local change
-// is left out untouched (parking it and then declining would strand the park
+// them; a row whose UNIQUE value is held by another row with an unpushed
+// local change is left out untouched (parking it and then declining would strand the park
 // suffix in the replica).
 func preparePulled(ctx context.Context, tx *sql.Tx, rows []pulledRow, pending map[string]bool) ([]pulledRow, error) {
 	var out []pulledRow
 	for _, r := range rows {
-		if pending[canonKey(r.t.name, r.key)] {
-			continue
-		}
 		blocked, err := blockedByPending(ctx, tx, r.t, r.cols, r.row, pending)
 		if err != nil {
 			return nil, err

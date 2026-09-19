@@ -33,11 +33,12 @@
 //     through the server forever. A push also tags the log entries it caused
 //     with this node's id, so the pull does not fetch its own writes back.
 //
-//   - A key with an unpushed local change is NOT overwritten by a pull (the
-//     rebase turso's engine does): the local change is pushed next and wins.
-//     Row-level last-push-wins, the semantics the turso engine already has.
-//     Push and pull are serialized, or a push landing between a pull's fetch
-//     and its apply would let the stale fetched row overwrite the pushed one.
+//   - Conflicts resolve by LATEST EDIT, per column (clock.go): every edit is
+//     stamped with a hybrid logical clock, a push writes a column only where
+//     its edit is later than the server's, and a pull takes a column only
+//     where the server's is later. A machine back from a spell offline does
+//     not overwrite newer edits, and two machines editing different columns
+//     of one row both keep theirs. Push and pull are serialized.
 //
 //   - DDL does not ride the replay. The local file is migrated by the store as
 //     a sqlite file is; the server by the schema lease as under libsql
@@ -185,7 +186,7 @@ func (d *DB) Prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := installCapture(ctx, d.raw, tables); err != nil {
+	if err := installCapture(ctx, d.raw, tables, d.nodeID); err != nil {
 		return err
 	}
 	d.syncMu.Lock()

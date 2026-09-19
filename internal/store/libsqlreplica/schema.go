@@ -32,6 +32,8 @@ var localDDL = []string{
 	`CREATE TABLE IF NOT EXISTS hap_sync_applying (x INTEGER)`,
 }
 
+func init() { localDDL = append(localDDL, clockDDL...) }
+
 // Keys of hap_sync_state.
 const (
 	stateCursor       = "cursor"       // highest change-log seq applied
@@ -58,7 +60,12 @@ var serverDDL = []string{
 		at      INTEGER NOT NULL
 	)`,
 	`CREATE TABLE IF NOT EXISTS hap_sync_meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL)`,
+	// Non-empty only inside a push's own transaction: the server's clock
+	// stamping triggers stand aside, since the push records the edit's clocks.
+	`CREATE TABLE IF NOT EXISTS hap_sync_pushing (x INTEGER)`,
 }
+
+func init() { serverDDL = append(serverDDL, clockDDL...) }
 
 // table is one replicated table.
 type table struct {
@@ -244,12 +251,13 @@ func triggers(prefix string, t *table, insert, when string) []string {
 const (
 	capturePrefix   = "hap_ob_"
 	changelogPrefix = "hap_cl_"
+	stampPrefix     = "hap_ck_"
 )
 
 // installCapture (re)creates the local capture triggers in one transaction:
 // every old one is dropped first, so a table's key change or removal never
 // leaves a stale trigger behind.
-func installCapture(ctx context.Context, db *sql.DB, tables map[string]*table) error {
+func installCapture(ctx context.Context, db *sql.DB, tables map[string]*table, node string) error {
 	old, err := queryStrings(ctx, db, `SELECT name FROM sqlite_master WHERE type = 'trigger'
 		AND name LIKE 'hap\_ob\_%' ESCAPE '\'`)
 	if err != nil {
@@ -267,7 +275,7 @@ func installCapture(ctx context.Context, db *sql.DB, tables map[string]*table) e
 	}
 	for _, t := range sortedTables(tables) {
 		insert := "INSERT INTO hap_outbox (tbl, pk) VALUES (" + lit(t.name) + ", %s)"
-		for _, ddl := range triggers(capturePrefix, t, insert, "NOT EXISTS (SELECT 1 FROM hap_sync_applying)") {
+		for _, ddl := range stampingTriggers(capturePrefix, t, node, "NOT EXISTS (SELECT 1 FROM hap_sync_applying)", insert) {
 			if _, err := tx.ExecContext(ctx, ddl); err != nil {
 				return fmt.Errorf("libsql: capture trigger on %s: %w", t.name, err)
 			}
@@ -326,6 +334,7 @@ func changelogTriggers(tables map[string]*table) map[string]bool {
 		}
 		for _, op := range []string{"i", "u", "k", "d"} {
 			out[changelogPrefix+t.name+"_"+op] = true
+			out[stampPrefix+t.name+"_"+op] = true
 		}
 	}
 	return out
@@ -348,7 +357,8 @@ func missingTriggers(tables map[string]*table, present []string) []string {
 }
 
 // listTriggersSQL lists the server's logging triggers.
-const listTriggersSQL = `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'hap\_cl\_%' ESCAPE '\'`
+const listTriggersSQL = `SELECT name FROM sqlite_master WHERE type = 'trigger'
+	AND (name LIKE 'hap\_cl\_%' ESCAPE '\' OR name LIKE 'hap\_ck\_%' ESCAPE '\')`
 
 // ensureChangelog makes sure the server's change log exists and every
 // replicated table it has carries its logging triggers, and says whether a
@@ -394,6 +404,11 @@ func ensureChangelog(ctx context.Context, r *libsql.DB, tables map[string]*table
 		insert := "INSERT INTO hap_changelog (tbl, pk, at) VALUES (" + lit(t.name) +
 			", %s, CAST(strftime('%%s','now') AS INTEGER))"
 		for _, ddl := range triggers(changelogPrefix, t, insert, "") {
+			stmts = append(stmts, libsql.Statement{SQL: ddl})
+		}
+		// A write that did not come through a push (an older hap, `hap
+		// migrate`) is stamped by the server itself, with the server's time.
+		for _, ddl := range stampingTriggers(stampPrefix, t, "", "NOT EXISTS (SELECT 1 FROM hap_sync_pushing)", "") {
 			stmts = append(stmts, libsql.Statement{SQL: ddl})
 		}
 	}
