@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.51
+
+- Renamed the config key `database.turso_sync_paused` to `database.sync_paused`, since it pauses both the turso and libsql engines. Existing configs keep working: the old key still loads (with a warning) and the next save rewrites it under the new name. **Breaking:** `hap config set database.turso_sync_paused …` no longer works; use `database.sync_paused`.
+- `hap migrate` to or from a libsql server now refuses while `database.sync_paused` is on, without contacting the server, because the libsql copy runs on the server itself. Under turso it still skips the pull or push around the copy.
+
 ## 0.9.50
 
 - Fixed the `libsql` engine failing every push against a real libsql server (sqld, Layerbase): the push used a temporary table, which sqld refuses, so local changes piled up unpushed and `hap status` showed fleet sync DEGRADED with `last push never`. Queued changes are pushed as soon as the upgraded daemon starts.
