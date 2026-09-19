@@ -987,9 +987,9 @@ sharing, conflicts and privacy applies unchanged. What differs:
   back from a spell offline does not overwrite what others changed meanwhile,
   two machines editing different fields of one row both keep theirs, and a
   delete and an edit of the same row resolve to whichever came later.
-  **Escalation outcomes are the exception**: acting on an escalation has
-  already touched a pane, so its status goes to the machine that pushed last,
-  as before — and only a machine that actually changed it pushes it.
+  **Escalation outcomes and queued agent actions are the exception**: acting
+  on either has already touched a pane, so they go to the machine that pushed
+  last, as before — and only a machine that actually changed them pushes them.
 - Nodes still running an older hap, which wrote straight to the server, can
   share the database: the server's triggers log every writer.
 - The change log keeps entries until every node that synced in the last 7 days

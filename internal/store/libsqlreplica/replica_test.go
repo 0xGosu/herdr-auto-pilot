@@ -1019,3 +1019,34 @@ func TestPushWinsCoversEveryEscalationTransition(t *testing.T) {
 		t.Fatal("found no escalation transition — the scan no longer matches the store's SQL")
 	}
 }
+
+// An agent action resolves by LAST PUSH on every column: the daemon that ran
+// it records what already happened at a pane, and a front end's later-stamped
+// edit must not roll that back — while a push carrying no change to the row's
+// columns leaves them alone.
+func TestAgentActionsAreLastPushWins(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO agent_actions (id, node_id, kind, status, created_at, updated_at)
+		VALUES (5, ?, 'send', 'pending', 1, 1)`, nodeB)
+	a.push(t)
+	b.pull(t)
+	b.exec(t, `UPDATE agent_actions SET status = 'done', result_json = '{"ok":true}', side_effect = 1 WHERE id = 5`)
+	tick()
+	a.exec(t, `UPDATE agent_actions SET status = 'cancelled' WHERE id = 5`) // later edit, pushed first
+	a.push(t)
+	b.push(t)
+	a.pull(t)
+	b.pull(t)
+	for _, n := range []*node{a, b} {
+		var status, result string
+		var side int
+		if err := n.r.DB().QueryRow(`SELECT status, result_json, side_effect FROM agent_actions WHERE id = 5`).
+			Scan(&status, &result, &side); err != nil {
+			t.Fatal(err)
+		}
+		if status != "done" || result != `{"ok":true}` || side != 1 {
+			t.Fatalf("%s: status %q result %q side_effect %d, want the last push's", n.id, status, result, side)
+		}
+	}
+}

@@ -733,8 +733,9 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
       server stored (the replica's own ceiling cannot do that — it is computed from the clock in doubt).
       Remaining limit: a clock that jumps ahead while the node is OFFLINE stamps those edits ahead until the
       next pull, and they win against everything up to the reconnect.
-    - **An escalation's OUTCOME is the exception: LAST PUSH wins** (`pushWins`: `audit_log.status`,
-      `actor`, `suggestion`, `rationale`, `while_fsp_mode_on`). Acting on an escalation has already touched
+    - **An escalation's OUTCOME and every `agent_actions` column are the exception: LAST PUSH wins**
+      (`pushWins`: `audit_log.status`, `actor`, `suggestion`, `rationale`, `while_fsp_mode_on`;
+      `pushWinsTables`: `agent_actions`, table-wide so a new column is covered unlisted). Acting on an escalation has already touched
       a live pane, so the outcome a node pushed must be what the fleet keeps; an older decision whose edit
       merely stamped later must not roll it back. A push writes such a column only when this replica
       CHANGED it and has not pushed that yet (`hap_clock.pushed = 0`, replica-only) — writing it on every

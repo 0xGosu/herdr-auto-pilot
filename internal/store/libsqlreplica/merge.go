@@ -28,6 +28,17 @@ var pushWins = map[string]map[string]bool{
 	"audit_log": {"status": true, "actor": true, "suggestion": true, "rationale": true, "while_fsp_mode_on": true},
 }
 
+// pushWinsTables resolve EVERY column by last push: agent_actions is the
+// control queue a front end fills for a node's daemon to carry out, and its
+// claim, result and side-effect marker record something that already
+// happened at a pane — the same reason as an escalation's outcome, for the
+// whole row. Table-wide, so a column added later is covered without anyone
+// remembering to list it.
+var pushWinsTables = map[string]bool{"agent_actions": true}
+
+// lastPush reports whether a column resolves by last push.
+func lastPush(table, col string) bool { return pushWinsTables[table] || pushWins[table][col] }
+
 // PushWinsColumns lists pushWins for a table (tests).
 func PushWinsColumns(table string) map[string]bool { return pushWins[table] }
 
@@ -113,7 +124,7 @@ func planMerge(ctx context.Context, tx *sql.Tx, t *table, key []any, srv serverR
 				continue
 			}
 			take := force || !fl(cl.eff(c)).after(fl(srv.clocks.eff(c)))
-			if pushWins[t.name][c] {
+			if lastPush(t.name, c) {
 				// Last push wins: the server's value, unless this replica's own
 				// change to the column is still waiting to be pushed.
 				take = force || !cl.changedHere(c)
@@ -281,7 +292,7 @@ func pushStmts(it pushItem) []libsql.Statement {
 		if t.isPK(c) {
 			continue
 		}
-		if pushWins[t.name][c] {
+		if lastPush(t.name, c) {
 			// Last push wins — for a change made HERE. Anything else keeps
 			// what the server has.
 			if it.clocks.changedHere(c) {
