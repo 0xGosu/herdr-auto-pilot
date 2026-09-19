@@ -1,1 +1,0 @@
-- Fixed the `libsql` engine failing every push against a real libsql server (sqld, Layerbase): the push used a temporary table, which sqld refuses, so local changes piled up unpushed and `hap status` showed fleet sync DEGRADED with `last push never`. Queued changes are pushed as soon as the upgraded daemon starts.

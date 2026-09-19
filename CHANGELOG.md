@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.50
+
+- Fixed the `libsql` engine failing every push against a real libsql server (sqld, Layerbase): the push used a temporary table, which sqld refuses, so local changes piled up unpushed and `hap status` showed fleet sync DEGRADED with `last push never`. Queued changes are pushed as soon as the upgraded daemon starts.
+
 ## 0.9.49
 
 - **Breaking.** The `libsql` engine now keeps the store in a local replica (`<state-dir>/libsql/hap.db`) and syncs it with the server, like `turso` does. Local changes are pushed a couple of seconds after each write, and other nodes' changes are pulled every `libsql_poll_interval_seconds`. Reads no longer wait on the server, so a far server no longer slows the daemon or every `hap` command, and hap keeps working while the server is unreachable. Any libsql server works, including a self-hosted `sqld`. The first start after upgrading needs the server, to copy its rows down. `database.turso_sync_paused` now applies to `libsql` too. When several machines change the same data, the most recent edit wins field by field, whatever order the machines sync in, so a machine that was offline doesn't overwrite newer changes when it reconnects. Escalation outcomes and queued agent actions are the exception: the machine that syncs its change last wins, because acting on either has already reached the agent.
