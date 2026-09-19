@@ -119,6 +119,8 @@ type DB struct {
 	lastPush   time.Time
 	lastCursor time.Time
 	lastPrune  time.Time
+	// lastSkewWarn throttles the clock-disagreement warning.
+	lastSkewWarn time.Time
 }
 
 // Open opens (creating if needed) the local replica. Nothing is sent: a node

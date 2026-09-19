@@ -147,8 +147,14 @@ func applyMerges(ctx context.Context, tx *sql.Tx, acts []mergeAct, pending map[s
 	}
 	written := map[string]bool{}
 	for _, r := range ready {
-		if _, err := applyRow(ctx, tx, r.t, r.cols, r.row, pending); err != nil {
+		ok, err := applyRow(ctx, tx, r.t, r.cols, r.row, pending)
+		if err != nil {
 			return n, err
+		}
+		if !ok {
+			// Declined: record nothing, or the replica would claim the server's
+			// version of a row it never wrote and no later pull would fix it.
+			continue
 		}
 		written[canonKey(r.t.name, r.key)] = true
 		n++
@@ -194,7 +200,7 @@ func copyClocks(ctx context.Context, tx *sql.Tx, tbl, pk string, c clockSet, for
 			return err
 		}
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE hap_hlc SET v = MAX(v, ?)`, c.latest().hlc)
+	_, err := tx.ExecContext(ctx, `UPDATE hap_hlc SET v = MAX(v, MIN(?, `+ceilExpr+`))`, c.latest().hlc)
 	return err
 }
 
@@ -276,7 +282,9 @@ func clockUpsert(it pushItem) []libsql.Statement {
 		if alive {
 			a = 1
 		}
-		vals = append(vals, `(?, `+kx+`, ?, ?, ?, ?)`)
+		// Stored no later than the server's now + MaxClockLead: a clock from a
+		// machine running ahead cannot win for longer than that.
+		vals = append(vals, `(?, `+kx+`, ?, MIN(?, `+ceilExpr+`), ?, ?)`)
 		args = append(args, concat([]any{it.t.name}, it.key, []any{col, s.hlc, s.node, a})...)
 	}
 	if it.clocks.has {
@@ -391,6 +399,36 @@ func (d *DB) pushItems(ctx context.Context, r *libsql.DB, items []pushItem, floo
 // mergeBack merges the server's rows for pushed keys into the replica.
 func (d *DB) mergeBack(ctx context.Context, items []pushItem, srv []serverRow, floor int64, force bool) error {
 	return d.applyTx(ctx, func(tx *sql.Tx, pending map[string]bool) error {
+		// The server stored this replica's clocks for these keys no later than
+		// ITS now + MaxClockLead. Where it cut one down, take its value: a
+		// replica whose clock ran ahead would otherwise keep preferring its own
+		// value over a later honest edit the server holds. (This replica's own
+		// ceiling cannot do it — it is computed from the very clock in doubt.)
+		for i, it := range items {
+			pk, err := localKeyText(ctx, tx, it.key)
+			if err != nil {
+				return err
+			}
+			c := srv[i].clocks
+			clamp := func(col string, s stamp) error {
+				if s.node != d.nodeID {
+					return nil
+				}
+				_, err := tx.ExecContext(ctx, `UPDATE hap_clock SET hlc = ? WHERE tbl = ? AND pk = ? AND col = ?
+					AND node = ? AND hlc > ?`, s.hlc, it.t.name, pk, col, d.nodeID, s.hlc)
+				return err
+			}
+			if c.has {
+				if err := clamp("", c.row); err != nil {
+					return err
+				}
+			}
+			for col, s := range c.cols {
+				if err := clamp(col, s); err != nil {
+					return err
+				}
+			}
+		}
 		acts := make([]mergeAct, 0, len(items))
 		for i, it := range items {
 			a, err := planMerge(ctx, tx, it.t, it.key, srv[i], floor, force)

@@ -33,11 +33,27 @@ import (
 // high-water mark is the CLOCK FLOOR, and a missing clock reads as the
 // floor, so an edit older than it can never win.
 
+// wallMsExpr is this side's wall clock in milliseconds. julianday rather
+// than unixepoch('subsec'), which older servers lack.
+const wallMsExpr = `CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`
+
 // clockTick advances the HLC and is the first statement of every stamping
-// trigger. julianday rather than unixepoch('subsec'), which older servers
-// lack.
-const clockTick = `UPDATE hap_hlc SET v = MAX(v + 1, ` +
-	`CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) * 65536)`
+// trigger. Its physical part is the wall clock CORRECTED to the server's
+// (hap_hlc.off, measured by every pull; 0 on the server itself), so machines
+// whose clocks disagree still stamp comparable edits.
+const clockTick = `UPDATE hap_hlc SET v = MAX(v + 1, (` + wallMsExpr + ` + off) * 65536)`
+
+// MaxClockLead is how far past (corrected) now a clock is ever taken to be.
+// A machine whose clock jumped ahead after its last pull stamps edits in the
+// future, and a future edit beats every honest one until real time catches
+// up — so a pulled clock lifts this side's HLC no further than this, the
+// server stores no pushed clock beyond it, and a pushed key's own clocks are
+// brought back to it. The damage a wrong clock can do is bounded by this.
+const MaxClockLead = 60_000 // ms
+
+// ceilExpr is the latest HLC value this side accepts: corrected now plus
+// MaxClockLead.
+const ceilExpr = `((` + wallMsExpr + ` + COALESCE((SELECT off FROM hap_hlc), 0) + 60000) * 65536)`
 
 // clockNow is the tick's value, read in the same trigger.
 const clockNow = `(SELECT v FROM hap_hlc)`
@@ -54,7 +70,8 @@ var clockDDL = []string{
 		PRIMARY KEY (tbl, pk, col)
 	)`,
 	`CREATE INDEX IF NOT EXISTS hap_clock_hlc ON hap_clock (hlc)`,
-	`CREATE TABLE IF NOT EXISTS hap_hlc (k INTEGER PRIMARY KEY CHECK (k = 1), v INTEGER NOT NULL)`,
+	`CREATE TABLE IF NOT EXISTS hap_hlc (k INTEGER PRIMARY KEY CHECK (k = 1), v INTEGER NOT NULL,
+		off INTEGER NOT NULL DEFAULT 0)`,
 	`INSERT OR IGNORE INTO hap_hlc (k, v) VALUES (1, 0)`,
 }
 

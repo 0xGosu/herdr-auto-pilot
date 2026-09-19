@@ -286,14 +286,19 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	if err != nil {
 		return false, false, err
 	}
+	sent := time.Now()
 	res, err := r.Batch(ctx, []libsql.Statement{
 		{SQL: `SELECT seq, tbl, pk, origin FROM hap_changelog WHERE seq > ? ORDER BY seq LIMIT ?`,
 			Args: []any{cursor, int64(pullBatch)}},
 		{SQL: `SELECT v FROM hap_sync_meta WHERE k = 'pruned_through'`},
 		{SQL: listTriggersSQL},
 		{SQL: `SELECT v FROM hap_sync_meta WHERE k = 'clock_floor'`},
+		{SQL: `SELECT ` + wallMsExpr},
 	})
 	if err != nil {
+		return false, false, err
+	}
+	if err := d.noteServerClock(ctx, res[4], sent, time.Now()); err != nil {
 		return false, false, err
 	}
 	// A logging trigger gone (a table rebuilt by a migration, or created by a
@@ -398,6 +403,59 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	return n > 0, len(log) == pullBatch, nil
 }
 
+// noteServerClock measures this machine's clock against the server's (the
+// server's reading taken at the midpoint of the round trip) and stores the
+// offset every local edit is stamped with. It says so, at most hourly, when
+// the two are far apart: the offset corrects the stamps, but a clock that
+// wrong is worth fixing (NTP), and an edit made while it could not be
+// measured is still stamped by it.
+func (d *DB) noteServerClock(ctx context.Context, res libsql.Rows, sent, recv time.Time) error {
+	if len(res.Rows) != 1 {
+		return nil
+	}
+	server, ok := res.Rows[0][0].(int64)
+	if !ok {
+		return nil
+	}
+	mid := sent.UnixMilli() + recv.Sub(sent).Milliseconds()/2
+	off := server - mid
+	if off < clockDeadbandMs && off > -clockDeadbandMs {
+		// Within the measurement's own noise (up to half a round trip):
+		// correcting by it would REORDER edits on machines whose clocks agree.
+		off = 0
+	}
+	if off > clockSkewWarnMs || off < -clockSkewWarnMs {
+		d.mu.Lock()
+		warn := d.now().Sub(d.lastSkewWarn) >= time.Hour
+		if warn {
+			d.lastSkewWarn = d.now()
+		}
+		d.mu.Unlock()
+		if warn {
+			slog.Warn("libsql: this machine's clock disagrees with the server's; edits are stamped in the server's "+
+				"time, but fix the clock (NTP) — an edit made before the next successful pull still uses the old offset",
+				"offset", time.Duration(off)*time.Millisecond)
+		}
+	}
+	// And bring the HLC itself back within the bound: a clock that ran ahead
+	// before this correction left it there, and it only ever advances. Every
+	// later stamp is still after every clock the server stored for this node,
+	// since those were bounded by the same lead.
+	if _, err := d.raw.ExecContext(ctx, `UPDATE hap_hlc SET off = ?`, off); err != nil {
+		return err
+	}
+	_, err := d.raw.ExecContext(ctx, `UPDATE hap_hlc SET v = MIN(v, `+ceilExpr+`)`)
+	return err
+}
+
+// clockSkewWarnMs is the clock disagreement past which a pull warns.
+const clockSkewWarnMs = 30_000
+
+// clockDeadbandMs is the disagreement below which no correction is applied:
+// a measured offset carries up to half a round trip of noise, and a fleet on
+// NTP agrees far better than that.
+const clockDeadbandMs = 2_000
+
 // setFloor records the server's clock floor locally.
 func (d *DB) setFloor(ctx context.Context, floor int64) error {
 	tx, err := d.raw.BeginTx(ctx, nil)
@@ -438,13 +496,18 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 	// log entirely (every live cursor had read it), and a head of 0 under a
 	// non-zero floor would read as "fell behind" on every pull — a full
 	// re-seed per tick, forever.
+	sent := time.Now()
 	head, err := r.Batch(ctx, []libsql.Statement{
 		{SQL: `SELECT MAX(
 		COALESCE((SELECT MAX(seq) FROM hap_changelog), 0),
 		COALESCE((SELECT v FROM hap_sync_meta WHERE k = 'pruned_through'), 0))`},
 		{SQL: `SELECT ` + floorExpr},
+		{SQL: `SELECT ` + wallMsExpr},
 	})
 	if err != nil {
+		return err
+	}
+	if err := d.noteServerClock(ctx, head[2], sent, time.Now()); err != nil {
 		return err
 	}
 	cursor, _ := head[0].Rows[0][0].(int64)

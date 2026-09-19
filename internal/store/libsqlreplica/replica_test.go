@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -824,5 +825,67 @@ func TestAnEditOlderThanTheClockFloorLoses(t *testing.T) {
 		if got, _ := n.label(t, "x"); got != "current" {
 			t.Fatalf("%s sees %q: an edit below the floor won", n.id, got)
 		}
+	}
+}
+
+// hlcMs reads a node's HLC as milliseconds.
+func (n *node) hlcMs(t *testing.T) (v, off int64) {
+	t.Helper()
+	if err := n.r.DB().QueryRow(`SELECT v >> 16, off FROM hap_hlc`).Scan(&v, &off); err != nil {
+		t.Fatal(err)
+	}
+	return v, off
+}
+
+// A machine whose clock runs an hour ahead cannot win for an hour: the
+// server stores its clock no later than now + MaxClockLead, a peer pulling it
+// lifts its own HLC no further than that, the machine's own copy is brought
+// back to the same bound, and its next pull corrects its offset.
+func TestAClockRunningAheadIsBounded(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'v1')`)
+	a.push(t)
+	b.pull(t)
+	a.exec(t, `UPDATE hap_hlc SET off = 3600000`) // an hour ahead
+	a.exec(t, `UPDATE operator SET label = 'from the future' WHERE id = 'x'`)
+	a.push(t)
+	bound := time.Now().UnixMilli() + libsqlreplica.MaxClockLead + 1000
+
+	var stored int64
+	online := onlineHandle(t, srv)
+	if err := online.DB().QueryRow(`SELECT MAX(hlc) >> 16 FROM hap_clock WHERE tbl = 'operator'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored > bound {
+		t.Fatalf("the server stored a clock %dms ahead", stored-time.Now().UnixMilli())
+	}
+	var local int64
+	if err := a.r.DB().QueryRow(`SELECT MAX(hlc) >> 16 FROM hap_clock WHERE tbl = 'operator'`).Scan(&local); err != nil {
+		t.Fatal(err)
+	}
+	if local > bound {
+		t.Fatalf("the pushing replica kept its own clock %dms ahead", local-time.Now().UnixMilli())
+	}
+	b.pull(t)
+	if v, _ := b.hlcMs(t); v > bound {
+		t.Fatalf("pulling a future clock lifted b's HLC %dms ahead", v-time.Now().UnixMilli())
+	}
+	a.pull(t)
+	v, off := a.hlcMs(t)
+	if off > 5000 || off < -5000 {
+		t.Fatalf("a's pull left its offset at %dms", off)
+	}
+	if v > time.Now().UnixMilli()+libsqlreplica.MaxClockLead+1000 {
+		t.Fatalf("a's HLC is still %dms ahead after the correction", v-time.Now().UnixMilli())
+	}
+	// And b, whose clock is right, wins with its next edit once the lead has
+	// passed — here, by b's edit being later than the bounded stamp.
+	b.exec(t, `UPDATE hap_hlc SET off = off + 2 * `+strconv.Itoa(libsqlreplica.MaxClockLead))
+	b.exec(t, `UPDATE operator SET label = 'honest' WHERE id = 'x'`)
+	b.push(t)
+	a.pull(t)
+	if got, _ := a.label(t, "x"); got != "honest" {
+		t.Fatalf("a sees %q, want the edit made after the bounded lead", got)
 	}
 }

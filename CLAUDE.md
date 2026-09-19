@@ -723,6 +723,16 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
       server's time instead of reading as "never edited".
     - **Pruned clocks read as the FLOOR** (`clock_floor`, raised by `PruneChangelog`): a machine back after
       longer than retention cannot win with an edit older than every clock the fleet still keeps.
+    - **Clocks are corrected to the SERVER's time and bounded by `MaxClockLead`.** "Latest edit wins" is only
+      as honest as the clocks: one machine an hour fast would win every conflict for an hour, and — since a
+      pull lifts the HLC to what it saw — drag every peer's clock along. So each pull measures this node's
+      offset from the server (`noteServerClock`, stored as `hap_hlc.off`, warned about past 30 s) and every
+      stamp uses corrected time — except inside a 2 s DEADBAND, since the measurement carries up to half a
+      round trip of noise and correcting by it would reorder edits on machines whose clocks agree; a pulled clock lifts the HLC no further than corrected now + the lead; the
+      server stores no pushed clock beyond ITS now + the lead; and a pushed key's local clocks take what the
+      server stored (the replica's own ceiling cannot do that — it is computed from the clock in doubt).
+      Remaining limit: a clock that jumps ahead while the node is OFFLINE stamps those edits ahead until the
+      next pull, and they win against everything up to the reconnect.
     What this cannot give is a state machine: an escalation dismissed on one machine and claimed by its
     owner's daemon on another resolves to whichever edit is later, and the `AND status = 'escalated'`
     guards only ever see the local replica.
