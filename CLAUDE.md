@@ -733,9 +733,16 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
       server stored (the replica's own ceiling cannot do that — it is computed from the clock in doubt).
       Remaining limit: a clock that jumps ahead while the node is OFFLINE stamps those edits ahead until the
       next pull, and they win against everything up to the reconnect.
-    What this cannot give is a state machine: an escalation dismissed on one machine and claimed by its
-    owner's daemon on another resolves to whichever edit is later, and the `AND status = 'escalated'`
-    guards only ever see the local replica.
+    - **An escalation's OUTCOME is the exception: LAST PUSH wins** (`pushWins`: `audit_log.status`,
+      `actor`, `suggestion`, `rationale`, `while_fsp_mode_on`). Acting on an escalation has already touched
+      a live pane, so the outcome a node pushed must be what the fleet keeps; an older decision whose edit
+      merely stamped later must not roll it back. A push writes such a column only when this replica
+      CHANGED it and has not pushed that yet (`hap_clock.pushed = 0`, replica-only) — writing it on every
+      push of the row would let an unrelated edit (retention blanking `pane_excerpt`) push a stale status
+      over another node's dismiss. A pull takes the server's value unless the column is changed-here.
+      `TestPushWinsCoversEveryEscalationTransition` scans the store's SQL: a statement that moves
+      `audit_log.status` may set only these columns, or it would pair one node's status with another's
+      actor. The `AND status = 'escalated'` guards still only see the local replica.
   - **The server's change log is written by TRIGGERS, not by the push** (`hap_cl_*`). That is what
     makes `hap migrate`'s and an older hap's direct writes visible to replicas. Both logs
     carry KEYS only, and each side fetches the current row. That is why the log needs no BLOB

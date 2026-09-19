@@ -10,6 +10,27 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/store/libsql"
 )
 
+// pushWins are the columns that resolve by LAST PUSH rather than latest edit:
+// an escalation's lifecycle. Acting on an escalation — delivering its
+// suggestion, dismissing it, retrying it — has an immediate, irreversible side
+// effect on a live pane, so the node that pushed the outcome must see the
+// fleet adopt exactly that outcome; a clock comparison could quietly roll it
+// back to an older decision whose edit merely stamped later. Such a column is
+// written by every push unconditionally, and a pull takes the server's value
+// unless this replica changed that column itself and has not pushed it yet.
+// A push that carries some OTHER change to the row leaves these columns
+// alone: only a change made here is pushed, or an unrelated edit (retention
+// blanking an excerpt) would roll back another node's outcome.
+//
+// TestPushWinsCoversEveryEscalationTransition pins this to the store: every
+// statement that moves audit_log.status may set only columns listed here.
+var pushWins = map[string]map[string]bool{
+	"audit_log": {"status": true, "actor": true, "suggestion": true, "rationale": true, "while_fsp_mode_on": true},
+}
+
+// PushWinsColumns lists pushWins for a table (tests).
+func PushWinsColumns(table string) map[string]bool { return pushWins[table] }
+
 // floorExpr is the server's clock floor, read inside a push's own statements.
 const floorExpr = `COALESCE((SELECT v FROM hap_sync_meta WHERE k = 'clock_floor'), 0)`
 
@@ -55,14 +76,15 @@ type mergeAct struct {
 	del   bool
 }
 
-// planMerge decides, column by column, what of the server's row the replica
+// planMerge decides, column by column (pushWins columns aside), what of the server's row the replica
 // takes: every column whose server edit is later than (or as late as — the
 // server wins a tie) the replica's own. A row the server does not have is
 // deleted unless the replica edited it after the server's delete; a row the
 // replica deleted is restored unless that delete is later than every edit
 // the server knows of. force takes the server's row whole (a push the server
 // refused outright). Missing clocks read as the floor.
-func planMerge(ctx context.Context, tx *sql.Tx, t *table, key []any, srv serverRow, floor int64, force bool) (mergeAct, error) {
+func planMerge(ctx context.Context, tx *sql.Tx, t *table, key []any, srv serverRow, floor int64, force bool,
+	pending map[string]bool) (mergeAct, error) {
 	a := mergeAct{t: t, key: key, srv: srv, force: force}
 	pk, err := localKeyText(ctx, tx, key)
 	if err != nil {
@@ -90,7 +112,13 @@ func planMerge(ctx context.Context, tx *sql.Tx, t *table, key []any, srv serverR
 			if t.isPK(c) {
 				continue
 			}
-			if force || !fl(cl.eff(c)).after(fl(srv.clocks.eff(c))) {
+			take := force || !fl(cl.eff(c)).after(fl(srv.clocks.eff(c)))
+			if pushWins[t.name][c] {
+				// Last push wins: the server's value, unless this replica's own
+				// change to the column is still waiting to be pushed.
+				take = force || !cl.changedHere(c)
+			}
+			if take {
 				if !sameValue(merged[i], srv.row[i]) {
 					merged[i], changed = srv.row[i], true
 				}
@@ -253,6 +281,15 @@ func pushStmts(it pushItem) []libsql.Statement {
 		if t.isPK(c) {
 			continue
 		}
+		if pushWins[t.name][c] {
+			// Last push wins — for a change made HERE. Anything else keeps
+			// what the server has.
+			if it.clocks.changedHere(c) {
+				set = append(set, ident(c)+` = ?`)
+				args = append(args, it.row[i])
+			}
+			continue
+		}
 		e := it.clocks.eff(c)
 		keep := ident(c)
 		if parked[c] {
@@ -399,6 +436,32 @@ func (d *DB) pushItems(ctx context.Context, r *libsql.DB, items []pushItem, floo
 // mergeBack merges the server's rows for pushed keys into the replica.
 func (d *DB) mergeBack(ctx context.Context, items []pushItem, srv []serverRow, floor int64, force bool) error {
 	return d.applyTx(ctx, func(tx *sql.Tx, pending map[string]bool) error {
+		// What this push carried is no longer "changed here" — but only the
+		// stamps it read: a column edited again while the push was in flight
+		// has a new stamp and stays unpushed.
+		if !force {
+			for _, it := range items {
+				pk, err := localKeyText(ctx, tx, it.key)
+				if err != nil {
+					return err
+				}
+				mark := func(col string, s stamp) error {
+					_, err := tx.ExecContext(ctx, `UPDATE hap_clock SET pushed = 1 WHERE tbl = ? AND pk = ? AND col = ?
+						AND hlc = ? AND node = ?`, it.t.name, pk, col, s.hlc, s.node)
+					return err
+				}
+				if it.clocks.has {
+					if err := mark("", it.clocks.row); err != nil {
+						return err
+					}
+				}
+				for col, s := range it.clocks.cols {
+					if err := mark(col, s); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		// The server stored this replica's clocks for these keys no later than
 		// ITS now + MaxClockLead. Where it cut one down, take its value: a
 		// replica whose clock ran ahead would otherwise keep preferring its own
@@ -431,7 +494,7 @@ func (d *DB) mergeBack(ctx context.Context, items []pushItem, srv []serverRow, f
 		}
 		acts := make([]mergeAct, 0, len(items))
 		for i, it := range items {
-			a, err := planMerge(ctx, tx, it.t, it.key, srv[i], floor, force)
+			a, err := planMerge(ctx, tx, it.t, it.key, srv[i], floor, force, pending)
 			if err != nil {
 				return err
 			}

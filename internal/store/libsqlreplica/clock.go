@@ -67,6 +67,10 @@ var clockDDL = []string{
 		hlc   INTEGER NOT NULL,
 		node  TEXT NOT NULL,
 		alive INTEGER NOT NULL DEFAULT 1,
+		-- Replica only: 0 while this node's own edit has not been pushed yet.
+		-- It is what makes a pushWins column "changed here", so a push writes
+		-- it only then (clock stamps say WHEN, not whether it was sent).
+		pushed INTEGER NOT NULL DEFAULT 1,
 		PRIMARY KEY (tbl, pk, col)
 	)`,
 	`CREATE INDEX IF NOT EXISTS hap_clock_hlc ON hap_clock (hlc)`,
@@ -101,7 +105,15 @@ type clockSet struct {
 	alive bool // the row register's state; true when there is none
 	has   bool // a row register exists
 	cols  map[string]stamp
+	// Replica only: the row register / columns whose own edit here is not
+	// pushed yet.
+	rowDirty bool
+	dirty    map[string]bool
 }
+
+// changedHere reports whether this replica changed col (or inserted the row)
+// and has not pushed it yet.
+func (c clockSet) changedHere(col string) bool { return c.rowDirty && c.alive || c.dirty[col] }
 
 // eff is a column's effective clock: the later of its own and the row's.
 func (c clockSet) eff(col string) stamp { return maxStamp(c.row, c.cols[col]) }
@@ -124,26 +136,33 @@ func orFloor(s stamp, floor int64) stamp {
 	return s
 }
 
-// clocksFromRows builds a clockSet from (col, hlc, node, alive) rows.
+// clocksFromRows builds a clockSet from (col, hlc, node, alive[, pushed])
+// rows; the fifth column is the replica's own and absent from a server read.
 func clocksFromRows(rows [][]any) clockSet {
-	c := clockSet{alive: true, cols: map[string]stamp{}}
+	c := clockSet{alive: true, cols: map[string]stamp{}, dirty: map[string]bool{}}
 	for _, r := range rows {
 		col, _ := r[0].(string)
 		hlc, _ := r[1].(int64)
 		node, _ := r[2].(string)
 		alive, _ := r[3].(int64)
+		unsent := false
+		if len(r) > 4 {
+			p, _ := r[4].(int64)
+			unsent = p == 0
+		}
 		if col == "" {
-			c.row, c.has, c.alive = stamp{hlc, node}, true, alive != 0
+			c.row, c.has, c.alive, c.rowDirty = stamp{hlc, node}, true, alive != 0, unsent
 			continue
 		}
 		c.cols[col] = stamp{hlc, node}
+		c.dirty[col] = unsent
 	}
 	return c
 }
 
 // localClocks reads one key's clocks from the replica.
 func localClocks(ctx context.Context, tx *sql.Tx, tbl, pk string) (clockSet, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT col, hlc, node, alive FROM hap_clock WHERE tbl = ? AND pk = ?`, tbl, pk)
+	rows, err := tx.QueryContext(ctx, `SELECT col, hlc, node, alive, pushed FROM hap_clock WHERE tbl = ? AND pk = ?`, tbl, pk)
 	if err != nil {
 		return clockSet{}, err
 	}
@@ -151,11 +170,11 @@ func localClocks(ctx context.Context, tx *sql.Tx, tbl, pk string) (clockSet, err
 	var raw [][]any
 	for rows.Next() {
 		var col, node string
-		var hlc, alive int64
-		if err := rows.Scan(&col, &hlc, &node, &alive); err != nil {
+		var hlc, alive, pushed int64
+		if err := rows.Scan(&col, &hlc, &node, &alive, &pushed); err != nil {
 			return clockSet{}, err
 		}
-		raw = append(raw, []any{col, hlc, node, alive})
+		raw = append(raw, []any{col, hlc, node, alive, pushed})
 	}
 	return clocksFromRows(raw), rows.Err()
 }
@@ -175,10 +194,17 @@ func localKeyText(ctx context.Context, tx *sql.Tx, key []any) (string, error) {
 // with %s for the key expression.
 func stampingTriggers(prefix string, t *table, node, when string, extra string) []string {
 	tick := clockTick + "; "
+	// A replica's own edit is unpushed until a push marks it; the server's
+	// own stamps have nothing to push.
+	pushed := 1
+	if node != "" {
+		pushed = 0
+	}
 	reg := func(keyRow string, alive int) string {
-		return fmt.Sprintf(`INSERT INTO hap_clock (tbl, pk, col, hlc, node, alive) VALUES (%s, %s, '', %s, %s, %d) `+
-			`ON CONFLICT (tbl, pk, col) DO UPDATE SET hlc = excluded.hlc, node = excluded.node, alive = excluded.alive; `,
-			lit(t.name), keyArray(t, keyRow), clockNow, lit(node), alive)
+		return fmt.Sprintf(`INSERT INTO hap_clock (tbl, pk, col, hlc, node, alive, pushed) VALUES (%s, %s, '', %s, %s, %d, %d) `+
+			`ON CONFLICT (tbl, pk, col) DO UPDATE SET hlc = excluded.hlc, node = excluded.node, alive = excluded.alive, `+
+			`pushed = excluded.pushed; `,
+			lit(t.name), keyArray(t, keyRow), clockNow, lit(node), alive, pushed)
 	}
 	var changed []string
 	for _, c := range t.cols {
@@ -189,9 +215,10 @@ func stampingTriggers(prefix string, t *table, node, when string, extra string) 
 	}
 	cols := ""
 	if len(changed) > 0 {
-		cols = fmt.Sprintf(`INSERT INTO hap_clock (tbl, pk, col, hlc, node, alive) SELECT %s, %s, c, %s, %s, 1 `+
-			`FROM (%s) WHERE true ON CONFLICT (tbl, pk, col) DO UPDATE SET hlc = excluded.hlc, node = excluded.node; `,
-			lit(t.name), keyArray(t, "NEW"), clockNow, lit(node), strings.Join(changed, " UNION ALL "))
+		cols = fmt.Sprintf(`INSERT INTO hap_clock (tbl, pk, col, hlc, node, alive, pushed) SELECT %s, %s, c, %s, %s, 1, %d `+
+			`FROM (%s) WHERE true ON CONFLICT (tbl, pk, col) DO UPDATE SET hlc = excluded.hlc, node = excluded.node, `+
+			`pushed = excluded.pushed; `,
+			lit(t.name), keyArray(t, "NEW"), clockNow, lit(node), pushed, strings.Join(changed, " UNION ALL "))
 	}
 	pre := func(row string) string {
 		if extra == "" {

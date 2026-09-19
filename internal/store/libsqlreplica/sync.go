@@ -381,7 +381,7 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	err = d.applyTx(ctx, func(tx *sql.Tx, pending map[string]bool) error {
 		acts := make([]mergeAct, 0, len(keys))
 		for i, k := range keys {
-			a, err := planMerge(ctx, tx, k.t, k.key, serverRowOf(fetched[2*i], fetched[2*i+1]), floor, false)
+			a, err := planMerge(ctx, tx, k.t, k.key, serverRowOf(fetched[2*i], fetched[2*i+1]), floor, false, pending)
 			if err != nil {
 				return err
 			}
@@ -580,7 +580,7 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 				if err != nil {
 					return err
 				}
-				a, err := planMerge(ctx, tx, p.t, key, serverRow{row: row, clocks: clocksFromRows(clocks[p.t.name+"\x00"+pk])}, floor, false)
+				a, err := planMerge(ctx, tx, p.t, key, serverRow{row: row, clocks: clocksFromRows(clocks[p.t.name+"\x00"+pk])}, floor, false, pending)
 				if err != nil {
 					return err
 				}
@@ -603,7 +603,7 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 				if err != nil {
 					return err
 				}
-				a, err := planMerge(ctx, tx, t, key, serverRow{clocks: clocksFromRows(clocks[t.name+"\x00"+pk])}, floor, false)
+				a, err := planMerge(ctx, tx, t, key, serverRow{clocks: clocksFromRows(clocks[t.name+"\x00"+pk])}, floor, false, pending)
 				if err != nil {
 					return err
 				}

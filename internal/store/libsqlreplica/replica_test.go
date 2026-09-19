@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -887,5 +891,131 @@ func TestAClockRunningAheadIsBounded(t *testing.T) {
 	a.pull(t)
 	if got, _ := a.label(t, "x"); got != "honest" {
 		t.Fatalf("a sees %q, want the edit made after the bounded lead", got)
+	}
+}
+
+func (n *node) insertEscalation(t *testing.T, id int64) {
+	t.Helper()
+	n.exec(t, `INSERT INTO audit_log (id, node_id, trigger, situation_type, action_or_escalation, status, created_at)
+		VALUES (?, ?, 'attention', 'approval', 'escalate', 'escalated', 1)`, id, n.id)
+}
+
+func (n *node) escalation(t *testing.T, id int64) (status, excerpt string) {
+	t.Helper()
+	if err := n.r.DB().QueryRow(`SELECT status, pane_excerpt FROM audit_log WHERE id = ?`, id).
+		Scan(&status, &excerpt); err != nil {
+		t.Fatal(err)
+	}
+	return status, excerpt
+}
+
+// An escalation's outcome resolves by LAST PUSH, not latest edit: acting on
+// one has already touched a live pane, so the outcome a node pushed is what
+// the fleet keeps — even over an edit that stamped later but was pushed first.
+func TestEscalationOutcomeIsLastPushWins(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.insertEscalation(t, 7)
+	a.push(t)
+	b.pull(t)
+	a.exec(t, `UPDATE audit_log SET status = 'dismissed', actor = 'operator' WHERE id = 7`) // edited first...
+	tick()
+	b.exec(t, `UPDATE audit_log SET status = 'resolved', actor = 'orchestrator' WHERE id = 7`)
+	b.push(t)
+	a.push(t) // ...pushed last
+	a.pull(t)
+	b.pull(t)
+	for _, n := range []*node{a, b} {
+		if st, _ := n.escalation(t, 7); st != "dismissed" {
+			t.Fatalf("%s: status %q, want the last push's outcome", n.id, st)
+		}
+	}
+}
+
+// A push that carries some OTHER change to an escalation's row leaves its
+// outcome alone, and that other column still resolves by latest edit.
+func TestAnUnrelatedPushLeavesTheOutcomeAlone(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.insertEscalation(t, 8)
+	a.exec(t, `UPDATE audit_log SET pane_excerpt = 'screen' WHERE id = 8`)
+	a.push(t)
+	b.pull(t)
+	a.exec(t, `UPDATE audit_log SET status = 'dismissed' WHERE id = 8`)
+	a.push(t)
+	b.exec(t, `UPDATE audit_log SET pane_excerpt = '' WHERE id = 8`) // retention, on a stale copy
+	b.push(t)
+	a.pull(t)
+	b.pull(t)
+	for _, n := range []*node{a, b} {
+		if st, ex := n.escalation(t, 8); st != "dismissed" || ex != "" {
+			t.Fatalf("%s: status %q excerpt %q, want dismissed and the blanked excerpt", n.id, st, ex)
+		}
+	}
+}
+
+// A pull does not overwrite an escalation outcome changed here and not yet
+// pushed; the push that follows wins.
+func TestAPullKeepsAnUnpushedOutcome(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.insertEscalation(t, 9)
+	a.push(t)
+	b.pull(t)
+	b.exec(t, `UPDATE audit_log SET status = 'auto_accepting' WHERE id = 9`) // not pushed
+	tick()
+	a.exec(t, `UPDATE audit_log SET status = 'dismissed' WHERE id = 9`)
+	a.push(t)
+	b.pull(t)
+	if st, _ := b.escalation(t, 9); st != "auto_accepting" {
+		t.Fatalf("a pull overwrote b's unpushed outcome: %q", st)
+	}
+	b.push(t)
+	a.pull(t)
+	if st, _ := a.escalation(t, 9); st != "auto_accepting" {
+		t.Fatalf("a sees %q, want b's later push", st)
+	}
+}
+
+var auditUpdateRE = regexp.MustCompile(`(?is)UPDATE\s+audit_log\s+SET\s+(.*?)\s+WHERE`)
+var setColRE = regexp.MustCompile(`(?i)([a-z_]+)\s*=`)
+
+// TestPushWinsCoversEveryEscalationTransition: every store statement that
+// moves audit_log.status may set only last-push-wins columns — a column set in
+// the same statement as an outcome belongs to that outcome, and resolving it
+// by latest edit could pair one node's status with another's actor.
+func TestPushWinsCoversEveryEscalationTransition(t *testing.T) {
+	files, err := filepath.Glob("../*.go")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("store sources: %v", err)
+	}
+	cols := libsqlreplica.PushWinsColumns("audit_log")
+	seen := 0
+	for _, f := range files {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range auditUpdateRE.FindAllStringSubmatch(string(src), -1) {
+			var set []string
+			for _, c := range setColRE.FindAllStringSubmatch(m[1], -1) {
+				set = append(set, strings.ToLower(c[1]))
+			}
+			if !slices.Contains(set, "status") {
+				continue
+			}
+			seen++
+			for _, c := range set {
+				if !cols[c] {
+					t.Errorf("%s: an escalation transition sets %q, which is not last-push-wins: %s", f, c, m[1])
+				}
+			}
+		}
+	}
+	if seen == 0 {
+		t.Fatal("found no escalation transition — the scan no longer matches the store's SQL")
 	}
 }
