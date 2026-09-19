@@ -50,17 +50,17 @@ func TestValidateLibSQLDatabase(t *testing.T) {
 	}
 	// libsql keeps a local replica, so the pause applies exactly as under
 	// turso: the replica serves while the round trips are skipped.
-	cfg.Database.TursoSyncPaused = true
+	cfg.Database.SyncPaused = true
 	if err := ValidateDatabase(cfg); err != nil {
-		t.Fatalf("turso_sync_paused refused a libsql start: %v", err)
+		t.Fatalf("sync_paused refused a libsql start: %v", err)
 	}
 	if !cfg.Database.SyncPausedEffective() {
 		t.Error("the pause is not in effect under libsql")
 	}
-	if (Database{Engine: EngineSQLite, TursoSyncPaused: true}).SyncPausedEffective() {
+	if (Database{Engine: EngineSQLite, SyncPaused: true}).SyncPausedEffective() {
 		t.Error("the pause is in effect under sqlite, which has nothing to sync")
 	}
-	turso := Database{Engine: EngineTurso, TursoSyncPaused: true}
+	turso := Database{Engine: EngineTurso, SyncPaused: true}
 	if !turso.SyncPausedEffective() {
 		t.Error("control: the pause is not in effect under turso")
 	}

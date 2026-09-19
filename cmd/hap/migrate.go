@@ -51,11 +51,6 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 		return err
 	}
 	if opt.shared == config.EngineLibSQL {
-		if opt.toSQLite && cfg.Database.IsLibSQL() {
-			fmt.Fprintln(out, "note: this copies the libsql SERVER's rows. Changes this node made while it could not "+
-				"reach the server, and has not pushed yet, are only in its local replica — start the daemon and let it "+
-				"sync first if there may be any")
-		}
 		return runMigrateLibSQL(ctx, paths, cfg, out, opt)
 	}
 	if cfg.Database.TursoDatabaseURL == "" {
@@ -127,10 +122,10 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 		return err
 	}
 
-	// Honours the pause for the COPY's own round trips — the pull that frames a
-	// copy out and the push that publishes a copy in. An operator who has taken
-	// this machine off the wire has said what they want from Turso Cloud, and
-	// the copy itself is not an exception they asked for.
+	// Honours database.sync_paused for the COPY's own round trips — the pull
+	// that frames a copy out and the push that publishes a copy in. An operator
+	// who has taken this machine off the wire has said what they want from
+	// Turso Cloud, and the copy itself is not an exception they asked for.
 	//
 	// It does NOT make the command silent on the wire, and nothing may claim
 	// so: PrepareSharedSchema above pulls unconditionally (and pushes when this
@@ -141,7 +136,7 @@ func runMigrate(ctx context.Context, paths config.Paths, out io.Writer, args []s
 	// against a replica that never saw the colliding node. DDL on a shared
 	// database needs the lease, which needs a push, so a pause-aware schema
 	// step could only refuse anyway.
-	paused := cfg.Database.TursoSyncPaused
+	paused := cfg.Database.SyncPaused
 	if opt.toSQLite && !paused {
 		// Pull first, or the copy out is whatever this machine last saw, which
 		// on a node that has been down is not the fleet's current state.
@@ -222,12 +217,30 @@ func resolveMigrateShared(opt migrateArgs, cfg config.Config) (string, error) {
 
 // runMigrateLibSQL is runMigrate against a libsql server. It differs from the
 // turso path in what there is NOT: no local replica to back up (the server is
-// the only copy — it is said so, not implied), no pull or push to frame the
-// copy (every statement already runs on the server), and no pause to honour.
+// the only copy — it is said so, not implied) and no pull or push to frame the
+// copy (every statement already runs on the server).
+//
+// That is also why database.sync_paused REFUSES here rather than trimming the
+// command the way it does under turso: the copy itself is the round trip, in
+// both directions, so there is nothing optional left to skip. The refusal comes
+// before the server is opened — the schema lease and the collision check below
+// would otherwise reach it before anything was refused.
 func runMigrateLibSQL(ctx context.Context, paths config.Paths, cfg config.Config, out io.Writer, opt migrateArgs) error {
 	if cfg.Database.LibSQLURL == "" {
 		return errors.New("database.libsql_url is not set, so there is no shared database to copy to or from.\n" +
 			"Run `hap config set database.libsql_url <url>` (and the auth token) first")
+	}
+	if cfg.Database.SyncPaused {
+		return errors.New("database.sync_paused is on, and a libsql migration IS a conversation with the server:\n" +
+			"the copy runs as one transaction on the server itself, in either direction, so there is no\n" +
+			"local-only part to do while paused. Nothing was copied and the server was not contacted.\n" +
+			"Lift the pause for the migration, then set it again if you want:\n" +
+			"    hap config set database.sync_paused false")
+	}
+	if opt.toSQLite && cfg.Database.IsLibSQL() {
+		fmt.Fprintln(out, "note: this copies the libsql SERVER's rows. Changes this node made while it could not "+
+			"reach the server, and has not pushed yet, are only in its local replica — start the daemon and let it "+
+			"sync first if there may be any")
 	}
 	if opt.toSQLite {
 		backup, err := backupBeforeMigrate(paths.DBPath())
@@ -284,6 +297,8 @@ func runMigrateLibSQL(ctx context.Context, paths config.Paths, cfg config.Config
 	if err != nil {
 		return err
 	}
+	// A paused config never reaches here (refused above), so there is no
+	// skipped round trip for the report to account for.
 	printMigrateReport(out, rep, opt, false)
 	return nil
 }
@@ -496,12 +511,12 @@ func destinationNotEmptyError(err error, opt migrateArgs) error {
 			"server every node reads, and this command takes no backup of it", err)
 	}
 	return fmt.Errorf(head+".\nGoing to turso there is NO way back: a forced copy is published to Turso Cloud\n"+
-		"(immediately, or on the first push after database.turso_sync_paused is lifted) and\n"+
+		"(immediately, or on the first push after database.sync_paused is lifted) and\n"+
 		"every other node pulls the duplicates in. The backup above is only this machine's\n"+
 		"local replica, and restoring it undoes none of that", err)
 }
 
-// pausedMigrateNote is the report's account of what database.turso_sync_paused
+// pausedMigrateNote is the report's account of what database.sync_paused
 // did and did not keep off the wire. It names the schema check's pull because
 // that pull happens whatever the pause says (see runMigrate), and an operator on
 // a metered link told "nothing was pulled or pushed" would be told something
@@ -513,7 +528,7 @@ func pausedMigrateNote(opt migrateArgs) string {
 		skipped = "the push after copying in was skipped, so the copy sits in the local replica\n" +
 			"until the first push after the pause is lifted"
 	}
-	return "\ndatabase.turso_sync_paused is on: " + skipped + ".\n" +
+	return "\ndatabase.sync_paused is on: " + skipped + ".\n" +
 		"The command still reached Turso Cloud for its schema check, which pulls once (and\n" +
 		"pushes if this node had to migrate the shared schema).\n"
 }

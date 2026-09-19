@@ -1745,6 +1745,63 @@ func TestDisableNeverAutoSeedPatternsMigration(t *testing.T) {
 	}
 }
 
+// TestSyncPausedRenameMigration: the renamed database.turso_sync_paused still
+// loads, an explicit canonical sync_paused beats it in EITHER direction (a
+// stale legacy true must not keep a node off the wire after the operator wrote
+// the new key as false), and a Save round trip drops the old spelling while
+// keeping the value.
+func TestSyncPausedRenameMigration(t *testing.T) {
+	cases := []struct {
+		name string
+		toml string
+		want bool
+	}{
+		{"legacy true migrates", "[database]\nturso_sync_paused = true\n", true},
+		{"legacy false migrates", "[database]\nturso_sync_paused = false\n", false},
+		{"canonical true loads", "[database]\nsync_paused = true\n", true},
+		{"canonical false wins over legacy true", "[database]\nturso_sync_paused = true\nsync_paused = false\n", false},
+		{"canonical true wins over legacy false", "[database]\nturso_sync_paused = false\nsync_paused = true\n", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(tc.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, logs, err := loadWithLogs(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(tc.toml, "turso_sync_paused") && !strings.Contains(logs, "deprecated") {
+				t.Errorf("legacy turso_sync_paused warning missing: %q", logs)
+			}
+			if cfg.Database.SyncPaused != tc.want {
+				t.Errorf("sync_paused = %v, want %v", cfg.Database.SyncPaused, tc.want)
+			}
+			if cfg.Database.DeprecatedTursoSyncPaused != nil {
+				t.Error("deprecated turso_sync_paused field must be cleared after load")
+			}
+			if err := Save(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(data), "turso_sync_paused") {
+				t.Fatalf("saved config must not re-emit deprecated turso_sync_paused:\n%s", data)
+			}
+			again, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if again.Database.SyncPaused != tc.want {
+				t.Errorf("after a Save round trip sync_paused = %v, want %v", again.Database.SyncPaused, tc.want)
+			}
+		})
+	}
+}
+
 func TestAutoActConfidenceThresholdDefault(t *testing.T) {
 	// Omitted key keeps the high-confidence default (85): auto-act only on a
 	// >= 85 LLM score, surface everything less confident for confirmation.

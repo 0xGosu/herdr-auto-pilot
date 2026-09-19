@@ -168,7 +168,7 @@ func TestAColdBootstrapIsOnlyAWarning(t *testing.T) {
 }
 
 // TestADeliberatelyPausedSyncIsNeitherWarningNorError: the reporting half of
-// database.turso_sync_paused. The record is the hard one — failing and isolated
+// database.sync_paused. The record is the hard one — failing and isolated
 // at the moment the operator paused it, and frozen there — because a pause
 // stops the timestamps advancing while the clock every banner reads does not.
 // Reported as a fault it would train the operator to ignore the banner that

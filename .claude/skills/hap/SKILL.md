@@ -390,8 +390,9 @@ hap daemon --restart
 
 - **Local replica**, as under turso: the store lives in `<state>/libsql/hap.db`.
   Local writes are pushed a couple of seconds after each write, and other nodes'
-  rows are pulled every `libsql_poll_interval_seconds`. `turso_sync_paused`
-  applies here too.
+  rows are pulled every `libsql_poll_interval_seconds`. `sync_paused` (formerly
+  `turso_sync_paused`, which still loads) applies here too; `hap migrate` to or
+  from libsql refuses while it is on.
 - The first start must reach the server to copy its rows into the replica. After
   that the daemon runs with the server down.
 - `hap status` shows `fleet sync: libsql — ok (last pull …, last push …, N unpushed)`.

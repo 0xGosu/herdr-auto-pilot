@@ -798,11 +798,15 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # turso_database_url = "libsql://<name>-<org>.turso.io"
 # turso_auth_token = ""                   # empty = read TURSO_AUTH_TOKEN from the environment
 # turso_sync_interval_seconds = 15        # how often the daemon pulls (min 5)
-# turso_sync_paused = false               # true = stop talking to Turso Cloud, keep everything else
-#                                         # the same: the engine stays "turso", the local replica
+# sync_paused = false                     # true = stop talking to the server, keep everything else
+#                                         # the same: the engine stays shared, the local replica
 #                                         # stays the store, and unpushed writes travel on the first
 #                                         # push after you turn it off. For a metered network or a
-#                                         # Turso incident, without unpicking the URL and the token.
+#                                         # server incident, without unpicking the URL and the token.
+#                                         # Applies to turso AND libsql alike (formerly
+#                                         # `turso_sync_paused`, which still loads). `hap migrate`
+#                                         # honours it: turso skips the pull/push around the copy,
+#                                         # libsql refuses (its copy runs on the server itself).
 #                                         # While paused this node sees none of the fleet's
 #                                         # escalations and the fleet sees none of its own; `hap
 #                                         # status` reports the sync as PAUSED, never as failing.
@@ -814,18 +818,18 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # "libsql" is the same central database for ANY libsql server — Turso Cloud, a
 # hosted provider (Layerbase, …) or your own `sqld` — reached over Hrana, the
 # HTTP protocol every libsql server speaks. Pick it when the server does not
-# speak Turso's sync protocol (a plain sqld answers 404 to it). There is NO
-# local replica: every statement is a round trip to the server, so it wants a
-# NEARBY server — at ~200 ms per round trip the daemon starts in ~20 s and a
-# `hap` verb takes seconds. Nothing is imported automatically: bring a local
-# history over with `hap migrate --to libsql` (daemon stopped).
+# speak Turso's sync protocol (a plain sqld answers 404 to it). Like turso it
+# keeps a LOCAL replica that the daemon serves from, pulling other nodes' writes
+# and pushing its own in the background, so a far or unreachable server does not
+# stall the herd. Nothing is imported automatically: bring a local history over
+# with `hap migrate --to libsql` (daemon stopped).
 # [database]
 # engine = "libsql"
 # libsql_url = "libsql://<db>.<provider>"  # or https://…, or http://host:8080 for a private sqld
 # libsql_auth_token = ""                  # empty = read LIBSQL_AUTH_TOKEN; a server without auth needs none
 # libsql_poll_interval_seconds = 15       # how often the daemon checks for other nodes' writes (min 5)
 # node_label = ""
-# turso_sync_paused has no effect under libsql (there is no local copy to fall back on).
+# sync_paused = false                     # as above: pauses the replica's pulls and pushes
 
 # ── Where task lists are stored: the DEFAULT (per-source overridable) ──
 # This section supplies the DEFAULT storage for the checklists below. Each

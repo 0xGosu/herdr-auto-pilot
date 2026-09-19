@@ -66,9 +66,9 @@ func TestBannerReservesChromeLine(t *testing.T) {
 func TestFleetSyncPausedIsStated(t *testing.T) {
 	m := Model{width: 100, height: 30}
 	m.data.daemonHealth = frontend.DaemonHealth{Running: true, FleetSyncPaused: true,
-		FleetSyncLine: "turso — PAUSED by database.turso_sync_paused (3 unpushed, last pull never, last push never)"}
+		FleetSyncLine: "turso — PAUSED by database.sync_paused (3 unpushed, last pull never, last push never)"}
 	view := m.View()
-	for _, want := range []string{"fleet sync PAUSED", "hap config set database.turso_sync_paused false"} {
+	for _, want := range []string{"fleet sync PAUSED", "hap config set database.sync_paused false"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("a paused fleet sync must say %q, got:\n%s", want, view)
 		}

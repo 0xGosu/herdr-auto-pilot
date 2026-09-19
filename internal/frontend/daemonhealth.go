@@ -86,8 +86,8 @@ type DaemonHealth struct {
 	// FleetSyncEngine names the shared engine ("turso" or "libsql"): the
 	// remedies differ (the keys to check), and so does what isolation means.
 	FleetSyncEngine string
-	// FleetSyncPaused: the operator turned database.turso_sync_paused on, so
-	// this node deliberately exchanges no rows with Turso Cloud. It is a
+	// FleetSyncPaused: the operator turned database.sync_paused on, so
+	// this node deliberately exchanges no rows with the shared server. It is a
 	// THIRD state, neither healthy nor failing, and it is reported rather than
 	// merely being silent: the consequence — the other nodes' escalations are
 	// not arriving and this one's are not leaving — is the same as isolation,

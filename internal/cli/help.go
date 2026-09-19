@@ -115,7 +115,7 @@ func buildCommands() {
 			Flags: []FlagDoc{
 				{Name: "--ensure", Desc: "start a daemon only if none is running; replace one left by an older binary or a binary at a different path (this is what herdr's event hook runs, and how you pick up a rebuild)"},
 				{Name: "--replace-only", Desc: "with --ensure: replace a running daemon, but never start one when none is running (used by the plugin install step, so installing hap does not bring a daemon up as a side effect)"},
-				{Name: "--restart", Desc: "stop the running daemon whatever binary it came from, and start a fresh one (starts one if none is running) — the only way to pick up a [database] or [logging] change, apart from database.turso_sync_paused, which applies on a reload. It waits for the new daemon to report healthy, and says so plainly when it does not"},
+				{Name: "--restart", Desc: "stop the running daemon whatever binary it came from, and start a fresh one (starts one if none is running) — the only way to pick up a [database] or [logging] change, apart from database.sync_paused, which applies on a reload. It waits for the new daemon to report healthy, and says so plainly when it does not"},
 				{Name: "--reload", Desc: "ask the running daemon to re-read config.toml, without restarting it; fails when no daemon is running"},
 			},
 			Details: "Without a flag the daemon runs in the foreground and holds the state-dir lock.\n" +
@@ -130,7 +130,7 @@ func buildCommands() {
 				"process opens its store, so switching engine, pointing at a different shared database,\n" +
 				"rotating its token, changing node_label or the log level takes effect only in a NEW\n" +
 				"process. Front ends read their store once too, so reopen `hap tui` after a restart.\n" +
-				"The ONE exception is database.turso_sync_paused, which applies on a --reload (every\n" +
+				"The ONE exception is database.sync_paused, which applies on a --reload (every\n" +
 				"`hap config set` sends one): the sync loop asks the live config before each pull and\n" +
 				"push, because taking a machine off the wire must not cost the herd the in-flight work\n" +
 				"a restart discards.\n\n" +
@@ -1292,7 +1292,11 @@ func buildCommands() {
 				"The libsql engine never imports the local database on its own (turso does, once).\n" +
 				"Both directions go through the libsql SERVER, not this node's local replica: every\n" +
 				"node's replica picks the rows up from the server's change log, and `--to sqlite`\n" +
-				"copies what the server has — let a node that was offline sync first.\n" +
+				"copies what the server has — let a node that was offline sync first.\n\n" +
+				"database.sync_paused is honoured for both engines. Under turso the pull before a\n" +
+				"copy out and the push after a copy in are skipped (the schema check still pulls\n" +
+				"once). Under libsql the copy itself runs on the server, so there is nothing\n" +
+				"optional to skip: the command REFUSES while paused, before contacting the server.\n\n" +
 				"Nothing switches engines: run `hap config set database.engine <engine>` and\n" +
 				"`hap daemon --ensure` when the copy reports what you expected.",
 			Examples: []string{"hap migrate --to sqlite", "hap config set database.engine sqlite", "hap daemon --ensure"},

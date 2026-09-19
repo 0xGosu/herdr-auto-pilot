@@ -176,7 +176,7 @@ type FleetSyncHealth struct {
 	// Bootstrapped is false while the first start is still waiting for the
 	// remote to hand over the initial database.
 	Bootstrapped bool `json:"bootstrapped"`
-	// Paused is the operator's own database.turso_sync_paused. It is the
+	// Paused is the operator's own database.sync_paused. It is the
 	// reason Degraded short-circuits to false: a sync nobody is attempting
 	// cannot be failing, and reporting a deliberate pause as DEGRADED or
 	// ISOLATED teaches an operator to ignore the banner that tells them about
@@ -296,7 +296,7 @@ func (f *FleetSyncHealth) Line(now time.Time) string {
 	// re-reported as a fault. The unpushed count is the number an operator
 	// deciding when to lift the pause actually wants.
 	if f.Paused {
-		return fmt.Sprintf("%s — PAUSED by database.turso_sync_paused (%d unpushed, last pull %s, last push %s)",
+		return fmt.Sprintf("%s — PAUSED by database.sync_paused (%d unpushed, last pull %s, last push %s)",
 			f.Engine, f.PendingOps, ago(f.LastPullAt), ago(f.LastPushAt))
 	}
 	if !f.Bootstrapped {

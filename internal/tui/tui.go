@@ -6940,7 +6940,7 @@ func configFieldChoices(key string) (choices []string, ok bool) {
 		return config.ValidTaskSourceProviders, true
 	case "database.engine":
 		return config.ValidDatabaseEngines, true
-	case "database.turso_sync_paused":
+	case "database.sync_paused":
 		// A picker rather than the free-text box every other bool key gets,
 		// for the reason taskSourceBoolPrompt gives: this one decides whether
 		// the herd is on the wire at all, so it is chosen from a list instead
@@ -7634,7 +7634,7 @@ func (m Model) View() string {
 	if m.data.daemonHealth.FleetSyncPaused {
 		fmt.Fprintf(&b, "%s\n", st.paused.Render(
 			"fleet sync PAUSED — other nodes' escalations and agents are not shown here, nor this node's there"+
-				" · resume: hap config set database.turso_sync_paused false"))
+				" · resume: hap config set database.sync_paused false"))
 	}
 	if m.data.daemonHealth.FleetSyncDegraded {
 		for _, line := range m.data.daemonHealth.FleetSyncDiagLines {

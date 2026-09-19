@@ -690,9 +690,14 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     (`refuseNodeBitsCollision`) — with its own remedy, since regenerating THIS machine's id strands the local
     file's rows under the old one and the copy then takes nothing. It backs the destination up **before either handle is opened** and takes
     the `-wal`/`-shm` sidecars with it (a copy from under an open handle loses whatever the WAL had not
-    folded in), and it honours `database.turso_sync_paused` by skipping the framing pull/push — ONLY those:
+    folded in), and under turso it honours `database.sync_paused` by skipping the framing pull/push — ONLY those:
     `PrepareSharedSchema` still pulls (and pushes when it leads a schema migration), deliberately, since that
     pull is what the collision check reads peers from. Never tell the operator nothing went over the wire.
+    **Under libsql the pause REFUSES** (`runMigrateLibSQL`), in both directions and before `libsql.Open`: that
+    copy runs on the server's direct handle, so there is no optional round trip to skip, and a check placed after
+    the schema lease or the collision check would already have reached the server. The key was
+    `turso_sync_paused` until it was made engine-neutral; the old spelling migrates at Load (presence-probed, so
+    an explicit canonical `false` beats a stale legacy `true`) and is NOT accepted by `hap config set`.
 - **The libsql engine's replica is turso's offline behaviour rebuilt over Hrana, by LOGICAL row replay**
   (`internal/store/libsqlreplica`). The local SQLite file is the authority, and the network is still
   reached only through `internal/store/libsql` (`Batch`/`Tx`, which pipeline many statements into
@@ -816,7 +821,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     cannot establish the lease fails closed rather than migrating blind.
   - `fleetRun` runs every sync op off the loop and waits for it OR shutdown; `turso.DB.Close` waits a
     bounded time and refuses to close underneath an in-flight op.
-  - **`database.turso_sync_paused` gates the CLOUD round trips only, and it is the one `[database]` key
+  - **`database.sync_paused` gates the SERVER round trips only (turso AND libsql), and it is the one `[database]` key
     read LIVE** (`daemon.fleetSyncPaused` off `d.snapshot()`, not captured at loop start like
     `FleetSyncInterval`) — a pause reachable only through `--restart` costs the herd the in-flight work it
     exists to protect, which is why `hap config set` suppresses the section's usual restart note for this

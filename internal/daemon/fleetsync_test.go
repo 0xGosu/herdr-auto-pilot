@@ -260,7 +260,7 @@ func TestFleetSyncShutdownIsNotHeldByAHungPull(t *testing.T) {
 
 // TestFleetSyncPauseStopsEveryCloudOpAndAppliesOnAReload is the feature's
 // central claim, and it asserts BOTH halves of it: while
-// database.turso_sync_paused is on nothing is pulled or pushed, and the toggle
+// database.sync_paused is on nothing is pulled or pushed, and the toggle
 // arrives through a RELOAD rather than a restart — which is the whole point of
 // the key, since a restart costs the herd its in-flight work.
 //
@@ -444,7 +444,7 @@ func TestFleetSyncPauseAppliesUnderEveryEngine(t *testing.T) {
 				o.FleetSyncInterval = 20 * time.Millisecond
 			})
 		if !h.daemon.fleetSyncPaused() {
-			t.Fatalf("engine %q: turso_sync_paused did not pause", engine)
+			t.Fatalf("engine %q: sync_paused did not pause", engine)
 		}
 		want := engine
 		if want == "" {
