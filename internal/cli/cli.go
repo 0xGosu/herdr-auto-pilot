@@ -1809,7 +1809,7 @@ func printDatabaseLine(out io.Writer, cfg config.Config) {
 	}
 	token, urlKey, interval := "none", "database.turso_database_url", "sync"
 	hasToken := d.AuthToken() != ""
-	if d.UsesLibSQLServer() {
+	if d.IsLibSQL() {
 		urlKey, interval, hasToken = "database.libsql_url", "poll", d.LibSQLToken() != ""
 	}
 	if hasToken {
@@ -1822,10 +1822,6 @@ func printDatabaseLine(out io.Writer, cfg config.Config) {
 	fmt.Fprintf(out, "database:   engine=%s url=%s token=%s %s=%s node_label=%s\n",
 		d.EngineOrDefault(), frontend.FieldValue(cfg, urlKey), token, interval,
 		d.SyncInterval(), label)
-	if d.IsLibSQL() && d.TursoSyncPaused {
-		fmt.Fprintln(out, "database:   database.turso_sync_paused is set but has NO effect under libsql "+
-			"(no local copy to fall back on)")
-	}
 	if err := config.ValidateDatabase(cfg); err != nil {
 		fmt.Fprintf(out, "database:   MISCONFIGURED — %v\n", err)
 	}

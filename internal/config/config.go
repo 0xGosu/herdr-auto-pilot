@@ -752,29 +752,22 @@ const (
 	// audit and learned rules.
 	EngineTurso = "turso"
 	// EngineLibSQL is the opt-in central database for ANY libsql server —
-	// Turso Cloud, Layerbase, a self-hosted sqld — reached over Hrana (the
-	// HTTP protocol every libsql server speaks). Unlike turso there is no
-	// local replica: the daemon holds one remote connection, every statement
-	// is a round trip, and every other hap process reaches it through the
-	// daemon. It is the engine to pick when the server does not speak Turso's
-	// sync protocol, and it wants a NEARBY server: the daemon's store calls
-	// sit on its event loop.
+	// Turso Cloud, Layerbase, a self-hosted sqld — synced over Hrana (the
+	// HTTP protocol every libsql server speaks). Like turso, the daemon keeps
+	// a LOCAL REPLICA (<state>/libsql/hap.db) that every other hap process
+	// reaches through it, and syncs it by logical row replay: a push after
+	// every local write, a pull every libsql_poll_interval_seconds. Reads
+	// never leave the machine and writes commit while the server is
+	// unreachable. It is the engine to pick when the server does not speak
+	// Turso's own sync protocol.
 	EngineLibSQL = "libsql"
-	// EngineLibSQLReplica is libsql with a LOCAL REPLICA: the daemon keeps the
-	// store in a local SQLite file and syncs it with the same libsql server
-	// (libsql_url, libsql_auth_token) by logical row replay — push on every
-	// local write, pull every libsql_poll_interval_seconds. Reads never leave
-	// the machine and writes commit while the server is unreachable, which is
-	// what turso's engine offers, over a protocol any libsql server speaks.
-	// Nodes on either libsql engine can share one database.
-	EngineLibSQLReplica = "libsql_replica"
 )
 
 // ValidDatabaseEngines are the values database.engine accepts. Mirrors
 // ValidTaskSourceProviders: `hap config set` and the TUI picker validate
 // against it, while a hand-edited config.toml still LOADS an unrecognized
 // value and fails at use time (ValidateDatabase).
-var ValidDatabaseEngines = []string{EngineSQLite, EngineTurso, EngineLibSQL, EngineLibSQLReplica}
+var ValidDatabaseEngines = []string{EngineSQLite, EngineTurso, EngineLibSQL}
 
 // DefaultTursoSyncIntervalSeconds is how often the daemon pulls from Turso
 // Cloud when the key is 0. Short enough that a remote confirm lands while the
@@ -794,14 +787,13 @@ const TursoAuthTokenEnv = "TURSO_AUTH_TOKEN"
 // is empty.
 const LibSQLAuthTokenEnv = "LIBSQL_AUTH_TOKEN"
 
-// DefaultLibSQLPollIntervalSeconds is how often the libsql engine asks the
-// server whether another node wrote anything (one small request) when the key
-// is 0. Nothing is transferred — every row already lives on the server — so
-// this only decides how soon the daemon notices ANOTHER node's rules and how
-// soon a front end refreshes.
+// DefaultLibSQLPollIntervalSeconds is how often the libsql engine pulls the
+// other nodes' changes from the server when the key is 0. This node's own
+// changes are pushed on write, so it only decides how soon the daemon sees
+// ANOTHER node's rows.
 const DefaultLibSQLPollIntervalSeconds = 15
 
-// MinLibSQLPollIntervalSeconds floors the change poll.
+// MinLibSQLPollIntervalSeconds floors the pull interval.
 const MinLibSQLPollIntervalSeconds = 5
 
 // Database selects where hap keeps its state. The default is the local SQLite
@@ -836,7 +828,7 @@ type Database struct {
 	// built-in default, floored at MinTursoSyncIntervalSeconds).
 	TursoSyncIntervalSeconds int `toml:"turso_sync_interval_seconds,omitempty"`
 	// TursoSyncPaused (named for the engine it came with; it applies to
-	// libsql_replica too) stops this node talking to Turso Cloud while leaving
+	// libsql too) stops this node talking to the server while leaving
 	// everything else exactly as it was: the engine stays turso, the local
 	// replica stays the store, every process still goes through the daemon.
 	// Only the pulls, the pushes and the shutdown push are skipped — local
@@ -863,8 +855,8 @@ type Database struct {
 	// operator surface. Empty falls back to the LIBSQL_AUTH_TOKEN environment
 	// variable; a server run without auth needs neither.
 	LibSQLAuthToken string `toml:"libsql_auth_token,omitempty"`
-	// LibSQLPollIntervalSeconds is how often the daemon checks the server for
-	// other nodes' writes (0 = the built-in default, floored at
+	// LibSQLPollIntervalSeconds is how often the daemon pulls other nodes'
+	// writes from the server (0 = the built-in default, floored at
 	// MinLibSQLPollIntervalSeconds).
 	LibSQLPollIntervalSeconds int `toml:"libsql_poll_interval_seconds,omitempty"`
 	// NodeLabel is how other machines see this one beside its agents
@@ -886,29 +878,16 @@ func (d Database) IsTurso() bool { return d.Engine == EngineTurso }
 // IsLibSQL reports whether the remote libsql engine is selected.
 func (d Database) IsLibSQL() bool { return d.Engine == EngineLibSQL }
 
-// IsLibSQLReplica reports whether the replicated libsql engine is selected.
-func (d Database) IsLibSQLReplica() bool { return d.Engine == EngineLibSQLReplica }
+// SyncPausedEffective reports whether the sync pause is in force: under
+// either shared engine, since both keep a local replica that serves while
+// the server round trips are skipped.
+func (d Database) SyncPausedEffective() bool { return d.TursoSyncPaused && d.IsShared() }
 
-// UsesLibSQLServer reports whether a libsql server is configured for — either
-// libsql engine, which share libsql_url, libsql_auth_token and
-// libsql_poll_interval_seconds.
-func (d Database) UsesLibSQLServer() bool { return d.IsLibSQL() || d.IsLibSQLReplica() }
-
-// SyncPausedEffective reports whether the sync pause is in force. Only an
-// engine with a local replica can pause — turso and libsql_replica — since the
-// replica serves while the server round trips are skipped. The libsql engine
-// keeps no local copy, so honouring the key would mean refusing every
-// statement — the herd stops dead — and it is IGNORED there instead (the
-// daemon says so once).
-func (d Database) SyncPausedEffective() bool {
-	return d.TursoSyncPaused && (d.IsTurso() || d.IsLibSQLReplica())
-}
-
-// IsShared reports whether a SHARED engine is selected — turso, libsql or
-// libsql_replica. All put the store behind the daemon (front ends reach it
-// over the store socket) and allocate node-scoped ids; what differs is only
-// how the daemon reaches the remote.
-func (d Database) IsShared() bool { return d.IsTurso() || d.UsesLibSQLServer() }
+// IsShared reports whether a SHARED engine is selected — turso or libsql.
+// Both put the store behind the daemon (front ends reach it over the store
+// socket), keep a local replica, and allocate node-scoped ids; what differs
+// is only the protocol that syncs the replica.
+func (d Database) IsShared() bool { return d.IsTurso() || d.IsLibSQL() }
 
 // LibSQLToken is the libsql token in force: the config value, else the
 // LIBSQL_AUTH_TOKEN environment variable. Empty is legal (an unauthenticated
@@ -933,7 +912,7 @@ func (d Database) AuthToken() string {
 // change-poll interval, which drives the same loop.
 func (d Database) SyncInterval() time.Duration {
 	s, def, floor := d.TursoSyncIntervalSeconds, DefaultTursoSyncIntervalSeconds, MinTursoSyncIntervalSeconds
-	if d.UsesLibSQLServer() {
+	if d.IsLibSQL() {
 		s, def, floor = d.LibSQLPollIntervalSeconds, DefaultLibSQLPollIntervalSeconds, MinLibSQLPollIntervalSeconds
 	}
 	if s <= 0 {
@@ -965,14 +944,11 @@ func ValidateDatabase(cfg Config) error {
 				"`hap config set database.turso_auth_token <token>` or export %s", EngineTurso, TursoAuthTokenEnv)
 		}
 		return nil
-	case EngineLibSQL, EngineLibSQLReplica:
+	case EngineLibSQL:
 		if strings.TrimSpace(d.LibSQLURL) == "" {
 			return fmt.Errorf("database.engine is %q but database.libsql_url is not set: "+
-				"`hap config set database.libsql_url <libsql://… or https://…>`", d.Engine)
+				"`hap config set database.libsql_url <libsql://… or https://…>`", EngineLibSQL)
 		}
-		// turso_sync_paused is deliberately NOT refused here: it has no effect
-		// under libsql (SyncPausedEffective), and refusing to start over it
-		// would leave the herd unmonitored for a key that changes nothing.
 		return nil
 	default:
 		return fmt.Errorf("database.engine %q is not one of %s", d.Engine, strings.Join(ValidDatabaseEngines, ", "))
@@ -1954,18 +1930,13 @@ func (p Paths) ControlSocketPath() string { return filepath.Join(p.StateDir, "co
 // remote on the next daemon start.
 func (p Paths) TursoDir() string { return filepath.Join(p.StateDir, "turso") }
 
-// LibSQLDir holds the libsql engine's only local state — the marker that the
-// local sqlite database was folded into the shared one. The engine keeps no
-// database file.
+// LibSQLDir is where the libsql engine keeps its local replica. Unlike
+// TursoDir it is NOT disposable while the daemon has unpushed changes: they
+// live in the replica's outbox until a push reaches the server.
 func (p Paths) LibSQLDir() string { return filepath.Join(p.StateDir, "libsql") }
 
-// LibSQLReplicaDir is where the libsql_replica engine keeps its local replica.
-// Unlike TursoDir it is NOT disposable while the daemon has unpushed changes:
-// they live in the replica's outbox until a push reaches the server.
-func (p Paths) LibSQLReplicaDir() string { return filepath.Join(p.StateDir, "libsql_replica") }
-
-// LibSQLReplicaDBPath is the libsql_replica engine's local database file.
-func (p Paths) LibSQLReplicaDBPath() string { return filepath.Join(p.LibSQLReplicaDir(), "hap.db") }
+// LibSQLDBPath is the libsql engine's local replica file.
+func (p Paths) LibSQLDBPath() string { return filepath.Join(p.LibSQLDir(), "hap.db") }
 
 // TursoDBPath is the turso engine's local database file.
 func (p Paths) TursoDBPath() string { return filepath.Join(p.TursoDir(), "hap.db") }

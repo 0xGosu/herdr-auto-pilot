@@ -1,25 +1,17 @@
-// Package libsql is hap's adapter for the libsql engine: the shared store kept
-// on ANY libsql server — Turso Cloud, Layerbase, a self-hosted sqld — and
-// reached over Hrana, the HTTP protocol every libsql server speaks.
+// Package libsql is hap's connection to a libsql server — Turso Cloud,
+// Layerbase, a self-hosted sqld — over Hrana, the HTTP protocol every libsql
+// server speaks. It is the libsql engine's ONLY route to the network.
 //
-// It is the provider-neutral sibling of internal/store/turso, and the two are
-// deliberately different engines rather than one engine with two transports.
-// turso keeps a LOCAL REPLICA synced over Turso's own protocol (/pull-updates,
-// /export), which only Turso Cloud and `tursodb --sync-server` serve — a plain
-// sqld answers 404 to all of it. This engine keeps no local copy at all:
+// The engine's store is a local replica (internal/store/libsqlreplica), which
+// reaches the server through this package: Batch and Tx pipeline its push and
+// pull, and DB() is a database/sql handle straight onto the server, used for
+// the server's schema (under the schema lease) and by `hap migrate`. On that
+// handle every statement is a round trip; Pull is a CHANGE CHECK (the
+// server's replication index) and Push a reachability check, which is what
+// the schema lease's Pull/Push need of it.
 //
-//   - every statement is a round trip to the server, so it wants a NEARBY
-//     server (the daemon's store calls sit on its event loop);
-//   - there is nothing to push or pull: Pull is a CHANGE CHECK (one small
-//     request comparing the server's replication index) so a front end
-//     refreshes and the daemon re-reads rules only when something moved, and
-//     Push is a reachability check so the fleet health reports the truth;
-//   - there is nothing to pause, and nothing to checkpoint.
-//
-// Everything above the connection is shared with turso: the daemon alone
-// holds the connection and serves it to the other processes over the store
-// socket (sqlbridge), ids are node-scoped (store.TimeOrderedIDs), and the
-// schema is identical — one remote database can be served by either engine.
+// Ids are node-scoped (store.TimeOrderedIDs) and the schema is identical to
+// turso's — one remote database can be served by either engine.
 package libsql
 
 import (

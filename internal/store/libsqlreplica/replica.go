@@ -1,15 +1,15 @@
-// Package libsqlreplica is hap's adapter for the libsql_replica engine: a LOCAL
-// SQLite replica of the shared store, synced with any libsql server (Turso
-// Cloud, a self-hosted sqld, any Hrana provider) by LOGICAL ROW REPLAY.
+// Package libsqlreplica is the libsql engine's store: a LOCAL SQLite replica
+// of the shared store, synced with any libsql server (Turso Cloud, a
+// self-hosted sqld, any Hrana provider) by LOGICAL ROW REPLAY.
 //
-// It exists because neither sibling gives a far or flaky libsql server a
-// usable store. The libsql engine keeps no local copy, so every statement is a
-// round trip on the daemon's event loop and an unreachable server is a dead
-// store. The turso engine keeps a replica, but its SDK pulls over Turso's own
-// protocol (/pull-updates, /export), which a plain sqld answers with 404 — so
-// its offline behaviour is rebuilt here over the one protocol every libsql
-// server speaks, /v2/pipeline (internal/store/libsql, which stays this
-// package's only route to the network).
+// It replaced the engine's first shape, which kept no local copy: every
+// statement was a round trip on the daemon's event loop (~20 s to start
+// against a far server, seconds per `hap` verb) and an unreachable server was
+// a dead store. The turso engine keeps a replica, but its SDK pulls over
+// Turso's own protocol (/pull-updates, /export), which a plain sqld answers
+// with 404 — so its offline behaviour is rebuilt here over the one protocol
+// every libsql server speaks, /v2/pipeline (internal/store/libsql, which stays
+// this package's only route to the network).
 //
 // The design, and the invariant each part carries:
 //
@@ -125,28 +125,28 @@ type DB struct {
 // migration runs next (store.OpenDB on DB()), and then Prepare.
 func Open(ctx context.Context, opts Options) (*DB, error) {
 	if opts.Path == "" || opts.DSN == "" || opts.NodeID == "" {
-		return nil, errors.New("libsql_replica: a replica path, its DSN and a node id are required")
+		return nil, errors.New("libsql: a replica path, its DSN and a node id are required")
 	}
 	if !libsql.ValidURL(opts.Remote.URL) && opts.Remote.Transport == nil {
-		return nil, fmt.Errorf("libsql_replica: %q is not a libsql URL (want libsql://, https:// or http://)", opts.Remote.URL)
+		return nil, fmt.Errorf("libsql: %q is not a libsql URL (want libsql://, https:// or http://)", opts.Remote.URL)
 	}
 	if err := os.MkdirAll(filepath.Dir(opts.Path), 0o700); err != nil {
-		return nil, fmt.Errorf("libsql_replica: %w", err)
+		return nil, fmt.Errorf("libsql: %w", err)
 	}
 	raw, err := sql.Open("sqlite", opts.DSN)
 	if err != nil {
-		return nil, fmt.Errorf("libsql_replica: open %s: %w", opts.Path, err)
+		return nil, fmt.Errorf("libsql: open %s: %w", opts.Path, err)
 	}
 	raw.SetMaxOpenConns(localConnections)
 	raw.SetMaxIdleConns(4)
 	if err := raw.PingContext(ctx); err != nil {
 		raw.Close()
-		return nil, fmt.Errorf("libsql_replica: open %s: %w", opts.Path, err)
+		return nil, fmt.Errorf("libsql: open %s: %w", opts.Path, err)
 	}
 	for _, ddl := range localDDL {
 		if _, err := raw.ExecContext(ctx, ddl); err != nil {
 			raw.Close()
-			return nil, fmt.Errorf("libsql_replica: local sync tables: %w", err)
+			return nil, fmt.Errorf("libsql: local sync tables: %w", err)
 		}
 	}
 	now := opts.Now
@@ -261,7 +261,7 @@ func (d *DB) remoteDB(ctx context.Context) (*libsql.DB, map[string]*table, error
 	r, tables := d.remote, d.tables
 	d.mu.Unlock()
 	if tables == nil {
-		return nil, nil, errors.New("libsql_replica: Prepare has not run")
+		return nil, nil, errors.New("libsql: Prepare has not run")
 	}
 	if r != nil {
 		return r, tables, nil

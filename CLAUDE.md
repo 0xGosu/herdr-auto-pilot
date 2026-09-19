@@ -619,7 +619,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   (`store.TimeOrderedIDs` via `s.nextID()` — NULL under sqlite so AUTOINCREMENT still assigns). Every
   OPERATIONAL statement filters `node_id = self`; FLEET reads span nodes and return `node_id`.
   `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by AST walk with an exemption map that must stay
-  live; the store suite runs FIVE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql|libsql_replica`; libsql runs on
+  live; the store suite runs FIVE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql|libsql_replica` — `libsql` is the direct server handle, `libsql_replica` the daemon's replica; both run on
   `hranafake`, an in-process Hrana server over SQLite). Two-node sync tests in
   `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` +
   `HAP_TURSO_TEST_TOKEN` point them at a REAL database instead — its hap tables must start empty, so run
@@ -632,22 +632,21 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   Cloud included — serves. Everything above the connection is shared (`store.Engine.Shared()`, the daemon
   owns the handle and serves `store.sock`, node-bit ids, identical schema, the lease in
   `turso.PrepareSharedSchema` over the `SchemaSyncer` interface). What differs, each load-bearing:
-  - **No local copy, so every statement is a round trip** on the daemon's event loop (~230 ms to a remote
-    provider: a ~20 s start, seconds per `hap` verb). `openLibSQL` warns past `libsqlSlowRTT`; the engine is
-    for NEARBY servers, and the per-request timeout (`libsql.DefaultTimeout`) is what bounds a hung server.
-  - **Pull is a change check, Push a reachability check** — never no-ops. Pull compares the server's
-    `replication_index` (own writes included: re-baselining on them could swallow a foreign write) and
-    answers "changed" when the server reports none, the direction a change token must fail in. Pull drives
-    the isolation clock; Push runs only on the push-now nudge (a front end queueing a remote-agent action,
-    `FleetWrites` is nil) and is skipped at shutdown, but a no-op there would still clear the isolation
-    banner while the server is down (`fleetPush` counts success as proof).
+  - **The daemon's store is a LOCAL REPLICA** (`internal/store/libsqlreplica`, below). It replaced an
+    engine with no local copy, where every statement was a round trip on the daemon's event loop (~230 ms
+    to a remote provider: a ~20 s start, seconds per `hap` verb) and an unreachable server was a dead store.
+    `internal/store/libsql` is now its transport (`Batch`/`Tx`), plus a `database/sql` handle straight onto
+    the server that the SERVER's schema lease (`PrepareServer`) and `hap migrate` use. The per-request
+    timeout (`libsql.DefaultTimeout`) is what bounds a hung server.
+  - **That direct handle's Pull is a change check and its Push a reachability check** — never no-ops, because
+    the schema lease reads them as proof. Pull compares the server's `replication_index` and answers
+    "changed" when the server reports none, the direction a change token must fail in.
   - **Every server error is prefixed `domain.LibSQLServerErrorPrefix`**, which `syncRemoteFaults` vetoes:
     sqld relays SQLite's own `database is locked`, a PROCESS-LOCAL shape, so without it a busy server
     restarts the daemon every cooldown.
-  - `turso_sync_paused` is IGNORED (`SyncPausedEffective`, `fleetSyncPaused`), never refused at start:
-    honouring it would stop the store, refusing would leave the herd unmonitored.
-  - **The legacy import never runs automatically** — it is ONE transaction paying a round trip per row
-    while the server holds its write lock; `hap migrate --to libsql` does it deliberately.
+  - **The legacy import never runs automatically** — an install upgraded from the old no-copy engine had
+    deliberately NOT folded its local file in, and doing it on upgrade would publish a history the operator
+    chose to keep; `hap migrate --to libsql` does it deliberately, straight into the server.
   - Hrana's execute takes ONE statement; the schema's batches are resent as a `sequence` on sqld's
     `SQL_MANY_STATEMENTS` (asking the server, never splitting SQL here). Integers travel as STRINGS and are
     parsed with `ParseInt` — node-bit ids live past 2^53. An idle stream expires in ~10 s (`STREAM_EXPIRED`),
@@ -694,7 +693,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     folded in), and it honours `database.turso_sync_paused` by skipping the framing pull/push — ONLY those:
     `PrepareSharedSchema` still pulls (and pushes when it leads a schema migration), deliberately, since that
     pull is what the collision check reads peers from. Never tell the operator nothing went over the wire.
-- **`libsql_replica` is turso's offline behaviour rebuilt over Hrana, by LOGICAL row replay**
+- **The libsql engine's replica is turso's offline behaviour rebuilt over Hrana, by LOGICAL row replay**
   (`internal/store/libsqlreplica`). The local SQLite file is the authority, and the network is still
   reached only through `internal/store/libsql` (`Batch`/`Tx`, which pipeline many statements into
   one or two round trips). Every rule below fails silently:
@@ -704,7 +703,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     caused with its node id (the marker row + `temp.hap_push_mark`), so the node does not pull its
     own writes back. Both halves are covered by `TestPulledRowsAreNotRePushed`.
   - **The server's change log is written by TRIGGERS, not by the push** (`hap_cl_*`). That is what
-    makes an online `libsql` node's or `hap migrate`'s direct writes visible to replicas. Both logs
+    makes `hap migrate`'s and an older hap's direct writes visible to replicas. Both logs
     carry KEYS only, and each side fetches the current row. That is why the log needs no BLOB
     encoding and why several changes to one row cost one fetch.
   - **A key with unpushed local changes is skipped by a pull** (the rebase), and Push and Pull hold
@@ -780,7 +779,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     means a real outage — but it is still SAID (`hap status`, `FleetSyncPaused`), because a herd off the wire
     looks exactly like a quiet one.
   - **A front end's full refresh fans its reads out, and only ONE tick poll is ever in flight.** Under a
-    shared engine every read is a round trip (under libsql, on to a remote server), so `GetStatus`, the
+    shared engine every read is a round trip over the daemon's socket, so `GetStatus`, the
     rule listing and the TUI's `refreshDataProgress` issue independent reads together
     (`frontend.Concurrently`; each writes only its own variables, assembled after the wait). A tick used to
     start a poll regardless, which over a far server queued ~6 full refreshes behind the proxy's 2-connection
@@ -788,7 +787,7 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     carries exactly the reads before the failing one in the old sequential order — the TUI replaces its data
     wholesale. Progress is PULLED (`loadTracker`, repainted by the 1s clock tick) so a refresh stays one
     command yielding one `refreshMsg`; until the first lands the body is the loading screen, never "no
-    agents detected". Under libsql the TUI's pool is `tuiLibSQLPool` and the socket serves `libsqlMaxClients`.
+    agents detected".
   - **A front end polls a change token, not the data** (`Store.Revision` → `ports.RevisionReporter`,
     `frontend.App.ChangeKey`, `tui.Model.poll`). Under turso it is the executor's counter
     (`sqlbridge.Executor.Revision`, a `rev` request over a POOLED connection), bumped AFTER every committed
@@ -1356,8 +1355,8 @@ where the behaviour could revert.
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |
 | `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
-| `internal/store/libsqlreplica` | the libsql_replica engine: local replica, capture triggers + outbox, change-log pull, re-seed, retention |
-| `internal/store/libsql` | the libsql engine: Hrana client (`hrana.go`, its only HTTP), `database/sql` streams over `sqlbridge.Backend`; `hranafake` is the in-process test server |
+| `internal/store/libsqlreplica` | the libsql engine's store: local replica, capture triggers + outbox, change-log pull, re-seed, retention |
+| `internal/store/libsql` | the libsql engine's transport: Hrana client (`hrana.go`, its only HTTP), `Batch`/`Tx` pipelines, a direct `database/sql` handle over `sqlbridge.Backend`; `hranafake` is the in-process test server |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
 | `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |
 | `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `sqlite` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |

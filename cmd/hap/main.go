@@ -256,7 +256,6 @@ func run(verb string, args []string) error {
 		}
 		defer closeStore()
 		defer drainSubmitRetries(app)
-		widenTUIPool(paths, app)
 		// The TUI logs into the same file as the daemon, so it honours the same
 		// configured level. It used to be pinned to Info regardless, which is
 		// what made its 2s-tick warnings impossible to turn down.
@@ -466,11 +465,8 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		if nodeID, err = store.LoadNodeID(paths.StateDir); err != nil {
 			return err
 		}
-		if bootCfg.Database.IsTurso() || bootCfg.Database.IsLibSQLReplica() {
-			// Only a replica has anything to push; a libsql write is already
-			// on the server when it commits.
-			fleetWrites = make(chan struct{}, 1)
-		}
+		// Both shared engines keep a local replica with changes to push.
+		fleetWrites = make(chan struct{}, 1)
 		tdb, engine, err := openShared(ctx, paths, bootCfg, nodeID, fleetWrites, time.Now())
 		if err != nil {
 			return fmt.Errorf("%s: %w", bootCfg.Database.Engine, err)
@@ -492,8 +488,8 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		if rdb, ok := tdb.(*libsqlreplica.DB); ok {
 			// The replica is a local file this daemon alone migrates; the
 			// SERVER's schema goes through the lease when the server is first
-			// reached (openLibSQLReplica's PrepareServer).
-			if err := prepareLibSQLReplica(ctx, paths, bootCfg, rdb, st, time.Now()); err != nil {
+			// reached (openLibSQL's PrepareServer).
+			if err := prepareLibSQL(ctx, paths, bootCfg, rdb, st, time.Now()); err != nil {
 				return fmt.Errorf("%s: prepare the local replica: %w", engine, err)
 			}
 		} else if err := turso.PrepareSharedSchema(ctx, tdb, st, time.Now); err != nil {
@@ -514,7 +510,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 				"never written to the shared store (its rows would otherwise stay filed under the old id)",
 				engine, label, other.ID, filepath.Join(paths.StateDir, store.NodeIDFile))
 		}
-		if engine == store.EngineLibSQL || engine == store.EngineLibSQLReplica {
+		if engine == store.EngineLibSQL {
 			// Never automatic under libsql: the copy is ONE transaction paying a
 			// server round trip per row, holding the server's write lock (every
 			// other node's writes wait) for as long as that takes. The operator
@@ -531,7 +527,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		// The front ends draw their ids from this allocator too, so every
 		// process on the node shares one sequence.
 		srv := sqlbridge.Serve(ln, tdb.Executor(), sqlbridge.ServerOptions{NextID: ids.MustNext,
-			MaxClients: storeMaxClients(engine)})
+			MaxClients: sqlbridge.DefaultMaxClients})
 		defer srv.Close()
 		fleet = tdb
 	} else {

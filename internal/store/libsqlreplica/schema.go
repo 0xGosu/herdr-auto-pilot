@@ -115,14 +115,14 @@ func localTables(ctx context.Context, db *sql.DB) (map[string]*table, error) {
 	names, err := queryStrings(ctx, db, `SELECT name FROM sqlite_master WHERE type = 'table'
 		AND name NOT LIKE 'sqlite\_%' ESCAPE '\' AND name NOT LIKE 'hap\_%' ESCAPE '\' ORDER BY name`)
 	if err != nil {
-		return nil, fmt.Errorf("libsql_replica: list tables: %w", err)
+		return nil, fmt.Errorf("libsql: list tables: %w", err)
 	}
 	out := make(map[string]*table, len(names))
 	for _, name := range names {
 		t := &table{name: name}
 		rows, err := db.QueryContext(ctx, `SELECT name, pk FROM pragma_table_info(?) ORDER BY cid`, name)
 		if err != nil {
-			return nil, fmt.Errorf("libsql_replica: columns of %s: %w", name, err)
+			return nil, fmt.Errorf("libsql: columns of %s: %w", name, err)
 		}
 		type pkCol struct {
 			name string
@@ -147,7 +147,7 @@ func localTables(ctx context.Context, db *sql.DB) (map[string]*table, error) {
 			return nil, err
 		}
 		if len(pks) == 0 {
-			return nil, fmt.Errorf("libsql_replica: table %s has no primary key, so its rows have no identity "+
+			return nil, fmt.Errorf("libsql: table %s has no primary key, so its rows have no identity "+
 				"on another node and cannot be replicated", name)
 		}
 		sort.Slice(pks, func(i, j int) bool { return pks[i].pos < pks[j].pos })
@@ -157,12 +157,12 @@ func localTables(ctx context.Context, db *sql.DB) (map[string]*table, error) {
 		idx, err := queryStrings(ctx, db, `SELECT name FROM pragma_index_list(?)
 			WHERE "unique" = 1 AND origin = 'u' ORDER BY name`, name)
 		if err != nil {
-			return nil, fmt.Errorf("libsql_replica: indexes of %s: %w", name, err)
+			return nil, fmt.Errorf("libsql: indexes of %s: %w", name, err)
 		}
 		for _, ix := range idx {
 			cols, err := queryStrings(ctx, db, `SELECT name FROM pragma_index_info(?) ORDER BY seqno`, ix)
 			if err != nil {
-				return nil, fmt.Errorf("libsql_replica: index %s: %w", ix, err)
+				return nil, fmt.Errorf("libsql: index %s: %w", ix, err)
 			}
 			if len(cols) > 0 {
 				t.uniques = append(t.uniques, cols)
@@ -253,7 +253,7 @@ func installCapture(ctx context.Context, db *sql.DB, tables map[string]*table) e
 	old, err := queryStrings(ctx, db, `SELECT name FROM sqlite_master WHERE type = 'trigger'
 		AND name LIKE 'hap\_ob\_%' ESCAPE '\'`)
 	if err != nil {
-		return fmt.Errorf("libsql_replica: list capture triggers: %w", err)
+		return fmt.Errorf("libsql: list capture triggers: %w", err)
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -262,14 +262,14 @@ func installCapture(ctx context.Context, db *sql.DB, tables map[string]*table) e
 	defer func() { _ = tx.Rollback() }()
 	for _, name := range old {
 		if _, err := tx.ExecContext(ctx, "DROP TRIGGER IF EXISTS "+ident(name)); err != nil {
-			return fmt.Errorf("libsql_replica: drop %s: %w", name, err)
+			return fmt.Errorf("libsql: drop %s: %w", name, err)
 		}
 	}
 	for _, t := range sortedTables(tables) {
 		insert := "INSERT INTO hap_outbox (tbl, pk) VALUES (" + lit(t.name) + ", %s)"
 		for _, ddl := range triggers(capturePrefix, t, insert, "NOT EXISTS (SELECT 1 FROM hap_sync_applying)") {
 			if _, err := tx.ExecContext(ctx, ddl); err != nil {
-				return fmt.Errorf("libsql_replica: capture trigger on %s: %w", t.name, err)
+				return fmt.Errorf("libsql: capture trigger on %s: %w", t.name, err)
 			}
 		}
 	}
@@ -287,7 +287,7 @@ func resolveRemoteColumns(ctx context.Context, r *libsql.DB, tables map[string]*
 	}
 	res, err := r.Batch(ctx, stmts)
 	if err != nil {
-		return fmt.Errorf("libsql_replica: read the server's columns: %w", err)
+		return fmt.Errorf("libsql: read the server's columns: %w", err)
 	}
 	for i, t := range sorted {
 		cols := map[string]bool{}
@@ -298,16 +298,16 @@ func resolveRemoteColumns(ctx context.Context, r *libsql.DB, tables map[string]*
 		}
 		for _, p := range t.pk {
 			if len(cols) > 0 && !cols[p] {
-				return fmt.Errorf("libsql_replica: table %s is keyed differently on the server (no column %s)", t.name, p)
+				return fmt.Errorf("libsql: table %s is keyed differently on the server (no column %s)", t.name, p)
 			}
 		}
 		// Said once per change, not on every re-read (refreshRemote).
 		if t.remote == nil || len(t.remote) != len(cols) {
 			if len(cols) == 0 {
-				slog.Warn("libsql_replica: the server has no table for this one; its changes wait in the outbox "+
+				slog.Warn("libsql: the server has no table for this one; its changes wait in the outbox "+
 					"until it does", "table", t.name)
 			} else if len(cols) != len(t.cols) || t.remote != nil {
-				slog.Info("libsql_replica: the server's columns for this table differ from this build's, or it just "+
+				slog.Info("libsql: the server's columns for this table differ from this build's, or it just "+
 					"appeared; replaying the columns both have", "table", t.name, "local", len(t.cols), "server", len(cols))
 			}
 		}
@@ -370,7 +370,7 @@ func ensureChangelog(ctx context.Context, r *libsql.DB, tables map[string]*table
 		{SQL: listTriggersSQL},
 	})
 	if err != nil {
-		return false, fmt.Errorf("libsql_replica: read the server's change log: %w", err)
+		return false, fmt.Errorf("libsql: read the server's change log: %w", err)
 	}
 	var present []string
 	for _, row := range res[1].Rows {
@@ -407,11 +407,11 @@ func ensureChangelog(ctx context.Context, r *libsql.DB, tables map[string]*table
 				ON CONFLICT (k) DO UPDATE SET v = MAX(v, excluded.v)`},
 			libsql.Statement{SQL: `DELETE FROM hap_changelog WHERE tbl = '' AND pk = 'gap'`},
 		)
-		slog.Warn("libsql_replica: the server's change log was missing triggers, so writes to these tables may "+
+		slog.Warn("libsql: the server's change log was missing triggers, so writes to these tables may "+
 			"have gone unlogged; reinstalling them and making every replica re-seed", "missing", missing)
 	}
 	if _, err := r.Tx(ctx, stmts); err != nil {
-		return false, fmt.Errorf("libsql_replica: install the server's change log: %w", err)
+		return false, fmt.Errorf("libsql: install the server's change log: %w", err)
 	}
 	return gap, nil
 }

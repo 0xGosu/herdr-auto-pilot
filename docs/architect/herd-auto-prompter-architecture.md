@@ -1017,7 +1017,7 @@ works again, its pane is recycled, or it leaves the listing.
   done inside the SDK. The fourth is the `libsql` store engine
   (`internal/store/libsql/hrana.go`), which keeps the same WHOLE store on any
   libsql server the operator names (Turso Cloud, a hosted provider, their own
-  sqld), speaking Hrana over HTTP with no local copy. The other two: the release check (`internal/updatecheck/fetch.go`), which asks GitHub
+  sqld), syncing a local replica with it by speaking Hrana over HTTP. The other two: the release check (`internal/updatecheck/fetch.go`), which asks GitHub
   for the newest published version, sends nothing about the operator or their
   panes, and is switched off by `[tui] disable_check_for_update`; and the
   `github_gist` task-list backend (`internal/taskstore/gist/gist.go`), which reads

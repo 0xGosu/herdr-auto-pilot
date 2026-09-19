@@ -20,7 +20,7 @@ type Rows struct {
 }
 
 // Batch runs statements in ONE round trip, outside a transaction, and returns
-// each one's decoded result. It is the libsql_replica engine's read path: a
+// each one's decoded result. It is the libsql replica's sync path: a
 // pull fetches many rows by key, and a round trip per key would cost the far
 // servers this engine exists for a second or more per sync.
 //

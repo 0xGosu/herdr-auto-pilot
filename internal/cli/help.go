@@ -1285,13 +1285,14 @@ func buildCommands() {
 				"destination that already holds history is refused unless you pass --force.\n" +
 				"With `--to turso` that backup is only this machine's local replica: the copy is\n" +
 				"pushed to Turso Cloud and pulled by every node, so a forced duplicate cannot be\n" +
-				"rolled back from it. With `--to libsql` there is no local copy at all — the rows go\n" +
+				"rolled back from it. With `--to libsql` the rows go\n" +
 				"straight to the server, which this command does not back up. The copy is ONE\n" +
 				"transaction paying a server round trip per row, and other nodes' writes wait on it\n" +
 				"until it commits: run it before the other machines join, or when the herd is quiet.\n" +
 				"The libsql engine never imports the local database on its own (turso does, once).\n" +
-				"Under `libsql_replica` the shared database IS the libsql server: `--to libsql` (and\n" +
-				"`--to sqlite`) go through it, and every replica picks the rows up from its change log.\n" +
+				"Both directions go through the libsql SERVER, not this node's local replica: every\n" +
+				"node's replica picks the rows up from the server's change log, and `--to sqlite`\n" +
+				"copies what the server has — let a node that was offline sync first.\n" +
 				"Nothing switches engines: run `hap config set database.engine <engine>` and\n" +
 				"`hap daemon --ensure` when the copy reports what you expected.",
 			Examples: []string{"hap migrate --to sqlite", "hap config set database.engine sqlite", "hap daemon --ensure"},

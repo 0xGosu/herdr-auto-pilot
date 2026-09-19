@@ -63,7 +63,7 @@ func openNode(t *testing.T, srv *hranafake.Server, id string) *node {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.OpenDB(r.DB(), store.Options{NodeID: id, Engine: store.EngineLibSQLReplica,
+	st, err := store.OpenDB(r.DB(), store.Options{NodeID: id, Engine: store.EngineLibSQL,
 		IDs: store.NewTimeOrderedIDs(store.NodeBits(id), nil), Migrate: true, AgentLockDir: dir})
 	if err != nil {
 		t.Fatal(err)
@@ -251,7 +251,7 @@ func TestBootstrappedReplicaOpensOffline(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		st, err := store.OpenDB(r.DB(), store.Options{NodeID: nodeA, Engine: store.EngineLibSQLReplica,
+		st, err := store.OpenDB(r.DB(), store.Options{NodeID: nodeA, Engine: store.EngineLibSQL,
 			IDs: store.NewTimeOrderedIDs(store.NodeBits(nodeA), nil), Migrate: true, AgentLockDir: dir})
 		if err != nil {
 			t.Fatal(err)
@@ -444,7 +444,7 @@ func TestChangesToATableTheServerLacksAreHeld(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.OpenDB(r.DB(), store.Options{NodeID: nodeB, Engine: store.EngineLibSQLReplica,
+	st, err := store.OpenDB(r.DB(), store.Options{NodeID: nodeB, Engine: store.EngineLibSQL,
 		IDs: store.NewTimeOrderedIDs(store.NodeBits(nodeB), nil), Migrate: true, AgentLockDir: dir})
 	if err != nil {
 		t.Fatal(err)

@@ -45,18 +45,18 @@ func TestMain(m *testing.M) {
 	if code := m.Run(); code != 0 {
 		os.Exit(code)
 	}
-	// Fourth pass: the libsql ENGINE — every statement a Hrana pipeline to a
-	// server (an in-process fake over SQLite), through the same gate and
-	// driver the daemon uses. This proves every statement survives the
+	// Fourth pass: a handle straight onto a libsql SERVER — every statement a
+	// Hrana pipeline to it (an in-process fake over SQLite), through the gate
+	// and driver `hap migrate` and the replica's schema preparation use. This proves every statement survives the
 	// protocol: one statement per execute, integers as strings, transactions
 	// on batons, and the schema's batches as sequences.
 	_ = os.Setenv(storeTestModeEnv, "libsql")
 	if code := m.Run(); code != 0 {
 		os.Exit(code)
 	}
-	// Fifth pass: the libsql_replica ENGINE — every statement on a local
-	// replica whose tables all carry the change-capture triggers, through the
-	// gate the daemon uses. This proves no store statement is broken by the
+	// Fifth pass: the libsql ENGINE as the daemon runs it — every statement on
+	// a local replica whose tables all carry the change-capture triggers,
+	// through the gate the daemon uses. This proves no store statement is broken by the
 	// capture (an UPSERT, a key-moving UPDATE, a REPLACE); the sync itself is
 	// proved in internal/store/libsqlreplica.
 	_ = os.Setenv(storeTestModeEnv, "libsql_replica")
@@ -129,7 +129,7 @@ func openLibSQLHandle(t *testing.T, path, nodeID string, migrate bool) *Store {
 	return s
 }
 
-// openReplicaHandle is one libsql_replica-engine handle on the local replica
+// openReplicaHandle is one libsql-engine (local replica) handle on the local replica
 // at path, as the given node — every handle on path shares the file (another
 // process, another node), with the fake server beside it.
 func openReplicaHandle(t *testing.T, path, nodeID string, migrate bool) *Store {
@@ -140,18 +140,18 @@ func openReplicaHandle(t *testing.T, path, nodeID string, migrate bool) *Store {
 		Remote: libsql.Options{URL: "https://fake.invalid", Transport: fakeServerFor(t, path+".server")},
 	})
 	if err != nil {
-		t.Fatalf("open libsql_replica engine: %v", err)
+		t.Fatalf("open libsql replica: %v", err)
 	}
 	s, err := OpenDB(db.DB(), Options{
 		NodeID:       nodeID,
-		Engine:       EngineLibSQLReplica,
+		Engine:       EngineLibSQL,
 		IDs:          NewTimeOrderedIDs(NodeBits(nodeID), nil),
 		Migrate:      migrate,
 		AgentLockDir: filepath.Join(filepath.Dir(path), "agent-automation-locks-"+nodeID),
 	})
 	if err != nil {
 		db.Close()
-		t.Fatalf("open store on libsql_replica: %v", err)
+		t.Fatalf("open store on libsql replica: %v", err)
 	}
 	if err := db.Prepare(ctx); err != nil {
 		s.Close()

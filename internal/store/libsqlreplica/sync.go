@@ -38,7 +38,7 @@ const (
 )
 
 // ErrNotBootstrapped is returned by Pull before the replica was seeded.
-var ErrNotBootstrapped = errors.New("libsql_replica: the replica has not been seeded from the server yet")
+var ErrNotBootstrapped = errors.New("libsql: the replica has not been seeded from the server yet")
 
 // Push sends every local change the outbox holds. With nothing to send it
 // still makes one round trip: the daemon counts a successful push as proof
@@ -132,7 +132,7 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			}
 			key, err := decodeKey(pk)
 			if err != nil || len(key) != len(t.pk) {
-				slog.Warn("libsql_replica: dropping a malformed outbox entry", "table", tbl, "key", pk, "error", err)
+				slog.Warn("libsql: dropping a malformed outbox entry", "table", tbl, "key", pk, "error", err)
 				continue
 			}
 			ck := canonKey(tbl, key)
@@ -165,7 +165,7 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		return nil
 	})
 	if err != nil {
-		return 0, fmt.Errorf("libsql_replica: read the outbox: %w", err)
+		return 0, fmt.Errorf("libsql: read the outbox: %w", err)
 	}
 	if n == 0 {
 		return 0, nil
@@ -179,7 +179,7 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		append([]any{maxSeq}, heldArgs...)...); err != nil {
 		// The server has the rows; the next push replays them again, which
 		// an upsert makes harmless.
-		return 0, fmt.Errorf("libsql_replica: clear the pushed outbox: %w", err)
+		return 0, fmt.Errorf("libsql: clear the pushed outbox: %w", err)
 	}
 	return n, nil
 }
@@ -233,7 +233,7 @@ func (d *DB) Pull() (changed bool, err error) {
 		// build did not have when the log carried its rows past this node's
 		// cursor, or one the server did not have yet. Its existing rows are
 		// in no entry this node will read again; only the tables can say.
-		slog.Info("libsql_replica: re-seeding for tables this replica was never seeded with", "tables", unseeded)
+		slog.Info("libsql: re-seeding for tables this replica was never seeded with", "tables", unseeded)
 		if err := d.reseed(ctx, r, tables); err != nil {
 			return false, err
 		}
@@ -294,7 +294,7 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		if pruned, ok := res[1].Rows[0][0].(int64); ok && pruned > cursor {
 			// Entries this node never read are gone: only the tables
 			// themselves can say what changed.
-			slog.Warn("libsql_replica: this node fell behind the server's change-log retention; re-seeding",
+			slog.Warn("libsql: this node fell behind the server's change-log retention; re-seeding",
 				"cursor", cursor, "pruned_through", pruned)
 			if err := d.reseed(ctx, r, tables); err != nil {
 				return false, false, err
@@ -375,7 +375,7 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		return setState(ctx, tx, stateCursor, maxSeq)
 	})
 	if err != nil {
-		return false, false, fmt.Errorf("libsql_replica: apply pulled rows: %w", err)
+		return false, false, fmt.Errorf("libsql: apply pulled rows: %w", err)
 	}
 	return n > 0, len(log) == pullBatch, nil
 }
@@ -401,7 +401,7 @@ func (d *DB) Bootstrap(ctx context.Context) error {
 // syncMu.
 func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table) error {
 	if _, err := d.pushAll(ctx, r, tables); err != nil {
-		slog.Warn("libsql_replica: pushing before the re-seed failed; the unpushed rows are kept", "error", err)
+		slog.Warn("libsql: pushing before the re-seed failed; the unpushed rows are kept", "error", err)
 	}
 	// The cursor is never set below pruned_through: retention can empty the
 	// log entirely (every live cursor had read it), and a head of 0 under a
@@ -431,7 +431,7 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 		for {
 			res, err := r.Batch(ctx, []libsql.Statement{{SQL: q, Args: []any{after, int64(seedPage)}}})
 			if err != nil {
-				return fmt.Errorf("libsql_replica: copy %s: %w", t.name, err)
+				return fmt.Errorf("libsql: copy %s: %w", t.name, err)
 			}
 			rows := res[0].Rows
 			for _, row := range rows {
@@ -506,7 +506,7 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 	// SEE, so a node that had not published one yet would have the entries it
 	// still needs pruned by the first other node to tidy up — and re-seed.
 	if err := d.publishCursor(ctx, r, d.now()); err != nil {
-		slog.Warn("libsql_replica: publishing this node's change-log cursor failed", "error", err)
+		slog.Warn("libsql: publishing this node's change-log cursor failed", "error", err)
 	}
 	return nil
 }
@@ -519,11 +519,11 @@ func (d *DB) refreshRemote(ctx context.Context, r *libsql.DB) {
 	tables := d.tables
 	d.mu.Unlock()
 	if err := resolveRemoteColumns(ctx, r, tables); err != nil {
-		slog.Warn("libsql_replica: re-reading the server's columns failed", "error", err)
+		slog.Warn("libsql: re-reading the server's columns failed", "error", err)
 		return
 	}
 	if _, err := ensureChangelog(ctx, r, tables); err != nil {
-		slog.Warn("libsql_replica: extending the server's change log failed", "error", err)
+		slog.Warn("libsql: extending the server's change log failed", "error", err)
 	}
 }
 
@@ -562,14 +562,14 @@ func (d *DB) housekeep(ctx context.Context, r *libsql.DB) {
 	// A prune always publishes first: it prunes below the cursors it can see,
 	// and this node's must be among them.
 	if err := d.publishCursor(ctx, r, now); err != nil {
-		slog.Warn("libsql_replica: publishing this node's change-log cursor failed", "error", err)
+		slog.Warn("libsql: publishing this node's change-log cursor failed", "error", err)
 		return
 	}
 	if !prune {
 		return
 	}
 	if err := PruneChangelog(ctx, r, now); err != nil {
-		slog.Warn("libsql_replica: change-log retention failed", "error", err)
+		slog.Warn("libsql: change-log retention failed", "error", err)
 		return
 	}
 	d.mu.Lock()
