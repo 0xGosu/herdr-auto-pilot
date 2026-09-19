@@ -723,10 +723,19 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   - **A cursor is published at seed time, not just on the throttle.** Retention prunes below the
     cursors it can SEE, so an unregistered node had its entries pruned by the first peer to tidy up,
     and re-seeded.
-  - Accepted limits: a table created on the server by an online node before any replica installed
-    its trigger misses those rows until a re-seed; and retention runs only on replica nodes, so a
-    fleet that later drops every replica keeps its triggers writing a log nothing prunes (drop `hap_cl_*`
-    and `hap_changelog` by hand).
+  - **A missing logging trigger is a LOGGING GAP, not just a missing trigger** (`ensureChangelog`, also
+    checked on every pull in the same round trip). A table REBUILT by a migration (create/copy/drop/
+    rename — the drop takes its triggers) or created by a node that does not install them has writes in
+    no log, and recreating the trigger cannot recover them. The repair raises `pruned_through` past
+    everything logged, so EVERY replica re-seeds, including those that never saw the gap.
+  - **A table the replica was never seeded with is seeded on the next pull** (`seeded:<table>` in
+    `hap_sync_state`): an older build skips log entries for a table it lacks, and its cursor moves past them.
+  - **A replay never uses INSERT OR REPLACE** (it resets every column the replaying side does not know). A
+    UNIQUE collision is handled by PARKING the batch's own rows (a suffix on their unique values), then a
+    key upsert, then a real DELETE of any conflicting row outside the batch. A pulled row blocked by an
+    unpushed local change is decided BEFORE any parking, or its park suffix is stranded in the replica.
+  - Accepted limit: retention runs only on replica nodes, so a fleet that later drops every replica keeps
+    its triggers writing a log nothing prunes (drop `hap_cl_*` and `hap_changelog` by hand).
   - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a
     `database/sql` driver over `<state>/store.sock` (`internal/store/sqlbridge`), lazily dialled so
     `hap config` works with no daemon.

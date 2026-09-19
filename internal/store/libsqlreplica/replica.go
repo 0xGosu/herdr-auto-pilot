@@ -188,6 +188,22 @@ func (d *DB) Prepare(ctx context.Context) error {
 	if err := installCapture(ctx, d.raw, tables); err != nil {
 		return err
 	}
+	d.syncMu.Lock()
+	defer d.syncMu.Unlock()
+	d.mu.Lock()
+	r := d.remote
+	d.mu.Unlock()
+	if r != nil {
+		// Already connected (a migration after the first sync): the new
+		// table set needs the server's columns, or every table would read as
+		// one the server lacks.
+		if err := resolveRemoteColumns(ctx, r, tables); err != nil {
+			return err
+		}
+		if _, err := ensureChangelog(ctx, r, tables); err != nil {
+			return err
+		}
+	}
 	d.mu.Lock()
 	d.tables = tables
 	d.mu.Unlock()
@@ -264,7 +280,7 @@ func (d *DB) remoteDB(ctx context.Context) (*libsql.DB, map[string]*table, error
 		_ = r.Close()
 		return nil, nil, err
 	}
-	if err := installChangelog(ctx, r, tables); err != nil {
+	if _, err := ensureChangelog(ctx, r, tables); err != nil {
 		_ = r.Close()
 		return nil, nil, err
 	}

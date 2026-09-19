@@ -68,10 +68,12 @@ type table struct {
 	// pk are the primary-key columns in key order: a row's identity on every
 	// node. (A rowid is not one — it differs per file for a non-INTEGER key.)
 	pk []string
-	// uniqueOther: a UNIQUE constraint beyond the key. A replayed upsert on
-	// such a table can collide with a row the same batch is about to move
-	// (agent_names swapping names), so it replays as INSERT OR REPLACE.
-	uniqueOther bool
+	// uniques are the column sets of every UNIQUE constraint beyond the key.
+	// A replayed row can collide on one with a row that has since moved
+	// (agent_names swapping names); the replay clears that row by an explicit
+	// DELETE first (clearConflicts), never by INSERT OR REPLACE, which would
+	// reset every column the replaying side does not know to its default.
+	uniques [][]string
 	// remote is the server's column set; nil until the server answered.
 	remote map[string]bool
 }
@@ -152,12 +154,20 @@ func localTables(ctx context.Context, db *sql.DB) (map[string]*table, error) {
 		for _, p := range pks {
 			t.pk = append(t.pk, p.name)
 		}
-		var uniques int
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_index_list(?)
-			WHERE "unique" = 1 AND origin = 'u'`, name).Scan(&uniques); err != nil {
+		idx, err := queryStrings(ctx, db, `SELECT name FROM pragma_index_list(?)
+			WHERE "unique" = 1 AND origin = 'u' ORDER BY name`, name)
+		if err != nil {
 			return nil, fmt.Errorf("libsql_replica: indexes of %s: %w", name, err)
 		}
-		t.uniqueOther = uniques > 0
+		for _, ix := range idx {
+			cols, err := queryStrings(ctx, db, `SELECT name FROM pragma_index_info(?) ORDER BY seqno`, ix)
+			if err != nil {
+				return nil, fmt.Errorf("libsql_replica: index %s: %w", ix, err)
+			}
+			if len(cols) > 0 {
+				t.uniques = append(t.uniques, cols)
+			}
+		}
 		out[name] = t
 	}
 	return out, nil
@@ -306,12 +316,74 @@ func resolveRemoteColumns(ctx context.Context, r *libsql.DB, tables map[string]*
 	return nil
 }
 
-// installChangelog creates the server's change log and a logging trigger on
-// every replicated table it has. Idempotent (IF NOT EXISTS throughout), so
-// every node runs it on connect: whichever node first knows a new table is
-// the one that starts logging it.
-func installChangelog(ctx context.Context, r *libsql.DB, tables map[string]*table) error {
-	stmts := make([]libsql.Statement, 0, len(serverDDL)+4*len(tables))
+// changelogTriggers are the logging trigger names every table the server has
+// must carry.
+func changelogTriggers(tables map[string]*table) map[string]bool {
+	out := map[string]bool{}
+	for _, t := range tables {
+		if len(t.remote) == 0 {
+			continue
+		}
+		for _, op := range []string{"i", "u", "k", "d"} {
+			out[changelogPrefix+t.name+"_"+op] = true
+		}
+	}
+	return out
+}
+
+// missingTriggers lists the expected logging triggers absent from present.
+func missingTriggers(tables map[string]*table, present []string) []string {
+	have := map[string]bool{}
+	for _, p := range present {
+		have[p] = true
+	}
+	var out []string
+	for name := range changelogTriggers(tables) {
+		if !have[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// listTriggersSQL lists the server's logging triggers.
+const listTriggersSQL = `SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'hap\_cl\_%' ESCAPE '\'`
+
+// ensureChangelog makes sure the server's change log exists and every
+// replicated table it has carries its logging triggers, and says whether a
+// LOGGING GAP was repaired.
+//
+// A trigger can go missing on a log that already exists: a table created by a
+// node that does not install them (an online libsql node, an older build), or
+// a table REBUILT by a migration (create, copy, drop, rename — the drop takes
+// its triggers with it). Every write to that table since is in no log, and
+// recreating the trigger cannot recover it. So the repair also raises the
+// retention floor (pruned_through) past everything logged so far, in the same
+// transaction: EVERY replica whose cursor is below it — which is all of them —
+// then re-seeds from the tables on its next pull, exactly as one that fell
+// behind retention does. A brand-new log (no table yet) is not a gap: nobody
+// has a cursor into it.
+func ensureChangelog(ctx context.Context, r *libsql.DB, tables map[string]*table) (gap bool, err error) {
+	res, err := r.Batch(ctx, []libsql.Statement{
+		{SQL: `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'hap_changelog'`},
+		{SQL: listTriggersSQL},
+	})
+	if err != nil {
+		return false, fmt.Errorf("libsql_replica: read the server's change log: %w", err)
+	}
+	var present []string
+	for _, row := range res[1].Rows {
+		if s, ok := row[0].(string); ok {
+			present = append(present, s)
+		}
+	}
+	missing := missingTriggers(tables, present)
+	exists := len(res[0].Rows) == 1 && res[0].Rows[0][0] == int64(1)
+	if exists && len(missing) == 0 {
+		return false, nil
+	}
+	stmts := make([]libsql.Statement, 0, len(serverDDL)+4*len(tables)+3)
 	for _, ddl := range serverDDL {
 		stmts = append(stmts, libsql.Statement{SQL: ddl})
 	}
@@ -325,10 +397,23 @@ func installChangelog(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			stmts = append(stmts, libsql.Statement{SQL: ddl})
 		}
 	}
-	if _, err := r.Batch(ctx, stmts); err != nil {
-		return fmt.Errorf("libsql_replica: install the server's change log: %w", err)
+	gap = exists
+	if gap {
+		// The floor is a seq the log itself hands out, so the re-seeded
+		// cursors land on it and the next real entry is above it.
+		stmts = append(stmts,
+			libsql.Statement{SQL: `INSERT INTO hap_changelog (tbl, pk, origin, at) VALUES ('', 'gap', NULL, 0)`},
+			libsql.Statement{SQL: `INSERT INTO hap_sync_meta (k, v) VALUES ('pruned_through', last_insert_rowid())
+				ON CONFLICT (k) DO UPDATE SET v = MAX(v, excluded.v)`},
+			libsql.Statement{SQL: `DELETE FROM hap_changelog WHERE tbl = '' AND pk = 'gap'`},
+		)
+		slog.Warn("libsql_replica: the server's change log was missing triggers, so writes to these tables may "+
+			"have gone unlogged; reinstalling them and making every replica re-seed", "missing", missing)
 	}
-	return nil
+	if _, err := r.Tx(ctx, stmts); err != nil {
+		return false, fmt.Errorf("libsql_replica: install the server's change log: %w", err)
+	}
+	return gap, nil
 }
 
 func sortedTables(tables map[string]*table) []*table {

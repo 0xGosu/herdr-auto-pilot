@@ -146,6 +146,7 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			return err
 		}
 		rows.Close()
+		var parks []libsql.Statement
 		for _, e := range entries {
 			row, err := readRow(ctx, tx, e.t, e.key)
 			if err != nil {
@@ -153,10 +154,14 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 			}
 			if row == nil {
 				stmts = append(stmts, deleteStmt(e.t, e.key))
-			} else {
-				stmts = append(stmts, upsertStmt(e.t, row))
+				continue
 			}
+			if p, ok := parkStmt(e.t, e.t.shared(), e.key); ok {
+				parks = append(parks, libsql.Statement{SQL: p.sql, Args: p.args})
+			}
+			stmts = append(stmts, upsertStmts(e.t, row)...)
 		}
+		stmts = append(parks, stmts...)
 		return nil
 	})
 	if err != nil {
@@ -221,6 +226,19 @@ func (d *DB) Pull() (changed bool, err error) {
 	} else if !ok {
 		return false, ErrNotBootstrapped
 	}
+	if unseeded, err := d.unseededTables(ctx, tables); err != nil {
+		return false, err
+	} else if len(unseeded) > 0 {
+		// A table this replica holds that it was never seeded with — one its
+		// build did not have when the log carried its rows past this node's
+		// cursor, or one the server did not have yet. Its existing rows are
+		// in no entry this node will read again; only the tables can say.
+		slog.Info("libsql_replica: re-seeding for tables this replica was never seeded with", "tables", unseeded)
+		if err := d.reseed(ctx, r, tables); err != nil {
+			return false, err
+		}
+		changed = true
+	}
 	for round := 0; round < maxPullRounds; round++ {
 		applied, more, err := d.pullOnce(ctx, r, tables)
 		if err != nil {
@@ -251,9 +269,26 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		{SQL: `SELECT seq, tbl, pk, origin FROM hap_changelog WHERE seq > ? ORDER BY seq LIMIT ?`,
 			Args: []any{cursor, int64(pullBatch)}},
 		{SQL: `SELECT v FROM hap_sync_meta WHERE k = 'pruned_through'`},
+		{SQL: listTriggersSQL},
 	})
 	if err != nil {
 		return false, false, err
+	}
+	// A logging trigger gone (a table rebuilt by a migration, or created by a
+	// node that does not install them) means writes went unlogged. The repair
+	// raises the retention floor, so the next round re-seeds — here and on
+	// every other replica.
+	var present []string
+	for _, row := range res[2].Rows {
+		if s, ok := row[0].(string); ok {
+			present = append(present, s)
+		}
+	}
+	if len(missingTriggers(tables, present)) > 0 {
+		if _, err := ensureChangelog(ctx, r, tables); err != nil {
+			return false, false, err
+		}
+		return false, true, nil
 	}
 	if len(res[1].Rows) == 1 {
 		if pruned, ok := res[1].Rows[0][0].(int64); ok && pruned > cursor {
@@ -312,6 +347,7 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	}
 	n := 0
 	err = d.applyTx(ctx, func(tx *sql.Tx, pending map[string]bool) error {
+		var upserts []pulledRow
 		for i, k := range keys {
 			if pending[canonKey(k.t.name, k.key)] {
 				// An unpushed local change: it is pushed next and wins.
@@ -321,7 +357,17 @@ func (d *DB) pullOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 				if _, err := tx.ExecContext(ctx, deleteSQL(k.t), k.key...); err != nil {
 					return fmt.Errorf("apply delete on %s: %w", k.t.name, err)
 				}
-			} else if err := replaceRow(ctx, tx, k.t, fetched[i].Cols, fetched[i].Rows[0]); err != nil {
+				n++
+				continue
+			}
+			upserts = append(upserts, pulledRow{k.t, fetched[i].Cols, fetched[i].Rows[0], k.key})
+		}
+		ready, err := preparePulled(ctx, tx, upserts, pending)
+		if err != nil {
+			return err
+		}
+		for _, r := range ready {
+			if _, err := applyRow(ctx, tx, r.t, r.cols, r.row, pending); err != nil {
 				return err
 			}
 			n++
@@ -404,33 +450,48 @@ func (d *DB) reseed(ctx context.Context, r *libsql.DB, tables map[string]*table)
 		}
 	}
 	// Only now, with every row in hand, is the local file touched — in one
-	// transaction, so a failed copy leaves the replica as it was.
+	// transaction, so a failed copy leaves the replica as it was. Rows are
+	// UPSERTED by key and only the rows the server no longer has are deleted:
+	// a delete-and-reinsert would reset every column this build has and the
+	// server does not yet (an additive migration mid-rollout) to its default.
 	err = d.applyTx(ctx, func(tx *sql.Tx, pending map[string]bool) error {
+		onServer := map[string]bool{}
+		var rows []pulledRow
+		for _, p := range pages {
+			for _, row := range p.rows {
+				key := keyOf(p.t, p.cols, row)
+				onServer[canonKey(p.t.name, key)] = true
+				rows = append(rows, pulledRow{p.t, p.cols, row, key})
+			}
+		}
+		ready, err := preparePulled(ctx, tx, rows, pending)
+		if err != nil {
+			return err
+		}
+		for _, r := range ready {
+			if _, err := applyRow(ctx, tx, r.t, r.cols, r.row, pending); err != nil {
+				return err
+			}
+		}
 		for _, t := range sortedTables(tables) {
 			if len(t.remote) == 0 {
 				continue
 			}
-			if _, err := tx.ExecContext(ctx, `DELETE FROM `+ident(t.name)+` WHERE `+keyArray(t, ident(t.name))+
-				` NOT IN (SELECT pk FROM hap_outbox WHERE tbl = ?)`, t.name); err != nil {
-				return fmt.Errorf("clear %s: %w", t.name, err)
+			local, err := localKeys(ctx, tx, t)
+			if err != nil {
+				return err
 			}
-		}
-		for _, p := range pages {
-			for _, row := range p.rows {
-				key := make([]any, len(p.t.pk))
-				for i, pk := range p.t.pk {
-					for j, c := range p.cols {
-						if c == pk {
-							key[i] = row[j]
-						}
-					}
-				}
-				if pending[canonKey(p.t.name, key)] {
+			for _, key := range local {
+				ck := canonKey(t.name, key)
+				if onServer[ck] || pending[ck] {
 					continue
 				}
-				if err := replaceRow(ctx, tx, p.t, p.cols, row); err != nil {
-					return err
+				if _, err := tx.ExecContext(ctx, deleteSQL(t), key...); err != nil {
+					return fmt.Errorf("clear %s: %w", t.name, err)
 				}
+			}
+			if err := setState(ctx, tx, seededKey(t.name), 1); err != nil {
+				return err
 			}
 		}
 		if err := setState(ctx, tx, stateCursor, cursor); err != nil {
@@ -461,7 +522,7 @@ func (d *DB) refreshRemote(ctx context.Context, r *libsql.DB) {
 		slog.Warn("libsql_replica: re-reading the server's columns failed", "error", err)
 		return
 	}
-	if err := installChangelog(ctx, r, tables); err != nil {
+	if _, err := ensureChangelog(ctx, r, tables); err != nil {
 		slog.Warn("libsql_replica: extending the server's change log failed", "error", err)
 	}
 }
@@ -664,13 +725,22 @@ func readRow(ctx context.Context, tx *sql.Tx, t *table, key []any) ([]any, error
 	return vals, nil
 }
 
-// upsertStmt replays a row onto the server. An upsert rather than a replace
-// wherever it can be: a replace resets every column this build does not know
-// (a newer node's) to its default. A table with a UNIQUE constraint beyond
-// its key replays as a replace, which resolves a collision with a row the
-// same push is about to move.
-func upsertStmt(t *table, row []any) libsql.Statement {
+// upsertStmts replays a row onto the server: first clearConflicts, then an
+// upsert by key that sets only the columns both sides have — never INSERT OR
+// REPLACE, which would reset every column this build does not know (a newer
+// node's, mid-rollout) to its default.
+func upsertStmts(t *table, row []any) []libsql.Statement {
 	cols := t.shared()
+	var out []libsql.Statement
+	for _, c := range conflictDeletes(t, cols, row) {
+		out = append(out, libsql.Statement{SQL: c.sql, Args: c.args})
+	}
+	return append(out, libsql.Statement{SQL: upsertSQL(t, cols), Args: row})
+}
+
+// upsertSQL inserts a row by key, or updates only cols of the row already
+// there.
+func upsertSQL(t *table, cols []string) string {
 	var set []string
 	for _, c := range cols {
 		if !t.isPK(c) {
@@ -678,32 +748,250 @@ func upsertStmt(t *table, row []any) libsql.Statement {
 		}
 	}
 	insert := ` INTO ` + ident(t.name) + ` (` + identList(cols) + `) VALUES (` + placeholders(len(cols)) + `)`
-	var q string
-	switch {
-	case t.uniqueOther:
-		q = `INSERT OR REPLACE` + insert
-	case len(set) == 0:
-		q = `INSERT OR IGNORE` + insert
-	default:
-		pk := make([]string, len(t.pk))
-		for i, p := range t.pk {
-			pk[i] = ident(p)
-		}
-		q = `INSERT` + insert + ` ON CONFLICT (` + strings.Join(pk, ", ") + `) DO UPDATE SET ` + strings.Join(set, ", ")
+	if len(set) == 0 {
+		return `INSERT OR IGNORE` + insert
 	}
-	return libsql.Statement{SQL: q, Args: row}
+	pk := make([]string, len(t.pk))
+	for i, p := range t.pk {
+		pk[i] = ident(p)
+	}
+	return `INSERT` + insert + ` ON CONFLICT (` + strings.Join(pk, ", ") + `) DO UPDATE SET ` + strings.Join(set, ", ")
 }
 
-// replaceRow writes a server row locally. A replace, so a UNIQUE value the
-// row now holds evicts the stale local row that held it (the server cannot
-// hold both, so that local row is already gone or moved there).
-func replaceRow(ctx context.Context, tx *sql.Tx, t *table, cols []string, row []any) error {
-	_, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO `+ident(t.name)+` (`+identList(cols)+`) VALUES (`+
-		placeholders(len(cols))+`)`, row...)
-	if err != nil {
+type conflict struct {
+	sql  string
+	args []any
+}
+
+// parkStmt moves a row that is about to be replayed OUT of the way of its own
+// UNIQUE values: each non-key column of each constraint gets a suffix no real
+// value carries. A batch that swaps two rows' values (agent_names trading
+// names) then applies in any order, and neither row is deleted — a delete and
+// re-insert would reset every column the replaying side does not know. The
+// replay that follows writes each row's real values back. false when the table
+// has no such constraint (or it is all key columns, which cannot collide
+// differently).
+func parkStmt(t *table, cols []string, key []any) (conflict, bool) {
+	have := map[string]bool{}
+	for _, c := range cols {
+		have[c] = true
+	}
+	var set []string
+	var args []any
+	seen := map[string]bool{}
+	suffix := "\x00hap-park:" + canonKey(t.name, key)
+	for _, u := range t.uniques {
+		for _, c := range u {
+			if t.isPK(c) || !have[c] || seen[c] {
+				continue
+			}
+			seen[c] = true
+			set = append(set, ident(c)+" = CAST("+ident(c)+" AS TEXT) || ?")
+			args = append(args, suffix)
+		}
+	}
+	if len(set) == 0 {
+		return conflict{}, false
+	}
+	return conflict{
+		sql:  `UPDATE ` + ident(t.name) + ` SET ` + strings.Join(set, ", ") + ` WHERE ` + whereKey(t),
+		args: append(args, key...),
+	}, true
+}
+
+// park runs parkStmt locally.
+func park(ctx context.Context, tx *sql.Tx, t *table, cols []string, key []any) error {
+	p, ok := parkStmt(t, cols, key)
+	if !ok {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, p.sql, p.args...); err != nil {
 		return fmt.Errorf("apply %s: %w", t.name, err)
 	}
 	return nil
+}
+
+// conflictDeletes are the statements removing every OTHER row that holds one
+// of this row's UNIQUE values once the batch's own rows are parked. The side
+// replaying the row cannot hold both, so such a row is stale: it moved or went
+// on the other side, and is not in this batch. A
+// real DELETE, unlike a REPLACE's implicit one, fires the change-log trigger,
+// so every replica learns of it. A NULL never conflicts, and a constraint on
+// a column the other side does not have is skipped.
+func conflictDeletes(t *table, cols []string, row []any) []conflict {
+	val := map[string]any{}
+	for i, c := range cols {
+		val[c] = row[i]
+	}
+	var out []conflict
+	for _, u := range t.uniques {
+		var where []string
+		var args []any
+		ok := true
+		for _, c := range u {
+			v, has := val[c]
+			if !has || v == nil {
+				ok = false
+				break
+			}
+			where = append(where, ident(c)+" = ?")
+			args = append(args, v)
+		}
+		if !ok {
+			continue
+		}
+		var notKey []string
+		for _, p := range t.pk {
+			notKey = append(notKey, ident(p)+" IS ?")
+			args = append(args, val[p])
+		}
+		out = append(out, conflict{
+			sql: `DELETE FROM ` + ident(t.name) + ` WHERE ` + strings.Join(where, " AND ") +
+				` AND NOT (` + strings.Join(notKey, " AND ") + `)`,
+			args: args,
+		})
+	}
+	return out
+}
+
+// applyRow writes a server row locally the same way a push writes one
+// remotely (conflict deletes, then an upsert of the shared columns), so the
+// columns only this build has keep their values. It declines (false) when a
+// conflicting local row has an unpushed change: that change is pushed next
+// and the server settles the conflict.
+func applyRow(ctx context.Context, tx *sql.Tx, t *table, cols []string, row []any, pending map[string]bool) (bool, error) {
+	if blocked, err := blockedByPending(ctx, tx, t, cols, row, pending); err != nil || blocked {
+		return false, err
+	}
+	for _, c := range conflictDeletes(t, cols, row) {
+		if _, err := tx.ExecContext(ctx, c.sql, c.args...); err != nil {
+			return false, fmt.Errorf("apply %s: %w", t.name, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, upsertSQL(t, cols), row...); err != nil {
+		return false, fmt.Errorf("apply %s: %w", t.name, err)
+	}
+	return true, nil
+}
+
+// blockedByPending reports whether a local row with an UNPUSHED change holds
+// one of row's UNIQUE values. Such a row is never parked or deleted by an
+// apply, so the answer is the same before and after any parking — which is
+// what lets preparePulled decide it before parking anything.
+func blockedByPending(ctx context.Context, tx *sql.Tx, t *table, cols []string, row []any, pending map[string]bool) (bool, error) {
+	for _, c := range conflictDeletes(t, cols, row) {
+		sel := strings.Replace(c.sql, `DELETE FROM`, `SELECT `+identList(t.pk)+` FROM`, 1)
+		keys, err := queryKeys(ctx, tx, sel, c.args...)
+		if err != nil {
+			return false, fmt.Errorf("apply %s: %w", t.name, err)
+		}
+		for _, k := range keys {
+			if pending[canonKey(t.name, k)] {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// pulledRow is one server row an apply is about to write.
+type pulledRow struct {
+	t    *table
+	cols []string
+	row  []any
+	key  []any
+}
+
+// preparePulled parks every row that will really be applied and returns
+// them; a row whose key or UNIQUE value is held by an unpushed local change
+// is left out untouched (parking it and then declining would strand the park
+// suffix in the replica).
+func preparePulled(ctx context.Context, tx *sql.Tx, rows []pulledRow, pending map[string]bool) ([]pulledRow, error) {
+	var out []pulledRow
+	for _, r := range rows {
+		if pending[canonKey(r.t.name, r.key)] {
+			continue
+		}
+		blocked, err := blockedByPending(ctx, tx, r.t, r.cols, r.row, pending)
+		if err != nil {
+			return nil, err
+		}
+		if blocked {
+			continue
+		}
+		out = append(out, r)
+	}
+	for _, r := range out {
+		if err := park(ctx, tx, r.t, r.cols, r.key); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// keyOf picks a row's key out of its cols.
+func keyOf(t *table, cols []string, row []any) []any {
+	key := make([]any, len(t.pk))
+	for i, pk := range t.pk {
+		for j, c := range cols {
+			if c == pk {
+				key[i] = row[j]
+			}
+		}
+	}
+	return key
+}
+
+// localKeys lists every local row's key.
+func localKeys(ctx context.Context, tx *sql.Tx, t *table) ([][]any, error) {
+	return queryKeys(ctx, tx, `SELECT `+identList(t.pk)+` FROM `+ident(t.name))
+}
+
+func queryKeys(ctx context.Context, tx *sql.Tx, q string, args ...any) ([][]any, error) {
+	rows, err := tx.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out [][]any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		out = append(out, vals)
+	}
+	return out, rows.Err()
+}
+
+// seededKey is the hap_sync_state key recording that a table was seeded.
+func seededKey(table string) string { return "seeded:" + table }
+
+// unseededTables lists the replicated tables the server has that this replica
+// was never seeded with.
+func (d *DB) unseededTables(ctx context.Context, tables map[string]*table) ([]string, error) {
+	var out []string
+	for _, t := range sortedTables(tables) {
+		if len(t.remote) == 0 {
+			continue
+		}
+		_, ok, err := d.state(ctx, d.raw, seededKey(t.name))
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			out = append(out, t.name)
+		}
+	}
+	return out, nil
 }
 
 // heldTables are the replicated tables the server does not have yet.

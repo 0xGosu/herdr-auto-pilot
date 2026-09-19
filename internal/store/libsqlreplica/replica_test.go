@@ -479,3 +479,198 @@ func TestChangesToATableTheServerLacksAreHeld(t *testing.T) {
 		t.Fatalf("a sees %q, want the held change", got)
 	}
 }
+
+func onlineHandle(t *testing.T, srv *hranafake.Server) *libsql.DB {
+	t.Helper()
+	online, err := libsql.Open(context.Background(), libsql.Options{URL: "https://fake.invalid", Transport: srv})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { online.Close() })
+	return online
+}
+
+func (n *node) reprepare(t *testing.T) {
+	t.Helper()
+	if err := n.r.Prepare(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A pulled row must not reset a column only THIS build has (an additive
+// migration the server has not had yet): the apply updates the shared columns
+// by key, never INSERT OR REPLACE.
+func TestPullKeepsColumnsOnlyThisBuildHas(t *testing.T) {
+	srv := newServer(t)
+	a := newNode(t, srv, nodeA)
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'v1')`)
+	a.push(t)
+
+	b := openNode(t, srv, nodeB)
+	b.exec(t, `ALTER TABLE operator ADD COLUMN extra TEXT NOT NULL DEFAULT ''`)
+	b.reprepare(t)
+	if err := b.r.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b.exec(t, `UPDATE operator SET extra = 'keep' WHERE id = 'x'`)
+	b.push(t)
+
+	a.exec(t, `UPDATE operator SET label = 'v2' WHERE id = 'x'`)
+	a.push(t)
+	b.pull(t)
+	var label, extra string
+	if err := b.r.DB().QueryRow(`SELECT label, extra FROM operator WHERE id = 'x'`).Scan(&label, &extra); err != nil {
+		t.Fatal(err)
+	}
+	if label != "v2" || extra != "keep" {
+		t.Fatalf("after the pull: label %q extra %q, want v2 and the local-only value kept", label, extra)
+	}
+	// A re-seed keeps it too.
+	if err := b.r.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.r.DB().QueryRow(`SELECT extra FROM operator WHERE id = 'x'`).Scan(&extra); err != nil || extra != "keep" {
+		t.Fatalf("after a re-seed: extra %q (%v)", extra, err)
+	}
+}
+
+// A push to a table with a UNIQUE constraint beyond its key must not reset a
+// column only the SERVER has (a newer node's migration).
+func TestPushKeepsColumnsOnlyTheServerHas(t *testing.T) {
+	srv := newServer(t)
+	online := onlineHandle(t, srv)
+	seed := newNode(t, srv, nodeB) // migrates the server
+	_ = seed
+	if _, err := online.DB().Exec(`ALTER TABLE agent_names ADD COLUMN extra TEXT NOT NULL DEFAULT ''`); err != nil {
+		t.Fatal(err)
+	}
+	a := newNode(t, srv, nodeA)
+	a.exec(t, `INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, 'p1', 'one', 1), (?, 'p2', 'two', 1)`,
+		nodeA, nodeA)
+	a.push(t)
+	if _, err := online.DB().Exec(`UPDATE agent_names SET extra = 'srv' WHERE agent_id IN ('p1', 'p2')`); err != nil {
+		t.Fatal(err)
+	}
+	a.pull(t)
+	// Swap the two names: each row's push collides with the other's old value.
+	tx, err := a.r.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{
+		`UPDATE agent_names SET name = 'tmp' WHERE agent_id = 'p1'`,
+		`UPDATE agent_names SET name = 'one' WHERE agent_id = 'p2'`,
+		`UPDATE agent_names SET name = 'two' WHERE agent_id = 'p1'`,
+	} {
+		if _, err := tx.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	a.push(t)
+	rows, err := online.DB().Query(`SELECT agent_id, name, extra FROM agent_names WHERE agent_id IN ('p1', 'p2') ORDER BY agent_id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := map[string][2]string{}
+	for rows.Next() {
+		var id, name, extra string
+		if err := rows.Scan(&id, &name, &extra); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = [2]string{name, extra}
+	}
+	if got["p1"] != [2]string{"two", "srv"} || got["p2"] != [2]string{"one", "srv"} {
+		t.Fatalf("server rows %v, want the swap applied and the server-only column kept", got)
+	}
+}
+
+// A table REBUILT on the server (create, copy, drop, rename) loses its
+// logging triggers, and writes after it go unlogged. The first replica to
+// notice reinstalls them and raises the floor, so EVERY replica re-seeds and
+// sees the unlogged write.
+func TestRebuiltTableIsReseededEverywhere(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	online := onlineHandle(t, srv)
+	for _, q := range []string{
+		`CREATE TABLE operator_new (id TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '')`,
+		`INSERT INTO operator_new SELECT id, label FROM operator`,
+		`DROP TABLE operator`,
+		`ALTER TABLE operator_new RENAME TO operator`,
+		`INSERT INTO operator (id, label) VALUES ('z', 'unlogged')`,
+	} {
+		if _, err := online.DB().Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	b.pull(t)
+	if got, _ := b.label(t, "z"); got != "unlogged" {
+		t.Fatalf("b (which repaired the log) sees %q", got)
+	}
+	a.pull(t)
+	if got, _ := a.label(t, "z"); got != "unlogged" {
+		t.Fatalf("a (whose triggers were already back) sees %q", got)
+	}
+	// And the log works again for later writes.
+	if _, err := online.DB().Exec(`INSERT INTO operator (id, label) VALUES ('w', 'logged')`); err != nil {
+		t.Fatal(err)
+	}
+	if !a.pull(t) {
+		t.Fatal("a later write to the rebuilt table was not logged")
+	}
+	b.pull(t)
+	if a.pull(t) || b.pull(t) {
+		t.Fatal("the repair keeps re-seeding")
+	}
+}
+
+// A table this replica was never seeded with (its build lacked it while the
+// log carried the table's rows past its cursor) is seeded once it has it.
+func TestATableGainedAfterTheSeedIsSeeded(t *testing.T) {
+	srv := newServer(t)
+	a := newNode(t, srv, nodeA)
+	b := openNode(t, srv, nodeB)
+	b.exec(t, `DROP TABLE operator`) // b's "older build" has no such table
+	b.reprepare(t)
+	if err := b.r.Bootstrap(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	a.exec(t, `INSERT INTO operator (id, label) VALUES ('x', 'before b had it')`)
+	a.push(t)
+	b.pull(t) // skips the entry: b has no operator table
+
+	// b "upgrades": its migration creates the table, empty.
+	b.exec(t, `CREATE TABLE operator (id TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '')`)
+	b.reprepare(t)
+	if !b.pull(t) {
+		t.Fatal("the pull after gaining a table reported no change")
+	}
+	if got, _ := b.label(t, "x"); got != "before b had it" {
+		t.Fatalf("b sees %q, want the row written before it had the table", got)
+	}
+	if b.pull(t) {
+		t.Fatal("b keeps re-seeding")
+	}
+}
+
+// A pulled row blocked by an unpushed local change on one of its UNIQUE
+// values is left exactly as it was — never parked and then abandoned.
+func TestABlockedPulledRowIsLeftUntouched(t *testing.T) {
+	srv := newServer(t)
+	a, b := newNode(t, srv, nodeA), newNode(t, srv, nodeB)
+	a.exec(t, `INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, 'p1', 'one', 1)`, nodeA)
+	a.push(t)
+	b.pull(t)
+	b.exec(t, `INSERT INTO agent_names (node_id, agent_id, name, created_at) VALUES (?, 'p3', 'x', 1)`, nodeA) // unpushed
+	a.exec(t, `UPDATE agent_names SET name = 'x' WHERE agent_id = 'p1'`)
+	a.push(t)
+	b.pull(t)
+	var name string
+	if err := b.r.DB().QueryRow(`SELECT name FROM agent_names WHERE agent_id = 'p1'`).Scan(&name); err != nil || name != "one" {
+		t.Fatalf("p1 is %q (%v), want it untouched at 'one'", name, err)
+	}
+}
