@@ -173,7 +173,7 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	if len(stmts) > 0 {
 		pushed := make([]pushedKey, len(entries))
 		for i, e := range entries {
-			pushed[i] = pushedKey{e.t, e.key}
+			pushed[i] = pushedKey(e)
 		}
 		if _, err := r.Tx(ctx, d.tagged(stmts, pushed)); err != nil {
 			return 0, err
