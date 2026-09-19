@@ -63,7 +63,18 @@ var serverDDL = []string{
 	// Non-empty only inside a push's own transaction: the server's clock
 	// stamping triggers stand aside, since the push records the edit's clocks.
 	`CREATE TABLE IF NOT EXISTS hap_sync_pushing (x INTEGER)`,
+	pushMarksDDL,
+	pushKeysDDL,
 }
+
+// The push's own bookkeeping (see tagged): ordinary tables, since sqld
+// refuses TEMP ones. Also ensured on every connect (checkServerIdentity), so a
+// server whose change log predates them gains them without a logging-gap
+// repair.
+const (
+	pushMarksDDL = `CREATE TABLE IF NOT EXISTS hap_push_marks (tok TEXT PRIMARY KEY, seq INTEGER NOT NULL)`
+	pushKeysDDL  = `CREATE TABLE IF NOT EXISTS hap_push_keys (tok TEXT NOT NULL, tbl TEXT NOT NULL, pk TEXT NOT NULL)`
+)
 
 func init() { serverDDL = append(serverDDL, clockDDL...) }
 
