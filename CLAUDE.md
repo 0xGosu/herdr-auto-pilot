@@ -700,8 +700,8 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
   - **Capture is suppressed while pulled rows are applied** (`hap_sync_applying`, checked in each
     `hap_ob_*` trigger's WHEN). Without it, every pulled row is re-captured and re-pushed, and two
     nodes echo each other through the server forever. A push also TAGS the change-log entries it
-    caused with its node id (the marker row + `temp.hap_push_mark`), so the node does not pull its
-    own writes back. Both halves are covered by `TestPulledRowsAreNotRePushed`.
+    caused with its node id (the marker row, its seq recorded in `hap_push_marks` under the per-push
+    token), so the node does not pull its own writes back. Both halves are covered by `TestPulledRowsAreNotRePushed`.
   - **Never a TEMP table (or `temp.`) in anything sent to the server.** sqld classifies every statement
     before SQLite sees it and REFUSES `CREATE TEMP TABLE` ("unsupported statement", `SQL_PARSE_ERROR`) —
     shipped in v0.9.49, it failed every push in production while the in-process fake accepted it. The
@@ -709,8 +709,8 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     written and deleted inside the push's own transaction). `hranafake.sqldRefuses` now refuses the shapes
     a real sqld refuses; add to it whenever a live server rejects something the fake accepted, and run
     `TestLiveSyncStatementShapes` (scratch tables only) against a real server after changing any sync SQL.
-  - **A push tags ONLY the keys it sent** (`temp.hap_push_keys`, rendered by the server's own `json_array`),
-    never "every entry after my marker". The bare range relies on the server serializing the whole
+  - **A push tags ONLY the keys it sent** (`hap_push_keys` under the per-push token, rendered by the
+    server's own `json_array`), never "every entry after my marker". The bare range relies on the server serializing the whole
     transaction; one that let another node's writes commit inside it would get them tagged as this node's,
     and that node's pull would skip them for good. `hranafake` serializes everything, so no test there can
     tell the two apart — the narrowing is the guarantee, not a test.
