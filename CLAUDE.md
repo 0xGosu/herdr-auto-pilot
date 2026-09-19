@@ -733,6 +733,10 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     UNIQUE collision is handled by PARKING the batch's own rows (a suffix on their unique values), then a
     key upsert, then a real DELETE of any conflicting row outside the batch. A pulled row blocked by an
     unpushed local change is decided BEFORE any parking, or its park suffix is stranded in the replica.
+  - **A push is OWED at start and after every failed push** (`runFleetSync`'s `payOwed`, on the pull tick). The
+    debounce is armed only by a NEW write, so outbox rows a previous process or a failed push left behind would
+    otherwise wait for the next write — on an idle node, indefinitely. Paused, nothing is paid; the resume nudge
+    covers it.
   - Accepted limit: retention runs only on replica nodes, so a fleet that later drops every replica keeps
     its triggers writing a log nothing prunes (drop `hap_cl_*` and `hap_changelog` by hand).
   - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a
