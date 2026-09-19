@@ -702,6 +702,17 @@ unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — th
     nodes echo each other through the server forever. A push also TAGS the change-log entries it
     caused with its node id (the marker row + `temp.hap_push_mark`), so the node does not pull its
     own writes back. Both halves are covered by `TestPulledRowsAreNotRePushed`.
+  - **A push tags ONLY the keys it sent** (`temp.hap_push_keys`, rendered by the server's own `json_array`),
+    never "every entry after my marker". The bare range relies on the server serializing the whole
+    transaction; one that let another node's writes commit inside it would get them tagged as this node's,
+    and that node's pull would skip them for good. `hranafake` serializes everything, so no test there can
+    tell the two apart — the narrowing is the guarantee, not a test.
+  - **Conflicts resolve as row-level last-PUSH-wins, as under turso — and most tables cannot conflict**:
+    node-scoped tables are single-writer by construction, `agent_actions` is claimed and finished only by
+    its owning node, and `decisions` is append-only on node-bit ids (the denormalized `signatures` row
+    races, but is recomputable from it). The genuine cross-machine case is an `audit_log` status set from
+    two machines at once: each `AND status = 'escalated'` guard passes on its own replica and the later push
+    wins — identical under turso.
   - **The server's change log is written by TRIGGERS, not by the push** (`hap_cl_*`). That is what
     makes `hap migrate`'s and an older hap's direct writes visible to replicas. Both logs
     carry KEYS only, and each side fetches the current row. That is why the log needs no BLOB

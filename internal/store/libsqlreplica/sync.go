@@ -171,7 +171,11 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 		return 0, nil
 	}
 	if len(stmts) > 0 {
-		if _, err := r.Tx(ctx, d.tagged(stmts)); err != nil {
+		pushed := make([]pushedKey, len(entries))
+		for i, e := range entries {
+			pushed[i] = pushedKey{e.t, e.key}
+		}
+		if _, err := r.Tx(ctx, d.tagged(stmts, pushed)); err != nil {
 			return 0, err
 		}
 	}
@@ -184,29 +188,49 @@ func (d *DB) pushOnce(ctx context.Context, r *libsql.DB, tables map[string]*tabl
 	return n, nil
 }
 
+// pushedKey is one key a push replays.
+type pushedKey struct {
+	t   *table
+	key []any
+}
+
 // tagged wraps a push's statements so the change-log entries they cause carry
-// this node's id: a marker entry takes the server's write lock and records
-// where this transaction's entries start (SQLite serializes writers, so every
-// later entry until COMMIT is ours), and the tail tags them and drops the
-// marker. The pull skips entries tagged with its own node.
+// this node's id, which is what lets its pull skip its own writes. A marker
+// entry records where this transaction's entries start, and the tail tags
+// the entries after it — but ONLY those naming a key this push sent
+// (temp.hap_push_keys, rendered by the server's own json_array so the text
+// matches the triggers' exactly). A bare "every entry after my marker" relies
+// on the server serializing the whole transaction; a server that let another
+// node's writes commit inside that range would have them tagged as this
+// node's, and that node would then skip them on its own pull — rows lost for
+// good, with nothing to correct it. The narrowing costs nothing where the
+// range is exclusive; where it is not, the worst case is this node fetching a
+// row it pushed itself (a conflict-delete of a key outside the batch goes
+// untagged the same way), which is the safe direction.
 //
-// The marker INSERT must stay the FIRST statement after Tx's BEGIN. A deferred
-// transaction takes the write lock at its first write, so that is what makes
-// "every later entry is ours" true. A read ahead of it would start the
-// transaction as a reader: the range would stop being exclusive, and the
-// upgrade could fail with SQLITE_BUSY_SNAPSHOT (see store.sqliteDSN).
-func (d *DB) tagged(stmts []libsql.Statement) []libsql.Statement {
-	out := make([]libsql.Statement, 0, len(stmts)+6)
+// The marker INSERT stays the FIRST statement after Tx's BEGIN, so the write
+// lock is taken there (a read ahead of it would start the transaction as a
+// reader and could fail with SQLITE_BUSY_SNAPSHOT; see store.sqliteDSN).
+func (d *DB) tagged(stmts []libsql.Statement, keys []pushedKey) []libsql.Statement {
+	out := make([]libsql.Statement, 0, len(stmts)+len(keys)+8)
 	out = append(out,
 		libsql.Statement{SQL: `INSERT INTO hap_changelog (tbl, pk, origin, at) VALUES ('', '', ?, 0)`, Args: []any{d.nodeID}},
 		libsql.Statement{SQL: `CREATE TEMP TABLE IF NOT EXISTS hap_push_mark (seq INTEGER)`},
 		libsql.Statement{SQL: `DELETE FROM temp.hap_push_mark`},
 		libsql.Statement{SQL: `INSERT INTO temp.hap_push_mark (seq) VALUES (last_insert_rowid())`},
+		libsql.Statement{SQL: `CREATE TEMP TABLE IF NOT EXISTS hap_push_keys (tbl TEXT NOT NULL, pk TEXT NOT NULL)`},
+		libsql.Statement{SQL: `DELETE FROM temp.hap_push_keys`},
 	)
+	for _, k := range keys {
+		out = append(out, libsql.Statement{
+			SQL:  `INSERT INTO temp.hap_push_keys (tbl, pk) VALUES (?, json_array(` + placeholders(len(k.key)) + `))`,
+			Args: append([]any{k.t.name}, k.key...),
+		})
+	}
 	out = append(out, stmts...)
 	return append(out,
-		libsql.Statement{SQL: `UPDATE hap_changelog SET origin = ? WHERE seq > (SELECT seq FROM temp.hap_push_mark)`,
-			Args: []any{d.nodeID}},
+		libsql.Statement{SQL: `UPDATE hap_changelog SET origin = ? WHERE seq > (SELECT seq FROM temp.hap_push_mark)
+			AND (tbl, pk) IN (SELECT tbl, pk FROM temp.hap_push_keys)`, Args: []any{d.nodeID}},
 		libsql.Statement{SQL: `DELETE FROM hap_changelog WHERE seq = (SELECT seq FROM temp.hap_push_mark)`},
 	)
 }
