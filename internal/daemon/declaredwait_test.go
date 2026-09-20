@@ -40,9 +40,17 @@ func declareWait(t *testing.T, h *harness, agentID string, d time.Duration) {
 // publishOne names an agent and publishes it as this node's live roster, which
 // is what resolveActionTarget reads: a queued kind only ever acts on an agent
 // the owning daemon can still see.
+//
+// The fake herdr is told about it FIRST, and that half is load-bearing rather
+// than tidiness: the running daemon republishes the roster from its own agent
+// listing, so a row seeded here alone is wiped by the next sweep and the
+// action then fails with "no agent known as … is running on this machine".
+// It passed on a fast runner and failed on a slow one, which is the whole
+// signature of leaving it out.
 func publishOne(t *testing.T, h *harness, agentID string) {
 	t.Helper()
 	ctx := context.Background()
+	h.herdr.setAgents(parked(agentID, "idle"))
 	if _, err := h.raw.EnsureAgentName(ctx, agentID); err != nil {
 		t.Fatalf("name agent: %v", err)
 	}
