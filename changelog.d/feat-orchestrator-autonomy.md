@@ -1,7 +1,0 @@
-- Stopped the `[no_task_source]` escalation flood: hap now recognises when a Claude or agy agent is waiting on background work it started itself, raises the notice at most once per parked spell, and holds it for 30 minutes afterwards instead of re-asking on every event
-- Fixed an orchestrator's `hap resolve --action` prose being refused by a safety heuristic written to read a pane: it is now screened as prose, exactly as a task hand-out is, while the operator's own replies are unchanged
-- Added an operator escalation and a `correction.withdrawn` stream event whenever a safety control refuses a queued answer, so a blocked hand-out is visible instead of silent
-- Added `hap snooze <agent>` / `hap unsnooze`: stops hap asking about a finished agent's queue while its prompts are still answered, and lifts by itself when the agent next works (`hap disable` stopped both)
-- Stopped hap generating or sending into a pane while an operator has a half-written message in the composer — herdr reports such a pane as idle, so the existing status checks could not see it
-- Rewrote the orchestrator's built-in brief and skill so carrying work to completion is the default — follow CI, get reviews answered, merge when green, clean up — with escalation reserved for the genuinely irreversible, and a repo's own `AUTO.md` treated as decisions the operator already made
-- Told the orchestrator how to keep its event-stream watch alive across the host's 30-minute cap, and that a `# suppressed` line is bookkeeping rather than something to report
