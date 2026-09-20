@@ -752,13 +752,21 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 		// Same reasoning for the per-episode notices: the latch belongs to the
 		// spell, and a recycled pane is a different agent entirely.
 		delete(d.episodeNoticeRaised, a.AgentID)
-		// The notice COOLDOWN is deliberately NOT dropped beside the latch
-		// above, where the agent merely stopped being parked: surviving that
-		// boundary is the whole point of it (#526). It is dropped here, and
-		// only here, because reaching this line means the pane or terminal
-		// changed — a different agent, which has interrupted nobody yet.
-		delete(d.noticeCooldownUntil, a.AgentID)
-		delete(d.noticeSuppressionNoted, a.AgentID)
+		// The notice COOLDOWN is deliberately NOT dropped here, and this is the
+		// line to read twice: reaching it does NOT mean the pane was recycled.
+		// It is also reached whenever idleSince has no mark — and the working
+		// transition DELETES that mark (handleTransition, and the !autoSendParked
+		// arm above). So an agent flapping parked->working->parked, which is
+		// exactly the #526 population, arrives here with !ok on the next sweep
+		// and would have its cooldown cleared by the very boundary the cooldown
+		// exists to survive. Dropping it here collapsed the 30-minute bound back
+		// to the one-per-flap cadence the issue measured.
+		//
+		// A genuine recycle is handled where it is actually KNOWN:
+		// resetRecycledPaneState, which compares terminal ids. That is enough
+		// because this map is in memory — the only recycle it can ever need to
+		// survive is one this daemon observed — and the vanished-agent prune
+		// below covers the rest.
 		d.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, terminalID: a.TerminalID, at: now}
 	}
 	for id := range d.idleSince {
@@ -774,7 +782,20 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 	for id := range d.noticeCooldownUntil {
 		if _, ok := live[id]; !ok {
 			delete(d.noticeCooldownUntil, id)
+		}
+	}
+	// Its own loop, not a line inside the one above: noteNoticeWithheld records
+	// causes that never open a cooldown (a snooze, background work, and any
+	// suppression of a reason noticeCooldownApplies excludes), so such an agent
+	// has no noticeCooldownUntil entry for that loop to visit.
+	for id := range d.noticeSuppressionNoted {
+		if _, ok := live[id]; !ok {
 			delete(d.noticeSuppressionNoted, id)
+		}
+	}
+	for id := range d.refusalEscalated {
+		if _, ok := live[id]; !ok {
+			delete(d.refusalEscalated, id)
 		}
 	}
 	for id := range d.pollRedrive {

@@ -222,9 +222,13 @@ func (d *Daemon) runAgentAction(ctx context.Context, a domain.AgentAction) {
 			msg = fmt.Sprintf("%s (gave up after %d attempts)", runErr, attempts)
 		}
 		if withdrawsCorrection(runErr) {
-			d.finishWithdrawn(ctx, a, msg)
-			// AFTER the withdrawal, which is the part that must be atomic.
-			d.escalateRefusedAction(ctx, a, runErr, msg)
+			// AFTER the withdrawal, which is the part that must be atomic, and
+			// only when it RECORDED: a failed withdrawal leaves the row running
+			// for the startup reclaim to requeue, so announcing here would put a
+			// second row in front of the operator for one refusal.
+			if d.finishWithdrawn(ctx, a, msg) {
+				d.escalateRefusedAction(ctx, a, runErr, msg)
+			}
 			return
 		}
 		d.finishAgentAction(ctx, a, domain.AgentActionFailed, msg, result)
@@ -284,18 +288,24 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 //
 // A failed transaction leaves the action 'running', so nothing is released and
 // the next pass (or the startup reclaim) tries again.
-func (d *Daemon) finishWithdrawn(ctx context.Context, a domain.AgentAction, errText string) {
+// It reports whether the withdrawal was RECORDED. A failed transaction leaves
+// the row 'running', so the startup reclaim requeues it and the refusal happens
+// again — and the caller must not announce a refusal it is about to repeat.
+func (d *Daemon) finishWithdrawn(ctx context.Context, a domain.AgentAction, errText string) bool {
 	ok, err := d.opt.Store.FinishAgentActionWithdrawn(ctx, a.ID, errText, a.CorrectionID, d.opt.Clock.Now())
 	switch {
 	case err != nil:
 		slog.Error("agent actions: a refused reply could not be recorded and withdrawn together; "+
 			"the claim is left in place for the next pass",
 			"action", a.ID, "correction", a.CorrectionID, "error", err)
+		return false
 	case !ok:
 		slog.Warn("agent actions: the refusal was not recorded; another writer moved the row",
 			"action", a.ID)
+		return false
 	default:
 		slog.Warn("agent action refused", "action", a.ID, "kind", a.Kind, "reason", errText)
+		return true
 	}
 }
 
@@ -335,17 +345,30 @@ func (d *Daemon) escalateRefusedAction(ctx context.Context, a domain.AgentAction
 	if !errors.Is(runErr, errOutboundRefused) {
 		return
 	}
+	if d.refusalAlreadyEscalated(a, errText) {
+		return
+	}
+	// a.Target is the operator's SPELLING, not an agent id: send_task queues an
+	// agent NAME. Filing the row under that would write an audit_log.agent_id
+	// that joins to nothing in agent_names, so the row would be invisible to
+	// every per-agent query — on exactly the kind whose refusal has no other row
+	// at all. Resolution can fail (the agent is gone), and the spelling is then
+	// the most useful thing left to say.
+	agentID := a.Target
+	if resolved, err := d.resolveActionTarget(ctx, a); err == nil && resolved != "" {
+		agentID = resolved
+	}
 	agentType := ""
-	if live, ok := d.liveAgentFor(ctx, a.Target); ok {
+	if live, ok := d.liveAgentFor(ctx, agentID); ok {
 		agentType = live.AgentType
 	}
 	if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
-		AgentID: a.Target, AgentType: agentType,
+		AgentID: agentID, AgentType: agentType,
 		Trigger:       domain.TriggerQueuedActionRefused,
 		SituationType: domain.SituationUnclassifiable,
 		Action:        domain.AuditActionQueuedActionRefusedPrefix + string(a.Kind),
 		Rationale: fmt.Sprintf("[%s] a safety control refused %s's %s for %s and nothing was sent: %s",
-			domain.ReasonQueuedActionRefused, actionAuthorLabel(a), a.Kind, a.Target, errText),
+			domain.ReasonQueuedActionRefused, actionAuthorLabel(a), a.Kind, agentID, errText),
 		Status: "escalated", CreatedAt: d.opt.Clock.Now(),
 	}); err != nil {
 		slog.Error("agent actions: a refusal could not be escalated, so it is visible only in this log",
@@ -358,9 +381,23 @@ func (d *Daemon) escalateRefusedAction(ctx context.Context, a domain.AgentAction
 	if a.CorrectionID != 0 {
 		d.emitStream(ctx, domain.StreamCorrectionWithdrawn,
 			domain.StreamInt("id", a.CorrectionID),
-			domain.StreamStr("agent", a.Target),
+			domain.StreamStr("agent", agentID),
 			domain.StreamStr("reason", errText))
 	}
+}
+
+// refusalAlreadyEscalated reports whether this agent's last refusal row already
+// said exactly this, and records it otherwise. See Daemon.refusalEscalated for
+// why an unbounded row-per-attempt is the wrong shape on this path.
+func (d *Daemon) refusalAlreadyEscalated(a domain.AgentAction, errText string) bool {
+	key := string(a.Kind) + "\x00" + errText
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.refusalEscalated[a.Target] == key {
+		return true
+	}
+	d.refusalEscalated[a.Target] = key
+	return false
 }
 
 // actionAuthorLabel names the author for the refusal rationale. An empty author

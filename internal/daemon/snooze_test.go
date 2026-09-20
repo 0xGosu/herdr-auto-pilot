@@ -186,3 +186,44 @@ func TestAnUnattendedHandoutStillReachesAnEmptyComposer(t *testing.T) {
 		return strings.Contains(readTasks(t, taskFile), "[-]")
 	})
 }
+
+// TestTheAutoAcceptClaimIsBlockedWhileTheOperatorTypes is item 5 at its most
+// load-bearing point: full self-prompting answers an idle row by typing free
+// text into the composer, which is exactly where an operator's half-written
+// message is.
+//
+// claimBlockedBy is driven DIRECTLY, which is this repo's rule for the
+// auto-accept gates: every one of them fails closed, so a pipeline test can
+// hold for the wrong reason and pass. The pair below differs only in the caret
+// line.
+func TestTheAutoAcceptClaimIsBlockedWhileTheOperatorTypes(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	rec := &domain.AuditRecord{AgentID: "pA", AgentType: "claude"}
+
+	h.herdr.setPane(claudeDraftPane)
+	if why := h.daemon.claimBlockedBy(ctx, rec, "respond: continue", true, nil); why == "" {
+		t.Fatal("a draft in the composer must block the claim")
+	}
+
+	// The control: the SAME pane with the draft removed. Without it a gate that
+	// blocked every claim would pass above.
+	h.herdr.setPane(strings.Replace(claudeDraftPane,
+		"❯ can you also check whether the", "❯", 1))
+	if why := h.daemon.claimBlockedBy(ctx, rec, "respond: continue", true, nil); why != "" {
+		t.Fatalf("a clean composer must not block the claim: %s", why)
+	}
+}
+
+// TestTheAutoAcceptClaimIsNotBlockedByAnUnreadableComposer pins the direction
+// this guard fails in, which is the opposite of agyComposerRefusal's. Most
+// captures show no composer at all, so blocking on "we could not tell" would
+// stand full self-prompting down almost everywhere.
+func TestTheAutoAcceptClaimIsNotBlockedByAnUnreadableComposer(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setPane("● Ran the tests. All 23 packages pass.\n")
+	rec := &domain.AuditRecord{AgentID: "pA", AgentType: "claude"}
+	if why := h.daemon.claimBlockedBy(context.Background(), rec, "respond: continue", true, nil); why != "" {
+		t.Fatalf("an unreadable composer must not block the claim: %s", why)
+	}
+}

@@ -535,12 +535,19 @@ keystroke.
   transition to `working`** (`handleTransition`, `noteIdleAgents`), and an agent waiting on its own
   background shells flips parked→working→parked every time one prints a line. Each flip re-arms the
   latch. The excerpt dedup cannot help either — that keys on a screen these agents repaint.
-- **The wall-clock cooldown is scoped to `no_task_source` ALONE** (`noticeCooldownApplies`), and widening
-  it is a regression two existing tests already catch: the other two ask the operator to QUEUE WORK,
-  which they do many times a day, and the hand-out proposal a cooldown would swallow is precisely the row
-  that gets the agent working again. `no_task_source` asks them to REGISTER A SOURCE — configuration,
-  performed on their own clock. It is pruned only on a recycled pane or a vanished agent, never on the
-  parked→working boundary, because surviving that boundary is the whole point.
+- **The wall-clock cooldown AND the background-work evidence are scoped to `no_task_source` ALONE**
+  (`noticeCooldownApplies` gates both), and widening either is a regression two existing tests already
+  catch: the other two ask the operator to QUEUE WORK, which they do many times a day, and the hand-out
+  proposal is precisely the row that gets the agent working again — a `tail -f` or a dev server would
+  otherwise withhold it for as long as that process lives. `no_task_source` asks them to REGISTER A
+  SOURCE — configuration, performed on their own clock.
+- **The cooldown is NOT pruned in `noteIdleAgents`' new-episode block, and the comment there says why.**
+  That block is reached whenever `idleSince` carries no mark — which the WORKING transition deletes — so
+  a pruning line there is hit on the first sweep after every flap and collapses the 30-minute bound back
+  to the cadence #526 measured. A genuine recycle is handled where it is actually known,
+  `resetRecycledPaneState`, which compares terminal ids; the map is in memory, so the only recycle it can
+  ever need to survive is one this daemon observed. **Test trap:** the guarding test passed on the broken
+  code until it drove the RE-PARK as well as the working flip.
 - **`domain.BackgroundWorkRunning` is the only one of the four that is EVIDENCE rather than
   bookkeeping.** herdr reports a pane with three of its own shells running as `idle`, identical to one
   waiting for a human. Claude paints it as a `·`-separated SEGMENT of the mode line (`⏵⏵ auto mode on ·
@@ -569,7 +576,13 @@ keystroke.
   hand-out. It withholds only on proof. Asked at task generation (`generateTask`, ABOVE
   `HasPendingLLMConsult` so a refusal strands no `llm_requests` row) and at every unattended send, from a
   `--source visible` read (`operatorTypingRefusal`), whose unreadable case deliberately fails OPEN —
-  the opposite of `agyComposerRefusal`, which proves a positive precondition.
+  the opposite of `agyComposerRefusal`, which proves a positive precondition. agy is SUBSUMED rather than
+  exempt: `AgyComposerReady` already proves a bare caret, which is strictly stronger, so asking again
+  would only cost a second herdr shell-out at all five shared call sites.
+  - **The auto-accept path asks in `claimBlockedBy`, not in `autoAcceptDeliver`**, because the
+    OPERATOR's own `--send` goes through the latter and a human who just looked at the screen must not
+    be refused for the draft they are holding. Refusing at the claim also leaves the row PENDING with
+    `notePending` naming the reason, rather than burning a delivery attempt.
   - **codex answers UNKNOWN outright, and that is a refusal rather than a gap**: it renders suggestion
     text on the caret line of an EMPTY composer, and reading that as a draft would silently withhold
     every hand-out from every parked codex agent. Finish it only with a live sample of both states.
@@ -586,7 +599,13 @@ keystroke.
   correction, logged one line and told only the process that queued it — which for the orchestrator is a
   terminal its own skill has just told that refusals are final. The row carries NO suggestion (the text a
   safety control refused is exactly what a confirm would type), and it is raised for `errOutboundRefused`
-  only: `errEscalationClosed` withdraws too, but there the row is already resolved.
+  only: `errEscalationClosed` withdraws too, but there the row is already resolved. Two bounds:
+  `finishWithdrawn` REPORTS whether it recorded, and a failed withdrawal leaves the row running for the
+  startup reclaim to requeue — announcing there would put a second row in front of the operator for one
+  refusal; and an identical repeat is deduped in memory (`refusalEscalated`), because the author this
+  exists for is an LLM. **It must RESOLVE `a.Target` first**: that field is the operator's SPELLING, and
+  `send_task` queues an agent NAME, so filing the row under it writes an `audit_log.agent_id` that joins
+  to nothing — on precisely the kind whose refusal has no other row at all.
 
 ### Task sources and hand-outs
 

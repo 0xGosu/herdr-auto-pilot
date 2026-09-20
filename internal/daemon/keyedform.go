@@ -142,6 +142,14 @@ func (d *Daemon) agyComposerRefusal(ctx context.Context, paneID string) error {
 // with no footer answers UNKNOWN, so refusing on unknown would withhold nearly
 // every hand-out from every agent. It withholds only on proof.
 func (d *Daemon) operatorTypingRefusal(ctx context.Context, paneID, agentType string) error {
+	// agy is SUBSUMED, not exempt: every agy send path already calls
+	// agyComposerRefusal, and AgyComposerReady proves the caret line is a bare
+	// ">" or a mode placeholder — which is strictly stronger than "no draft".
+	// Asking again could only agree, at the price of a second herdr shell-out
+	// on the select loop at all five of those call sites.
+	if domain.IsAgy(agentType) {
+		return nil
+	}
 	pane, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
 	if err != nil {
 		slog.Debug("could not read the pane to check for an operator draft",

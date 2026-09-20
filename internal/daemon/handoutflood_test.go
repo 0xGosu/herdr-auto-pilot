@@ -330,8 +330,14 @@ func TestNoTaskSourceSurvivesTheWorkingFlap(t *testing.T) {
 	h.daemon.escalate(ctx, first, domain.ComputeSignature(first), noTaskSourceNotice(),
 		parked("pA", "idle")[0], now)
 
-	// The flap. This is the exact call that clears the episode latch.
+	// The flap, BOTH halves. The working half clears the episode latch; the
+	// re-park is what makes this test discriminate, and leaving it out is how
+	// the first version of this test passed on code that cleared the cooldown
+	// here — noteIdleAgents reaches its new-episode block whenever idleSince
+	// carries no mark, which the working half just deleted, not only when the
+	// pane was recycled.
 	h.daemon.noteIdleAgents(parked("pA", "working"), now.Add(2*time.Second))
+	h.daemon.noteIdleAgents(parked("pA", "idle"), now.Add(2500*time.Millisecond))
 
 	next := parkedAgySituation("pA", "Shell finished. Awaiting instructions.\n")
 	h.daemon.escalate(ctx, next, domain.ComputeSignature(next), noTaskSourceNotice(),
@@ -349,6 +355,35 @@ func TestNoTaskSourceSurvivesTheWorkingFlap(t *testing.T) {
 		parked("pA", "idle")[0], now.Add(queueNoticeCooldown+time.Minute))
 	if n := pendingFor(t, h, domain.ReasonNoTaskSource); n != 2 {
 		t.Fatalf("past the cooldown the notice must be raised again, pending = %d", n)
+	}
+}
+
+// TestARecycledPaneDoesNotInheritTheCooldown is the other side of the fix
+// above: the cooldown survives a flap, but it must NOT survive onto a different
+// agent. resetRecycledPaneState is where that is known, because it compares
+// terminal ids — noteIdleAgents cannot tell the two apart.
+func TestARecycledPaneDoesNotInheritTheCooldown(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setAgents(parked("pA", "idle"))
+
+	now := time.Now()
+	first := parkedAgySituation("pA", "Nothing left to run here.\n")
+	h.daemon.escalate(ctx, first, domain.ComputeSignature(first), noTaskSourceNotice(),
+		parked("pA", "idle")[0], now)
+	if n := pendingFor(t, h, domain.ReasonNoTaskSource); n != 1 {
+		t.Fatalf("the first notice should escalate, pending = %d", n)
+	}
+
+	h.daemon.resetRecycledPaneState(ctx, domain.AgentTransition{
+		AgentID: "pA", PaneID: "pA", AgentType: "agy", Status: "idle", TerminalID: "term_new",
+	})
+
+	next := parkedAgySituation("pA", "A different agent, same pane id.\n")
+	h.daemon.escalate(ctx, next, domain.ComputeSignature(next), noTaskSourceNotice(),
+		parked("pA", "idle")[0], now.Add(time.Second))
+	if n := pendingFor(t, h, domain.ReasonNoTaskSource); n != 2 {
+		t.Fatalf("a recycled pane must be able to raise its own notice, pending = %d", n)
 	}
 }
 
@@ -420,5 +455,24 @@ func TestBackgroundWorkNeverWithholdsAnApproval(t *testing.T) {
 	h.daemon.escalate(ctx, s, domain.ComputeSignature(s), dec, parked("pA", "idle")[0], time.Now())
 	if n := pendingFor(t, h, domain.ReasonShadowMode); n != 1 {
 		t.Fatalf("an approval must escalate whatever the agent is running, pending = %d", n)
+	}
+}
+
+// TestBackgroundWorkNeverWithholdsAHandoutProposal is the scope control for the
+// evidence guard, matching the one the cooldown has. An indicator can be
+// long-lived — a dev server, a `tail -f`, a watcher — so withholding the
+// hand-out proposal on it would withhold the row that gets the agent working
+// again for as long as that process lives.
+func TestBackgroundWorkNeverWithholdsAHandoutProposal(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.setAgents(parked("pA", "idle"))
+
+	busy := parkedClaudeSituation("pA", claudeParkedWithShells)
+	h.daemon.escalate(ctx, busy, domain.ComputeSignature(busy), handoutProposal(),
+		parked("pA", "idle")[0], time.Now())
+
+	if n := pendingFor(t, h, domain.ReasonNoopVsPendingTasks); n != 1 {
+		t.Fatalf("a hand-out proposal must reach the operator whatever the agent is running, pending = %d", n)
 	}
 }

@@ -427,6 +427,21 @@ type Daemon struct {
 	// 3 minutes ago" are different facts about the same agent.
 	noticeSuppressionNoted map[string]map[domain.EscalateReason]string
 
+	// refusalEscalated dedupes escalateRefusedAction, holding the last
+	// (kind, reason) it raised a row for per agent.
+	//
+	// Unlike the queue notices above, this path is not sweep-driven: one row per
+	// QUEUED ACTION is already a bound, because each action is a separate `hap
+	// resolve --send`. But the author on the path this exists for is an LLM, and
+	// #526's whole finding is that an LLM asked the same thing on a loop — so an
+	// identical refusal, repeated, writes ONE row. A CHANGED refusal is new
+	// information and writes again, the same rule noteNoticeWithheld follows.
+	//
+	// In memory, so a restart re-raises: that fails in the direction of telling
+	// the operator too much, which is the safe one here. Pruned with the rest in
+	// noteIdleAgents.
+	refusalEscalated map[string]string
+
 	// preDeliveryReviewInFlight tracks the one live pre-delivery review per
 	// agent; the token lets the outcome handler drop superseded results.
 	// Guarded by mu alongside preDeliveryReviewSeq.
@@ -905,6 +920,7 @@ func New(opt Options) (*Daemon, error) {
 		episodeNoticeRaised:       map[string]map[domain.EscalateReason]int{},
 		noticeCooldownUntil:       map[string]map[domain.EscalateReason]time.Time{},
 		noticeSuppressionNoted:    map[string]map[domain.EscalateReason]string{},
+		refusalEscalated:          map[string]string{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
 		rerankInFlight:            map[string]rerankFlight{},
 		rerankCache:               map[string][]domain.RerankResult{},
@@ -2000,8 +2016,14 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// its queue". It is working, so that is no longer true — and clearing
 		// it here rather than making the operator do it is the whole difference
 		// between snooze and disable (#526): a pane reused for new work must
-		// not carry a quiet switch its last tenant earned. Conditional in the
-		// store, or this would report a write on every turn boundary.
+		// not carry a quiet switch its last tenant earned.
+		//
+		// The STATEMENT runs on every working transition; only the WRITE is
+		// conditional (ClearAgentSnoozeIfSet's WHERE), which is what keeps it
+		// from arming the turso push debounce per turn boundary. Under a shared
+		// engine that still costs one socket round trip per transition — judged
+		// acceptable against a throttle here, because the cost of a LATE lift is
+		// an agent silently withheld from the idle poll while it works.
 		if lifted, err := d.opt.Store.ClearAgentSnoozeIfSet(ctx, tr.AgentID); err != nil {
 			slog.Warn("snooze could not be lifted for a working agent",
 				"agent", tr.AgentID, "error", err)
@@ -3879,7 +3901,13 @@ const queueNoticeCooldown = 30 * time.Minute
 //     agent with its own shells running does not need a task, and herdr cannot
 //     say so because it reports the pane as idle either way. It reads the
 //     situation's own content, which is the RAW pane (classify.Classify stores
-//     it unstripped), so it costs no herdr round trip.
+//     it unstripped), so it costs no herdr round trip. Scoped to the same one
+//     reason the cooldown is, and for the same argument — see
+//     noticeCooldownApplies. An indicator can be long-lived (a dev server, a
+//     `tail -f`, a watcher), so applying it to the queue-work notices would
+//     withhold the hand-out proposal for as long as that process lives, and
+//     the proposal is the only path to that work when
+//     enable_auto_send_task_when_idle is off.
 //   - one was raised recently (queueNoticeCooldown). This is what survives the
 //     idle->working->idle flap a background command's output causes, which is
 //     exactly what defeats the episode latch below. It applies to
@@ -3901,7 +3929,8 @@ func (d *Daemon) queueNoticeWithheld(ctx context.Context, s domain.Situation,
 		d.noteNoticeWithheld(s.AgentID, reason, "the agent is snoozed")
 		return true
 	}
-	if domain.BackgroundWorkRunning(s.AgentType, s.Content) {
+	if noticeCooldownApplies(reason) &&
+		domain.BackgroundWorkRunning(s.AgentType, s.Content) {
 		d.noteNoticeWithheld(s.AgentID, reason, "the agent is waiting on background work it started")
 		return true
 	}
@@ -3913,8 +3942,8 @@ func (d *Daemon) queueNoticeWithheld(ctx context.Context, s domain.Situation,
 	return d.episodeNoticeSuppressed(s.AgentID, reason)
 }
 
-// noticeCooldownApplies reports whether a reason is bounded by the wall clock as
-// well as by the episode.
+// noticeCooldownApplies reports whether a reason is bounded by the wall clock and
+// by the agent's own background work, as well as by the episode.
 //
 // ReasonNoTaskSource alone, and the dividing line is the one
 // domain.LatchedPerParkedEpisode's original comment drew: its remedy is
@@ -5806,6 +5835,15 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// must be proven empty on the same visible re-read (see AgyComposerReady).
 	if domain.IsAgy(s.AgentType) && !domain.AgyComposerReady(pane) {
 		reject(domain.ReasonLLMNoSubmit, "stale: agy's composer is not ready for a message")
+		return
+	}
+	// And a human at the composer, whatever the agent type. This is the same
+	// question the line above asks agy, asked of everyone: an idle-typed row
+	// promoted to a send types free text into the composer, which is exactly
+	// where an operator's half-written message would be (#526). `pane` is the
+	// visible re-read verified current above, so this costs no extra round trip.
+	if typing, known := domain.OperatorTyping(s.AgentType, pane); known && typing {
+		reject(domain.ReasonLLMNoSubmit, "stale: an operator has a draft in the composer")
 		return
 	}
 	if domain.UnmatchedMenuReply(s.Type, s.AgentType, pane, llmDec.Action) {

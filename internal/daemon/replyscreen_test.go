@@ -188,3 +188,70 @@ func TestAClosedEscalationRaisesNoRefusalRow(t *testing.T) {
 		t.Fatalf("a closed escalation must raise no refusal row, got %d", len(rows))
 	}
 }
+
+// TestARefusedHandOutIsFiledUnderTheAgentID is the case a reply-only suite
+// cannot reach, and the reason escalateRefusedAction resolves its target.
+//
+// `send_task` queues the agent's NAME, not its id (frontend.SendTaskToAgentOn),
+// while `deliver_reply` and `accept_generated_task` both queue an audit row's
+// AgentID. Filing the refusal under the name would write an audit_log.agent_id
+// that joins to nothing in agent_names — invisible to every per-agent query, on
+// precisely the kind whose refusal has no other row at all.
+func TestARefusedHandOutIsFiledUnderTheAgentID(t *testing.T) {
+	// The shared sendTaskSeam only RECORDS the screen closure; the real seam
+	// calls it right before the send. This one does too, or the refusal under
+	// test never happens and the case passes for the wrong reason.
+	seam := &sendTaskSeam{}
+	seam.run = func(p domain.SendTaskPayload, screen func(string) error) error {
+		if screen == nil {
+			return nil
+		}
+		return screen(p.TaskText)
+	}
+	h := newSendTaskHarnessWith(t, seam,
+		"[safety]\nnever_auto_patterns = [\"wipe the staging bucket\"]\n", "w1:p4")
+	ctx := context.Background()
+
+	name, err := h.raw.EnsureAgentName(ctx, "w1:p4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if name == "w1:p4" {
+		t.Fatal("the harness must give the agent a short name distinct from its id")
+	}
+
+	payload, err := json.Marshal(domain.SendTaskPayload{
+		Locator: "/tmp/tasks.md", Index: 1, TaskText: "wipe the staging bucket",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Queued by NAME, as the real hand-out path does, and authored by the
+	// orchestrator so the text is screened at all.
+	id := h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionSendTask, Target: name,
+		Payload: string(payload), Author: domain.OrchestratorAuthor,
+		CreatedAt: time.Now(),
+	})
+	if got := h.awaitAction(id); got.Status == domain.AgentActionDone {
+		t.Fatalf("a never-auto match must refuse the hand-out; status = %q", got.Status)
+	}
+
+	rows, err := h.raw.PendingEscalations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rows {
+		if !strings.Contains(r.Rationale, "["+domain.ReasonQueuedActionRefused+"]") {
+			continue
+		}
+		found = true
+		if r.AgentID != "w1:p4" {
+			t.Fatalf("the refusal is filed under %q, want the agent id w1:p4", r.AgentID)
+		}
+	}
+	if !found {
+		t.Fatal("a refused hand-out raised no escalation")
+	}
+}

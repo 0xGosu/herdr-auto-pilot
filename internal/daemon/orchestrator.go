@@ -832,6 +832,31 @@ func CallerIsOrchestrator(stateDir, paneID string) bool {
 // than through a seam and so has its own entry point, deliverReplyScreen, which
 // applies the same author policy — see the rationale there for why a reply
 // keeps the action rules a hand-out drops.
+func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(string) error {
+	if a.Author != domain.OrchestratorAuthor {
+		return nil
+	}
+	if a.Kind == domain.AgentActionSendTask {
+		return func(text string) error {
+			if err := d.screenOutboundStrict(agentType, text); err != nil {
+				return fmt.Errorf("%w: %v", errOutboundRefused, err)
+			}
+			return nil
+		}
+	}
+	return func(text string) error {
+		if err := d.screenOutbound(agentType, text); err != nil {
+			return fmt.Errorf("%w: %v", errOutboundRefused, err)
+		}
+		// The action rules too: the orchestrator CHOOSES this text, so a
+		// widening menu option it picked is exactly what they exist to refuse.
+		if why := d.actionRefused(agentType, text); why != "" {
+			return fmt.Errorf("%w: matched never-auto action %s", errOutboundRefused, why)
+		}
+		return nil
+	}
+}
+
 // deliverReplyScreen is actionScreen for the one kind screened INLINE rather
 // than through a seam: a reply to an escalation (`hap resolve --send`,
 // `hap confirm --send`). It is never nil — a reply's text is authored AFTER the
@@ -875,31 +900,6 @@ func (d *Daemon) deliverReplyScreen(a domain.AgentAction, agentType string) func
 		if err := d.screenOutboundStrict(agentType, text); err != nil {
 			return fmt.Errorf("%w: %v", errOutboundRefused, err)
 		}
-		if why := d.actionRefused(agentType, text); why != "" {
-			return fmt.Errorf("%w: matched never-auto action %s", errOutboundRefused, why)
-		}
-		return nil
-	}
-}
-
-func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(string) error {
-	if a.Author != domain.OrchestratorAuthor {
-		return nil
-	}
-	if a.Kind == domain.AgentActionSendTask {
-		return func(text string) error {
-			if err := d.screenOutboundStrict(agentType, text); err != nil {
-				return fmt.Errorf("%w: %v", errOutboundRefused, err)
-			}
-			return nil
-		}
-	}
-	return func(text string) error {
-		if err := d.screenOutbound(agentType, text); err != nil {
-			return fmt.Errorf("%w: %v", errOutboundRefused, err)
-		}
-		// The action rules too: the orchestrator CHOOSES this text, so a
-		// widening menu option it picked is exactly what they exist to refuse.
 		if why := d.actionRefused(agentType, text); why != "" {
 			return fmt.Errorf("%w: matched never-auto action %s", errOutboundRefused, why)
 		}
