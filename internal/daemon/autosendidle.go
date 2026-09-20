@@ -469,6 +469,24 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 			awaiting[r.AgentID] = true
 			continue
 		}
+		// ...and a PARKED one may be working too. herdr reports a pane whose
+		// agent is waiting on its own shells, build or CI poll as idle,
+		// identical to one that has finished and is waiting for a human — so a
+		// fifteen-minute cold build ran out the two-minute grace below, the item
+		// was reclaimed and re-handed, and after maxTaskHandouts the agent was
+		// escalated as never having started work it was doing all along (#508).
+		// Every stall alert in the session that reported it was that shape.
+		//
+		// Evidence only: domain.BackgroundWorkRunning answers false for an
+		// unrecognized screen and for every agent type with no known indicator,
+		// so an unproven agent is reclaimed exactly as before. It DEFERS rather
+		// than exempts — staleHandoutTTL is checked above and unconditionally,
+		// so a long-lived indicator (a dev server, a tail -f) can never pin an
+		// item at "[-]" indefinitely.
+		if a, present := live[r.AgentID]; present && sameTenant(a, r) && d.backgroundWorkFor(a, now) {
+			awaiting[r.AgentID] = true
+			continue
+		}
 		if now.Sub(r.ReservedAt) <= reclaimGrace {
 			awaiting[r.AgentID] = true
 			continue
@@ -796,6 +814,11 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 	for id := range d.refusalEscalated {
 		if _, ok := live[id]; !ok {
 			delete(d.refusalEscalated, id)
+		}
+	}
+	for id := range d.backgroundWork {
+		if _, ok := live[id]; !ok {
+			delete(d.backgroundWork, id)
 		}
 	}
 	for id := range d.pollRedrive {

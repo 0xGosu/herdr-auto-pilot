@@ -960,3 +960,119 @@ func TestStripNoopGeneratedLinesKeepsConfirmParseSingle(t *testing.T) {
 		}
 	}
 }
+
+// TestStripForeignAgentGeneratedLines pins the guard #508 asks for: a generated
+// task may not name a DIFFERENT agent, because the pane the generator treats as
+// ground truth routinely carries one (every hand-out renders "hap task <name>
+// list" into it).
+func TestStripForeignAgentGeneratedLines(t *testing.T) {
+	known := []string{"zesty-heron", "wise-wombat", "daring-jackal"}
+	cases := []struct {
+		name    string
+		raw     string
+		self    string
+		want    string
+		dropped []string
+	}{
+		{
+			name:    "a line naming another agent is dropped",
+			raw:     "- Fix the parser\n- Run `hap task wise-wombat list` to see the rest",
+			self:    "zesty-heron",
+			want:    "- Fix the parser",
+			dropped: []string{"wise-wombat"},
+		},
+		{
+			name: "the agent's own name is kept",
+			raw:  "- Run `hap task zesty-heron list` and finish item 2",
+			self: "zesty-heron",
+			want: "- Run `hap task zesty-heron list` and finish item 2",
+		},
+		{
+			name: "a name butted against more name characters is not a mention",
+			raw:  "- Update wise-wombats.md and my-wise-wombat_helper",
+			self: "zesty-heron",
+			want: "- Update wise-wombats.md and my-wise-wombat_helper",
+		},
+		{
+			name:    "case is folded",
+			raw:     "- Ask Wise-Wombat to review it",
+			self:    "zesty-heron",
+			want:    "",
+			dropped: []string{"wise-wombat"},
+		},
+		{
+			name:    "prose is dropped too, because plain mode makes every line a task",
+			raw:     "wise-wombat is already on this\n\n- Fix the parser",
+			self:    "zesty-heron",
+			want:    "- Fix the parser",
+			dropped: []string{"wise-wombat"},
+		},
+		{
+			name:    "every name is reported once, in a stable order",
+			raw:     "- ping daring-jackal\n- ping wise-wombat\n- ping daring-jackal again",
+			self:    "zesty-heron",
+			want:    "",
+			dropped: []string{"daring-jackal", "wise-wombat"},
+		},
+		{
+			name: "a fence line is left alone",
+			raw:  "```wise-wombat\n- Fix the parser\n```",
+			self: "zesty-heron",
+			want: "```wise-wombat\n- Fix the parser\n```",
+		},
+		{
+			name: "nothing is screened when the agent is the only one known",
+			raw:  "- Fix the parser",
+			self: "zesty-heron",
+			want: "- Fix the parser",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			set := known
+			if tc.name == "nothing is screened when the agent is the only one known" {
+				set = []string{"zesty-heron"}
+			}
+			got, dropped := StripForeignAgentGeneratedLines(tc.raw, tc.self, set)
+			if got != tc.want {
+				t.Errorf("kept = %q, want %q", got, tc.want)
+			}
+			if len(dropped) != len(tc.dropped) {
+				t.Fatalf("dropped = %v, want %v", dropped, tc.dropped)
+			}
+			for i := range dropped {
+				if dropped[i] != tc.dropped[i] {
+					t.Fatalf("dropped = %v, want %v", dropped, tc.dropped)
+				}
+			}
+		})
+	}
+}
+
+// TestStripForeignAgentGeneratedLinesLeavesRawTextRaw is the control for the
+// contract StripNoopGeneratedLines states: the survivors must still be RAW, so
+// the confirm path normalizes exactly once. A stripper that normalized on the
+// way through would make the daemon's parse and the confirm's parse disagree.
+func TestStripForeignAgentGeneratedLinesLeavesRawTextRaw(t *testing.T) {
+	raw := "Here is what is left:\n\n1. Fix the parser\n2. Run the tests"
+	got, dropped := StripForeignAgentGeneratedLines(raw, "zesty-heron", []string{"zesty-heron", "wise-wombat"})
+	if got != raw || dropped != nil {
+		t.Fatalf("StripForeignAgentGeneratedLines = %q, %v, want the input unchanged", got, dropped)
+	}
+	if tasks := NormalizeGeneratedTasks(got); len(tasks) != 2 {
+		t.Fatalf("NormalizeGeneratedTasks(kept) = %v, want the two numbered items", tasks)
+	}
+}
+
+func TestForeignAgentDropNote(t *testing.T) {
+	if got := ForeignAgentDropNote(nil); got != "" {
+		t.Errorf("ForeignAgentDropNote(nil) = %q, want empty", got)
+	}
+	if got := ForeignAgentDropNote([]string{"wise-wombat"}); !strings.Contains(got, "another agent") ||
+		!strings.Contains(got, "wise-wombat") {
+		t.Errorf("ForeignAgentDropNote(one) = %q, want it to name the agent", got)
+	}
+	if got := ForeignAgentDropNote([]string{"wise-wombat", "daring-jackal"}); !strings.Contains(got, "other agents") {
+		t.Errorf("ForeignAgentDropNote(two) = %q, want the plural", got)
+	}
+}

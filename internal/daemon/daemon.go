@@ -427,6 +427,22 @@ type Daemon struct {
 	// 3 minutes ago" are different facts about the same agent.
 	noticeSuppressionNoted map[string]map[domain.EscalateReason]string
 
+	// backgroundWork holds the last POSITIVE observation, per agent, that the
+	// agent is waiting on work IT started (domain.BackgroundWorkRunning).
+	//
+	// Recorded from the capture that is already in hand, because the sweep that
+	// READS it runs on the main loop: autoSendIdleTasks' own doc already names
+	// its inline per-row writes as the reason it is no longer "only cheap
+	// reads", so a per-row herdr shell-out added there would be strictly worse —
+	// and not rare either, since a parked agent in a thirteen-minute build is
+	// past reclaimGrace on every one of those thirteen sweeps.
+	//
+	// A NEGATIVE observation DELETES the entry rather than storing a false: the
+	// protection must lapse as soon as the agent's own work is done, and
+	// backgroundWorkFresh only ever bounds the case where no capture has been
+	// taken at all.
+	backgroundWork map[string]backgroundWorkMark
+
 	// refusalEscalated dedupes escalateRefusedAction, holding the last
 	// (kind, reason) it raised a row for per agent.
 	//
@@ -919,6 +935,7 @@ func New(opt Options) (*Daemon, error) {
 		lastAutoNoop:              map[string]time.Time{},
 		episodeNoticeRaised:       map[string]map[domain.EscalateReason]int{},
 		noticeCooldownUntil:       map[string]map[domain.EscalateReason]time.Time{},
+		backgroundWork:            map[string]backgroundWorkMark{},
 		noticeSuppressionNoted:    map[string]map[domain.EscalateReason]string{},
 		refusalEscalated:          map[string]string{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
@@ -2271,11 +2288,68 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	delete(d.noticeCooldownUntil, a.AgentID)
 	delete(d.noticeSuppressionNoted, a.AgentID)
 	delete(d.autoTaskClaim, a.AgentID)
+	delete(d.backgroundWork, a.AgentID)
 	d.forgetSessionRenamePushesLocked(a.AgentID)
 	d.mu.Unlock()
 	// sweepInFlight is deliberately left alone: it is a live-goroutine claim
 	// released by its owner's defer, and clearing it here would license a
 	// second concurrent pane interaction.
+}
+
+// backgroundWorkMark is one positive observation that an agent is waiting on
+// work it started itself, with the terminal it was seen on.
+type backgroundWorkMark struct {
+	terminalID string
+	at         time.Time
+}
+
+// backgroundWorkFresh bounds how long one observation stands for.
+//
+// It only ever matters when NO capture has been taken since — a negative
+// observation deletes the entry outright — so this is the answer to "the agent
+// has gone completely quiet", not to "its shells finished". Comfortably wider
+// than the one-minute sweep so an ordinary quiet spell does not lapse it, and
+// narrow enough that a genuinely finished agent is unprotected within minutes.
+// Accepted limit: an agent whose background work prints NOTHING for this long
+// stops being recognized and its hand-out is reclaimed exactly as before.
+const backgroundWorkFresh = 5 * time.Minute
+
+// noteBackgroundWork records whether this capture positively shows the agent
+// waiting on work it started.
+//
+// situation.Content is the RAW pane (classify.Classify stores it unstripped),
+// which is the same fact queueNoticeWithheld relies on, so this costs nothing
+// beyond the predicate itself.
+func (d *Daemon) noteBackgroundWork(s domain.Situation, tr domain.AgentTransition, now time.Time) {
+	running := domain.BackgroundWorkRunning(s.AgentType, s.Content)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !running {
+		delete(d.backgroundWork, s.AgentID)
+		return
+	}
+	d.backgroundWork[s.AgentID] = backgroundWorkMark{terminalID: tr.TerminalID, at: now}
+}
+
+// backgroundWorkFor reports whether this agent was RECENTLY seen waiting on
+// work it started itself.
+//
+// Absence, staleness and a foreign terminal all answer false, which is the
+// contract domain.BackgroundWorkRunning states: false is UNKNOWN, and every
+// caller must behave exactly as it did before on it.
+//
+// The tenancy compare fails OPEN on an empty terminal id, the way recycledSince
+// does and for the same reason: event-socket transitions carry none, so a
+// strict compare would veto nearly every real observation. A recycle this
+// daemon actually observes drops the entry in resetRecycledPaneState.
+func (d *Daemon) backgroundWorkFor(a domain.AgentTransition, now time.Time) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	mark, ok := d.backgroundWork[a.AgentID]
+	if !ok || now.Sub(mark.at) > backgroundWorkFresh {
+		return false
+	}
+	return mark.terminalID == "" || a.TerminalID == "" || mark.terminalID == a.TerminalID
 }
 
 // hasOpenEscalation reports whether the agent already has an unresolved
@@ -2546,6 +2620,11 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	// itself once the rule graduates, so by the time it matters most it never
 	// reaches an escalation at all.
 	d.noteAgyWorkspace(ctx, situation, agentName, pane)
+
+	// Same chokepoint and the same argument: read off the capture already in
+	// hand, so the reclaim sweep can ask "is this parked agent actually busy?"
+	// without a herdr round trip on the main loop.
+	d.noteBackgroundWork(situation, tr, now)
 
 	// Multi-tab MCQ forms show one question at a time: sweep the remaining
 	// tabs (Right-arrow protocol) so the signature, the escalation, and the
@@ -4540,6 +4619,13 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 	// StripNoopGeneratedLines).
 	task, declined := domain.StripNoopGeneratedLines(res.task)
 
+	// Then drop anything naming ANOTHER agent. The generator treats the pane as
+	// ground truth and the pane routinely carries a sibling's name — every
+	// hand-out hap sends renders "hap task <name> list" into it — so a foreign
+	// name comes back as this agent's work (#508). Same line-wise, still-RAW
+	// treatment as the sentinel above, and for the same reasons.
+	task, foreign := d.stripForeignAgentTasks(ctx, s.AgentID, task)
+
 	// Parse to VALIDATE and to recover the ignored prose. Output that yields no
 	// task (a bare horizontal rule, a punctuation-only reply) would otherwise
 	// become a confirmable escalation that can ONLY fail when the operator acts
@@ -4560,6 +4646,18 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		// source — which takes precedence in Decide but still yields to real
 		// pending items (ReasonNoopVsPendingTasks), so a later refill is not
 		// parked by it.
+		// ABOVE the decline, deliberately: a reply of "- @noop" beside one
+		// foreign-name line strips to nothing with declined set, and reporting
+		// that as "the model declined" hides the only fact worth knowing. Kept
+		// RETRYABLE so `l: retry LLM` can re-ask — unlike a decline, the model
+		// has not answered the question that was put to it.
+		if len(foreign) > 0 {
+			d.escalate(ctx, s, res.sig, domain.Decision{
+				Action: domain.ActionEscalate, Reason: domain.ReasonTaskGenFailed,
+				Rationale: "generate-task produced no usable task: " + domain.ForeignAgentDropNote(foreign),
+			}.WithLLMSession(res.request.SessionID), res.tr, now)
+			return
+		}
 		if declined {
 			d.escalate(ctx, s, res.sig, domain.Decision{
 				Action: domain.ActionEscalate, Reason: res.reason,
@@ -4582,6 +4680,11 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 	// task_source_exhausted for a declared source that ran out) so the
 	// escalation stays NOT retryable — the operator confirms or dismisses it
 	// — while the suggestion carries the generated task for the confirm path.
+	// Lead with the drop note for the reason supersededListNote is led with: the
+	// tail of a long rationale is exactly where it would otherwise vanish.
+	if len(foreign) > 0 {
+		rationale = strings.TrimSpace(domain.ForeignAgentDropNote(foreign) + "\n" + rationale)
+	}
 	d.escalate(ctx, s, res.sig, domain.Decision{
 		Action: domain.ActionEscalate, Reason: res.reason,
 		// Rationale is the model's non-list prose in list mode (empty in plain
@@ -4589,6 +4692,32 @@ func (d *Daemon) handleTaskGenOutcome(ctx context.Context, res taskGenOutcome) {
 		Rationale:  rationale,
 		Suggestion: domain.SuggestTaskPrefix + task,
 	}.WithLLMSession(res.request.SessionID), res.tr, now)
+}
+
+// stripForeignAgentTasks removes generated lines naming a DIFFERENT agent,
+// reporting which names it dropped.
+//
+// The known set is this NODE's agent names (Store.AgentNames), never the
+// fleet's: the echo this exists to catch is THIS node's hand-out template
+// rendering into THIS node's pane, and a fleet read would let another machine's
+// agent name suppress a legitimate local task.
+//
+// A read error degrades to no screening and says so. Losing a whole generation
+// because the name table could not be read would be the worse failure: the
+// suggestion still reaches the operator, who is the gate this path has always
+// had.
+func (d *Daemon) stripForeignAgentTasks(ctx context.Context, agentID, raw string) (string, []string) {
+	names, err := d.opt.Store.AgentNames(ctx)
+	if err != nil {
+		slog.Warn("generate-task: agent names unreadable; not screening the suggestion for other agents' names",
+			"agent", agentID, "error", err)
+		return raw, nil
+	}
+	known := make([]string, 0, len(names))
+	for _, name := range names {
+		known = append(known, name)
+	}
+	return domain.StripForeignAgentGeneratedLines(raw, names[agentID], known)
 }
 
 // agentNotCleanlyIdle reports whether the agent's LIVE herdr status means it is

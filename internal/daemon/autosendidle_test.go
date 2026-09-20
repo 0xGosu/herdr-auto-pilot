@@ -1935,3 +1935,131 @@ func TestAutoSendIdleHandsOutFromASQLiteProviderList(t *testing.T) {
 		t.Errorf("reservations = %+v, want one keyed on %s", res, locator)
 	}
 }
+
+// noteBackgroundWorkFrom drives the daemon's own recorder over a pane capture,
+// the way the classify path does. Deliberately not a direct map write: the
+// predicate under test is domain.BackgroundWorkRunning, and a test that seeded
+// the answer would pass for an agent type that has no indicator at all.
+func noteBackgroundWorkFrom(h *harness, agentID, pane string) {
+	h.daemon.noteBackgroundWork(
+		domain.Situation{AgentID: agentID, PaneID: agentID, AgentType: "claude", Content: pane},
+		domain.AgentTransition{AgentID: agentID, PaneID: agentID, AgentType: "claude"},
+		h.daemon.opt.Clock.Now())
+}
+
+func TestAutoSendIdleReclaimSkipsAnAgentWaitingOnItsOwnShells(t *testing.T) {
+	// #508: herdr reports an agent sitting on a fifteen-minute cold build as
+	// idle, identical to one that has finished. The two-minute grace therefore
+	// expired under an agent that was working the whole time, the item was
+	// reclaimed and re-handed, and the agent was eventually escalated as never
+	// having started. A pane that POSITIVELY shows its own shells running is the
+	// evidence herdr's status cannot carry.
+	h, taskFile := autoSendFixture(t, "agent-bgw1", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-bgw1")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	backdateHandouts(t, h, 2*reclaimGrace)
+	// The ledger row the guard must preserve. Comparing the ID is what makes
+	// this test discriminate: without the guard the sweep reclaims the item AND
+	// re-hands it in the same pass, so the row COUNT and the "[-]" marker both
+	// look untouched a moment later. Only the identity — and the second send —
+	// tell the two apart.
+	before := openHandouts(t, h)[0]
+	noteBackgroundWorkFrom(h, "agent-bgw1", claudeParkedWithShells)
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+
+	// Give a would-be reclaim + resend time to happen before asserting it did not.
+	time.Sleep(500 * time.Millisecond)
+	rs := openHandouts(t, h)
+	if len(rs) != 1 {
+		t.Fatalf("a busy agent's hand-out was retired: %d rows left", len(rs))
+	}
+	if rs[0].ID != before.ID {
+		t.Errorf("the hand-out was reclaimed and re-issued (row %d -> %d); the agent was busy",
+			before.ID, rs[0].ID)
+	}
+	if n := len(h.herdr.sentInputs()); n != 1 {
+		t.Errorf("expected no resend to a busy agent, got %d sends", n)
+	}
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [-] step two") {
+		t.Errorf("a task an agent is working on was reclaimed:\n%s", got)
+	}
+	if esc, _ := h.raw.PendingEscalations(ctx); len(esc) != 0 {
+		t.Errorf("a busy agent was escalated: %+v", esc)
+	}
+}
+
+func TestAutoSendIdleReclaimStillRunsWithoutTheIndicator(t *testing.T) {
+	// The CONTROL for the case above, and the point of the pair: the same pane
+	// with the "· 2 shells" segment removed must reclaim exactly as it always
+	// has. Without it the guard passes on code that answers "busy" for every
+	// parked agent, which would disable the reclaim entirely.
+	quiet := strings.Replace(claudeParkedWithShells,
+		"⏵⏵ auto mode on · 2 shells · ← for agents", "⏵⏵ auto mode on · ← for agents", 1)
+	if quiet == claudeParkedWithShells {
+		t.Fatal("the control pane is identical to the fixture; the indicator was not removed")
+	}
+
+	h, taskFile := autoSendFixture(t, "agent-bgw2", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-bgw2")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	backdateHandouts(t, h, 2*reclaimGrace)
+	noteBackgroundWorkFrom(h, "agent-bgw2", quiet)
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [ ] step two")
+	})
+	if got := readTasks(t, taskFile); !strings.Contains(got, "- [ ] step two") {
+		t.Errorf("an unproven parked agent's task was not reclaimed:\n%s", got)
+	}
+}
+
+func TestBackgroundWorkNeverOutlastsTheStaleHandoutTTL(t *testing.T) {
+	// The bound that makes the guard safe to apply to a CHECKLIST: it defers,
+	// it does not exempt. staleHandoutTTL is asked first and unconditionally, so
+	// a long-lived indicator — a dev server, a tail -f, a watcher — cannot pin
+	// an item at "[-]" for good.
+	h, _ := autoSendFixture(t, "agent-bgw3", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-bgw3")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	backdateHandouts(t, h, 2*staleHandoutTTL)
+	noteBackgroundWorkFrom(h, "agent-bgw3", claudeParkedWithShells)
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+}
+
+func TestBackgroundWorkEvidenceGoesStale(t *testing.T) {
+	// One observation does not stand forever. An agent that has gone completely
+	// quiet stops being recognized after backgroundWorkFresh and is reclaimed
+	// exactly as before — the accepted limit of reading this off a capture
+	// instead of asking herdr.
+	h, taskFile := autoSendFixture(t, "agent-bgw4", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-bgw4")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	backdateHandouts(t, h, 2*reclaimGrace)
+	noteBackgroundWorkFrom(h, "agent-bgw4", claudeParkedWithShells)
+	h.daemon.mu.Lock()
+	mark := h.daemon.backgroundWork["agent-bgw4"]
+	mark.at = mark.at.Add(-2 * backgroundWorkFresh)
+	h.daemon.backgroundWork["agent-bgw4"] = mark
+	h.daemon.mu.Unlock()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "- [ ] step two")
+	})
+}
