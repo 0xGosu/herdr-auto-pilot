@@ -227,6 +227,26 @@ func (d *Daemon) declareWaitAction(ctx context.Context, a domain.AgentAction) (s
 	if err := domain.ValidateWaitDuration(wait); err != nil {
 		return "", err
 	}
+	// A declaration is bounded by its OWN duration, which is tighter than the
+	// agentStateStaleAfter the generic gate applies to this kind (an hour) and
+	// is the only bound that means anything here: the other state kinds go
+	// stale because the operator's belief about which agent this is decays,
+	// while this one's whole content is "I am busy for N minutes". Queued
+	// longer ago than that — an owning daemon that was down — it has nothing
+	// left to say, and honouring it would withhold work from an agent that was
+	// free by the time the row was drained.
+	//
+	// The two sides are different machines' clocks, as they already are in the
+	// generic gate this narrows; the deadline itself is still minted below on
+	// the owner's, which is the clock every reader compares against.
+	//
+	// A CLEAR (Seconds == 0) is deliberately exempt: it has no duration to
+	// outlive, and an agent saying it finished early should land whenever it
+	// arrives.
+	if wait > 0 && !a.CreatedAt.IsZero() && d.opt.Clock.Now().Sub(a.CreatedAt) >= wait {
+		return "", fmt.Errorf("this wait was declared %s ago and asks for %s, so it has already run out; declare a new one",
+			d.opt.Clock.Now().Sub(a.CreatedAt).Round(time.Second), wait)
+	}
 	agentID, err := d.resolveActionTarget(ctx, a)
 	if err != nil {
 		return "", err

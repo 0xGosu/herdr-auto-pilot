@@ -389,3 +389,56 @@ func TestDeclareWaitActionRefusesAnOutOfBoundsDuration(t *testing.T) {
 		}
 	}
 }
+
+// TestAQueuedWaitThatOutlivedItsOwnDurationIsRefused is the bound the generic
+// staleness gate cannot express: that one gives every agent-state kind an hour,
+// because what decays there is the operator's belief about WHICH AGENT this is.
+// A declaration's whole content is "I am busy for N minutes", so one drained
+// after longer than that would withhold work from an agent that was already
+// free.
+func TestAQueuedWaitThatOutlivedItsOwnDurationIsRefused(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	publishOne(t, h, "pW7")
+
+	_, err := h.daemon.declareWaitAction(ctx, domain.AgentAction{
+		Kind: domain.AgentActionDeclareWait, Target: "pW7",
+		Payload:   `{"seconds":1200}`,
+		CreatedAt: h.daemon.opt.Clock.Now().Add(-25 * time.Minute),
+	})
+	if err == nil {
+		t.Fatal("a wait queued longer ago than its own duration was accepted")
+	}
+	w, werr := h.raw.AgentWaitFor(ctx, "pW7")
+	if werr != nil {
+		t.Fatal(werr)
+	}
+	if !w.Until.IsZero() {
+		t.Fatal("the refused wait still wrote a row")
+	}
+
+	// The control: the same row inside its duration still lands, so the case
+	// above cannot pass on a gate that refuses every queued declaration.
+	if _, err := h.daemon.declareWaitAction(ctx, domain.AgentAction{
+		Kind: domain.AgentActionDeclareWait, Target: "pW7",
+		Payload:   `{"seconds":1200}`,
+		CreatedAt: h.daemon.opt.Clock.Now().Add(-5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("a wait still inside its duration was refused: %v", err)
+	}
+	if w, err := h.raw.AgentWaitFor(ctx, "pW7"); err != nil || !w.Active(h.daemon.opt.Clock.Now()) {
+		t.Fatalf("no standing wait: %+v (%v)", w, err)
+	}
+
+	// ...and a CLEAR is exempt: it has no duration to outlive, and an agent
+	// saying it finished early must land whenever it arrives.
+	if _, err := h.daemon.declareWaitAction(ctx, domain.AgentAction{
+		Kind: domain.AgentActionDeclareWait, Target: "pW7", Payload: `{"seconds":0}`,
+		CreatedAt: h.daemon.opt.Clock.Now().Add(-50 * time.Minute),
+	}); err != nil {
+		t.Fatalf("an aged clear was refused: %v", err)
+	}
+	if w, err := h.raw.AgentWaitFor(ctx, "pW7"); err != nil || w.Active(h.daemon.opt.Clock.Now()) {
+		t.Fatalf("the aged clear did not land: %+v (%v)", w, err)
+	}
+}
