@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.54
+
+- Fixed a schema-lease hole under a shared database: a takeover the background renewal had already seen could be forgotten, and a later check that failed to reach the server then let the migration carry on issuing DDL alongside the node that now held the lease.
+- Fixed two tests that failed only on a loaded machine, so `go test ./...` no longer goes red for reasons that have nothing to do with the change under test.
+
 ## 0.9.53
 
 - Fixed generated tasks that named a different agent: the generator reads the pane as ground truth, and every hand-out renders another agent's name into it, so it proposed work for the wrong agent. Such lines are now dropped before the suggestion is stored, and a generation left with nothing is offered for retry instead of reported as a decline.

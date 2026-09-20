@@ -1,2 +1,0 @@
-- Fixed a schema-lease hole under a shared database: a takeover the background renewal had already seen could be forgotten, and a later check that failed to reach the server then let the migration carry on issuing DDL alongside the node that now held the lease.
-- Fixed two tests that failed only on a loaded machine, so `go test ./...` no longer goes red for reasons that have nothing to do with the change under test.
