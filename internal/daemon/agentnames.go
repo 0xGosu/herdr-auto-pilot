@@ -166,6 +166,44 @@ func (d *Daemon) setAgentEnabledAction(ctx context.Context, a domain.AgentAction
 	}
 }
 
+// setAgentSnoozedAction silences (or restores) queue notices for an agent this
+// node owns.
+//
+// It is setAgentEnabledAction's sibling and deliberately a much shorter one:
+// there is no automation flock to time-box, because a snooze commits to no
+// delivery in either direction — it only decides what hap will ASK ABOUT. That
+// is the same reason the identity guard reads asymmetrically here: waking a
+// stranger's agent restores notices nobody is harmed by, while silencing one
+// hides its queue, so the guard is what stops a recycled pane inheriting the
+// last tenant's quiet.
+func (d *Daemon) setAgentSnoozedAction(ctx context.Context, a domain.AgentAction) (string, error) {
+	var p domain.SetSnoozedPayload
+	if err := json.Unmarshal([]byte(a.Payload), &p); err != nil {
+		return "", fmt.Errorf("the queued snooze request could not be read: %w", err)
+	}
+	agentID, err := d.resolveActionTarget(ctx, a)
+	if err != nil {
+		return "", err
+	}
+	verb := "unsnoozed"
+	if p.Snoozed {
+		verb = "snoozed"
+	}
+	if err := d.agentStillTheSame(ctx, agentID, a.TerminalID, verb); err != nil {
+		return "", err
+	}
+	err = d.opt.Store.SetAgentSnoozed(ctx, agentID, p.Snoozed)
+	if errors.Is(err, ports.ErrUnknownAgent) {
+		// The same live-but-unnamed window rename and set_enabled have: name
+		// the agent first so the state is visible and addressable, then set it.
+		if _, nameErr := d.opt.Store.EnsureAgentName(ctx, agentID); nameErr != nil {
+			return "", nameErr
+		}
+		err = d.opt.Store.SetAgentSnoozed(ctx, agentID, p.Snoozed)
+	}
+	return "", err
+}
+
 // resolveActionTarget maps the operator's spelling of an agent to its agent id,
 // in THIS node's namespace — which is the whole reason these kinds are queued.
 //

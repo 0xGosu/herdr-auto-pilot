@@ -1275,8 +1275,13 @@ type agentRow struct {
 	// while the node is the one thing they need in order to act on the row.
 	Location string
 	Disabled bool
-	Stale    bool // remote only: that node stopped reporting
-	Stats    domain.AgentStats
+	// Snoozed: notices about this agent's QUEUE are silenced, but hap still
+	// answers its prompts. Rendered apart from Disabled, never folded into it —
+	// they are different switches and an operator reading one for the other is
+	// the confusion `hap snooze` exists to end.
+	Snoozed bool
+	Stale   bool // remote only: that node stopped reporting
+	Stats   domain.AgentStats
 	// sep marks the "── other nodes ──" divider. It is an ordinary row rather
 	// than rendered chrome, which is what keeps window()/listPageSize()'s
 	// one-row-one-line accounting exact — the same shape the Tasks tab uses
@@ -1299,6 +1304,7 @@ func (m Model) localRow(a domain.AgentTransition) agentRow {
 		Name:            st.AgentName(a.AgentID),
 		Location:        agentLocation(a, st),
 		Disabled:        st.AgentDisabled(a.AgentID),
+		Snoozed:         st.AgentSnoozed(a.AgentID),
 		Stats:           st.StatsFor(a.AgentID),
 	}
 }
@@ -1318,6 +1324,7 @@ func (m Model) agentRows() []agentRow {
 			Name:            r.ShortName(),
 			Location:        r.NodeLabel,
 			Disabled:        r.Disabled,
+			Snoozed:         r.Snoozed,
 			Stale:           r.Stale,
 			Stats:           r.Stats,
 		})
@@ -1336,8 +1343,11 @@ func (m Model) visibleAgents() []agentRow {
 	for _, r := range m.agentRows() {
 		if m.query[tabAgents] != "" {
 			automation := "enabled"
-			if r.Disabled {
+			switch {
+			case r.Disabled:
 				automation = "disabled"
+			case r.Snoozed:
+				automation = "snoozed"
 			}
 			// NodeLabel is searchable so "/laptop" finds one machine's agents.
 			// It is also r.Location for a remote row; passing both costs
@@ -5888,8 +5898,11 @@ func (m Model) agentDetailLines(r agentRow, w int) []string {
 		lines = m.detailField(lines, w, "Working dir", m.data.status.AgentCwd(a.AgentID))
 	}
 	status := a.Status
-	if r.Disabled {
+	switch {
+	case r.Disabled:
 		status += " [DISABLED]"
+	case r.Snoozed:
+		status += " [SNOOZED]"
 	}
 	lines = m.detailField(lines, w, "Status", status)
 	if !r.remote() {
@@ -8097,8 +8110,13 @@ func isOrchestratorRow(r agentRow) bool {
 // invisible for every status longer than two characters, which is all of them.
 func agentRowStatus(r agentRow) string {
 	status := r.Status
-	if r.Disabled {
+	switch {
+	case r.Disabled:
 		status = "DISABLED"
+	case r.Snoozed:
+		// Eight characters, like DISABLED, so the stale marker's column
+		// accounting above is unchanged.
+		status = "SNOOZED"
 	}
 	if r.Stale {
 		status = oneLine(status, 9) + "*"

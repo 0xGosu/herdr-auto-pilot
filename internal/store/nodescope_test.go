@@ -84,6 +84,7 @@ var nodeScopeExemptions = map[string]string{
 	"FleetRoster#1":                  "fleet read: every node's publish time, node_id per row",
 	"FleetAgentNames#1":              "fleet read: every node's names, keyed by (node, agent)",
 	"DisabledAgentsAll#1":            "fleet read: every node's disabled agents, keyed by (node, agent)",
+	"SnoozedAgentsAll#1":             "fleet read: every node's snoozed agents, keyed by (node, agent)",
 }
 
 // sqlVerbRE recognises a flattened argument as a SQL statement.

@@ -520,6 +520,93 @@ while the mode is on; it watches `hap stream orchestrator`.
 **Accepted limitation, not a bug:** a generated-task escalation is `idle`-typed, so its baseline salient is
 unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — the row waits for the operator.
 
+### Queue notices, snooze, and the operator at the keyboard
+
+**A notice about an agent's QUEUE is not a question about its SCREEN, and only the first kind may ever
+be withheld.** `domain.LatchedPerParkedEpisode` names them — `noop_vs_pending_tasks`,
+`task_source_exhausted` and now `no_task_source`. `daemon.queueNoticeWithheld` is the ONE gate they all
+pass, asking four things broadest-first; every other escalation on the same event reaches the operator
+untouched, and a bug in any of this can only ever be an operator seeing too few notices, never a
+keystroke.
+
+- **`ReasonNoTaskSource` was excluded from the latch because "nothing has reported it flooding". It has
+  now been reported** (#526: 454 rows in one day, four for one agent inside three minutes). Latching it
+  was necessary and is NOT sufficient, and the reason is the trap: **the episode latch is cleared by the
+  transition to `working`** (`handleTransition`, `noteIdleAgents`), and an agent waiting on its own
+  background shells flips parked→working→parked every time one prints a line. Each flip re-arms the
+  latch. The excerpt dedup cannot help either — that keys on a screen these agents repaint.
+- **The wall-clock cooldown AND the background-work evidence are scoped to `no_task_source` ALONE**
+  (`noticeCooldownApplies` gates both), and widening either is a regression two existing tests already
+  catch: the other two ask the operator to QUEUE WORK, which they do many times a day, and the hand-out
+  proposal is precisely the row that gets the agent working again — a `tail -f` or a dev server would
+  otherwise withhold it for as long as that process lives. `no_task_source` asks them to REGISTER A
+  SOURCE — configuration, performed on their own clock.
+- **The cooldown is NOT pruned in `noteIdleAgents`' new-episode block, and the comment there says why.**
+  That block is reached whenever `idleSince` carries no mark — which the WORKING transition deletes — so
+  a pruning line there is hit on the first sweep after every flap and collapses the 30-minute bound back
+  to the cadence #526 measured. A genuine recycle is handled where it is actually known,
+  `resetRecycledPaneState`, which compares terminal ids; the map is in memory, so the only recycle it can
+  ever need to survive is one this daemon observed. **Test trap:** the guarding test passed on the broken
+  code until it drove the RE-PARK as well as the working flip.
+- **`domain.BackgroundWorkRunning` is the only one of the four that is EVIDENCE rather than
+  bookkeeping.** herdr reports a pane with three of its own shells running as `idle`, identical to one
+  waiting for a human. Claude paints it as a `·`-separated SEGMENT of the mode line (`⏵⏵ auto mode on ·
+  2 shells · ← for agents`, verified live 2.1.252) — not a line of its own, which is why
+  `claudeModeLabel` already truncates at the first `·`; agy's own count is in the status bar
+  (`· N task(s) ·`). It reads `Situation.Content`, which is the RAW pane (`classify.Classify` stores it
+  unstripped), so it costs no herdr round trip. **Do not put it in `internal/classify`** beside the agy
+  idle suppression: withholding the idle verdict leaves `SituationUnclassifiable`, which still escalates,
+  so it would trade `[no_task_source]` rows for `[unclassifiable]` rows at the same rate.
+- **Every suppression names itself once** (`noteNoticeWithheld`, per (agent, reason, CAUSE) — a changed
+  cause is new information). `notePending`'s rule: the unlogged skips cost a five-round investigation,
+  and a line per event would move the flood into the log.
+- **`hap snooze` is a SEPARATE column from `disabled`, never a second meaning for it.** `hap disable`
+  stops hap answering the agent at all — `escalationAutoDismissReason` records its escalations already
+  dismissed — so an orchestrator that used it to quiet a finished agent also stopped its approvals being
+  answered, and both agents needed re-enabling by hand when their panes were reused. Snooze adds exactly
+  three gates (`queueNoticeWithheld`, `eligibleIdleAgents`, the `ActionGenerateTask` arm) and MUST NOT
+  touch `WithAgentAutomation`, `deliverreply.go`, `autoaccept.go` or `generatedtask.go`'s barrier — that
+  is the whole difference. It clears on the transition to working through a **conditional** store write
+  (`ClearAgentSnoozeIfSet`): unconditional, it would report a write on every turn boundary of every
+  working agent and arm the turso push debounce each time.
+- **"Idle" is not "unattended": `domain.OperatorTyping` looks for a human.** An operator with a
+  half-written message in the composer is present, and typing there appends to their draft and submits
+  it. **`known == false` is UNKNOWN and is the COMMON case** — the classification read is a consuming
+  delta that usually shows no footer — so a guard that withheld on unknown would withhold nearly every
+  hand-out. It withholds only on proof. Asked at task generation (`generateTask`, ABOVE
+  `HasPendingLLMConsult` so a refusal strands no `llm_requests` row) and at every unattended send, from a
+  `--source visible` read (`operatorTypingRefusal`), whose unreadable case deliberately fails OPEN —
+  the opposite of `agyComposerRefusal`, which proves a positive precondition. agy is SUBSUMED rather than
+  exempt: `AgyComposerReady` already proves a bare caret, which is strictly stronger, so asking again
+  would only cost a second herdr shell-out at all five shared call sites.
+  - **The auto-accept path asks in `claimBlockedBy`, not in `autoAcceptDeliver`**, because the
+    OPERATOR's own `--send` goes through the latter and a human who just looked at the screen must not
+    be refused for the draft they are holding. Refusing at the claim also leaves the row PENDING with
+    `notePending` naming the reason, rather than burning a delivery attempt.
+  - **codex answers UNKNOWN outright, and that is a refusal rather than a gap**: it renders suggestion
+    text on the caret line of an EMPTY composer, and reading that as a draft would silently withhold
+    every hand-out from every parked codex agent. Finish it only with a live sample of both states.
+- **An orchestrator-authored reply gets the PROSE screen** (`deliverReplyScreen`): `screenOutboundStrict`
+  plus `actionRefused`, never the suspected-irreversible heuristic. The heuristic corroborates a
+  destructive verb against a data target across a line or two because it reads a PENDING PANE OPERATION,
+  so over narration it refuses work for DISCUSSING it — observed live refusing a `resolve --action`
+  carrying review-fix instructions because "without deleting the PK row" was followed by "table", which
+  stalled a pull request for three hours. The operator's arm is UNCHANGED. What is kept, and the
+  difference from a `send_task` hand-out: the ACTION rules, because a reply is routinely a MENU LABEL and
+  a widening option picked by an LLM is exactly what they refuse.
+- **A refused queued action raises its own escalation** (`escalateRefusedAction`, `queued_action_refused`)
+  and emits `correction.withdrawn`. Before it, a refusal set `agent_actions.error`, deleted the
+  correction, logged one line and told only the process that queued it — which for the orchestrator is a
+  terminal its own skill has just told that refusals are final. The row carries NO suggestion (the text a
+  safety control refused is exactly what a confirm would type), and it is raised for `errOutboundRefused`
+  only: `errEscalationClosed` withdraws too, but there the row is already resolved. Two bounds:
+  `finishWithdrawn` REPORTS whether it recorded, and a failed withdrawal leaves the row running for the
+  startup reclaim to requeue — announcing there would put a second row in front of the operator for one
+  refusal; and an identical repeat is deduped in memory (`refusalEscalated`), because the author this
+  exists for is an LLM. **It must RESOLVE `a.Target` first**: that field is the operator's SPELLING, and
+  `send_task` queues an agent NAME, so filing the row under it writes an `audit_log.agent_id` that joins
+  to nothing — on precisely the kind whose refusal has no other row at all.
+
 ### Task sources and hand-outs
 
 - **`enable_auto_send_task_when_idle` skips the LEARNING gates, never the safety ones.** A declared task
@@ -1418,6 +1505,8 @@ where the behaviour could revert.
 | `internal/classify` | pane-content classifier + golden fixtures |
 | `internal/mcqdeliver` | answers a live multi-tab MCQ form, verifying each keystroke landed |
 | `internal/domain/agentmode.go` | parses an agent's permission mode out of its composer footer; proves the composer is safe to press into |
+| `internal/domain/backgroundwork.go` | reads "this agent is waiting on its OWN shells/monitors/subagents" off a pane herdr calls idle |
+| `internal/domain/operatortyping.go` | reads "a human has a draft in the composer" off the same pane; UNKNOWN is the common answer |
 | `internal/llm` | operator LLM CLI adapter (argv template, auto-repair) |
 | `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
 | `internal/herdr` | herdr CLI + events-socket adapters |

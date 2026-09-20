@@ -69,6 +69,20 @@ func (a *App) SetAgentDisabledOn(ctx context.Context, nodeID, target string, dis
 	return err
 }
 
+// SetAgentSnoozedOn turns queue notices off or on for an agent on the named
+// node.
+func (a *App) SetAgentSnoozedOn(ctx context.Context, nodeID, target string, snoozed bool) error {
+	if a.isSelf(nodeID) {
+		return a.SetAgentSnoozed(ctx, target, snoozed)
+	}
+	payload, err := json.Marshal(domain.SetSnoozedPayload{Snoozed: snoozed})
+	if err != nil {
+		return err
+	}
+	_, err = a.runRemoteAction(ctx, nodeID, domain.AgentActionSetSnoozed, target, string(payload), true)
+	return err
+}
+
 // CaptureAgentOn re-runs the attention pipeline for a parked agent on the named
 // node.
 func (a *App) CaptureAgentOn(ctx context.Context, nodeID, target string) (domain.CaptureResult, error) {

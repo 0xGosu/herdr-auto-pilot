@@ -396,6 +396,52 @@ type Daemon struct {
 	// flood this fixes into the log.
 	episodeNoticeRaised map[string]map[domain.EscalateReason]int
 
+	// noticeCooldownUntil bounds a queue notice by WALL CLOCK as well as by
+	// episode, per (agent, reason).
+	//
+	// The episode latch above is not sufficient on its own, and #526 is the
+	// report: it is cleared by the working transition (handleTransition's
+	// `case "working"` and noteIdleAgents), and an agent waiting on its OWN
+	// background shells flips idle->working->idle every time one of them prints
+	// a line. Each flip is a fresh episode, so the latch re-arms and the notice
+	// is raised again — 454 [no_task_source] rows in one day, four for one agent
+	// inside three minutes, every one of them dismissed by hand.
+	//
+	// A duration is justifiable here where it was not for the latch alone: what
+	// is being bounded is not "once per spell" but "how often a queue notice may
+	// interrupt a human", and the remedy these notices ask for (register a
+	// source, queue work) is one the operator performs on their own clock.
+	//
+	// Kept ACROSS the parked/working boundary on purpose — that boundary is the
+	// bug — and pruned only when the agent leaves the live listing or its pane
+	// is recycled, which is a different agent entirely.
+	noticeCooldownUntil map[string]map[domain.EscalateReason]time.Time
+
+	// noticeSuppressionNoted is the once-per-(agent, reason) log latch for the
+	// two content- and clock-driven suppressions, holding the CAUSE last logged.
+	//
+	// notePending's rule, for the same reason: an unlogged skip cost a five-round
+	// investigation, and a line per suppressed event would put the flood this
+	// fixes into the log instead. A CHANGED cause logs again, because "withheld
+	// because the agent has shells running" and "withheld because one was raised
+	// 3 minutes ago" are different facts about the same agent.
+	noticeSuppressionNoted map[string]map[domain.EscalateReason]string
+
+	// refusalEscalated dedupes escalateRefusedAction, holding the last
+	// (kind, reason) it raised a row for per agent.
+	//
+	// Unlike the queue notices above, this path is not sweep-driven: one row per
+	// QUEUED ACTION is already a bound, because each action is a separate `hap
+	// resolve --send`. But the author on the path this exists for is an LLM, and
+	// #526's whole finding is that an LLM asked the same thing on a loop — so an
+	// identical refusal, repeated, writes ONE row. A CHANGED refusal is new
+	// information and writes again, the same rule noteNoticeWithheld follows.
+	//
+	// In memory, so a restart re-raises: that fails in the direction of telling
+	// the operator too much, which is the safe one here. Pruned with the rest in
+	// noteIdleAgents.
+	refusalEscalated map[string]string
+
 	// preDeliveryReviewInFlight tracks the one live pre-delivery review per
 	// agent; the token lets the outcome handler drop superseded results.
 	// Guarded by mu alongside preDeliveryReviewSeq.
@@ -872,6 +918,9 @@ func New(opt Options) (*Daemon, error) {
 		lastAutoSend:              map[string]time.Time{},
 		lastAutoNoop:              map[string]time.Time{},
 		episodeNoticeRaised:       map[string]map[domain.EscalateReason]int{},
+		noticeCooldownUntil:       map[string]map[domain.EscalateReason]time.Time{},
+		noticeSuppressionNoted:    map[string]map[domain.EscalateReason]string{},
+		refusalEscalated:          map[string]string{},
 		preDeliveryReviewInFlight: map[string]preDeliveryReviewFlight{},
 		rerankInFlight:            map[string]rerankFlight{},
 		rerankCache:               map[string][]domain.RerankResult{},
@@ -1963,6 +2012,24 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// budget back, and its settle window starts again from the next park.
 		delete(d.sessionSyncDeferred, tr.AgentID)
 		d.mu.Unlock()
+		// A snooze says "this agent has nothing left to do, stop asking about
+		// its queue". It is working, so that is no longer true — and clearing
+		// it here rather than making the operator do it is the whole difference
+		// between snooze and disable (#526): a pane reused for new work must
+		// not carry a quiet switch its last tenant earned.
+		//
+		// The STATEMENT runs on every working transition; only the WRITE is
+		// conditional (ClearAgentSnoozeIfSet's WHERE), which is what keeps it
+		// from arming the turso push debounce per turn boundary. Under a shared
+		// engine that still costs one socket round trip per transition — judged
+		// acceptable against a throttle here, because the cost of a LATE lift is
+		// an agent silently withheld from the idle poll while it works.
+		if lifted, err := d.opt.Store.ClearAgentSnoozeIfSet(ctx, tr.AgentID); err != nil {
+			slog.Warn("snooze could not be lifted for a working agent",
+				"agent", tr.AgentID, "error", err)
+		} else if lifted {
+			slog.Info("snooze lifted: the agent is working again", "agent", tr.AgentID)
+		}
 		// The agent is doing something, which is the ONLY evidence that an
 		// unattended hand-out actually reached it (a successful `agent send`
 		// only proves herdr accepted the keystrokes). Latch it here rather than
@@ -2198,6 +2265,11 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	delete(d.lastAutoNoop, a.AgentID)
 	delete(d.idleSince, a.AgentID)
 	delete(d.episodeNoticeRaised, a.AgentID)
+	// The notice cooldown survives a parked->working flip by design, so this
+	// is one of only two places it is dropped: a recycled pane is a different
+	// agent, and it has interrupted nobody yet.
+	delete(d.noticeCooldownUntil, a.AgentID)
+	delete(d.noticeSuppressionNoted, a.AgentID)
 	delete(d.autoTaskClaim, a.AgentID)
 	d.forgetSessionRenamePushesLocked(a.AgentID)
 	d.mu.Unlock()
@@ -2899,6 +2971,27 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 			d.ignoreDuplicate(ctx, situation, tr, now)
 			return
 		}
+		// And the queue-notice guards, for the same reason and at the same
+		// position: escalate() applies this identical verdict before its audit
+		// write, so a notice suppressed there is one this generation could never
+		// have delivered — but only AFTER the LLM subprocess has run in the
+		// agent's cwd. On an install with llm.task_generate_command configured
+		// that subprocess is where the whole cost of the #526 flood sits: 454
+		// no_task_source rows means 454 generations, every one of them for a row
+		// that was then dismissed by hand.
+		//
+		// The reason is ReasonNoTaskSource by construction here (see the comment
+		// at the top of this arm), and it is asked for explicitly rather than
+		// taken from the decision, which carries none.
+		//
+		// Same bound as duplicateAskBeforeLLM's: nothing is staged before this
+		// point — StageLLMRequest lives inside generateTask — so no request row,
+		// reservation or file write is stranded, and the next attention event
+		// raises the situation again once the guard clears.
+		if d.queueNoticeWithheld(ctx, situation, domain.ReasonNoTaskSource, now) {
+			d.dropAutoTaskClaim(situation.AgentID)
+			return
+		}
 		d.generateTask(ctx, cfg, situation, sig, tr, now, declared != nil)
 	default:
 		d.escalate(ctx, situation, sig, decision, tr, now)
@@ -3392,6 +3485,15 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 			return abandon()
 		}
 	}
+	// And for every agent type, a human with a draft in the composer. This is
+	// the unattended path by definition, so "the pane is idle" is the only
+	// evidence it has that nobody is there — and it is wrong exactly when
+	// somebody has started typing and not yet submitted (#526).
+	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		slog.Info("not sending: an operator has a draft in the composer",
+			"agent", s.AgentID, "reason", err)
+		return abandon()
+	}
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
@@ -3453,6 +3555,16 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 			d.opt.Store.UpdateAuditStatus(ctx, auditID, domain.AuditStatusIgnored)
 			return false
 		}
+	}
+	// The same last look for a human, and it needs one for the same reason: the
+	// earlier proof is seconds old, and starting to type is exactly the thing an
+	// operator does in those seconds.
+	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		slog.Info("an operator started typing between the proof and the send; nothing was typed",
+			"agent", s.AgentID, "reason", err)
+		rollback()
+		d.opt.Store.UpdateAuditStatus(ctx, auditID, domain.AuditStatusIgnored)
+		return false
 	}
 
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
@@ -3763,6 +3875,141 @@ func (d *Daemon) episodeNoticeSuppressed(agentID string, reason domain.EscalateR
 	return true
 }
 
+// queueNoticeCooldown is how long a domain.LatchedPerParkedEpisode notice is
+// withheld after one was raised for the same agent and reason.
+//
+// Deliberately longer than escalationDedupWindow (10m) and than the sweep: this
+// bounds how often a notice may interrupt a human, not how long a screen stays
+// the same. The remedy it asks for — registering a task source — is an act of
+// configuration the operator performs on their own clock, so re-asking sooner
+// buys nothing, and #526 measured what re-asking on every event costs.
+const queueNoticeCooldown = 30 * time.Minute
+
+// queueNoticeWithheld reports whether a queue notice must be withheld right now,
+// naming the cause for the log.
+//
+// Four guards, broadest first, and they answer different questions:
+//
+//   - the operator (or their deputy) asked for quiet on this agent
+//     (`hap snooze`). An instruction, so it outranks every inference below it,
+//     and it is scoped to these reasons ALONE — that scope is the whole point
+//     of the switch. `hap disable` silences the agent's approvals too, which is
+//     why using it to stop a finished agent's queue notices meant re-enabling
+//     the agent by hand when its pane was reused (#526).
+//   - the agent is waiting on work IT started (domain.BackgroundWorkRunning).
+//     This is the only one that is TRUE EVIDENCE rather than bookkeeping: an
+//     agent with its own shells running does not need a task, and herdr cannot
+//     say so because it reports the pane as idle either way. It reads the
+//     situation's own content, which is the RAW pane (classify.Classify stores
+//     it unstripped), so it costs no herdr round trip. Scoped to the same one
+//     reason the cooldown is, and for the same argument — see
+//     noticeCooldownApplies. An indicator can be long-lived (a dev server, a
+//     `tail -f`, a watcher), so applying it to the queue-work notices would
+//     withhold the hand-out proposal for as long as that process lives, and
+//     the proposal is the only path to that work when
+//     enable_auto_send_task_when_idle is off.
+//   - one was raised recently (queueNoticeCooldown). This is what survives the
+//     idle->working->idle flap a background command's output causes, which is
+//     exactly what defeats the episode latch below. It applies to
+//     ReasonNoTaskSource ALONE — see noticeCooldownApplies.
+//   - one was raised in this parked episode (the latch).
+//
+// Only reasons domain.LatchedPerParkedEpisode names reach here; every other
+// escalation on the same event still reaches the operator untouched.
+func (d *Daemon) queueNoticeWithheld(ctx context.Context, s domain.Situation,
+	reason domain.EscalateReason, now time.Time) bool {
+
+	// A read error is NOT a snooze: an unreadable switch must not silence the
+	// operator's queue, which is the direction every other lifecycle read in
+	// this file fails in too.
+	if snoozed, err := d.opt.Store.AgentSnoozed(ctx, s.AgentID); err != nil {
+		slog.Warn("snooze read failed while raising a queue notice",
+			"agent", s.AgentID, "error", err)
+	} else if snoozed {
+		d.noteNoticeWithheld(s.AgentID, reason, "the agent is snoozed")
+		return true
+	}
+	if noticeCooldownApplies(reason) &&
+		domain.BackgroundWorkRunning(s.AgentType, s.Content) {
+		d.noteNoticeWithheld(s.AgentID, reason, "the agent is waiting on background work it started")
+		return true
+	}
+	if noticeCooldownApplies(reason) && d.noticeCooldownActive(s.AgentID, reason, now) {
+		d.noteNoticeWithheld(s.AgentID, reason,
+			"one was raised within the last "+queueNoticeCooldown.String())
+		return true
+	}
+	return d.episodeNoticeSuppressed(s.AgentID, reason)
+}
+
+// noticeCooldownApplies reports whether a reason is bounded by the wall clock and
+// by the agent's own background work, as well as by the episode.
+//
+// ReasonNoTaskSource alone, and the dividing line is the one
+// domain.LatchedPerParkedEpisode's original comment drew: its remedy is
+// REGISTERING A SOURCE, a rare act of configuration, while the other two ask the
+// operator to QUEUE WORK — something they do many times a day.
+//
+// Putting the other two on a clock is a regression, not a nicety, and the suite
+// says so: TestHandoutProposalIsRaisedOncePerParkedEpisode and
+// TestExhaustedNoticeIsRaisedOncePerParkedEpisodeEvenAfterDismissal both pin
+// "a NEW parked episode must be able to propose again" — the operator reads the
+// exhausted notice, adds tasks, the agent works and parks, and the hand-out
+// proposal is what delivers them. A cooldown would swallow exactly the row that
+// gets the agent working again, which is the failure the per-(agent, reason)
+// latch was designed to avoid in the first place.
+func noticeCooldownApplies(reason domain.EscalateReason) bool {
+	return reason == domain.ReasonNoTaskSource
+}
+
+// noticeCooldownActive reports whether this agent and reason are still inside
+// the cooldown a previous notice opened.
+func (d *Daemon) noticeCooldownActive(agentID string, reason domain.EscalateReason,
+	now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	until, ok := d.noticeCooldownUntil[agentID][reason]
+	return ok && now.Before(until)
+}
+
+// noteNoticeCooldown opens the cooldown. Called only once the audit row exists,
+// for the same reason the episode latch is: a failed insert must leave the next
+// event free to raise the notice.
+func (d *Daemon) noteNoticeCooldown(agentID string, reason domain.EscalateReason, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	per := d.noticeCooldownUntil[agentID]
+	if per == nil {
+		per = map[domain.EscalateReason]time.Time{}
+		d.noticeCooldownUntil[agentID] = per
+	}
+	per[reason] = now.Add(queueNoticeCooldown)
+	// A raised notice is new information, so the next suppression of it may
+	// speak again whatever its cause.
+	delete(d.noticeSuppressionNoted[agentID], reason)
+}
+
+// noteNoticeWithheld logs one INFO line per (agent, reason, cause).
+//
+// Per cause, not per suppression: a changed cause is new information — "it has
+// shells running" and "one was raised three minutes ago" are different facts —
+// while a line per event would move the flood this fixes into the log.
+func (d *Daemon) noteNoticeWithheld(agentID string, reason domain.EscalateReason, cause string) {
+	d.mu.Lock()
+	per := d.noticeSuppressionNoted[agentID]
+	if per == nil {
+		per = map[domain.EscalateReason]string{}
+		d.noticeSuppressionNoted[agentID] = per
+	}
+	if per[reason] == cause {
+		d.mu.Unlock()
+		return
+	}
+	per[reason] = cause
+	d.mu.Unlock()
+	slog.Info("queue notice withheld", "agent", agentID, "reason", reason, "cause", cause)
+}
+
 func (d *Daemon) escalate(ctx context.Context, s domain.Situation, sig domain.SignatureResult,
 	dec domain.Decision, tr domain.AgentTransition, now time.Time) {
 	d.escalateWith(ctx, s, sig, dec, tr, now, "")
@@ -3809,19 +4056,24 @@ func (d *Daemon) escalateWith(ctx context.Context, s domain.Situation, sig domai
 		return
 	}
 
-	// One notice per parked episode, per latched reason. The dedup above keys on
-	// the pane excerpt, which an agy changes on every repaint, so these reasons
-	// need an identity that survives a moving screen (finding 5,
-	// episodeNoticeRaised) — and task_source_exhausted additionally needs one
-	// that survives its own DISMISSAL, since full self-prompting retires it and
-	// the queue is then empty again by the next sweep.
+	// Queue notices are withheld while the agent is waiting on its own
+	// background work, inside the cooldown a previous one opened, or already
+	// raised in this parked episode — see queueNoticeWithheld, which explains
+	// why all three are needed. The dedup above keys on the pane excerpt, which
+	// an agy changes on every repaint, so these reasons need an identity that
+	// survives a moving screen (finding 5, episodeNoticeRaised); the cooldown
+	// additionally survives the idle->working->idle flap a background command's
+	// own output causes, which the episode latch cannot (#526); and
+	// task_source_exhausted needs one that survives its own DISMISSAL, since
+	// full self-prompting retires it and the queue is then empty again by the
+	// next sweep.
 	// Scoped to domain.LatchedPerParkedEpisode: every other escalation on the
 	// same event still reaches the operator. Below the auto-dismiss guard for the
 	// same reason the dedup is — a lifecycle dismissal must stay visible in
 	// history — and no audit row is written per repeat, since audit_log is never
 	// swept.
 	if autoDismissReason == "" && domain.LatchedPerParkedEpisode(dec.Reason) &&
-		d.episodeNoticeSuppressed(s.AgentID, dec.Reason) {
+		d.queueNoticeWithheld(ctx, s, dec.Reason, now) {
 		return
 	}
 
@@ -3881,6 +4133,9 @@ func (d *Daemon) escalateWith(ctx context.Context, s domain.Situation, sig domai
 	// whole parked episode.
 	if auditErr == nil && domain.LatchedPerParkedEpisode(dec.Reason) {
 		d.noteEpisodeNoticeRaised(s.AgentID, dec.Reason)
+		if noticeCooldownApplies(dec.Reason) {
+			d.noteNoticeCooldown(s.AgentID, dec.Reason, now)
+		}
 	}
 
 	// Rate-limit escalations pause the agent until human check-in — EXCEPT an
@@ -4119,6 +4374,22 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 
 	tg := d.taskGenPort()
 	if tg == nil {
+		return
+	}
+	// An operator mid-draft is present, and a generation exists only to produce
+	// something to send them away with. Asked HERE rather than at the send:
+	// nothing is staged before this point (StageLLMRequest lives below), so a
+	// refusal strands no llm_requests row for the in-flight guard above to trip
+	// on forever — the same bound duplicateAskBeforeLLM's call site relies on.
+	//
+	// It reads the situation's own capture rather than taking a fresh one: this
+	// runs on the select loop, the capture is seconds old, and the cost of being
+	// wrong here is one skipped generation that the next attention event redoes.
+	// The SEND paths are the ones that re-read (requireIdleForHandout,
+	// refuseIfAgentBusy, actionTaskSendHost.Send).
+	if typing, known := domain.OperatorTyping(s.AgentType, s.Content); known && typing {
+		slog.Info("task generation skipped: an operator has a draft in the composer",
+			"agent", s.AgentID)
 		return
 	}
 	// Don't stack a generation onto one already in flight for this agent.
@@ -5564,6 +5835,15 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	// must be proven empty on the same visible re-read (see AgyComposerReady).
 	if domain.IsAgy(s.AgentType) && !domain.AgyComposerReady(pane) {
 		reject(domain.ReasonLLMNoSubmit, "stale: agy's composer is not ready for a message")
+		return
+	}
+	// And a human at the composer, whatever the agent type. This is the same
+	// question the line above asks agy, asked of everyone: an idle-typed row
+	// promoted to a send types free text into the composer, which is exactly
+	// where an operator's half-written message would be (#526). `pane` is the
+	// visible re-read verified current above, so this costs no extra round trip.
+	if typing, known := domain.OperatorTyping(s.AgentType, pane); known && typing {
+		reject(domain.ReasonLLMNoSubmit, "stale: an operator has a draft in the composer")
 		return
 	}
 	if domain.UnmatchedMenuReply(s.Type, s.AgentType, pane, llmDec.Action) {

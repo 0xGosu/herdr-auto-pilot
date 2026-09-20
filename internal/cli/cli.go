@@ -922,6 +922,34 @@ func setAgentDisabled(ctx context.Context, app *frontend.App, out io.Writer,
 	return nil
 }
 
+// setAgentSnoozed is setAgentDisabled's sibling for the quiet switch. Kept
+// separate rather than parameterised further: the two verbs say different things
+// to the operator and their messages have to be able to diverge.
+func setAgentSnoozed(ctx context.Context, app *frontend.App, out io.Writer,
+	args []string, snoozed bool) error {
+	verb := "unsnooze"
+	state := "unsnoozed"
+	if snoozed {
+		verb = "snooze"
+		state = "snoozed"
+	}
+	rest, nodeID, label, err := splitNodeFlag(ctx, app, args)
+	if err != nil {
+		return err
+	}
+	if len(rest) != 1 || strings.TrimSpace(rest[0]) == "" {
+		return fmt.Errorf("usage: %s [--node <label|id>] <agent-name-or-pane-id> (see: hap agents)", verb)
+	}
+	if err := app.SetAgentSnoozedOn(ctx, nodeID, rest[0], snoozed); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "agent %q%s %s\n", rest[0], label, state)
+	if snoozed {
+		fmt.Fprintf(out, "its approvals are still answered; the snooze lifts by itself when it next works\n")
+	}
+	return nil
+}
+
 func status(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	stderrTail := fs.Bool("stderr", false, "also print the captured daemon stderr (the crash output the status line only names)")
@@ -1203,9 +1231,17 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		if name == "" {
 			name = "-"
 		}
+		// A THIRD value in the existing column rather than a new one: the row
+		// is tab-separated and scripts parse it by field number, so inserting
+		// a column would shift cwd, mode and node for every existing reader.
+		// "disabled" wins over "snoozed" — it is the stronger state, and an
+		// agent carrying both is one hap will not act on at all.
 		automation := "enabled"
-		if st.AgentDisabled(a.AgentID) {
+		switch {
+		case st.AgentDisabled(a.AgentID):
 			automation = "disabled"
+		case st.AgentSnoozed(a.AgentID):
+			automation = "snoozed"
 		}
 		// Appended AFTER cwd, deliberately: inserting it mid-row would shift
 		// cwd from field 6 to field 7 and silently break every existing
@@ -1235,8 +1271,11 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 	// reporting says so in the status field rather than pretending to be live.
 	for _, r := range st.RemoteAgents {
 		automation := "enabled"
-		if r.Disabled {
+		switch {
+		case r.Disabled:
 			automation = "disabled"
+		case r.Snoozed:
+			automation = "snoozed"
 		}
 		status := r.Status
 		if r.Stale {

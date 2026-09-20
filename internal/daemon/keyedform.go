@@ -104,6 +104,11 @@ func agyAnswerRefusalReason(err error) domain.EscalateReason {
 var errAgyComposerNotReady = errors.New("agy's composer is not ready for a message " +
 	"(a form, a draft, a picker or a working turn is on screen)")
 
+// errOperatorTyping is the refusal every unattended send path shares: a human
+// has a half-written message in the composer, so typing would append to it.
+var errOperatorTyping = errors.New("an operator has a draft in the composer, " +
+	"so sending now would be appended to their message and submitted with it")
+
 // agyComposerRefusal proves, from a fresh visible read, that agy is parked at
 // an empty composer (domain.AgyComposerReady) — the only state in which typed
 // text is a message rather than an answer to whatever stands. herdr reports
@@ -119,6 +124,40 @@ func (d *Daemon) agyComposerRefusal(ctx context.Context, paneID string) error {
 	}
 	if !domain.AgyComposerReady(pane) {
 		return errAgyComposerNotReady
+	}
+	return nil
+}
+
+// operatorTypingRefusal refuses when a human has a half-written message in the
+// agent's composer.
+//
+// It reads `--source visible` for the reason agyComposerRefusal does: the
+// classification capture is a CONSUMING delta that routinely shows no footer,
+// and "we could not see the composer" must not read as "nobody is typing".
+//
+// Unreadable is NOT a refusal, and that is the opposite of agyComposerRefusal's
+// bargain on purpose. That one proves a POSITIVE precondition — agy is waiting
+// at an empty composer — where absence of evidence is absence of the thing. This
+// one looks for a human, and every non-claude, non-agy agent plus every capture
+// with no footer answers UNKNOWN, so refusing on unknown would withhold nearly
+// every hand-out from every agent. It withholds only on proof.
+func (d *Daemon) operatorTypingRefusal(ctx context.Context, paneID, agentType string) error {
+	// agy is SUBSUMED, not exempt: every agy send path already calls
+	// agyComposerRefusal, and AgyComposerReady proves the caret line is a bare
+	// ">" or a mode placeholder — which is strictly stronger than "no draft".
+	// Asking again could only agree, at the price of a second herdr shell-out
+	// on the select loop at all five of those call sites.
+	if domain.IsAgy(agentType) {
+		return nil
+	}
+	pane, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
+	if err != nil {
+		slog.Debug("could not read the pane to check for an operator draft",
+			"pane", paneID, "error", err)
+		return nil
+	}
+	if typing, known := domain.OperatorTyping(agentType, pane); known && typing {
+		return errOperatorTyping
 	}
 	return nil
 }

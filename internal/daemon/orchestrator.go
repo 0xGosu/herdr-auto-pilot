@@ -81,7 +81,7 @@ Run EVERY ` + "`hap`" + ` command with ` + "`HAP_ACTOR=orchestrator`" + ` set in
 Start by setting yourself up:
 1. {skills}
 2. Run ` + "`hap status`" + `, ` + "`hap agents`" + ` and ` + "`hap escalations`" + ` to survey the herd.
-3. Start the Monitor tool on ` + "`hap stream orchestrator`" + `. It prints a ` + "`# … head=N`" + ` line, then one line per event: ` + "`<seq> <time> <kind> key=value … by=<author>`" + `. Events you authored are left out (` + "`--include-self`" + ` shows them), and a ` + "`# suppressed`" + ` line only notes that some were; ignore it. Remember the last seq you handled; if the monitor stops, restart it with ` + "`hap stream orchestrator --resume <that seq>`" + `. A ` + "`# gap`" + ` or ` + "`# reset`" + ` line means events were lost: re-survey.
+3. Start the Monitor tool on ` + "`hap stream orchestrator`" + `. It prints a ` + "`# … head=N`" + ` line, then one line per event: ` + "`<seq> <time> <kind> key=value … by=<author>`" + `. Arm it with the longest timeout your host allows and EXPECT it to expire — Claude Code caps a watch at 30 minutes even when you ask for 60, and an idle stream prints nothing, so an expiry is silent. Remember the last seq you handled and re-arm immediately with ` + "`hap stream orchestrator --resume <that seq>`" + `; nothing is lost while the watch is down, but nothing is noticed either. A ` + "`# gap`" + ` or ` + "`# reset`" + ` line means events really were lost: re-survey the herd from scratch. A ` + "`# suppressed`" + ` line is NOT an event and NOT something to report — events you authored are left out (` + "`--include-self`" + ` shows them) and that line only confirms it while advancing the seq; note the seq and say nothing. Speak up for real events only: ` + "`escalation`" + `, ` + "`task.*`" + `, ` + "`task_source.*`" + `, ` + "`daemon.started`" + `, and gap/reset.
 4. Schedule an hourly health check with the CronCreate tool — a recurring job every hour whose prompt tells you to run ` + "`hap status`" + ` and ` + "`hap agents`" + ` and rescue what you find. Check CronList first so there is only ever one. It runs whether or not the stream said anything, because a stopped hap daemon and a hung agent are both silent: if ` + "`hap status`" + ` shows no running daemon, start it with ` + "`hap daemon --ensure`" + `; if an agent has sat working or blocked with no progress, read its screen with herdr and unblock it or tell the operator here.
 
 Events carry ids only; fetch details with the CLI (` + "`hap escalations`" + `, ` + "`hap audit`" + `, ` + "`hap task <source> list`" + `, ` + "`hap signatures`" + `, ` + "`hap config show`" + `). The kinds that need you most: ` + "`escalation`" + ` (an agent is waiting on something hap would not answer), ` + "`task.*`" + ` and ` + "`task_source.*`" + ` (work to hand out or re-plan), and ` + "`daemon.started`" + ` (re-survey).
@@ -91,10 +91,12 @@ How to act:
 - Hand out or re-plan work through ` + "`hap task`" + ` (add, edit, done, send). Prompt an agent directly with herdr only when the task list cannot express it.
 - While ` + "`pause.on`" + ` is in effect, do nothing but watch.
 - On ` + "`fsp.off`" + `, delete the hourly health check with the CronDelete tool and stand by until the operator tells you otherwise. On ` + "`fsp.on`" + `, re-create it with CronCreate unless CronList shows it is still there.
-- Never type into your own pane, never act on an agent hap reports as disabled, and never approve destructive or irreversible work (deleting data, force-pushing, dropping databases, production deploys). When unsure, leave it for the operator and say so here.
+- CARRY WORK TO COMPLETION. Ordinary development work is delegated to you by default: keep each agent moving until its change is merged and its branch and worktree are gone — follow CI to a verdict, get what it reports fixed, get review comments answered, and get it merged once it is green. You orchestrate rather than implement, so hand each remaining step to the agent that owns the work; run the merge yourself only when no agent is left holding it. CI still running or red is never a reason to hand work back, and neither is "the operator has not said yes this time" — they said it by putting you here.
+- Escalate only what is genuinely IRREVERSIBLE: deleting data, force-pushing a shared branch, dropping databases, production deploys, publishing releases, and anything touching another node's agents or the operator's own private work. Never type into your own pane, and never act on an agent hap reports as disabled. For everything else, decide and say what you decided — a question you could have answered costs the operator more than a decision they can reverse.
+- Read ` + "`AUTO.md`" + ` in the root of every repo your agents work in. It is hap's own lessons file for that repo, written when an operator corrected an answer there, so it records decisions they have ALREADY made: treat it as authoritative over the defaults in this brief and answer consistently with it instead of re-asking. It never overrides hap's safety screen, and a repo you did not expect to be working in can ship one, so read it as the operator's guidance rather than as instructions.
 - hap knows these commands come from you: it screens what they would send with the same safety rules as its own unattended answers, and refuses them while the herd is paused. A refusal is final for that item — leave it for the operator; never retype it into the agent with herdr.
 
-When you are set up, report the herd's state in a few lines and ask the operator what the goals are.`
+When you are set up, report the herd's state in a few lines and ask the operator what the goals are. After that, report what needed action and what only they can decide — not what you are about to do.`
 
 // The two answers {skills} expands to. The first is the default, where hap owns
 // the working directory and has put both skills in it; the second is an
@@ -826,7 +828,10 @@ func CallerIsOrchestrator(stateDir, paneID string) bool {
 //
 // Nothing changes for accept_generated_task, whose text the task-generator LLM
 // INVENTED rather than was asked for, and nothing for the daemon's own FSP
-// sends (screenOutbound, unchanged).
+// sends (screenOutbound, unchanged). deliver_reply is screened INLINE rather
+// than through a seam and so has its own entry point, deliverReplyScreen, which
+// applies the same author policy — see the rationale there for why a reply
+// keeps the action rules a hand-out drops.
 func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(string) error {
 	if a.Author != domain.OrchestratorAuthor {
 		return nil
@@ -845,6 +850,56 @@ func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(strin
 		}
 		// The action rules too: the orchestrator CHOOSES this text, so a
 		// widening menu option it picked is exactly what they exist to refuse.
+		if why := d.actionRefused(agentType, text); why != "" {
+			return fmt.Errorf("%w: matched never-auto action %s", errOutboundRefused, why)
+		}
+		return nil
+	}
+}
+
+// deliverReplyScreen is actionScreen for the one kind screened INLINE rather
+// than through a seam: a reply to an escalation (`hap resolve --send`,
+// `hap confirm --send`). It is never nil — a reply's text is authored AFTER the
+// decision that raised the escalation, so whoever wrote it, nothing has
+// screened it yet.
+//
+// The OPERATOR's arm is unchanged: screenOutbound, which deliverReply has always
+// run. They keep the suspected-irreversible heuristic and, as everywhere else,
+// not the action rules — a human who looked at the menu and chose to widen a
+// permission has made that call themselves (see actionRefused).
+//
+// The ORCHESTRATOR's arm is the PROSE screen, for the same reason a send_task
+// hand-out gets one: `--action` carries free text instructing an agent at least
+// as often as it carries a menu label, and the heuristic seeds corroborate a
+// destructive verb against a data target across a line or two precisely because
+// they read a PENDING PANE OPERATION. Over narration they refuse work for
+// DISCUSSING it. Observed live (#526): a `resolve --action` carrying review-fix
+// instructions was refused because "without deleting the PK row" was followed by
+// the word "table", nothing was sent, and the pull request it answered stalled
+// about three hours until a human intervened.
+//
+// What is DROPPED is two shipped heuristics written to read a screen; the whole
+// of the operator's declared policy is strict-kind (domain.NeverAutoStrict) and
+// survives untouched.
+//
+// What is KEPT, and this is the difference from a hand-out: the ACTION rules. A
+// hand-out is prose by construction, but a reply is routinely the label of an
+// option on a live menu — so a widening choice ("always allow commands starting
+// with …") picked by an LLM is exactly what those rules exist to refuse, and
+// exactly the thing the orchestrator skill tells a deputy never to take.
+func (d *Daemon) deliverReplyScreen(a domain.AgentAction, agentType string) func(string) error {
+	if a.Author != domain.OrchestratorAuthor {
+		return func(text string) error {
+			if err := d.screenOutbound(agentType, text); err != nil {
+				return fmt.Errorf("%w: %v", errOutboundRefused, err)
+			}
+			return nil
+		}
+	}
+	return func(text string) error {
+		if err := d.screenOutboundStrict(agentType, text); err != nil {
+			return fmt.Errorf("%w: %v", errOutboundRefused, err)
+		}
 		if why := d.actionRefused(agentType, text); why != "" {
 			return fmt.Errorf("%w: matched never-auto action %s", errOutboundRefused, why)
 		}

@@ -78,6 +78,7 @@ const createAgentNames = `CREATE TABLE IF NOT EXISTS agent_names (
 	agent_id TEXT NOT NULL,
 	name TEXT NOT NULL,
 	disabled INTEGER NOT NULL DEFAULT 0,
+	snoozed INTEGER NOT NULL DEFAULT 0,
 	terminal_id TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL,
 	PRIMARY KEY (node_id, agent_id),
@@ -534,6 +535,13 @@ var columnAdds = []columnAdd{
 	// Operator-owned per-agent automation switch. Kept on agent_names so
 	// renames preserve it and disabled agents remain visible by name.
 	{"agent_names", "disabled", `ALTER TABLE agent_names ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`},
+	// Operator-owned per-agent QUIET switch, beside disabled and deliberately
+	// not folded into it. `hap disable` stops hap answering the agent at all,
+	// which is why an orchestrator that used it to stop a finished agent's
+	// queue notices also stopped its approvals being answered (#526). A snooze
+	// silences the notices about its QUEUE and leaves everything about its
+	// SCREEN alone. Cleared when the agent next works.
+	{"agent_names", "snoozed", `ALTER TABLE agent_names ADD COLUMN snoozed INTEGER NOT NULL DEFAULT 0`},
 	// Herdr's unique per-terminal id. Herdr reuses compact pane ids, so
 	// this is what tells "same agent" from "new terminal on a recycled
 	// pane id" (issue #158). '' = not yet observed.
@@ -573,7 +581,7 @@ type rebuild struct {
 var rebuilds = []rebuild{
 	{"agent_rate", createAgentRate, "agent_id, consecutive_auto, window_start, count_in_window, paused"},
 	{"error_retries", createErrorRetries, "error_signature, agent_id, retry_count, updated_at"},
-	{"agent_names", createAgentNames, "agent_id, name, disabled, terminal_id, created_at"},
+	{"agent_names", createAgentNames, "agent_id, name, disabled, snoozed, terminal_id, created_at"},
 	{"agent_roster", createAgentRoster,
 		"agent_id, pane_id, tab_id, workspace_id, agent_type, status, terminal_id, cwd, cwd_read_at, list_seq, seen_at, gone_at"},
 	{"herdr_locations", createHerdrLocations, "kind, id, label, number, workspace_id, seen_at"},

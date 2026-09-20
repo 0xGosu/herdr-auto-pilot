@@ -569,6 +569,18 @@ func (d *Daemon) claimBlockedBy(ctx context.Context, rec *domain.AuditRecord,
 			return "accepting generated tasks was switched off while this escalation was being checked"
 		}
 	}
+	// A human at the composer. This is the UNATTENDED path by definition, so
+	// "the pane is idle" is the only evidence it has that nobody is there — and
+	// herdr says idle over an operator's half-written message too (#526).
+	//
+	// Here rather than inside autoAcceptDeliver, which the OPERATOR's own
+	// `--send` also goes through: a human who just looked at the screen and
+	// answered must not be refused for the draft they are holding. The reward
+	// for refusing here is also the right one — the row stays PENDING and
+	// notePending names the reason, rather than burning a delivery attempt.
+	if err := d.operatorTypingRefusal(ctx, rec.AgentID, rec.AgentType); err != nil {
+		return "an operator has a draft in this agent's composer"
+	}
 	return ""
 }
 

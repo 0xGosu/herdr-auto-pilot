@@ -269,10 +269,24 @@ func TaskSourceUnusableRationale(err error) string {
 // reach them. A single per-agent latch would swallow exactly the row that gets
 // the agent working again.
 //
-// Deliberately NOT ReasonNoTaskSource: its remedy is registering a source rather
-// than queueing work, and nothing has reported it flooding.
+// ReasonNoTaskSource was deliberately excluded — "its remedy is registering a
+// source rather than queueing work, and nothing has reported it flooding". It
+// has now been reported (#526): one day of one herd produced 454 of these rows,
+// four for a single agent inside three minutes, every one dismissed by hand.
+// The remedy argument was right and is unchanged; what it does not license is
+// asking for that remedy on every event until somebody performs it. It is a
+// notice about a queue like the other two, so it is latched like them.
+//
+// The latch is NOT sufficient on its own for any of the three, and the daemon
+// does not rely on it alone: it is cleared by the working transition, and an
+// agent waiting on its OWN background shells flips parked->working->parked
+// every time one of them prints a line, re-arming it. See
+// daemon.queueNoticeWithheld for the two guards that cover that — the
+// background-work evidence (BackgroundWorkRunning) and the wall-clock cooldown.
 func LatchedPerParkedEpisode(reason EscalateReason) bool {
-	return reason == ReasonNoopVsPendingTasks || reason == ReasonTaskSourceExhausted
+	return reason == ReasonNoopVsPendingTasks ||
+		reason == ReasonTaskSourceExhausted ||
+		reason == ReasonNoTaskSource
 }
 
 // Decision is the outcome of the pure decision core for one situation.
@@ -398,6 +412,12 @@ const (
 	// delivery exhausts maxTaskHandouts. It marks a row as being about a
 	// hand-out rather than about what is on the agent's screen.
 	TriggerAutoSendReclaim = "auto-send-reclaim"
+	// TriggerQueuedActionRefused is the audit trigger of the row raised when a
+	// safety control refuses a queued action's text. Its own trigger for the
+	// same reason as the two above: it is about a REQUEST that was withdrawn,
+	// not about what is on the agent's screen, and "why did nothing happen when
+	// I answered that?" must be answerable from `hap audit`.
+	TriggerQueuedActionRefused = "queued-action-refused"
 	// TriggerLLMLearnFromUser is the audit_log trigger for the row a
 	// learn-from-correction run writes (llm.learn_from_user_command). Like
 	// TriggerLLMTaskReview it is its own trigger rather than a field folded
@@ -579,6 +599,22 @@ const (
 	AuditActionTaskQueuedPrefix = "task_queued:"
 	// ReasonTaskQueuedInComposer is that escalation's bracketed rationale tag.
 	ReasonTaskQueuedInComposer = "task_queued_in_composer"
+	// AuditActionQueuedActionRefusedPrefix prefixes the escalation raised when a
+	// safety control refuses a queued action's text.
+	AuditActionQueuedActionRefusedPrefix = "action_refused:"
+	// ReasonQueuedActionRefused is that escalation's bracketed rationale tag.
+	//
+	// The refusal used to be recorded in agent_actions.error and one daemon
+	// log line, and nowhere a human looks: the correction is deleted, no audit
+	// row is written, and only the process that queued the action is told —
+	// which for an orchestrator is its own terminal. #526 watched a refused
+	// `hap resolve --send` stall a pull request for about three hours that way,
+	// with nothing in `hap escalations` or `hap audit` to say why.
+	//
+	// It is NOT in autoAcceptExcludedReasons and does not need to be: the row
+	// carries no suggestion, so there is nothing for any automatic path to
+	// accept. What it does is make a blocked hand-out visible.
+	ReasonQueuedActionRefused = "queued_action_refused"
 )
 
 // TaskReservation is one unattended task hand-out recorded at delivery: the

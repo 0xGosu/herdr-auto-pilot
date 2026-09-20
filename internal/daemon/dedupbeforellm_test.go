@@ -112,6 +112,12 @@ func TestNewIdleSituationStillReachesTheTaskGenerator(t *testing.T) {
 		return len(esc) == 1
 	})
 
+	// The subject here is the pre-LLM DEDUP, not the queue-notice guards: since
+	// #526 a no_task_source notice is latched per parked episode and bounded by
+	// queueNoticeCooldown, so without this the second event is withheld by those
+	// and the generator count would measure them instead of the dedup.
+	h.clearQueueNoticeGuards("agent-dedup-new")
+
 	// A genuinely different idle screen on the SAME agent, while the first
 	// escalation is still pending.
 	h.herdr.setPane("All migrations applied. Nothing left in the queue.\n")

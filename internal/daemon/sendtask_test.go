@@ -17,6 +17,11 @@ type sendTaskSeam struct {
 	mu    sync.Mutex
 	calls []sendTaskCall
 	err   error
+	// run, when set, stands in for the real seam's body. Most cases only need
+	// to know WHAT the daemon resolved and handed over, so they leave it nil
+	// and read calls; a case about the SCREEN has to call the closure, because
+	// recording it proves nothing about what it would do.
+	run func(domain.SendTaskPayload, func(string) error) error
 }
 
 type sendTaskCall struct {
@@ -31,9 +36,13 @@ func (s *sendTaskSeam) send(_ context.Context, p domain.SendTaskPayload,
 	agentID, agentType, agentName string, _ ports.TaskSendHost, screen func(string) error) error {
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.calls = append(s.calls, sendTaskCall{p, agentID, agentType, agentName, screen})
-	return s.err
+	run, err := s.run, s.err
+	s.mu.Unlock()
+	if run != nil {
+		return run(p, screen)
+	}
+	return err
 }
 
 func (s *sendTaskSeam) seen() []sendTaskCall {

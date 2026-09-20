@@ -388,6 +388,13 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 			return
 		}
 	}
+	// Same reasoning for an operator's draft, which herdr's status cannot see
+	// on any agent type: a transient refusal of a delivery attempt, not a
+	// reason to commit the reviewer's edits.
+	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		d.standDown(ctx, res, "operator_typing", err.Error(), llmConf, proposal, now)
+		return
+	}
 
 	// The safety re-gate. The reviewer is an LLM authoring both task text and
 	// the choice of task, so its output is screened exactly like any other

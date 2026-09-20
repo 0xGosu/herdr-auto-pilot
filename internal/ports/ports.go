@@ -804,6 +804,11 @@ type FrontendStore interface {
 	EnsureAgentName(ctx context.Context, agentID string) (string, error)
 	// SetAgentDisabled changes the persistent operator-owned automation state.
 	SetAgentDisabled(ctx context.Context, target string, disabled bool) error
+	// SetAgentSnoozed changes the persistent operator-owned QUIET state: no
+	// notices about the agent's QUEUE, everything about its SCREEN unchanged.
+	// A separate switch from SetAgentDisabled, never a second meaning for it —
+	// see the store method for what conflating them cost.
+	SetAgentSnoozed(ctx context.Context, target string, snoozed bool) error
 	// DeleteSignature removes one learned signature with its decision
 	// history and error-retry row, returning the decision count. The daemon
 	// may recreate the signature from an in-flight event; the recreated
@@ -887,6 +892,8 @@ type ReadStore interface {
 	FleetRoster(ctx context.Context) ([]domain.RosterAgent, map[string]time.Time, error)
 	FleetAgentNames(ctx context.Context) (map[domain.NodeAgent]string, error)
 	DisabledAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool, error)
+	// SnoozedAgentsAll is SnoozedAgents across every node.
+	SnoozedAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool, error)
 	FleetAgentStats(ctx context.Context) (map[domain.NodeAgent]domain.AgentStats, error)
 	// LocationsOf is HerdrLocations for any node.
 	LocationsOf(ctx context.Context, nodeID string) (map[string]domain.WorkspaceInfo, map[string]domain.TabInfo, error)
@@ -954,6 +961,15 @@ type ReadStore interface {
 	AgentDisabled(ctx context.Context, agentID string) (bool, error)
 	// DisabledAgents returns all disabled agent ids for operator-facing views.
 	DisabledAgents(ctx context.Context) (map[string]bool, error)
+	// AgentSnoozed reports whether queue notices are silenced for one agent id.
+	AgentSnoozed(ctx context.Context, agentID string) (bool, error)
+	// SnoozedAgents returns all snoozed agent ids for operator-facing views.
+	SnoozedAgents(ctx context.Context) (map[string]bool, error)
+	// ClearAgentSnoozeIfSet lifts a snooze and reports whether one was lifted.
+	// Conditional on purpose: it runs on every transition to working, and an
+	// unconditional write would arm the turso push debounce on every turn
+	// boundary of every working agent.
+	ClearAgentSnoozeIfSet(ctx context.Context, agentID string) (bool, error)
 	// AgentStats returns lifetime per-agent counters keyed by agent/pane id,
 	// including agents with zero recorded events (so their FirstSeen shows).
 	AgentStats(ctx context.Context) (map[string]domain.AgentStats, error)

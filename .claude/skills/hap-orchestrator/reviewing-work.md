@@ -40,16 +40,21 @@ passing run proves nothing *in either direction* — neither "it passed when I
 re-ran it" nor "a full green run" is evidence. Re-run the job and compare, or
 measure the rate on main. A single green race run is closer to luck than proof.
 
-## delegation has a scope
+## delegation has a scope, and the line is reversibility
 
-Merge, publish and delete are the operator's unless they said otherwise **for
-these changes**. Permission given for one batch does not carry forward to work
-they have not seen. When an older delegation might or might not cover what is in
-front of you, ask — the cost of asking is a message; the cost of assuming is
-unrecoverable.
+Finishing a reviewed change is yours: merge it, delete its branch, remove its
+worktree. Those are recoverable, they are what the work was for, and holding
+them costs the operator a decision they already made by putting you here. A
+green PR left open is not a delivered PR.
 
-Silence is never consent. An automated event that echoes your own action back at
-you is not the operator answering.
+Publishing, releasing and deleting data are the operator's unless they said
+otherwise **for these changes**. Permission given for one batch does not carry
+forward to work they have not seen. When an older delegation might or might not
+cover something irreversible, ask — the cost of asking is a message; the cost of
+assuming is unrecoverable. For anything reversible, decide.
+
+Silence is never consent for the irreversible half. An automated event that
+echoes your own action back at you is not the operator answering.
 
 ## defects you were not asked to fix
 

@@ -785,6 +785,8 @@ hap agents                      # name, pane id, type, status, automation, cwd, 
 hap rename brave-otter backend-dev
 hap disable backend-dev         # stop automation for only this agent
 hap enable backend-dev
+hap snooze backend-dev          # its work is done: stop asking about its queue,
+hap unsnooze backend-dev        # but keep answering its prompts (lifts on next work)
 hap mode backend-dev plan --yes # the agent's own permission mode
 hap capture backend-dev         # re-run the capture pipeline for one agent now
 ```
@@ -798,6 +800,15 @@ A disabled agent stays in the list marked `DISABLED`. hap never performs
 autonomous pane actions for it: would-be actions are audited as `denied` with
 `[agent_disabled]`, and would-be escalations are written directly as `dismissed`
 with the same tag, never entering the pending queue.
+
+**`hap snooze` is the narrow switch, not a gentler disable.** It silences only
+the notices about an agent's *queue* — `no_task_source`, `task_source_exhausted`
+and the hand-out proposal — and withholds it from the idle task poll. Everything
+about its *screen* is unchanged: its prompts are still answered and anything hap
+cannot answer still reaches you. Use it for an agent whose work is finished; it
+lifts by itself the moment that agent works again, so a pane reused for new work
+never carries its last tenant's silence. The `automation` column reads `snoozed`
+(`disabled` wins when an agent is both).
 
 `hap capture` re-runs the daemon's normal delayed capture for a live `blocked`,
 `idle` or `done` agent. Classification, MCQ sweeping, safety gates, automation
@@ -1680,7 +1691,13 @@ full_self_prompting.orchestrator_agent_command --preset claude`) and, while full
 self-prompting is on, the daemon keeps an interactive claude session named
 `orchestrator` alive in its own `hap-orchestrator` herdr workspace: briefed to
 watch that stream and unblock the herd toward the goals you type into it, and
-ignored by hap entirely (highlighted on the TUI Agents tab). It is re-created if
+ignored by hap entirely (highlighted on the TUI Agents tab). The brief's default
+is to **carry ordinary work to completion** — follow CI, get what it reports
+fixed and reviews answered, merge when green, clean up the branch and worktree —
+and to escalate only what is genuinely irreversible (deleting data,
+force-pushing a shared branch, dropping databases, production deploys,
+publishing a release, another node's or your own private work). It is also told
+to read each repo's `AUTO.md` as decisions you have already made there. It is re-created if
 it disappears — at most 3 times an hour — and never closed by hap. Its brief also
 has it schedule an hourly health check (Claude's `CronCreate`) that restarts a
 stopped hap daemon and looks in on hung agents, removed while the mode is off. It

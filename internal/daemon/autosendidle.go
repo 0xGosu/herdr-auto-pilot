@@ -752,6 +752,21 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 		// Same reasoning for the per-episode notices: the latch belongs to the
 		// spell, and a recycled pane is a different agent entirely.
 		delete(d.episodeNoticeRaised, a.AgentID)
+		// The notice COOLDOWN is deliberately NOT dropped here, and this is the
+		// line to read twice: reaching it does NOT mean the pane was recycled.
+		// It is also reached whenever idleSince has no mark — and the working
+		// transition DELETES that mark (handleTransition, and the !autoSendParked
+		// arm above). So an agent flapping parked->working->parked, which is
+		// exactly the #526 population, arrives here with !ok on the next sweep
+		// and would have its cooldown cleared by the very boundary the cooldown
+		// exists to survive. Dropping it here collapsed the 30-minute bound back
+		// to the one-per-flap cadence the issue measured.
+		//
+		// A genuine recycle is handled where it is actually KNOWN:
+		// resetRecycledPaneState, which compares terminal ids. That is enough
+		// because this map is in memory — the only recycle it can ever need to
+		// survive is one this daemon observed — and the vanished-agent prune
+		// below covers the rest.
 		d.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, terminalID: a.TerminalID, at: now}
 	}
 	for id := range d.idleSince {
@@ -762,6 +777,25 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 	for id := range d.episodeNoticeRaised {
 		if _, ok := live[id]; !ok {
 			delete(d.episodeNoticeRaised, id)
+		}
+	}
+	for id := range d.noticeCooldownUntil {
+		if _, ok := live[id]; !ok {
+			delete(d.noticeCooldownUntil, id)
+		}
+	}
+	// Its own loop, not a line inside the one above: noteNoticeWithheld records
+	// causes that never open a cooldown (a snooze, background work, and any
+	// suppression of a reason noticeCooldownApplies excludes), so such an agent
+	// has no noticeCooldownUntil entry for that loop to visit.
+	for id := range d.noticeSuppressionNoted {
+		if _, ok := live[id]; !ok {
+			delete(d.noticeSuppressionNoted, id)
+		}
+	}
+	for id := range d.refusalEscalated {
+		if _, ok := live[id]; !ok {
+			delete(d.refusalEscalated, id)
 		}
 	}
 	for id := range d.pollRedrive {
@@ -818,6 +852,16 @@ func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 			continue
 		}
 		if disabled, err := d.opt.Store.AgentDisabled(ctx, a.AgentID); err != nil || disabled {
+			continue
+		}
+		// A snooze is an instruction to leave this agent's QUEUE alone, and an
+		// unattended hand-out is the loudest thing that queue does. A read error
+		// withholds here, unlike in queueNoticeWithheld: this path TYPES INTO A
+		// PANE, so an unreadable switch is not permission to send. It is a
+		// store/listing gate deliberately — no pane read: this loop runs per
+		// parked agent per sweep on the select loop, and the composer proof
+		// belongs at requireIdleForHandout, which already reads the pane.
+		if snoozed, err := d.opt.Store.AgentSnoozed(ctx, a.AgentID); err != nil || snoozed {
 			continue
 		}
 		// The runaway guard's stand-down, and only it: the per-agent disable

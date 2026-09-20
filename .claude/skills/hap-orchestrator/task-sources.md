@@ -62,9 +62,11 @@ approval menu, hap reads that as idle, and the hand-out is typed into the open
 menu.
 
 **`accept_generated_task=false`** keeps an exhausted list from being refilled
-with LLM-invented work. Check it before leaving a herd unattended — generated
-tasks have proposed merging a change, deleting its branch and removing the
-worktree, and have named the wrong agent while doing it.
+with LLM-invented work. Check it before leaving a herd unattended — the problem
+is not that generated tasks propose merging a change, deleting its branch and
+removing the worktree (those are finishing steps, and yours to take when the
+work in front of you calls for them), but that the generator invents work
+NOBODY ASKED FOR and has named the wrong agent while doing it.
 
 ## prompting an agent directly
 

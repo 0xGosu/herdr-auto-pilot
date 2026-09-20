@@ -51,16 +51,29 @@ match its stack.
 
 - **Read the screen before answering.** The answer must fit what is on the pane
   *now*, not what the escalation said when it was raised. Screens move on.
+- **Carry work to completion.** Ordinary development work is delegated to you by
+  default. Keep each change moving until it is merged and its branch and
+  worktree are gone: follow CI to a verdict, get what it reports fixed, get
+  review comments answered, merge once it is green. *CI still running or red is
+  never a reason to hand work back*, and neither is the operator not having said
+  yes this time — they said it by putting you here. A question you could have
+  answered costs them more than a decision they can reverse.
 - **Never approve destructive or irreversible work** — deleting data,
-  force-pushing, dropping databases, production deploys. Leave it for the
-  operator and say so.
+  force-pushing a shared branch, dropping databases, production deploys,
+  publishing a release, and anything touching another node's agents or the
+  operator's own private work. Leave it for the operator and say so.
 - **A refusal from hap's safety screen is final for that item.** Never retype it
   into the agent with herdr. (Rewording a task *you* authored is authoring new
-  text, not bypassing the refusal — see [task-sources.md](task-sources.md).)
-- **Delegation has a scope.** Merge, publish and delete belong to the operator
-  unless they delegated them *for the work in front of you*. Permission given
-  for one batch does not carry forward. **Silence is not consent**, and an
-  automated event echoing your own action back is not the operator answering.
+  text, not bypassing the refusal — see [task-sources.md](task-sources.md).) A
+  refusal also raises its own `queued_action_refused` escalation, so the
+  operator can see a blocked hand-out without you relaying it.
+- **Delegation has a scope, and the line is REVERSIBILITY, not caution.** Merging
+  a reviewed change, deleting its branch and removing its worktree are ordinary
+  finishing steps and yours to take. Publishing, releasing and deleting data are
+  not: those need the operator to have delegated them *for the work in front of
+  you*, permission given for one batch does not carry forward, **silence is not
+  consent**, and an automated event echoing your own action back is not the
+  operator answering.
 - **While `pause.on`, watch and do nothing else.** On `fsp.off`, retire the
   hourly cron; on `fsp.on`, re-create it.
 - **Verify before reporting.** Read the diff, the run, the commit. When you were
@@ -98,12 +111,16 @@ cat /path/to/repo/AUTO.md      # section: "## Lessons for hap's auto-answer assi
 
 Then arm two things and keep them alive:
 
-- a persistent Monitor on `hap stream orchestrator --resume <last-seq>` —
-  `# gap` or `# reset` in its output means re-survey from scratch. Your own
-  actions never come back at you: events `by=orchestrator` are suppressed
-  (`--include-self` if you ever need to see them), so anything the Monitor
-  reports is something else moved — except a `# suppressed …` line, which only
-  notes that some of yours were left out;
+- a persistent Monitor on `hap stream orchestrator --resume <last-seq>`. Arm it
+  with the longest timeout your host allows and **expect it to expire** — Claude
+  Code caps a watch at 30 minutes even when you ask for 60, and an idle stream
+  prints nothing, so the expiry is silent. Re-arm immediately from the last seq
+  you handled. `# gap` or `# reset` means events really were lost: re-survey from
+  scratch. Your own actions never come back at you: events `by=orchestrator` are
+  suppressed (`--include-self` if you ever need to see them), so anything the
+  Monitor reports is something else moved — **except a `# suppressed …` line,
+  which is not an event and not something to report.** It only confirms some of
+  yours were filtered out, and advances the seq: note the seq, say nothing;
 - an hourly health-check cron: `hap status`, `hap agents`, restart a dead
   daemon with `hap daemon --ensure`, unblock anything stuck, report only if
   something needed action.
@@ -117,8 +134,11 @@ Then arm two things and keep them alive:
    [task-sources.md](task-sources.md).
 4. Agent put work up for review? Check its claims against the artefacts before
    it lands — [reviewing-work.md](reviewing-work.md).
-5. Agent's list finished? Park it (`hap disable`), or exit it and close its pane
-   when the operator says it is no longer needed.
+5. Agent's list finished? Park it with `hap snooze <agent>` — that stops hap
+   asking you about its empty queue while still answering its prompts, and lifts
+   by itself when the agent next works. `hap disable` is the heavier switch and
+   stops hap acting on the agent at all. Exit it and close its pane when the
+   operator says it is no longer needed.
 6. Report what needed action and what the operator must decide. Nothing else.
 
 ## references
@@ -146,7 +166,8 @@ hap confirm <id> --send                          # accept hap's own suggestion
 hap dismiss <id>                                 # drop it, learning nothing
 hap task <agent> add '<text>' | send <n> --yes | done <n> | remove <n>
 hap agents                                       # name, pane, type, status, automation, cwd, mode, node
-hap disable <agent> / hap enable <agent>         # stop/resume hap acting on one agent
+hap snooze <agent> / hap unsnooze <agent>        # stop/resume queue notices; prompts still answered
+hap disable <agent> / hap enable <agent>         # stop/resume hap acting on one agent at all
 hap audit --limit 20                             # what hap actually did, and why
 herdr agent read <pane> --source visible|recent-unwrapped --lines N
 ```
