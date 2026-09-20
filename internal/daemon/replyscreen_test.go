@@ -139,7 +139,13 @@ func TestARefusedReplyReachesTheOperator(t *testing.T) {
 		t.Fatalf("the reply should have been refused; status = %q", got.Status)
 	}
 
-	rows := rationalesContaining(t, h, "["+domain.ReasonQueuedActionRefused+"]")
+	// Waited for, for the reason TestARefusedHandOutIsFiledUnderTheAgentID
+	// spells out: the row is written after the withdrawal awaitAction observes.
+	var rows []string
+	waitFor(t, 3*time.Second, func() bool {
+		rows = rationalesContaining(t, h, "["+domain.ReasonQueuedActionRefused+"]")
+		return len(rows) > 0
+	})
 	if len(rows) != 1 {
 		t.Fatalf("a refusal must raise exactly one escalation, got %d", len(rows))
 	}
@@ -237,21 +243,26 @@ func TestARefusedHandOutIsFiledUnderTheAgentID(t *testing.T) {
 		t.Fatalf("a never-auto match must refuse the hand-out; status = %q", got.Status)
 	}
 
-	rows, err := h.raw.PendingEscalations(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, r := range rows {
-		if !strings.Contains(r.Rationale, "["+domain.ReasonQueuedActionRefused+"]") {
-			continue
+	// WAITED for, not read straight after awaitAction: escalateRefusedAction
+	// runs AFTER finishWithdrawn, because the withdrawal is the part that has to
+	// be atomic. So the action reaches a terminal status — which is all
+	// awaitAction waits for — a moment before the row exists, and reading
+	// immediately is a race the detector loses reliably.
+	var refusal domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		rows, err := h.raw.PendingEscalations(ctx)
+		if err != nil {
+			return false
 		}
-		found = true
-		if r.AgentID != "w1:p4" {
-			t.Fatalf("the refusal is filed under %q, want the agent id w1:p4", r.AgentID)
+		for _, r := range rows {
+			if strings.Contains(r.Rationale, "["+domain.ReasonQueuedActionRefused+"]") {
+				refusal = r
+				return true
+			}
 		}
-	}
-	if !found {
-		t.Fatal("a refused hand-out raised no escalation")
+		return false
+	})
+	if refusal.AgentID != "w1:p4" {
+		t.Fatalf("the refusal is filed under %q, want the agent id w1:p4", refusal.AgentID)
 	}
 }
