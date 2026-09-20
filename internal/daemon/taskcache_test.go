@@ -11,6 +11,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
+	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
 
 // fakeRemoteStore is a ports.TaskStore that declares itself remote, so the
@@ -78,8 +79,13 @@ func (f *fakeRemoteStore) readCount() int {
 }
 
 // waitUntil polls cond, failing the test if it never holds.
+//
+// Scaled and floored exactly like waitFor: this one was the odd copy that used
+// the caller's raw duration, so it was the one helper in the package a loaded
+// runner could not stretch (#431).
 func waitUntil(t *testing.T, within time.Duration, cond func() bool) {
 	t.Helper()
+	within = max(testutil.Scale(within), waitForFloor)
 	deadline := time.Now().Add(within)
 	for time.Now().Before(deadline) {
 		if cond() {

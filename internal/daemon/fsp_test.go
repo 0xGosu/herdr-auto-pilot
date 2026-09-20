@@ -352,11 +352,22 @@ func TestFSPImmediateAcceptOnEscalate(t *testing.T) {
 		Action: domain.ActionEscalate, Reason: domain.ReasonShadowMode, Suggestion: "respond: Yes",
 	}, parked("pA", "blocked")[0], time.Now())
 
-	// The delivery runs off the select loop (see maybeFSPAcceptNow).
+	// The delivery runs off the select loop (see maybeFSPAcceptNow), so wait on
+	// its TERMINAL state.
+	//
+	// Never on PendingEscalations going empty: that query selects only
+	// status = 'escalated', and the delivery CLAIMS the row into the transient
+	// 'auto_accepting' before it sends (ClaimForAutoAccept → deliver →
+	// MarkAutoAccepted). So the queue empties BEFORE any keystroke, and an
+	// assertion after it raced the send with zero margin — which is exactly how
+	// this failed under parallel load, reporting "sent = [], want [1]" with the
+	// row apparently stranded in auto_accepting (#431). It was not stranded; the
+	// test looked mid-window.
 	waitFor(t, 5*time.Second, func() bool {
-		p, err := h.raw.PendingEscalations(ctx)
-		return err == nil && len(p) == 0
+		audits, err := h.raw.AuditLog(ctx, 5)
+		return err == nil && len(audits) > 0 && audits[0].Status == domain.AuditStatusAutoAccepted
 	})
+	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 1 })
 	pending, err := h.raw.PendingEscalations(ctx)
 	if err != nil {
 		t.Fatal(err)
