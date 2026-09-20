@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.55
+
+- Added `hap wait <duration>` — an agent can now say it is deliberately busy (a cold build, a CI poll) instead of looking wedged, and hap leaves its queue alone until the wait lapses while still answering its prompts.
+- Fixed a task handed to an agent on a long FOREGROUND build being given up on after an hour, telling the operator to clear a `[-]` the agent was working through.
+- hap now recognizes a codex agent waiting on its own background terminal, so it is no longer offered more work or escalated as having never started.
+- The MCP surface gained `declare_wait`, so a consulted model can record the same bounded wait without a pending decision request.
+
 ## 0.9.54
 
 - Fixed a schema-lease hole under a shared database: a takeover the background renewal had already seen could be forgotten, and a later check that failed to reach the server then let the migration carry on issuing DDL alongside the node that now held the lease.
