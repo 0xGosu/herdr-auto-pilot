@@ -45,6 +45,11 @@ golangci-lint run --build-tags "vectors,cpu"
 - Golden classifier fixtures: `internal/classify/testdata/`; regenerate with
   `UPDATE_GOLDEN=1 go test ./internal/classify/` and review the diff.
 - Run the full suite before every commit that touches Go code.
+- **On a loaded machine, export `HAP_TEST_TIMEOUT_SCALE` (CI uses `4`) or cap `-p`.** `testutil.Scale`'s
+  fallback counts CORES and says so: it cannot see load from outside the process, and `go test ./...`
+  runs `-p = GOMAXPROCS` binaries against those same cores. That is the whole of #431's "red locally,
+  green serialized, green in CI, a different test each run" — `internal/daemon`'s waits are floored
+  (`waitForFloor`) so an ordinary run is unaffected, but a busy box still wants the knob.
 - Profiling (opt-in, any verb): `HAP_PROFILE_DIR=<dir> [HAP_PROFILE_SECONDS=60] hap daemon --restart` writes
   ROLLING `<verb>-<pid>.cpu.pprof` / `.heap.pprof` windows (`internal/profiling`) — the files are always the latest
   complete window, so an idle daemon hours in can be read with `go tool pprof -top bin/hap <file>`. The detached
@@ -942,6 +947,15 @@ keystroke.
     failing closed with `ErrSchemaLeaseLost` — a background renewal alone is starved by a step's own write
     lock. Two identical ALTERs wedge the loser SILENTLY, and elapsed time is never ownership: a node that
     cannot establish the lease fails closed rather than migrating blind.
+    - **A DEFINITIVE loss is LATCHED** (`leaseHold.lost`, asked first in `check` and never cleared, #431).
+      The renewal goroutine runs the SAME check and its answer goes nowhere but the log, so a takeover it
+      observed used to be re-derived from scratch at the next step boundary — and a boundary whose PULL
+      then failed transiently fell through to `tolerate()`, which returns nil while the last confirmed
+      renewal is younger than the TTL. The migration carried on issuing DDL beside the new owner: the
+      exact wedge the lease exists to prevent. A transient failure is still forgiven; only `RowsAffected
+      == 0` latches. **Test trap:** every case in `schema_lease_test.go` needs `tursodb` and SKIPS
+      without it, which is why this one is written against a fake `SchemaSyncer`
+      (`schema_lease_latch_test.go`) — a regression only CI can see is one nobody sees.
   - `fleetRun` runs every sync op off the loop and waits for it OR shutdown; `turso.DB.Close` waits a
     bounded time and refuses to close underneath an in-flight op.
   - **`database.sync_paused` gates the SERVER round trips only (turso AND libsql), and it is the one `[database]` key

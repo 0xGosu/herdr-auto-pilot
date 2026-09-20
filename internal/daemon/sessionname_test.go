@@ -46,9 +46,13 @@ func claudeTr(agentID, status string) domain.AgentTransition {
 
 // waitForSend blocks until the fake has received an input containing want.
 // Path 2 runs off the main loop, so a test cannot read the result inline.
+//
+// Floored like waitFor, for the reason stated there: every caller asserts the
+// POSITIVE, so the deadline only ever bounds a failure. An absence is asserted
+// with noSendWithin below, which is a plain sleep and deliberately not floored.
 func waitForSend(t *testing.T, h *harness, want string) bool {
 	t.Helper()
-	deadline := time.Now().Add(testutil.Scale(3 * time.Second))
+	deadline := time.Now().Add(max(testutil.Scale(3*time.Second), waitForFloor))
 	for time.Now().Before(deadline) {
 		for _, in := range h.herdr.sentInputs() {
 			if strings.Contains(in, want) {

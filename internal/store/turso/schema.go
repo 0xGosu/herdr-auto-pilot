@@ -238,6 +238,20 @@ type leaseHold struct {
 	now    func() time.Time
 	mu     sync.Mutex
 	lastOK time.Time
+	// lost latches a DEFINITIVE loss: the row no longer names this node.
+	//
+	// The renewal goroutine runs the SAME check as the step boundary and used to
+	// throw its answer away (Warn, then carry on), so a takeover it observed was
+	// re-derived from scratch at the next boundary — and a boundary whose Pull
+	// fails transiently goes through tolerate(), which returns nil while the last
+	// confirmed renewal is younger than the TTL. The migration then issued DDL
+	// alongside the new owner, which is the concurrent-DDL wedge this whole file
+	// exists to prevent.
+	//
+	// Never cleared. "Another node owns the lease" is not a transient fact, and a
+	// hold that could un-see it would be no latch at all; the daemon exits and
+	// `--ensure` starts it again, which re-claims from the top.
+	lost   bool
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -254,6 +268,11 @@ func newLeaseHold(db SchemaSyncer, self string, now func() time.Time) *leaseHold
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				// A failure here is returned to nobody — the migration is on
+				// another goroutine. A DEFINITIVE one is latched inside check()
+				// so the next step boundary stops; a transient one is only ever
+				// a warning, because that boundary can still prove ownership
+				// for itself.
 				if err := h.verify(); err != nil {
 					slog.Warn("shared schema: schema lease renewal", "error", err)
 				}
@@ -286,6 +305,12 @@ func (h *leaseHold) verifyStrict() error { return h.check(true) }
 func (h *leaseHold) check(strict bool) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Asked FIRST, ahead of every tolerance below: once the lease has provably
+	// gone elsewhere there is nothing a fresh read could say that would make it
+	// ours again, and the branch that would otherwise answer is tolerate().
+	if h.lost {
+		return ErrSchemaLeaseLost
+	}
 	fail := func(err error) error {
 		if strict {
 			return fmt.Errorf("shared schema: the schema lease could not be freshly proved before publishing the migration; "+
@@ -303,6 +328,7 @@ func (h *leaseHold) check(strict bool) error {
 		return fail(fmt.Errorf("renew: %w", err))
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
+		h.lost = true
 		return ErrSchemaLeaseLost
 	}
 	if err := h.db.Push(); err != nil {

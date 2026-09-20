@@ -99,11 +99,21 @@ func (o *slowOwner) MigrateWith(between func() error) error {
 // lockingOwner is a SchemaOwner whose one migration step holds a REAL write
 // transaction on its own database for longer than the lease can survive without
 // renewal — the case a background renewal cannot cover, because its UPDATE is
-// refused behind that lock.
+// refused behind that lock — and during which another node takes the lease.
+//
+// steal runs INSIDE the held transaction and the step does not continue until
+// it returns, which is the happens-before the assertion needs. It used to be a
+// fixed sleep with the other node claiming concurrently from the test body: on
+// a loaded machine one claim iteration (two pulls, a push and a settle) could
+// outlast the sleep, so A finished, RELEASED the lease on its way out
+// (PrepareSharedSchema's success path) and B then claimed the released one —
+// giving "B holds it" and "A returned nil" together, with no product bug
+// involved (#431). Serializing it the way takeoverOwner already does removes
+// the wall clock from the question entirely.
 type lockingOwner struct {
 	id      string
 	db      *DB
-	hold    time.Duration
+	steal   func() error // runs while the write lock is held; makes B the owner
 	current atomic.Bool
 	stepErr error
 }
@@ -127,7 +137,12 @@ func (o *lockingOwner) MigrateWith(between func() error) error {
 		tx.Rollback()
 		return err
 	}
-	time.Sleep(o.hold) // the write lock is held for the whole hold
+	// The write lock is held across the steal, so A's background renewal cannot
+	// land and B's claim is the only thing that moves.
+	if err := o.steal(); err != nil {
+		tx.Rollback()
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -216,25 +231,24 @@ func TestALockedMigrationStepLosesTheLeaseAndFailsClosed(t *testing.T) {
 	b := openLeaseNode(t, url, "bbbbbbbbbbbbbbbb")
 	ctx := context.Background()
 
-	owner := &lockingOwner{id: "aaaaaaaaaaaaaaaa", db: a, hold: 3 * schemaLeaseTTL}
-	done := make(chan error, 1)
-	go func() { done <- PrepareSharedSchema(ctx, a, owner, time.Now) }()
-
-	// B keeps trying; once A's lease has lapsed unrenewed, B gets it.
-	deadline := time.Now().Add(testutil.Scale(15 * time.Second))
-	bHolds := false
-	for !bHolds && time.Now().Before(deadline) {
-		got, err := AcquireSchemaLease(ctx, b, "bbbbbbbbbbbbbbbb", time.Now)
-		if err != nil {
-			t.Fatal(err)
+	owner := &lockingOwner{id: "aaaaaaaaaaaaaaaa", db: a}
+	// B keeps trying from INSIDE A's locked step; once A's lease has lapsed
+	// unrenewed, B gets it — and only then does A's step reach its re-prove.
+	owner.steal = func() error {
+		deadline := time.Now().Add(testutil.Scale(15 * time.Second))
+		for time.Now().Before(deadline) {
+			got, err := AcquireSchemaLease(ctx, b, "bbbbbbbbbbbbbbbb", time.Now)
+			if err != nil {
+				return err
+			}
+			if got {
+				return nil
+			}
 		}
-		bHolds = got
-	}
-	if !bHolds {
-		t.Fatal("B never obtained the lease although A's renewals were locked out")
+		return errors.New("B never obtained the lease although A's renewals were locked out")
 	}
 
-	err := <-done
+	err := PrepareSharedSchema(ctx, a, owner, time.Now)
 	if !errors.Is(err, ErrSchemaLeaseLost) {
 		t.Fatalf("A's migration = %v, want ErrSchemaLeaseLost (fail closed before the next DDL)", err)
 	}

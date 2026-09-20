@@ -1050,7 +1050,25 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 	}
 }
 
-// waitFor polls cond until it holds or the (scaled) deadline passes.
+// waitForFloor is the shortest deadline waitFor will ever enforce, whatever a
+// caller asked for.
+//
+// testutil.Scale's own doc names the hole this fills: its fallback heuristic
+// counts CORES and "cannot see load imposed from OUTSIDE this process". A
+// developer running `go test ./...` gets -p = GOMAXPROCS package binaries
+// competing for those same cores, and CI sets HAP_TEST_TIMEOUT_SCALE while a
+// devbox does not — which is why this package failed under parallel load, green
+// serialized and green in CI, on a DIFFERENT test each run (#431). A floor,
+// rather than a bigger number on each caller: the signature was never one
+// test, so raising one test's budget only moves the failure.
+//
+// It costs a passing test nothing — waitFor polls every 10ms and returns on the
+// first true, and the measured p99 wait in this package is 260ms — and costs a
+// genuinely hung one only the extra seconds it takes to fail. The per-caller
+// timeout still means something above the floor.
+const waitForFloor = 20 * time.Second
+
+// waitFor polls cond until it holds or the (scaled, floored) deadline passes.
 //
 // Every caller's timeout goes through testutil.Scale, so a loaded runner gets
 // proportionally longer to satisfy the SAME condition — see the rationale and
@@ -1059,7 +1077,7 @@ func newHarnessCore(t *testing.T, cfgTOML string, wrap func(*fakeHerdr) ports.He
 // hang from a machine that needed one more poll.
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
 	t.Helper()
-	scaled := testutil.Scale(timeout)
+	scaled := max(testutil.Scale(timeout), waitForFloor)
 	deadline := time.Now().Add(scaled)
 	for time.Now().Before(deadline) {
 		if cond() {
