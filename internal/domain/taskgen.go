@@ -2,9 +2,11 @@ package domain
 
 import (
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // Task generation for idle agents with no task source (FR-011 relaxation):
@@ -572,6 +574,136 @@ func isNoopLine(line string) bool {
 	}
 	t = strings.TrimSpace(stripInlineEmphasis(strings.TrimSpace(t)))
 	return IsNoopAction(NormalizeNoopAction(t))
+}
+
+// StripForeignAgentGeneratedLines removes every line of a generate-task CLI's
+// raw stdout that names a KNOWN agent other than the one the generation was
+// for, returning the remaining text and the foreign names it found.
+//
+// The generator is handed "Agent: {agent_name}" on one line and then the whole
+// screen as ground truth, and the screen routinely carries another agent's
+// name: DefaultNextTaskTemplate (tasklist.go) renders "hap task {agent_name}
+// list" into every hand-out hap itself sends, so a pane holding a sibling's
+// text, a pre-rename scrollback or a recycled tenant puts a foreign name in
+// front of the model as fact. It described one and hap surfaced the result as
+// this agent's work — observed as "Select option 2 or 3 to grant permission to
+// run the `hap task wise-wombat list` command" on an agent that was not
+// wise-wombat (#508). Neither outbound screen can catch it: both are never-auto
+// patterns plus the irreversible heuristic, identity-blind by construction, and
+// the operator's own confirm is screened by nothing at all.
+//
+// It works LINE-WISE on the RAW text, before NormalizeGeneratedTasks, for the
+// two reasons StripNoopGeneratedLines states: the name must never survive into
+// a checklist (where a later confirm --send types it into a pane), and the
+// remaining text must stay raw so the confirm path normalizes exactly once —
+// NormalizeGeneratedTasks is not idempotent.
+//
+// A line is dropped whatever its shape, prose included, rather than only list
+// items: the parser has TWO modes and the mode is not known until it has run,
+// and in plain mode every non-empty line is a task. Losing a prose line costs a
+// sentence of the escalation's rationale; keeping one can put another agent's
+// name into this agent's checklist. Fence lines are left alone, as the parser
+// skips them anyway.
+//
+// Matching is against the known-name SET on name boundaries, never a pattern
+// over the adjective-animal shape, which would fire on ordinary prose. A name
+// is only a mention when neither neighbour could be part of a name itself, so
+// "wise-wombats" and "my-wise-wombat" are not "wise-wombat". Comparison folds
+// case: a herdr agent name is lowercase by construction (invalid_agent_name),
+// so a model that capitalized it still means the agent.
+func StripForeignAgentGeneratedLines(raw, self string, known []string) (kept string, dropped []string) {
+	foreign := make([]string, 0, len(known))
+	for _, name := range known {
+		if name == "" || strings.EqualFold(name, self) {
+			continue
+		}
+		foreign = append(foreign, name)
+	}
+	if len(foreign) == 0 {
+		return raw, nil
+	}
+	// Sorted so the reported name is the same one on every run: the caller's
+	// set comes from a map, and the rationale this feeds is compared in tests.
+	sort.Strings(foreign)
+
+	lines := strings.Split(raw, "\n")
+	out := make([]string, 0, len(lines))
+	seen := map[string]bool{}
+	for _, line := range lines {
+		hit := ""
+		if !isFenceLine(line) {
+			for _, name := range foreign {
+				if mentionsAgentName(line, name) {
+					hit = name
+					break
+				}
+			}
+		}
+		if hit == "" {
+			out = append(out, line)
+			continue
+		}
+		if !seen[hit] {
+			seen[hit] = true
+			dropped = append(dropped, hit)
+		}
+	}
+	return strings.TrimSpace(strings.Join(out, "\n")), dropped
+}
+
+// ForeignAgentDropNote renders the one-line note the daemon leads a generated
+// task's rationale with when StripForeignAgentGeneratedLines dropped something.
+// It lives here beside the stripper so the two spellings cannot drift, and it
+// names the agents because "a line was dropped" tells an operator nothing about
+// which pane put the wrong name in front of the model.
+func ForeignAgentDropNote(dropped []string) string {
+	if len(dropped) == 0 {
+		return ""
+	}
+	noun := "another agent"
+	if len(dropped) > 1 {
+		noun = "other agents"
+	}
+	return "dropped generated lines naming " + noun + " (" + strings.Join(dropped, ", ") + ")"
+}
+
+// mentionsAgentName reports whether line names this agent as a whole name.
+//
+// RE2 has no lookaround, so the boundary is checked by hand rather than with
+// \b: an agent name may contain "-" and "_", which \b treats as boundaries, so
+// \bwise-wombat\b matches inside "my-wise-wombat".
+func mentionsAgentName(line, name string) bool {
+	hay, needle := strings.ToLower(line), strings.ToLower(name)
+	for i := 0; i+len(needle) <= len(hay); {
+		j := strings.Index(hay[i:], needle)
+		if j < 0 {
+			return false
+		}
+		start, end := i+j, i+j+len(needle)
+		before := start == 0
+		if !before {
+			r, _ := utf8.DecodeLastRuneInString(hay[:start])
+			before = !agentNameRune(r)
+		}
+		after := end == len(hay)
+		if !after {
+			r, _ := utf8.DecodeRuneInString(hay[end:])
+			after = !agentNameRune(r)
+		}
+		if before && after {
+			return true
+		}
+		i = start + 1
+	}
+	return false
+}
+
+// agentNameRune reports whether r could be part of a herdr agent name
+// ([a-z0-9_-], per invalid_agent_name). Letters and digits beyond that set are
+// included deliberately: they cannot appear in a name, but a name butted
+// against one is not a mention of it either.
+func agentNameRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_'
 }
 
 // hasAlphanumeric reports whether s contains any letter or digit.

@@ -517,6 +517,21 @@ while the mode is on; it watches `hap stream orchestrator`.
   transcript at the TOP of a tall pane, so a short read never sees a delivered brief (see
   `TestRealOrchestratorAgentStart`).
 
+- **A generated task may not name ANOTHER agent** (`domain.StripForeignAgentGeneratedLines`, applied once
+  in `handleTaskGenOutcome`). The generator is told `Agent: {agent_name}` on one line and handed ~5000
+  chars of pane as ground truth, and `DefaultNextTaskTemplate` renders `hap task {agent_name} list` into
+  every hand-out — so a sibling's name, a pre-rename scrollback or a recycled tenant puts a foreign name
+  in front of the model as fact, and it comes back as this agent's work (#508). Neither outbound screen
+  can catch it: both are never-auto patterns plus the irreversible heuristic, identity-blind by
+  construction, and the OPERATOR's own confirm is screened by nothing at all. Four bounds: line-wise on
+  the RAW text before normalization, the same contract `StripNoopGeneratedLines` states (the confirm path
+  must normalize exactly ONCE); the known set is `AgentNames`, this NODE's, never `FleetAgentNames`;
+  matching is on NAME BOUNDARIES against that set, never a pattern over the adjective-animal shape, which
+  fires on prose; and the all-dropped branch sits **ABOVE** the `declined` branch, or `- @noop` beside one
+  foreign line reports "the model declined" and parks the agent on a noop rule it never asked for.
+  Applied before the row is stored, so the FSP accept and the operator confirm inherit one clean
+  suggestion.
+
 **Accepted limitation, not a bug:** a generated-task escalation is `idle`-typed, so its baseline salient is
 unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — the row waits for the operator.
 
@@ -557,6 +572,17 @@ keystroke.
   unstripped), so it costs no herdr round trip. **Do not put it in `internal/classify`** beside the agy
   idle suppression: withholding the idle verdict leaves `SituationUnclassifiable`, which still escalates,
   so it would trade `[no_task_source]` rows for `[unclassifiable]` rows at the same rate.
+  - **It now has a SECOND caller, and it is narrower than this one** (`reclaimStrandedTasks`, #508) — so
+    the contract comment on the predicate names both. It may only ever WITHHOLD something hap would say;
+    a caller that would TYPE must prove its precondition positively (`AgyComposerReady`,
+    `ClaudeComposerReady`) rather than read a `false` here as permission.
+  - **The evidence is recorded at CLASSIFY time and read from memory** (`noteBackgroundWork` beside
+    `noteAgyWorkspace`; `backgroundWorkFor`). `autoSendIdleTasks` runs ON the main loop and its own doc
+    already names its inline per-row writes as the reason it is no longer "only cheap reads", so a
+    per-row herdr shell-out there is a stall — and not a rare one, since a parked agent in a
+    thirteen-minute build is past `reclaimGrace` on all thirteen sweeps. A NEGATIVE observation DELETES
+    the entry rather than storing a false, so `backgroundWorkFresh` only ever bounds "no capture has
+    been taken at all"; an agent whose own work prints nothing for that long is reclaimed as before.
 - **Every suppression names itself once** (`noteNoticeWithheld`, per (agent, reason, CAUSE) — a changed
   cause is new information). `notePending`'s rule: the unlogged skips cost a five-round investigation,
   and a line per event would move the flood into the log.
@@ -625,6 +651,16 @@ keystroke.
   second hand-out lets one resumption confirm — and so strand — the untaken first; confirm and reclaim both
   compare `terminal_id`, because an agent id IS a recycled pane id; and an item handed out `maxTaskHandouts`
   times without ever being started is left `[-]` and escalated rather than resent forever.
+  - **"Parked" is not "finished", and that cost every stall alert in one session** (#508). herdr reports an
+    agent sitting on a fifteen-minute cold build as `idle`, so `!autoSendParked` does not save it: the
+    two-minute grace expired under an agent that was working, the item was reclaimed and re-handed, and
+    `maxTaskHandouts` later it was escalated `task_never_started` for work it was doing all along. A parked
+    agent whose pane POSITIVELY shows work it started (`domain.BackgroundWorkRunning`) is held `awaiting`
+    instead. It DEFERS, never exempts: `staleHandoutTTL` is asked FIRST and unconditionally, or a dev
+    server or `tail -f` would pin an item at `[-]` for as long as that process lives. **Test trap:** the
+    obvious assertions cannot see the bug — without the guard the same sweep reclaims AND re-hands, so the
+    row count and the `[-]` marker both look untouched; only the reservation's ID and the second send
+    discriminate.
 - **A pending escalation never benches an agent from the idle poll** — `eligibleIdleAgents` has no
   escalation gate, deliberately: gating on one deadlocks the feature against itself, since a pending task is
   what raises `noop_vs_pending_tasks`, which then blocks the poll that would deliver it. **Do not reach for

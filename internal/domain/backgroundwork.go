@@ -22,8 +22,24 @@ import (
 // only ever read as an indicator when it can be POSITIVELY identified, and an
 // unrecognized screen answers false — hap then behaves exactly as it does today.
 // Absence of the indicator is never evidence that nothing is running, which is
-// why this predicate may only ever SUPPRESS a queue notice and must never gate a
-// send.
+// why this predicate may only ever WITHHOLD something hap would otherwise say,
+// and must never gate a send.
+//
+// There are two such callers, and the second is the narrower one:
+//
+//   - daemon.queueNoticeWithheld holds back a [no_task_source] notice. Nothing
+//     is typed, and the operator can always queue work by hand.
+//   - daemon.reclaimStrandedTasks holds back the hand-out reclaim and the
+//     [task_never_started] escalation it ends in (#508): herdr reports an agent
+//     in a fifteen-minute cold build as idle, so a two-minute grace expired
+//     under an agent that was working the whole time. This one touches a
+//     CHECKLIST, so it is bounded twice over — it only ever DEFERS, and
+//     staleHandoutTTL is asked first and unconditionally, so an indicator that
+//     never goes away cannot pin an item at "[-]" for good.
+//
+// Neither reaches a pane. A caller that would type something must prove its
+// precondition positively (AgyComposerReady, ClaudeComposerReady), not read a
+// false here as permission.
 
 var (
 	// claudeBackgroundCountRE matches one counted background-work segment of

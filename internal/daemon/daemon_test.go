@@ -4885,3 +4885,91 @@ func (f *failingStore) EnsureTaskList(ctx context.Context, nodeID, name, agentNa
 func (f *failingStore) ListTaskLists(ctx context.Context) ([]domain.StoredTaskList, error) {
 	return f.StorePort.(ports.TaskListStore).ListTaskLists(ctx)
 }
+
+// TestIdleTaskGenDropsTasksNamingAnotherAgent: the generator treats the pane as
+// ground truth, and the pane routinely carries a SIBLING's name — every
+// hand-out hap sends renders "hap task <name> list" into it — so it proposed
+// work naming an agent the task was not for (#508). Neither outbound screen can
+// catch that: both are never-auto patterns plus the irreversible heuristic, and
+// the operator's own confirm is screened by nothing at all. The clean task must
+// survive, and the rationale must name the agent that was dropped.
+func TestIdleTaskGenDropsTasksNamingAnotherAgent(t *testing.T) {
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "- Add the missing parser tests\n- Run `hap task wise-wombat list` to see the rest", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	nameOtherAgent(t, h, "agent-other", "wise-wombat")
+
+	h.push("agent-40", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	want := domain.SuggestTaskPrefix + "- Add the missing parser tests"
+	if esc[0].Suggestion != want {
+		t.Errorf("suggestion = %q, want %q", esc[0].Suggestion, want)
+	}
+	if !strings.Contains(esc[0].Rationale, "wise-wombat") {
+		t.Errorf("rationale = %q, want it to name the dropped agent", esc[0].Rationale)
+	}
+	// Belt and braces: nothing the confirm path would write may name the other
+	// agent, since that text is what a confirm --send types into the pane.
+	confirmable := strings.TrimPrefix(esc[0].Suggestion, domain.SuggestTaskPrefix)
+	for _, task := range domain.NormalizeGeneratedTasks(confirmable) {
+		if strings.Contains(task, "wise-wombat") {
+			t.Errorf("another agent's name survived into confirmable task %q", task)
+		}
+	}
+}
+
+// TestIdleTaskGenAllForeignTasksAreRetryableNotADecline pins the branch ORDER.
+// A reply of "@noop" beside a foreign-name line strips to nothing with the
+// decline flag set, so a guard placed after the decline branch never runs and
+// the escalation reports "the model declined" — hiding the only fact worth
+// knowing, and parking the agent on a noop rule it never asked for.
+func TestIdleTaskGenAllForeignTasksAreRetryableNotADecline(t *testing.T) {
+	h, _ := newHarnessTaskGen(t, "", func(ctx context.Context, req domain.TaskGenRequest) (string, error) {
+		return "- @noop\n- Run `hap task wise-wombat list` and finish its items", nil
+	})
+	h.herdr.setPane("Task is complete.\n")
+
+	ctx := context.Background()
+	nameOtherAgent(t, h, "agent-other", "wise-wombat")
+
+	h.push("agent-41", "idle")
+	var esc []domain.AuditRecord
+	waitFor(t, 3*time.Second, func() bool {
+		esc, _ = h.raw.PendingEscalations(ctx)
+		return len(esc) == 1
+	})
+	if strings.HasPrefix(esc[0].Suggestion, domain.SuggestTaskPrefix) {
+		t.Errorf("a generation that named only another agent must not be confirmable, got %q", esc[0].Suggestion)
+	}
+	if esc[0].Suggestion == domain.ActionNoopSuggestion {
+		t.Error("this is not a decline: the model answered, it just answered about another agent")
+	}
+	if !domain.IsRetryableLLMEscalation(&esc[0]) {
+		t.Errorf("want a retryable escalation so `l: retry LLM` can re-ask, got rationale %q", esc[0].Rationale)
+	}
+	if !strings.Contains(esc[0].Rationale, "wise-wombat") {
+		t.Errorf("rationale = %q, want it to name the agent that was proposed instead", esc[0].Rationale)
+	}
+}
+
+// nameOtherAgent makes a SECOND agent known to this node under an exact name,
+// so a test can put that name in a generation without guessing the generated
+// one. Named before the agent under test is pushed, so the screening read
+// cannot race it.
+func nameOtherAgent(t *testing.T, h *harness, agentID, name string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := h.raw.EnsureAgentName(ctx, agentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.RenameAgent(ctx, agentID, name); err != nil {
+		t.Fatal(err)
+	}
+}
