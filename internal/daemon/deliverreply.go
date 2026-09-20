@@ -70,8 +70,13 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 	// MATERIALIZED text, not the stored form: a stored next-task sentinel
 	// carries none of the words a rule matches on, while the prompt that
 	// actually reaches the pane does.
-	if err := d.screenOutbound(audit.AgentType, outbound); err != nil {
-		return "", fmt.Errorf("%w: %v", errOutboundRefused, err)
+	//
+	// WHICH screen depends on the author, exactly as it does for a queued
+	// hand-out: deliverReplyScreen keeps the operator's arm as it has always
+	// been and gives the orchestrator's prose the same treatment a task
+	// hand-out gets. See its comment.
+	if err := d.deliverReplyScreen(a, audit.AgentType)(outbound); err != nil {
+		return "", err
 	}
 
 	// The point of no return: mark BEFORE the keystrokes, so a daemon that

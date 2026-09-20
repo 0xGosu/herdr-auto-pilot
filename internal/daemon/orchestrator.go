@@ -826,7 +826,60 @@ func CallerIsOrchestrator(stateDir, paneID string) bool {
 //
 // Nothing changes for accept_generated_task, whose text the task-generator LLM
 // INVENTED rather than was asked for, and nothing for the daemon's own FSP
-// sends (screenOutbound, unchanged).
+// sends (screenOutbound, unchanged). deliver_reply is screened INLINE rather
+// than through a seam and so has its own entry point, deliverReplyScreen, which
+// applies the same author policy — see the rationale there for why a reply
+// keeps the action rules a hand-out drops.
+// deliverReplyScreen is actionScreen for the one kind screened INLINE rather
+// than through a seam: a reply to an escalation (`hap resolve --send`,
+// `hap confirm --send`). It is never nil — a reply's text is authored AFTER the
+// decision that raised the escalation, so whoever wrote it, nothing has
+// screened it yet.
+//
+// The OPERATOR's arm is unchanged: screenOutbound, which deliverReply has always
+// run. They keep the suspected-irreversible heuristic and, as everywhere else,
+// not the action rules — a human who looked at the menu and chose to widen a
+// permission has made that call themselves (see actionRefused).
+//
+// The ORCHESTRATOR's arm is the PROSE screen, for the same reason a send_task
+// hand-out gets one: `--action` carries free text instructing an agent at least
+// as often as it carries a menu label, and the heuristic seeds corroborate a
+// destructive verb against a data target across a line or two precisely because
+// they read a PENDING PANE OPERATION. Over narration they refuse work for
+// DISCUSSING it. Observed live (#526): a `resolve --action` carrying review-fix
+// instructions was refused because "without deleting the PK row" was followed by
+// the word "table", nothing was sent, and the pull request it answered stalled
+// about three hours until a human intervened.
+//
+// What is DROPPED is two shipped heuristics written to read a screen; the whole
+// of the operator's declared policy is strict-kind (domain.NeverAutoStrict) and
+// survives untouched.
+//
+// What is KEPT, and this is the difference from a hand-out: the ACTION rules. A
+// hand-out is prose by construction, but a reply is routinely the label of an
+// option on a live menu — so a widening choice ("always allow commands starting
+// with …") picked by an LLM is exactly what those rules exist to refuse, and
+// exactly the thing the orchestrator skill tells a deputy never to take.
+func (d *Daemon) deliverReplyScreen(a domain.AgentAction, agentType string) func(string) error {
+	if a.Author != domain.OrchestratorAuthor {
+		return func(text string) error {
+			if err := d.screenOutbound(agentType, text); err != nil {
+				return fmt.Errorf("%w: %v", errOutboundRefused, err)
+			}
+			return nil
+		}
+	}
+	return func(text string) error {
+		if err := d.screenOutboundStrict(agentType, text); err != nil {
+			return fmt.Errorf("%w: %v", errOutboundRefused, err)
+		}
+		if why := d.actionRefused(agentType, text); why != "" {
+			return fmt.Errorf("%w: matched never-auto action %s", errOutboundRefused, why)
+		}
+		return nil
+	}
+}
+
 func (d *Daemon) actionScreen(a domain.AgentAction, agentType string) func(string) error {
 	if a.Author != domain.OrchestratorAuthor {
 		return nil

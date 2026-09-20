@@ -752,6 +752,13 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 		// Same reasoning for the per-episode notices: the latch belongs to the
 		// spell, and a recycled pane is a different agent entirely.
 		delete(d.episodeNoticeRaised, a.AgentID)
+		// The notice COOLDOWN is deliberately NOT dropped beside the latch
+		// above, where the agent merely stopped being parked: surviving that
+		// boundary is the whole point of it (#526). It is dropped here, and
+		// only here, because reaching this line means the pane or terminal
+		// changed — a different agent, which has interrupted nobody yet.
+		delete(d.noticeCooldownUntil, a.AgentID)
+		delete(d.noticeSuppressionNoted, a.AgentID)
 		d.idleSince[a.AgentID] = idleMark{paneID: a.PaneID, terminalID: a.TerminalID, at: now}
 	}
 	for id := range d.idleSince {
@@ -762,6 +769,12 @@ func (d *Daemon) noteIdleAgents(agents []domain.AgentTransition, now time.Time) 
 	for id := range d.episodeNoticeRaised {
 		if _, ok := live[id]; !ok {
 			delete(d.episodeNoticeRaised, id)
+		}
+	}
+	for id := range d.noticeCooldownUntil {
+		if _, ok := live[id]; !ok {
+			delete(d.noticeCooldownUntil, id)
+			delete(d.noticeSuppressionNoted, id)
 		}
 	}
 	for id := range d.pollRedrive {

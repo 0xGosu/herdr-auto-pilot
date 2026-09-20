@@ -223,6 +223,8 @@ func (d *Daemon) runAgentAction(ctx context.Context, a domain.AgentAction) {
 		}
 		if withdrawsCorrection(runErr) {
 			d.finishWithdrawn(ctx, a, msg)
+			// AFTER the withdrawal, which is the part that must be atomic.
+			d.escalateRefusedAction(ctx, a, runErr, msg)
 			return
 		}
 		d.finishAgentAction(ctx, a, domain.AgentActionFailed, msg, result)
@@ -293,6 +295,80 @@ func (d *Daemon) finishWithdrawn(ctx context.Context, a domain.AgentAction, errT
 	default:
 		slog.Warn("agent action refused", "action", a.ID, "kind", a.Kind, "reason", errText)
 	}
+}
+
+// escalateRefusedAction puts a refused request in front of a HUMAN.
+//
+// Before this, a refusal left agent_actions.error, deleted the correction it was
+// paired with, and logged one line. Nothing reached audit_log and nothing
+// reached the operator's queue: the only party told was the process that queued
+// the action, which for the orchestrator is its own terminal — and the
+// orchestrator skill correctly tells it that a safety refusal is FINAL and must
+// never be retyped into the agent, so it stops there. #526 watched exactly that
+// silence stall a pull request for about three hours.
+//
+// The escalation the refusal BLOCKED is a separate row and stays "escalated", so
+// it is still in the queue — but its rationale describes the agent's screen and
+// says nothing about an answer having been attempted and vetoed. This row is
+// what carries that, which is also why it is written for EVERY kind rather than
+// only for a reply: a refused hand-out or generated-task confirm has no other
+// row at all.
+//
+// Deliberately NO Suggestion and NO Input, the shape escalateNeverStartedTask
+// established: a confirm would send the suggestion to the pane as literal text,
+// and the text here is precisely the text a safety control refused. An empty
+// suggestion makes the row informational — explained by its rationale,
+// dismissible, not confirmable.
+//
+// Best-effort by construction: it runs AFTER the withdrawal transaction, which
+// is the part that must be atomic, and a failure to record it is logged rather
+// than retried. Retrying would re-enter a path whose claim is already released.
+func (d *Daemon) escalateRefusedAction(ctx context.Context, a domain.AgentAction,
+	runErr error, errText string) {
+
+	// errOutboundRefused ONLY. withdrawsCorrection also covers
+	// errEscalationClosed, which is the opposite situation: the row this
+	// answered is already resolved or dismissed, so there is nothing left to
+	// tell anyone about and a second row would be noise.
+	if !errors.Is(runErr, errOutboundRefused) {
+		return
+	}
+	agentType := ""
+	if live, ok := d.liveAgentFor(ctx, a.Target); ok {
+		agentType = live.AgentType
+	}
+	if _, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
+		AgentID: a.Target, AgentType: agentType,
+		Trigger:       domain.TriggerQueuedActionRefused,
+		SituationType: domain.SituationUnclassifiable,
+		Action:        domain.AuditActionQueuedActionRefusedPrefix + string(a.Kind),
+		Rationale: fmt.Sprintf("[%s] a safety control refused %s's %s for %s and nothing was sent: %s",
+			domain.ReasonQueuedActionRefused, actionAuthorLabel(a), a.Kind, a.Target, errText),
+		Status: "escalated", CreatedAt: d.opt.Clock.Now(),
+	}); err != nil {
+		slog.Error("agent actions: a refusal could not be escalated, so it is visible only in this log",
+			"action", a.ID, "kind", a.Kind, "error", err)
+	}
+	// And retract the correction event the front end already emitted. It fires
+	// when the answer is QUEUED — before this screen runs, deliberately, since
+	// the no-send path never waits for a daemon — so without this the stream's
+	// last word on a refused answer is that it was delivered.
+	if a.CorrectionID != 0 {
+		d.emitStream(ctx, domain.StreamCorrectionWithdrawn,
+			domain.StreamInt("id", a.CorrectionID),
+			domain.StreamStr("agent", a.Target),
+			domain.StreamStr("reason", errText))
+	}
+}
+
+// actionAuthorLabel names the author for the refusal rationale. An empty author
+// is an older row, written before agent_actions carried the column; "a front
+// end" is true of every one of them and claims nothing that is not known.
+func actionAuthorLabel(a domain.AgentAction) string {
+	if a.Author == "" {
+		return "a front end"
+	}
+	return a.Author
 }
 
 // finishAgentAction writes a terminal outcome, logging rather than propagating

@@ -51,6 +51,17 @@ const (
 	StreamEscalation          = "escalation"
 	StreamEscalationDismissed = "escalation.dismissed"
 	StreamCorrection          = "correction"
+	// StreamCorrectionWithdrawn retracts a StreamCorrection: the answer was
+	// recorded and queued, and then a safety control refused the text so
+	// nothing reached the pane and the correction was deleted.
+	//
+	// It exists because the correction event is emitted when the answer is
+	// QUEUED, which is before the daemon screens it — deliberately, since the
+	// no-send path never waits for a daemon at all. Without a retraction the
+	// stream's last word on a refused answer is that it was delivered, which is
+	// the opposite of what happened, and a reader acting on the stream (the
+	// orchestrator does) has no way to learn otherwise.
+	StreamCorrectionWithdrawn = "correction.withdrawn"
 	StreamPauseOn             = "pause.on"
 	StreamPauseOff            = "pause.off"
 	StreamFSPOn               = "fsp.on"
