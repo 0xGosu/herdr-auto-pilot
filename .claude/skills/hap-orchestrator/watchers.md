@@ -76,6 +76,15 @@ run on a forge, a release publishing. Even then:
   it waits for is alive. Every stall alert in one session was a false positive,
   and false alerts are how you learn to ignore the real one.
 
+  Two things now narrow this. hap itself withholds hand-outs and queue notices
+  from an agent whose pane POSITIVELY shows its own background work — claude,
+  codex and agy all paint a count it can read — so those agents no longer drift
+  toward a `task_never_started` escalation. And an agent can say so outright:
+  `hap wait 20m --reason "cold cargo build"`, run in its own pane before it
+  starts the long command. When you hand out work you expect to block, say so
+  in the task; when you see `waiting <time>` in `hap agents`, that agent is
+  busy on purpose and is not a stall.
+
 - **Scope to your own node.** `hap agents` lists other machines' agents; alerting
   on them is noise you cannot act on. Filter on the node column.
 

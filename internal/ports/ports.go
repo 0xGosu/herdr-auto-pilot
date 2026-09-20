@@ -809,6 +809,12 @@ type FrontendStore interface {
 	// A separate switch from SetAgentDisabled, never a second meaning for it —
 	// see the store method for what conflating them cost.
 	SetAgentSnoozed(ctx context.Context, target string, snoozed bool) error
+	// SetAgentWait records the AGENT's own bounded "I am deliberately busy
+	// until then" (domain.AgentWait, #508); a zero until clears it. A third
+	// switch beside disabled and snoozed, never a second meaning for either:
+	// it expires on the clock and is NOT lifted by the transition to working,
+	// because the flap that transition causes is exactly what it covers.
+	SetAgentWait(ctx context.Context, target string, until time.Time, reason string) error
 	// DeleteSignature removes one learned signature with its decision
 	// history and error-retry row, returning the decision count. The daemon
 	// may recreate the signature from an in-flight event; the recreated
@@ -845,6 +851,19 @@ type MCPStore interface {
 	GetLLMRequest(ctx context.Context, requestID string) (*domain.LLMRequest, error)
 	LatestPendingLLMRequest(ctx context.Context) (*domain.LLMRequest, error)
 	InsertLLMDecision(ctx context.Context, d domain.LLMDecision) (int64, error)
+}
+
+// WaitDeclarer is the OPTIONAL capability behind the MCP declare_wait tool
+// (domain.AgentWait, #508).
+//
+// Optional rather than a fourth MCPStore method, per the architecture rule on
+// optional capabilities: the server type-asserts and refuses the tool with a
+// reason when the store does not implement it, so every existing fake keeps
+// compiling and a build without the capability degrades instead of failing to
+// link. The real store satisfies it, and so does the sqlbridge handle every
+// non-daemon process reaches a shared store through.
+type WaitDeclarer interface {
+	SetAgentWait(ctx context.Context, target string, until time.Time, reason string) error
 }
 
 // BatchDecisionReader is the OPTIONAL bulk form of ReadStore's two
@@ -894,6 +913,8 @@ type ReadStore interface {
 	DisabledAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool, error)
 	// SnoozedAgentsAll is SnoozedAgents across every node.
 	SnoozedAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool, error)
+	// WaitingAgentsAll is WaitingAgents across every node.
+	WaitingAgentsAll(ctx context.Context) (map[domain.NodeAgent]domain.AgentWait, error)
 	FleetAgentStats(ctx context.Context) (map[domain.NodeAgent]domain.AgentStats, error)
 	// LocationsOf is HerdrLocations for any node.
 	LocationsOf(ctx context.Context, nodeID string) (map[string]domain.WorkspaceInfo, map[string]domain.TabInfo, error)
@@ -965,6 +986,13 @@ type ReadStore interface {
 	AgentSnoozed(ctx context.Context, agentID string) (bool, error)
 	// SnoozedAgents returns all snoozed agent ids for operator-facing views.
 	SnoozedAgents(ctx context.Context) (map[string]bool, error)
+	// AgentWaitFor returns one agent's declared wait, zero when it has none.
+	// A LAPSED wait comes back as stored: whether it still stands is a
+	// question about now, which the caller's clock answers.
+	AgentWaitFor(ctx context.Context, agentID string) (domain.AgentWait, error)
+	// WaitingAgents returns every agent carrying a declared wait, lapsed ones
+	// included, for operator-facing views.
+	WaitingAgents(ctx context.Context) (map[string]domain.AgentWait, error)
 	// ClearAgentSnoozeIfSet lifts a snooze and reports whether one was lifted.
 	// Conditional on purpose: it runs on every transition to working, and an
 	// unconditional write would arm the turso push debounce on every turn

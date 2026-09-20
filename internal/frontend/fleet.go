@@ -33,7 +33,17 @@ type RemoteAgent struct {
 	// Snoozed: that machine's operator silenced notices about this agent's
 	// QUEUE. Distinct from Disabled — its prompts are still answered.
 	Snoozed bool
-	Stats   domain.AgentStats
+	// Wait: the agent's own declared "I am busy until then", as stored — which
+	// may be LAPSED. Whether it still stands is a question about now, so the
+	// renderer asks domain.AgentWait.Active rather than trusting presence.
+	//
+	// Compared against the READER's clock, not the owning node's. That is the
+	// same approximation NodeStale and RosterFresh already make of this
+	// struct's other time fields, and the consequence is bounded: a skewed
+	// pair of machines renders a wait a minute early or late in a listing,
+	// while every gate that ACTS on one runs on the owning daemon.
+	Wait  domain.AgentWait
+	Stats domain.AgentStats
 }
 
 // ShortName is the agent's own name, with no node attached, falling back to
@@ -126,6 +136,7 @@ type fleetReads struct {
 	namesErr  error
 	disabled  map[domain.NodeAgent]bool
 	snoozed   map[domain.NodeAgent]bool
+	waiting   map[domain.NodeAgent]domain.AgentWait
 	stats     map[domain.NodeAgent]domain.AgentStats
 	roster    []domain.RosterAgent
 	published map[string]time.Time
@@ -149,6 +160,7 @@ func (a *App) readFleet(ctx context.Context, o statusOptions) fleetReads {
 		func() { f.names, f.namesErr = a.Store.FleetAgentNames(ctx) },
 		func() { f.disabled, _ = a.Store.DisabledAgentsAll(ctx) },
 		func() { f.snoozed, _ = a.Store.SnoozedAgentsAll(ctx) },
+		func() { f.waiting, _ = a.Store.WaitingAgentsAll(ctx) },
 		func() { f.roster, f.published, f.rosterErr = a.Store.FleetRoster(ctx) },
 	}
 	if !o.skipStats {
@@ -201,7 +213,7 @@ func (a *App) fillFleet(st *Status, f fleetReads) {
 	if f.namesErr == nil {
 		st.FleetNames = f.names
 	}
-	disabled, snoozed, stats := f.disabled, f.snoozed, f.stats
+	disabled, snoozed, stats, waiting := f.disabled, f.snoozed, f.stats, f.waiting
 	if f.rosterErr != nil {
 		return
 	}
@@ -230,6 +242,7 @@ func (a *App) fillFleet(st *Status, f fleetReads) {
 			Stale:       domain.NodeStale(node, now) || !domain.RosterFresh(published[r.NodeID], now),
 			Disabled:    disabled[key],
 			Snoozed:     snoozed[key],
+			Wait:        waiting[key],
 			Stats:       stats[key],
 		})
 	}

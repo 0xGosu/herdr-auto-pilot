@@ -83,6 +83,31 @@ func (a *App) SetAgentSnoozedOn(ctx context.Context, nodeID, target string, snoo
 	return err
 }
 
+// DeclareAgentWaitOn records an agent's declared wait on the named node.
+//
+// The remote form queues a DURATION, never a deadline: the gates that read the
+// row compare it against the OWNING node's clock, so the owner mints the
+// deadline against that clock and two machines' skew never enters the answer.
+// See domain.DeclareWaitPayload.
+func (a *App) DeclareAgentWaitOn(ctx context.Context, nodeID, target string,
+	d time.Duration, reason string) error {
+
+	if err := domain.ValidateWaitDuration(d); err != nil {
+		return err
+	}
+	if a.isSelf(nodeID) {
+		return a.DeclareAgentWait(ctx, target, d, reason)
+	}
+	payload, err := json.Marshal(domain.DeclareWaitPayload{
+		Seconds: int64(d / time.Second), Reason: domain.NormalizeWaitReason(reason),
+	})
+	if err != nil {
+		return err
+	}
+	_, err = a.runRemoteAction(ctx, nodeID, domain.AgentActionDeclareWait, target, string(payload), true)
+	return err
+}
+
 // CaptureAgentOn re-runs the attention pipeline for a parked agent on the named
 // node.
 func (a *App) CaptureAgentOn(ctx context.Context, nodeID, target string) (domain.CaptureResult, error) {

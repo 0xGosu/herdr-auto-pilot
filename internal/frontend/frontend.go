@@ -195,6 +195,10 @@ type Status struct {
 	// SnoozedAgents contains agent/pane ids whose QUEUE notices the operator
 	// silenced. Distinct from DisabledAgents: hap still answers their prompts.
 	SnoozedAgents map[string]bool
+	// WaitingAgents contains agent/pane ids whose AGENT declared a bounded
+	// wait, LAPSED ones included — the reader decides which still stand
+	// (domain.AgentWait.Active), because that is a question about now.
+	WaitingAgents map[string]domain.AgentWait
 	// AgentStats maps agent/pane ids to their lifetime counters (auto-sends,
 	// escalations, operator confirmations/corrections, first-seen). Nil when
 	// the stats query failed; a missing key means a live agent with no stats
@@ -286,6 +290,8 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 		disabledErr         error
 		snoozed             map[string]bool
 		snoozedErr          error
+		waiting             map[string]domain.AgentWait
+		waitingErr          error
 		stats               map[string]domain.AgentStats
 		statsErr            = errNotRead
 		cfg                 config.Config
@@ -307,6 +313,7 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 		func() { names, namesErr = a.Store.AgentNames(ctx) },
 		func() { disabled, disabledErr = a.Store.DisabledAgents(ctx) },
 		func() { snoozed, snoozedErr = a.Store.SnoozedAgents(ctx) },
+		func() { waiting, waitingErr = a.Store.WaitingAgents(ctx) },
 		func() { fleet = a.readFleet(ctx, o) },
 	}
 	if !o.skipStats {
@@ -380,6 +387,9 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 	}
 	if snoozedErr == nil {
 		st.SnoozedAgents = snoozed
+	}
+	if waitingErr == nil {
+		st.WaitingAgents = waiting
 	}
 	// Best-effort, like AgentNames: a stats-query error just leaves it nil.
 	if statsErr == nil {
@@ -488,6 +498,14 @@ func (st Status) AgentDisabled(agentID string) bool { return st.DisabledAgents[a
 
 // AgentSnoozed reports the persistent operator-owned quiet state.
 func (st Status) AgentSnoozed(agentID string) bool { return st.SnoozedAgents[agentID] }
+
+// AgentWaiting reports the agent's own declared wait as of now, and whether it
+// still stands. A lapsed declaration answers false and is returned as stored,
+// so a caller that wants to say "waited until …" still can.
+func (st Status) AgentWaiting(agentID string, now time.Time) (domain.AgentWait, bool) {
+	w := st.WaitingAgents[agentID]
+	return w, w.Active(now)
+}
 
 // StatsFor returns the lifetime counters for an agent id (a zero-valued
 // AgentStats when none are recorded).
@@ -781,6 +799,49 @@ func (a *App) SetAgentSnoozed(ctx context.Context, target string, snoozed bool) 
 				return nameErr
 			}
 			err = a.Store.SetAgentSnoozed(ctx, agentID, snoozed)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	a.nudge(ctx, control.KindReload)
+	return nil
+}
+
+// DeclareAgentWait records an agent's own bounded "I am deliberately busy
+// until then" (domain.AgentWait, #508); a zero duration clears it.
+//
+// Mirrors SetAgentSnoozed, naming a live-but-unnamed agent first for the same
+// reason — an agent declaring a wait on its very first act would otherwise be
+// refused for having no name row yet, which is exactly when a cold build
+// happens.
+//
+// The deadline is minted HERE against the local clock, which is this node's,
+// because this call only ever writes a LOCAL row; a remote target goes through
+// DeclareAgentWaitOn, which queues a DURATION for the owning node to mint
+// against its own.
+func (a *App) DeclareAgentWait(ctx context.Context, target string, d time.Duration, reason string) error {
+	if err := domain.ValidateWaitDuration(d); err != nil {
+		return err
+	}
+	var until time.Time
+	if d > 0 {
+		until = a.now().Add(d)
+	}
+	err := a.Store.SetAgentWait(ctx, target, until, reason)
+	if errors.Is(err, ports.ErrUnknownAgent) {
+		if rerr := a.refuseRemoteTargetUnlessLocal(ctx, target, "wait"); rerr != nil {
+			return rerr
+		}
+		agentID, rerr := a.liveRosterAgentID(ctx, target)
+		if rerr != nil {
+			return fmt.Errorf("%w (%v)", err, rerr)
+		}
+		if agentID != "" {
+			if _, nameErr := a.Store.EnsureAgentName(ctx, agentID); nameErr != nil {
+				return nameErr
+			}
+			err = a.Store.SetAgentWait(ctx, agentID, until, reason)
 		}
 	}
 	if err != nil {

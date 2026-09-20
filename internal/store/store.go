@@ -3217,6 +3217,96 @@ func (s *Store) SnoozedAgents(ctx context.Context) (map[string]bool, error) {
 	return snoozed, rows.Err()
 }
 
+// SetAgentWait records (or clears) an agent's own declared wait.
+// target may be its short name or pane/agent id; a zero until clears it.
+//
+// The deadline is computed by the CALLER on this node's clock — the owning
+// daemon's — because every gate that reads it compares against that same
+// clock. See domain.DeclareWaitPayload for why the queued form carries a
+// duration instead.
+//
+// Deliberately NOT behind lockAgentAutomation, for SetAgentSnoozed's reason:
+// that lock keeps a disable from landing mid-delivery, and a wait commits to
+// no delivery in either direction — it decides only what hap will ASK ABOUT
+// and what work it will OFFER.
+func (s *Store) SetAgentWait(ctx context.Context, target string, until time.Time, reason string) error {
+	agentID, err := s.ResolveAgent(ctx, target)
+	if err != nil {
+		return err
+	}
+	var unix int64
+	if !until.IsZero() {
+		unix = until.Unix()
+		reason = domain.NormalizeWaitReason(reason)
+	} else {
+		reason = ""
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agent_names SET wait_until = ?, wait_reason = ? WHERE node_id = ? AND agent_id = ?`,
+		unix, reason, s.self, agentID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("no agent known as %q: %w", target, ports.ErrUnknownAgent)
+	}
+	s.noteWrite()
+	return nil
+}
+
+// AgentWaitFor returns an agent's declared wait. An agent with no row has
+// none, the same default SetAgentWait's absence implies.
+//
+// A LAPSED wait is returned as it stands rather than zeroed here: whether it
+// still counts is a question about NOW, and the caller owns the clock
+// (domain.AgentWait.Active). Answering it in the store would also tempt a
+// write on read, which is the periodic-write leak.
+func (s *Store) AgentWaitFor(ctx context.Context, agentID string) (domain.AgentWait, error) {
+	var (
+		until  int64
+		reason string
+	)
+	err := s.db.QueryRowContext(ctx,
+		`SELECT wait_until, wait_reason FROM agent_names WHERE node_id = ? AND agent_id = ?`,
+		s.self, agentID).Scan(&until, &reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.AgentWait{}, nil
+	}
+	if err != nil || until == 0 {
+		return domain.AgentWait{}, err
+	}
+	return domain.AgentWait{Until: time.Unix(until, 0), Reason: reason}, nil
+}
+
+// WaitingAgents returns every agent id carrying a declared wait, lapsed ones
+// included, for operator-facing views. The caller decides which still stand.
+func (s *Store) WaitingAgents(ctx context.Context) (map[string]domain.AgentWait, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT agent_id, wait_until, wait_reason FROM agent_names WHERE node_id = ? AND wait_until != 0`,
+		s.self)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]domain.AgentWait{}
+	for rows.Next() {
+		var (
+			id     string
+			until  int64
+			reason string
+		)
+		if err := rows.Scan(&id, &until, &reason); err != nil {
+			return nil, err
+		}
+		out[id] = domain.AgentWait{Until: time.Unix(until, 0), Reason: reason}
+	}
+	return out, rows.Err()
+}
+
 // AgentStats returns lifetime per-agent counters keyed by agent/pane id.
 // It is keyed off agent_names (LEFT JOIN audit_log) so an agent with zero
 // events still surfaces, carrying its FirstSeen. The counting rules match the

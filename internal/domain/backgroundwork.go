@@ -75,23 +75,70 @@ var (
 	// package has never seen a completed sample of, while the count is by
 	// construction the number still running.
 	agyTaskCountRE = regexp.MustCompile(`(?:^|·)\s*(\d+)\s+task\(s\)`)
+	// codexBackgroundTerminalRE matches codex's own background-terminal line.
+	// Verified live (codex-cli 0.155.0, 2026-09-20) on a session asked to start
+	// a background terminal and end its turn — herdr reported the agent `done`
+	// while the pane carried, as a line of its own above the composer:
+	//
+	//	1 background terminal running · /ps to view · /stop to close
+	//
+	// It is NOT the composer footer, which is where the earlier look went
+	// wrong: that line is "<model> <effort> · <cwd>" with an optional right-
+	// aligned "Plan mode" and genuinely has no count slot. This is a separate
+	// line, present only while a terminal is actually running, and it survives
+	// the end of the turn — which is the whole reason it is usable here, since
+	// both of this predicate's callers only look at PARKED agents.
+	//
+	// The "/ps to view" hint is REQUIRED, not decoration. The count phrase
+	// alone is ordinary English an agent will type while reporting what it did
+	// ("I left 1 background terminal running"), and the footer window is the
+	// entire capture on a short pane, so the hint is what makes the line
+	// positively codex's own chrome rather than its prose. Line-anchored for
+	// the same reason every rule in claudechrome.go is.
+	codexBackgroundTerminalRE = regexp.MustCompile(
+		`^(\d+)\s+background\s+terminals?\s+running\s*·.*(?:/ps\b|/stop\b)`)
 )
 
 // BackgroundWorkRunning reports whether the capture positively shows the agent
 // waiting on work IT started, rather than on a human.
 //
 // Callers must treat false as UNKNOWN. Gated on agent type: the shapes below
-// carry no meaning for an agent that does not render them, and codex has no
-// known indicator at all, so it always answers false.
+// carry no meaning for an agent that does not render them, so an agent type
+// with no known indicator always answers false.
 func BackgroundWorkRunning(agentType, pane string) bool {
 	switch modeAgentKind(agentType) {
 	case "claude":
 		return claudeBackgroundWork(pane)
 	case AgentTypeAgy:
 		return agyBackgroundWork(pane)
+	case "codex":
+		return codexBackgroundWork(pane)
 	default:
 		return false
 	}
+}
+
+// codexBackgroundWork looks for codex's background-terminal line.
+//
+// The window is footerWindow's rather than the composer footer's: the line
+// sits ABOVE the composer, so the last few lines of the capture are the
+// composer's own and the indicator is further up.
+func codexBackgroundWork(pane string) bool {
+	for _, raw := range footerWindow(pane) {
+		m := codexBackgroundTerminalRE.FindStringSubmatch(strings.TrimSpace(raw))
+		if m == nil {
+			continue
+		}
+		// A zero count is not work. codex drops the line entirely once the
+		// last terminal closes, so "0 background terminals running" is a shape
+		// nobody has seen — but reading it as work would be the one way this
+		// predicate could claim an agent is busy on the evidence of it being
+		// idle.
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // claudeBackgroundWork looks for any of the three shapes in the footer window.

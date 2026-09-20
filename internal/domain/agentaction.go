@@ -126,6 +126,19 @@ const (
 	// of the agent. It takes no automation flock, because unlike a disable it
 	// commits to no delivery either way.
 	AgentActionSetSnoozed AgentActionKind = "set_snoozed"
+	// AgentActionDeclareWait records that an agent is deliberately busy until
+	// a deadline (AgentWait). A separate kind from set_snoozed for the same
+	// reason set_snoozed is separate from set_enabled: the two say different
+	// things — an operator's "stop asking about this finished agent" and an
+	// agent's own "I am mid-build until roughly T" — and they expire
+	// differently, so a surface that meant one and got the other would undo
+	// the distinction the state exists to draw.
+	//
+	// Queued for set_snoozed's reason, not set_enabled's: agent_names is
+	// node-keyed, so only the owning node can resolve the operator's (or the
+	// agent's) spelling of the agent, and like a snooze it takes no automation
+	// flock because it commits to no delivery either way.
+	AgentActionDeclareWait AgentActionKind = "declare_wait"
 )
 
 // AgentActionStatus is where a queued action stands.
@@ -161,6 +174,7 @@ func ValidAgentActionKind(kind AgentActionKind) bool {
 	switch kind {
 	case AgentActionDeliverReply, AgentActionSendTask, AgentActionSetMode, AgentActionCapture,
 		AgentActionFocus, AgentActionRename, AgentActionSetEnabled, AgentActionSetSnoozed,
+		AgentActionDeclareWait,
 		AgentActionAcceptGeneratedTask:
 		return true
 	}
@@ -233,6 +247,24 @@ type SetEnabledPayload struct {
 // flowing rather than silently muting a queue the operator is watching.
 type SetSnoozedPayload struct {
 	Snoozed bool `json:"snoozed"`
+}
+
+// DeclareWaitPayload is the declare_wait action's arguments.
+//
+// It carries a DURATION rather than a deadline, and that is the load-bearing
+// choice: the row is written and every gate reads it on the OWNING node's
+// clock, so a deadline computed by the surface that queued it would arrive
+// skewed by however far apart two machines' clocks are. The owner adds Seconds
+// to its own now, which is the clock the answer is compared against.
+//
+// Seconds == 0 clears the wait, which is how every surface spells "I finished
+// early" — so the zero value is the permissive one, exactly as
+// SetEnabledPayload's and SetSnoozedPayload's are: a payload that fails to
+// unmarshal restores hap's ordinary behaviour rather than silently benching an
+// agent's queue.
+type DeclareWaitPayload struct {
+	Seconds int64  `json:"seconds"`
+	Reason  string `json:"reason,omitempty"`
 }
 
 // RenameResult is the rename action's outcome.

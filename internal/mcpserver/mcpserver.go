@@ -279,6 +279,22 @@ func toolDefinitions() []map[string]any {
 				"required": []any{"confident_score"},
 			},
 		},
+		{
+			"name":        "declare_wait",
+			"description": "Declare that the agent is deliberately busy for a bounded period — a cold native build, a CI run, anything that leaves its pane looking idle while real work is under way. While the wait stands, hap leaves the agent's QUEUE alone: it offers it no new task, raises no notice about it having nothing to do, and does not reclaim a task already handed to it. Everything about its SCREEN is unchanged — its approvals and questions are still answered, and anything hap cannot answer still reaches the operator. This is NOT a way to stop hap acting on an agent (that is `hap disable`) and NOT a way to say an agent is finished (that is `hap snooze`); it is bounded and lapses on its own clock, after which hap starts asking again. Unlike get_context and submit_decision this tool does NOT need a pending decision request: pass agent to name the agent, or omit it to use the agent this consult is about. Pass minutes 0 to end a wait early.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"agent": map[string]any{"type": "string",
+						"description": "The agent to declare for — its short name or pane/agent id. Omit it to use the agent this decision request is about."},
+					"minutes": map[string]any{"type": "integer", "minimum": 0,
+						"description": "How long the agent expects to be busy, in minutes. Must be at least 1 and at most 120; 0 ends a wait that is already standing."},
+					"reason": map[string]any{"type": "string",
+						"description": "What is being waited on, shown to the operator in `hap agents`. Advisory: nothing branches on it."},
+				},
+				"required": []any{"minutes"},
+			},
+		},
 	}
 }
 
@@ -373,6 +389,13 @@ type toolCallParams struct {
 		// consult started under an older prompt still lands.
 		Action   string `json:"action"`
 		OptionID string `json:"option_id"`
+		// declare_wait's arguments. Minutes is a POINTER so "absent" and an
+		// explicit 0 stay distinguishable: 0 is how a wait is ended early,
+		// and treating a missing field as one would silently clear a
+		// declaration the caller never mentioned.
+		Agent   string `json:"agent"`
+		Minutes *int   `json:"minutes"`
+		Reason  string `json:"reason"`
 	} `json:"arguments"`
 }
 
@@ -500,6 +523,9 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 			return nil, err
 		}
 		return textResult(req.ContextJSON), nil
+
+	case "declare_wait":
+		return s.declareWait(ctx, p, requestID)
 
 	case "submit_decision":
 		action := p.Arguments.RecommendAction
@@ -630,6 +656,60 @@ func (s *Server) callTool(ctx context.Context, raw json.RawMessage) (any, error)
 		return textResult(`{"status":"staged","note":"decision staged; the daemon re-gates it through safety controls before acting"}`), nil
 	}
 	return nil, fmt.Errorf("unknown tool: %s", p.Name)
+}
+
+// declareWait records an agent's bounded wait (domain.AgentWait, #508).
+//
+// It is the one tool here that is NOT reactive: get_context and submit_decision
+// both answer a pending decision request, while a wait is a statement about an
+// agent that need not have a question outstanding. So the request is consulted
+// only as a FALLBACK for the target — an explicit agent skips resolveRequest
+// entirely, which is what lets the tool be used outside a consult at all.
+//
+// The deadline is minted here against the local clock. That is the owning
+// node's clock by construction: `hap mcp` runs on the machine whose daemon
+// spawned it, and the store write is node-scoped to that same machine.
+func (s *Server) declareWait(ctx context.Context, p toolCallParams, requestID string) (any, error) {
+	declarer, ok := s.Store.(ports.WaitDeclarer)
+	if !ok {
+		return nil, fmt.Errorf("this build cannot record a declared wait")
+	}
+	if p.Arguments.Minutes == nil {
+		return nil, fmt.Errorf("declare_wait requires minutes: how long the agent expects to be busy (0 ends a wait that is already standing)")
+	}
+	d := time.Duration(*p.Arguments.Minutes) * time.Minute
+	if err := domain.ValidateWaitDuration(d); err != nil {
+		return nil, err
+	}
+	target := strings.TrimSpace(p.Arguments.Agent)
+	if target == "" {
+		req, err := s.resolveRequest(ctx, requestID)
+		if err != nil {
+			return nil, fmt.Errorf("declare_wait needs an agent: pass one, or call it from a decision request (%w)", err)
+		}
+		if target = strings.TrimSpace(req.AgentID); target == "" {
+			return nil, fmt.Errorf("declare_wait needs an agent: this request names none, so pass agent explicitly")
+		}
+	}
+	var until time.Time
+	if d > 0 {
+		until = time.Now().Add(d)
+	}
+	if err := declarer.SetAgentWait(ctx, target, until, p.Arguments.Reason); err != nil {
+		return nil, err
+	}
+	if s.ControlPath != "" {
+		// Best-effort, exactly as submit_decision's nudge is: the gates read
+		// the row on their next sweep either way, so a failed wake costs at
+		// most one minute of the declaration.
+		control.Nudge(ctx, s.ControlPath, control.KindReload)
+	}
+	if d == 0 {
+		return textResult(`{"status":"cleared","note":"the declared wait was ended; hap will offer this agent work again"}`), nil
+	}
+	return textResult(fmt.Sprintf(
+		`{"status":"waiting","minutes":%d,"note":"hap will leave this agent's queue alone until the wait lapses; its prompts are still answered"}`,
+		*p.Arguments.Minutes)), nil
 }
 
 func (s *Server) resolveRequest(ctx context.Context, requestID string) (*domain.LLMRequest, error) {

@@ -1280,8 +1280,15 @@ type agentRow struct {
 	// they are different switches and an operator reading one for the other is
 	// the confusion `hap snooze` exists to end.
 	Snoozed bool
-	Stale   bool // remote only: that node stopped reporting
-	Stats   domain.AgentStats
+	// Waiting: the AGENT declared a bounded wait (`hap wait`) that still
+	// stands. Resolved against ONE clock reading when the rows are built, not
+	// stored as a deadline and re-asked per renderer, so a single frame cannot
+	// show the same agent waiting in the list and lapsed in its detail pane.
+	Waiting bool
+	// Wait is that declaration as stored, for the detail pane's "until when".
+	Wait  domain.AgentWait
+	Stale bool // remote only: that node stopped reporting
+	Stats domain.AgentStats
 	// sep marks the "── other nodes ──" divider. It is an ordinary row rather
 	// than rendered chrome, which is what keeps window()/listPageSize()'s
 	// one-row-one-line accounting exact — the same shape the Tasks tab uses
@@ -1299,12 +1306,15 @@ func (r agentRow) remote() bool { return !r.sep && r.NodeID != "" }
 // AgentTransition (always local: MonitoredAgents) rather than an id.
 func (m Model) localRow(a domain.AgentTransition) agentRow {
 	st := m.data.status
+	wait, waiting := st.AgentWaiting(a.AgentID, time.Now())
 	return agentRow{
 		AgentTransition: a,
 		Name:            st.AgentName(a.AgentID),
 		Location:        agentLocation(a, st),
 		Disabled:        st.AgentDisabled(a.AgentID),
 		Snoozed:         st.AgentSnoozed(a.AgentID),
+		Waiting:         waiting,
+		Wait:            wait,
 		Stats:           st.StatsFor(a.AgentID),
 	}
 }
@@ -1312,6 +1322,7 @@ func (m Model) localRow(a domain.AgentTransition) agentRow {
 // agentRows is the Agents tab's flat row list, before the search filter.
 func (m Model) agentRows() []agentRow {
 	st := m.data.status
+	now := time.Now()
 	rows := make([]agentRow, 0, len(st.MonitoredAgents)+len(st.RemoteAgents)+1)
 	for _, a := range st.MonitoredAgents {
 		rows = append(rows, m.localRow(a))
@@ -1325,6 +1336,8 @@ func (m Model) agentRows() []agentRow {
 			Location:        r.NodeLabel,
 			Disabled:        r.Disabled,
 			Snoozed:         r.Snoozed,
+			Waiting:         r.Wait.Active(now),
+			Wait:            r.Wait,
 			Stale:           r.Stale,
 			Stats:           r.Stats,
 		})
@@ -1348,6 +1361,8 @@ func (m Model) visibleAgents() []agentRow {
 				automation = "disabled"
 			case r.Snoozed:
 				automation = "snoozed"
+			case r.Waiting:
+				automation = "waiting"
 			}
 			// NodeLabel is searchable so "/laptop" finds one machine's agents.
 			// It is also r.Location for a remote row; passing both costs
@@ -5903,6 +5918,8 @@ func (m Model) agentDetailLines(r agentRow, w int) []string {
 		status += " [DISABLED]"
 	case r.Snoozed:
 		status += " [SNOOZED]"
+	case r.Waiting:
+		status += " [WAITING " + domain.ShortDuration(r.Wait.Remaining(time.Now())) + "]"
 	}
 	lines = m.detailField(lines, w, "Status", status)
 	if !r.remote() {
@@ -8117,6 +8134,11 @@ func agentRowStatus(r agentRow) string {
 		// Eight characters, like DISABLED, so the stale marker's column
 		// accounting above is unchanged.
 		status = "SNOOZED"
+	case r.Waiting:
+		// Seven, for the same accounting. The remaining time is in the detail
+		// pane rather than here: it changes every minute, and a column that
+		// rewrites itself on the clock tick is noise in a list.
+		status = "WAITING"
 	}
 	if r.Stale {
 		status = oneLine(status, 9) + "*"

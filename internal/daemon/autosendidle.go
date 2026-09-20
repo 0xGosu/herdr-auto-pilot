@@ -371,6 +371,8 @@ func (d *Daemon) groupEligibleByList(src config.TaskSource,
 //	confirmed                     → retire the row; the "[-]" stands
 //	item is no longer "[-]"       → retire the row (completed, released, edited)
 //	agent is working or blocked   → leave alone; it may be underway right now
+//	agent shows background work   → leave alone; herdr calls that pane idle
+//	agent declared a wait         → leave alone until the declaration lapses
 //	still inside reclaimGrace     → leave alone; the send may yet land
 //	otherwise                     → return the item to "[ ]" and re-offer it
 //
@@ -408,6 +410,27 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 	for _, a := range agents {
 		live[a.AgentID] = a
 	}
+	// One declared-wait read per AGENT per sweep, not per row: under a shared
+	// store every read is a round trip on this loop, and an agent can hold
+	// only one open hand-out anyway — the cache is what keeps a future
+	// multi-row shape from paying it twice.
+	waits := map[string]domain.AgentWait{}
+	declaredWait := func(agentID string) domain.AgentWait {
+		if w, ok := waits[agentID]; ok {
+			return w
+		}
+		w, err := d.opt.Store.AgentWaitFor(ctx, agentID)
+		if err != nil {
+			// A read error is NOT a wait. This is the reclaim, so failing the
+			// other way would hold an item at "[-]" on the strength of a
+			// question that could not be asked.
+			slog.Warn("auto-send: declared-wait read failed; treating the agent as not waiting",
+				"agent", agentID, "error", err)
+			w = domain.AgentWait{}
+		}
+		waits[agentID] = w
+		return w
+	}
 	// One read per source per sweep, dropped whenever this pass rewrites the
 	// file so a later row on the same source sees its own effect.
 	content := map[string]string{}
@@ -439,6 +462,30 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 		// leave the "[-]" for the operator, which is exactly where this feature
 		// stood before the ledger existed.
 		if now.Sub(r.ReservedAt) > staleHandoutTTL {
+			// ...unless the agent DECLARED that it is still busy (#508). This
+			// is the one branch a WORKING agent reaches, and the comment above
+			// names that shape ("an agent that has been busy the whole time")
+			// as a way in: a foreground build never parks, so it never meets
+			// the background-work evidence below, and past the TTL its item
+			// was given up on and the operator told to clear a "[-]" the agent
+			// was working through. That was the #508 false alarm by its last
+			// remaining door.
+			//
+			// Bounded absolutely, and the bound is the point: a declaration
+			// can be RENEWED, so honouring it here without a ceiling would
+			// restore the unbounded "[-]" this TTL exists to prevent. Past
+			// staleHandoutTTL + domain.MaxDeclaredWait the row is given up on
+			// whatever the agent says.
+			w := declaredWait(r.AgentID)
+			held := w.Active(now) && now.Sub(r.ReservedAt) <= staleHandoutTTL+domain.MaxDeclaredWait
+			if held {
+				slog.Info("auto-send: hand-out is past its TTL but the agent declared a wait; leaving it alone",
+					"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText,
+					"age", now.Sub(r.ReservedAt).Round(time.Second),
+					"wait_left", w.Remaining(now).Round(time.Second))
+				awaiting[r.AgentID] = true
+				continue
+			}
 			slog.Warn("auto-send: hand-out never settled; giving up on it — the item stays [-] until you clear it",
 				"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText,
 				"age", now.Sub(r.ReservedAt).Round(time.Second))
@@ -484,6 +531,21 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 		// so a long-lived indicator (a dev server, a tail -f) can never pin an
 		// item at "[-]" indefinitely.
 		if a, present := live[r.AgentID]; present && sameTenant(a, r) && d.backgroundWorkFor(a, now) {
+			awaiting[r.AgentID] = true
+			continue
+		}
+		// ...and one that SAID it is busy. Deliberately a separate branch from
+		// the indicator above rather than a second clause of it: this one is
+		// the agent's own word, so it needs no pane evidence and it holds for
+		// agent types and screens hap cannot read at all — a foreground build
+		// paints no background-work indicator anywhere, and an agent type hap
+		// has no sample of answers false by construction. Like that one it
+		// only ever DEFERS: the TTL above is asked first, and the declaration
+		// lapses on its own clock.
+		//
+		// The tenancy guard is the same and for the same reason: a recycled
+		// pane id must not inherit the last tenant's declaration.
+		if a, present := live[r.AgentID]; present && sameTenant(a, r) && declaredWait(r.AgentID).Active(now) {
 			awaiting[r.AgentID] = true
 			continue
 		}
@@ -885,6 +947,16 @@ func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 		// parked agent per sweep on the select loop, and the composer proof
 		// belongs at requireIdleForHandout, which already reads the pane.
 		if snoozed, err := d.opt.Store.AgentSnoozed(ctx, a.AgentID); err != nil || snoozed {
+			continue
+		}
+		// The agent's own declared wait (#508). Same posture as the snooze
+		// immediately above — a store read, no pane round trip — and the same
+		// failure direction: an unreadable switch is not permission to send,
+		// because this path TYPES INTO A PANE. It is the agent saying it is
+		// mid-build rather than the operator saying it is finished, so unlike
+		// the snooze it lapses on its own and nothing has to remember to lift
+		// it.
+		if wait, err := d.opt.Store.AgentWaitFor(ctx, a.AgentID); err != nil || wait.Active(now) {
 			continue
 		}
 		// The runaway guard's stand-down, and only it: the per-agent disable

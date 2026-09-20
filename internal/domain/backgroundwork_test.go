@@ -123,13 +123,66 @@ func TestBackgroundWorkIsNotReadFromQuotedProse(t *testing.T) {
 
 // TestBackgroundWorkRunningIsGatedOnAgentType covers the rule every predicate in
 // this package carries: the glyphs and words mean nothing for an agent that does
-// not render them, and codex has no known indicator, so it is always false —
+// not render them, so an agent type with no known indicator is always false —
 // UNKNOWN, never "nothing is running".
+//
+// codex is in the list on purpose even though it now HAS an arm: its arm reads
+// a different line, so a codex agent must not read Claude's mode line.
 func TestBackgroundWorkRunningIsGatedOnAgentType(t *testing.T) {
 	for _, agentType := range []string{"codex", "", "unknown-cli"} {
 		if BackgroundWorkRunning(agentType, claudeBackgroundShells) {
 			t.Fatalf("agent type %q read Claude's mode line", agentType)
 		}
+	}
+}
+
+// TestBackgroundWorkRunningReadsCodexBackgroundTerminal uses a LIVE capture
+// (codex-cli 0.155.0, 2026-09-20) of a codex session that started a background
+// terminal and ended its turn — herdr reported it `done`, which is the state
+// both of this predicate's callers look at.
+//
+// The pair is the point. The quiet fixture is the same pane with the indicator
+// line deleted and nothing else changed, so a predicate answering true for any
+// recognized codex pane passes the first case and fails the second.
+func TestBackgroundWorkRunningReadsCodexBackgroundTerminal(t *testing.T) {
+	busy := readFixture(t, "codex_background_terminal.txt")
+	if !BackgroundWorkRunning("codex", busy) {
+		t.Fatal("the codex background-terminal capture did not read as background work")
+	}
+	quiet := readFixture(t, "codex_background_terminal_quiet.txt")
+	if BackgroundWorkRunning("codex", quiet) {
+		t.Fatal("a codex pane with no background terminal read as background work")
+	}
+}
+
+// TestCodexBackgroundWorkNeedsTheChromeHint is the control for the widest way
+// this could go wrong: the count phrase is ordinary English an agent types
+// while reporting what it did, and on a short pane the footer window is the
+// whole capture, so prose would be read as chrome.
+func TestCodexBackgroundWorkNeedsTheChromeHint(t *testing.T) {
+	prose := []string{
+		"I left 1 background terminal running for you.\n",
+		"1 background terminal running\n",
+		"  1 background terminal running, see above\n",
+	}
+	for _, p := range prose {
+		if BackgroundWorkRunning("codex", p) {
+			t.Fatalf("prose read as codex chrome: %q", p)
+		}
+	}
+	// ...and the positive control, so the case above cannot pass by the
+	// predicate simply never answering true.
+	if !BackgroundWorkRunning("codex", "  2 background terminals running · /ps to view · /stop to close\n") {
+		t.Fatal("the real codex chrome line did not read as background work")
+	}
+}
+
+// TestCodexBackgroundWorkIgnoresAZeroCount pins the one direction a count can
+// invert the predicate: claiming an agent is busy on the evidence of it having
+// nothing running.
+func TestCodexBackgroundWorkIgnoresAZeroCount(t *testing.T) {
+	if BackgroundWorkRunning("codex", "  0 background terminals running · /ps to view · /stop to close\n") {
+		t.Fatal("a zero count read as background work")
 	}
 }
 
