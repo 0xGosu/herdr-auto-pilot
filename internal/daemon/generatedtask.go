@@ -140,6 +140,13 @@ func (d *Daemon) refuseIfAgentBusy(ctx context.Context, agentID string) error {
 					domain.SuggestionStaleMarker, err)
 			}
 		}
+		// An operator's draft in the composer means a human is at this pane.
+		// Carries the stale marker like the two above, so the TUI's "add them
+		// to the list instead" offer is what the operator is shown.
+		if err := d.operatorTypingRefusal(ctx, agentID, ag.AgentType); err != nil {
+			return fmt.Errorf("%v; %s — dismiss it, or confirm without --send to queue "+
+				"the tasks to the agent's list", err, domain.SuggestionStaleMarker)
+		}
 		return nil
 	}
 	return nil
@@ -205,6 +212,11 @@ func (h *actionTaskSendHost) Send(ctx context.Context, paneID, agentType, prompt
 		if err := h.d.agyComposerRefusal(ctx, paneID); err != nil {
 			return fmt.Errorf("%v; nothing was sent", err)
 		}
+	}
+	// And the last look for a human at the keyboard, for the same reason and at
+	// the same position: herdr's status is idle under an operator's draft too.
+	if err := h.d.operatorTypingRefusal(ctx, paneID, agentType); err != nil {
+		return fmt.Errorf("%v; nothing was sent", err)
 	}
 	if h.actionID != 0 {
 		if err := h.d.opt.Store.MarkAgentActionSideEffect(ctx, h.actionID, h.d.opt.Clock.Now()); err != nil {

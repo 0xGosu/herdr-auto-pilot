@@ -3463,6 +3463,15 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 			return abandon()
 		}
 	}
+	// And for every agent type, a human with a draft in the composer. This is
+	// the unattended path by definition, so "the pane is idle" is the only
+	// evidence it has that nobody is there — and it is wrong exactly when
+	// somebody has started typing and not yet submitted (#526).
+	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		slog.Info("not sending: an operator has a draft in the composer",
+			"agent", s.AgentID, "reason", err)
+		return abandon()
+	}
 
 	auditID, err := d.opt.Store.AppendAudit(ctx, domain.AuditRecord{
 		AgentID: s.AgentID, AgentType: s.AgentType, Trigger: trigger(tr),
@@ -3524,6 +3533,16 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 			d.opt.Store.UpdateAuditStatus(ctx, auditID, domain.AuditStatusIgnored)
 			return false
 		}
+	}
+	// The same last look for a human, and it needs one for the same reason: the
+	// earlier proof is seconds old, and starting to type is exactly the thing an
+	// operator does in those seconds.
+	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		slog.Info("an operator started typing between the proof and the send; nothing was typed",
+			"agent", s.AgentID, "reason", err)
+		rollback()
+		d.opt.Store.UpdateAuditStatus(ctx, auditID, domain.AuditStatusIgnored)
+		return false
 	}
 
 	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
@@ -4326,6 +4345,22 @@ func (d *Daemon) generateTask(ctx context.Context, cfg config.Config, s domain.S
 
 	tg := d.taskGenPort()
 	if tg == nil {
+		return
+	}
+	// An operator mid-draft is present, and a generation exists only to produce
+	// something to send them away with. Asked HERE rather than at the send:
+	// nothing is staged before this point (StageLLMRequest lives below), so a
+	// refusal strands no llm_requests row for the in-flight guard above to trip
+	// on forever — the same bound duplicateAskBeforeLLM's call site relies on.
+	//
+	// It reads the situation's own capture rather than taking a fresh one: this
+	// runs on the select loop, the capture is seconds old, and the cost of being
+	// wrong here is one skipped generation that the next attention event redoes.
+	// The SEND paths are the ones that re-read (requireIdleForHandout,
+	// refuseIfAgentBusy, actionTaskSendHost.Send).
+	if typing, known := domain.OperatorTyping(s.AgentType, s.Content); known && typing {
+		slog.Info("task generation skipped: an operator has a draft in the composer",
+			"agent", s.AgentID)
 		return
 	}
 	// Don't stack a generation onto one already in flight for this agent.

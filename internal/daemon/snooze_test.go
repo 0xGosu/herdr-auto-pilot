@@ -139,3 +139,50 @@ func TestTheIdlePollStillFeedsAnAwakeAgent(t *testing.T) {
 		return strings.Contains(readTasks(t, taskFile), "[-]")
 	})
 }
+
+// #526 item 5. Twice in one day an idle escalation fired while a half-written
+// operator message sat in the agent's input box; an automatic send would have
+// been appended to their draft and submitted with it. herdr reports such a pane
+// as idle, so the status check every send path already does cannot see it.
+
+// claudeDraftPane is a claude composer holding an operator's half-written
+// message, as `--source visible` renders it.
+const claudeDraftPane = "" +
+	"● Rebased onto main and re-ran the suite.\n" +
+	"\n" +
+	"────────────────────────────────────────────────────────────────────────\n" +
+	"❯ can you also check whether the\n" +
+	"────────────────────────────────────────────────────────────────────────\n" +
+	"  repo | Opus 5 (26%) | default | 2faa499f\n"
+
+func TestAnUnattendedHandoutWaitsForTheOperatorToFinishTyping(t *testing.T) {
+	h, taskFile := autoSendFixture(t, "", "- [ ] some task\n", true)
+	h.herdr.setPane(claudeDraftPane)
+	agents := parkIdle(h, 2*time.Minute, "agent-draft")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	quietFor(t, h, 300*time.Millisecond)
+	if got := readTasks(t, taskFile); strings.Contains(got, "[-]") {
+		t.Errorf("a task was handed to a pane an operator was typing into:\n%s", got)
+	}
+	if in := h.herdr.sentInputs(); len(in) != 0 {
+		t.Errorf("nothing may be typed over a draft, sent %v", in)
+	}
+}
+
+// TestAnUnattendedHandoutStillReachesAnEmptyComposer is the control. The guard
+// answers UNKNOWN for most captures by design, so a version that withheld on
+// unknown would pass the case above while switching the feature off entirely.
+func TestAnUnattendedHandoutStillReachesAnEmptyComposer(t *testing.T) {
+	h, taskFile := autoSendFixture(t, "", "- [ ] some task\n", true)
+	h.herdr.setPane(strings.Replace(claudeDraftPane,
+		"❯ can you also check whether the", "❯", 1))
+	agents := parkIdle(h, 2*time.Minute, "agent-empty")
+
+	h.daemon.autoSendIdleTasks(context.Background(), agents)
+
+	waitFor(t, 3*time.Second, func() bool {
+		return strings.Contains(readTasks(t, taskFile), "[-]")
+	})
+}
