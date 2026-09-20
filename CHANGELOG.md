@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.53
+
+- Fixed generated tasks that named a different agent: the generator reads the pane as ground truth, and every hand-out renders another agent's name into it, so it proposed work for the wrong agent. Such lines are now dropped before the suggestion is stored, and a generation left with nothing is offered for retry instead of reported as a decline.
+- Stopped hap asking an agent to look at a task it is already working on: an agent parked on its own shells, build or CI poll is no longer treated as one that never started its hand-out, so `task_never_started` stops firing on agents that are working.
+
 ## 0.9.52
 
 - Stopped the `[no_task_source]` escalation flood: hap now recognises when a Claude or agy agent is waiting on background work it started itself, raises the notice at most once per parked spell, and holds it for 30 minutes afterwards instead of re-asking on every event
