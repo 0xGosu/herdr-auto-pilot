@@ -13,9 +13,10 @@ said when it was raised; by the time you read it the agent may have moved on.
 | `llm CLI failed without submit_decision` | the LLM backend itself is broken | [incidents.md](incidents.md) — do not treat as a one-off |
 | `never_auto_match` | a safety rule forced a human | operator-only. Do not bypass, do not rephrase into the agent |
 | `suspected_irreversible` | heuristic matched the pane | read the screen: it often matched the agent's own prose |
-| `no_task_source` | the agent has no list | register a source, or dismiss if it is not your node |
+| `no_task_source` | the agent has no list | register a source, or dismiss if it is not your node. Latched per parked spell and held for 30 minutes after, so repeats mean something changed |
 | `task_source_unusable` | a source owns the agent but its list could not be read, so no task was generated | fix the source the rationale names (`hap config task-source list`), then dismiss |
-| `task_source_exhausted`, `noop_vs_pending_tasks` | bookkeeping notices about a queue | dismiss; latched once per parked episode on current builds |
+| `task_source_exhausted`, `noop_vs_pending_tasks` | bookkeeping notices about a queue | dismiss; latched once per parked episode on current builds. If the agent's work is finished, `hap snooze <agent>` instead of dismissing the same row every spell |
+| `queued_action_refused` | a safety control refused an answer you queued, and nothing was sent | informational, no suggestion to confirm. The escalation it answered is still open — answer it differently, or leave it for the operator |
 | `unclassifiable` | hap cannot read the screen | often a vendor form — [agy.md](agy.md) |
 
 ## answering

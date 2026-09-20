@@ -753,6 +753,7 @@ func buildCommands() {
 				"  task.created|updated|deleted|moved list=… [source=N] index=N [mark=…]\n" +
 				"  tasklist.created|deleted list=db://…      escalation id=… agent=… type=…\n" +
 				"  escalation.dismissed id=…        correction id=… escalation=… agent=… [send=…]\n" +
+				"  correction.withdrawn id=… agent=… reason=…\n" +
 				"  pause.on|off scope=…             fsp.on|off\n" +
 				"  rule.streak|reset|deleted sig=…  daemon.started version=…\n\n" +
 				"An escalation is announced once auto-accept has had its look at it and left it\n" +
@@ -777,7 +778,13 @@ func buildCommands() {
 				"still consume their sequence numbers, so a --resume cursor never replays them\n" +
 				"and a run of them is not a gap. Pass --include-self to see them anyway when\n" +
 				"debugging what an emitter writes. Another node's orchestrator is not affected:\n" +
-				"the log is per machine.",
+				"the log is per machine. A `# suppressed N … through seq=N` line only notes that\n" +
+				"some were left out; it carries no event and is not worth reporting onward.\n\n" +
+				"There is no heartbeat, deliberately: most of these streams are idle most of\n" +
+				"the time, and a keepalive on every quiet one buys nothing. So a reader whose\n" +
+				"watch has a timeout cannot tell an expiry from a quiet herd — arm it with the\n" +
+				"longest timeout available, expect it to end, and re-arm with --resume <last\n" +
+				"seq you handled>. Nothing is lost while it is down; nothing is noticed either.",
 			Examples: []string{"hap stream orchestrator", "hap stream orchestrator --resume 1024"},
 			// Every line is for a machine to read; a footer on exit is noise.
 			Bare:    true,

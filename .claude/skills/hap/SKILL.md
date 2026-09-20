@@ -162,14 +162,25 @@ resolves to escalate + audit rather than a crash.
 hap agents                        # tab-separated: name, pane id, type, status,
                                   # automation, cwd, permission mode
 hap rename brave-otter backend-dev
-hap disable backend-dev           # stop autonomous actions; it still escalates
+hap disable backend-dev           # stop hap acting on it at all, prompts included
 hap enable backend-dev
+hap snooze backend-dev            # its work is done: stop asking about its QUEUE,
+                                  # keep answering its prompts; lifts when it works
+hap unsnooze backend-dev
 hap capture backend-dev           # re-run the capture pipeline for one agent now
-# all four take --node <label|id> to reach another machine's agent (see "fleet")
+# all take --node <label|id> to reach another machine's agent (see "fleet")
 ```
 
 `cwd` and `mode` are `-` when unreadable. New columns are appended, so existing
-field positions never move.
+field positions never move. The `automation` column reads
+`enabled` / `disabled` / `snoozed`; `disabled` wins when an agent is both.
+
+**`snooze` is not a gentler `disable`.** Disable stops hap answering the agent
+and drops its escalations on the floor, so an agent parked with it needs
+re-enabling by hand before it is useful again. Snooze silences only the notices
+about its QUEUE — `no_task_source`, `task_source_exhausted`, the hand-out
+proposal — and withholds it from the idle poll; everything about its SCREEN is
+unchanged, and it clears itself the moment the agent next works.
 
 **Start an agy agent in the directory it will work in.** agy scopes its
 permissions to the directory it was STARTED in and asks approval for every file
@@ -1348,6 +1359,7 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
   `task_source.added|removed|updated source=N` (a removed source carries its OLD
   index — re-list) · `task.created|updated|deleted|moved` · `tasklist.created|deleted`
   (database lists only) · `escalation` · `escalation.dismissed` · `correction` ·
+  `correction.withdrawn` (a safety control refused that answer; nothing was sent) ·
   `pause.on|off` · `fsp.on|off` · `rule.streak|reset|deleted` · `daemon.started`.
 - **An escalation is announced once auto-accept has left it for a human** — up to
   a minute after it was raised under full self-prompting, or once its threshold
@@ -1397,10 +1409,14 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
   `hap skill install` puts the **hap** skill wherever you like; `hap-orchestrator`
   is installed only into hap's own directory.
 - Once its composer is ready the daemon sends it a brief (load the
-  `hap-orchestrator` skill, `herdr --skill`, run `Monitor` on `hap stream orchestrator`, schedule an hourly
+  `hap-orchestrator` skill, `herdr --skill`, run `Monitor` on `hap stream orchestrator`
+  — armed with the longest timeout the host allows, re-armed with `--resume` when it
+  expires — schedule an hourly
   `CronCreate` health check of `hap status` / `hap agents` that restarts a stopped
   daemon with `hap daemon --ensure` — deleted on `fsp.off`, re-created on
-  `fsp.on` — how to act, what never to do). Replace it with
+  `fsp.on` — and how to act: **carry ordinary work to completion**, escalate only
+  the irreversible, and treat a repo's `AUTO.md` as decisions the operator has
+  already made. Replace it with
   `full_self_prompting.orchestrator_agent_prompt`.
   **Type your goals into that session.** If claude shows a first-run prompt
   (trusting the new directory), answer it once — hap never types into a modal.
