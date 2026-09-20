@@ -89,6 +89,24 @@ func (s *Store) DisabledAgentsAll(ctx context.Context) (map[domain.NodeAgent]boo
 	return out, rows.Err()
 }
 
+// SnoozedAgentsAll returns every node's snoozed agents.
+func (s *Store) SnoozedAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT node_id, agent_id FROM agent_names WHERE snoozed != 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[domain.NodeAgent]bool{}
+	for rows.Next() {
+		var k domain.NodeAgent
+		if err := rows.Scan(&k.NodeID, &k.AgentID); err != nil {
+			return nil, err
+		}
+		out[k] = true
+	}
+	return out, rows.Err()
+}
+
 // FleetAgentStats is AgentStats across every node.
 func (s *Store) FleetAgentStats(ctx context.Context) (map[domain.NodeAgent]domain.AgentStats, error) {
 	rows, err := s.db.QueryContext(ctx, `

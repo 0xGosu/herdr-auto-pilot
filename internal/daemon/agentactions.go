@@ -113,7 +113,7 @@ func staleReason(kind domain.AgentActionKind) string {
 	switch kind {
 	case domain.AgentActionFocus:
 		return "the view it would have jumped to is no longer the one you asked for; press f again"
-	case domain.AgentActionRename, domain.AgentActionSetEnabled:
+	case domain.AgentActionRename, domain.AgentActionSetEnabled, domain.AgentActionSetSnoozed:
 		return "the agent it named may not be the one on that pane id any more; check the agent and ask again"
 	}
 	return "the screen it was decided against can no longer be trusted; look at the agent and answer again"
@@ -124,7 +124,7 @@ func agentActionStaleBound(kind domain.AgentActionKind) time.Duration {
 	case domain.AgentActionDeliverReply, domain.AgentActionSendTask, domain.AgentActionFocus,
 		domain.AgentActionAcceptGeneratedTask:
 		return actionStaleAfter
-	case domain.AgentActionRename, domain.AgentActionSetEnabled:
+	case domain.AgentActionRename, domain.AgentActionSetEnabled, domain.AgentActionSetSnoozed:
 		return agentStateStaleAfter
 	}
 	return 0
@@ -260,6 +260,8 @@ func (d *Daemon) executeAgentAction(ctx context.Context, a domain.AgentAction) (
 		return d.renameAgentAction(ctx, a)
 	case domain.AgentActionSetEnabled:
 		return d.setAgentEnabledAction(ctx, a)
+	case domain.AgentActionSetSnoozed:
+		return d.setAgentSnoozedAction(ctx, a)
 	case domain.AgentActionAcceptGeneratedTask:
 		return d.acceptGeneratedTaskAction(ctx, a)
 	case domain.AgentActionSendTask:

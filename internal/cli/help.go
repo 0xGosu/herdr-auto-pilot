@@ -285,8 +285,8 @@ func buildCommands() {
 			Group:   groupOperate,
 			Summary: "list monitored agents (name, id, type, status, automation, cwd, mode, node)",
 			Usage:   []string{"hap agents"},
-			Details: "One tab-separated row per agent. \"automation\" is enabled/disabled (see\n" +
-				"`hap disable`); \"mode\" is the agent's own permission mode (see `hap mode`); cwd\n" +
+			Details: "One tab-separated row per agent. \"automation\" is enabled/disabled/snoozed\n" +
+				"(see `hap disable` and `hap snooze`); \"mode\" is the agent's own permission mode (see `hap mode`); cwd\n" +
 				"is the agent's working directory. Either is \"-\" when it could not be read, so\n" +
 				"the field count stays constant for parsers. The last field is the node the\n" +
 				"agent runs on: under a shared database (`database.engine = turso` or `libsql`) other\n" +
@@ -432,6 +432,55 @@ func buildCommands() {
 			},
 			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 				return setAgentDisabled(ctx, app, out, args, false)
+			},
+		},
+		{
+			Name:    "snooze",
+			Group:   groupOperate,
+			Summary: "stop queue notices for one agent, keeping its prompts answered",
+			Usage:   []string{"hap snooze [--node <label|id>] <agent-name-or-pane-id>"},
+			Flags: []FlagDoc{
+				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
+			},
+			Details: "For an agent whose work is finished. hap stops raising notices ABOUT ITS\n" +
+				"QUEUE — no_task_source, task_source_exhausted, the hand-out proposal — and\n" +
+				"stops offering it work from a task source. Everything about its SCREEN is\n" +
+				"unchanged: its approvals and questions are still answered, and anything hap\n" +
+				"cannot answer still reaches you.\n\n" +
+				"That is the whole difference from `hap disable`, which stops hap acting on\n" +
+				"the agent at all — use snooze when the agent is simply done, and disable\n" +
+				"when you want hap's hands off it.\n\n" +
+				"It lifts BY ITSELF the moment the agent works again, so a pane reused for\n" +
+				"new work does not carry its last tenant's silence.\n" +
+				"Under a shared database (`[database] engine = \"turso\"` or `\"libsql\"`) `--node` acts on an\n" +
+				"agent on another machine: the request is queued and that machine's daemon runs\n" +
+				"it, so it lands when that node next syncs.",
+			Examples: []string{"hap snooze vivid-falcon", "hap snooze --node laptop reviewer"},
+			Next: []Hint{
+				{Cmd: "hap unsnooze <agent>", Why: "start asking about its queue again"},
+				{Cmd: "hap disable <agent>", Why: "stop hap acting on it at all, prompts included"},
+			},
+			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+				return setAgentSnoozed(ctx, app, out, args, true)
+			},
+		},
+		{
+			Name:    "unsnooze",
+			Group:   groupOperate,
+			Summary: "resume queue notices for one agent",
+			Usage:   []string{"hap unsnooze [--node <label|id>] <agent-name-or-pane-id>"},
+			Flags: []FlagDoc{
+				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
+			},
+			Details: "Undoes `hap snooze`. New agents are not snoozed, and a snooze lifts by\n" +
+				"itself when the agent next works, so this is only needed to start asking\n" +
+				"about a still-parked agent's queue again.",
+			Examples: []string{"hap unsnooze vivid-falcon"},
+			Next: []Hint{
+				{Cmd: "hap agents", Why: "confirm the automation column"},
+			},
+			Handler: func(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+				return setAgentSnoozed(ctx, app, out, args, false)
 			},
 		},
 		{

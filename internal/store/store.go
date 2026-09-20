@@ -3122,6 +3122,101 @@ func (s *Store) DisabledAgents(ctx context.Context) (map[string]bool, error) {
 	return disabled, rows.Err()
 }
 
+// SetAgentSnoozed changes the operator-owned QUIET state for a known agent.
+// target may be its short name or pane/agent id.
+//
+// It is a separate column from disabled, not a second meaning for it, and the
+// difference is what #526 asked for: `hap disable` stops hap answering the
+// agent AT ALL — escalationAutoDismissReason drops its escalations on the
+// floor — so an orchestrator that used it to stop a finished agent's queue
+// notices also stopped its approval prompts being answered, and both agents
+// needed re-enabling by hand when the operator reused their panes. A snooze
+// silences notices about the agent's QUEUE and leaves everything about its
+// SCREEN alone.
+//
+// Deliberately NOT behind lockAgentAutomation, which SetAgentDisabled takes:
+// that lock exists so a disable cannot land mid-delivery, and a snooze commits
+// to no delivery either way. Taking it would make a quiet switch wait on an
+// in-flight keystroke for no gain.
+func (s *Store) SetAgentSnoozed(ctx context.Context, target string, snoozed bool) error {
+	agentID, err := s.ResolveAgent(ctx, target)
+	if err != nil {
+		return err
+	}
+	value := 0
+	if snoozed {
+		value = 1
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agent_names SET snoozed = ? WHERE node_id = ? AND agent_id = ?`, value, s.self, agentID)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("no agent known as %q: %w", target, ports.ErrUnknownAgent)
+	}
+	s.noteWrite()
+	return nil
+}
+
+// AgentSnoozed reports the operator-owned quiet state. An agent with no row is
+// not snoozed, the same default SetAgentSnoozed's absence implies.
+func (s *Store) AgentSnoozed(ctx context.Context, agentID string) (bool, error) {
+	var snoozed int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT snoozed FROM agent_names WHERE node_id = ? AND agent_id = ?`, s.self, agentID).Scan(&snoozed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return snoozed != 0, err
+}
+
+// ClearAgentSnoozeIfSet lifts a snooze and reports whether one was actually
+// lifted, so the daemon can say so exactly once.
+//
+// The conditional WHERE is the point rather than an optimisation: this runs on
+// every transition to working, and an unconditional UPDATE would report a write
+// each time — which arms the turso push debounce, so one working agent would
+// push a row to the operator's cloud database on every turn boundary forever.
+// See the "a periodic write is CONDITIONAL, or it is a leak" rule.
+func (s *Store) ClearAgentSnoozeIfSet(ctx context.Context, agentID string) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agent_names SET snoozed = 0 WHERE node_id = ? AND agent_id = ? AND snoozed != 0`,
+		s.self, agentID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	s.noteWrite()
+	return true, nil
+}
+
+// SnoozedAgents returns the snoozed agent ids for operator-facing views.
+func (s *Store) SnoozedAgents(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT agent_id FROM agent_names WHERE node_id = ? AND snoozed != 0`, s.self)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	snoozed := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		snoozed[id] = true
+	}
+	return snoozed, rows.Err()
+}
+
 // AgentStats returns lifetime per-agent counters keyed by agent/pane id.
 // It is keyed off agent_names (LEFT JOIN audit_log) so an agent with zero
 // events still surfaces, carrying its FirstSeen. The counting rules match the

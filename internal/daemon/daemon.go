@@ -1996,6 +1996,18 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// budget back, and its settle window starts again from the next park.
 		delete(d.sessionSyncDeferred, tr.AgentID)
 		d.mu.Unlock()
+		// A snooze says "this agent has nothing left to do, stop asking about
+		// its queue". It is working, so that is no longer true — and clearing
+		// it here rather than making the operator do it is the whole difference
+		// between snooze and disable (#526): a pane reused for new work must
+		// not carry a quiet switch its last tenant earned. Conditional in the
+		// store, or this would report a write on every turn boundary.
+		if lifted, err := d.opt.Store.ClearAgentSnoozeIfSet(ctx, tr.AgentID); err != nil {
+			slog.Warn("snooze could not be lifted for a working agent",
+				"agent", tr.AgentID, "error", err)
+		} else if lifted {
+			slog.Info("snooze lifted: the agent is working again", "agent", tr.AgentID)
+		}
 		// The agent is doing something, which is the ONLY evidence that an
 		// unattended hand-out actually reached it (a successful `agent send`
 		// only proves herdr accepted the keystrokes). Latch it here rather than
@@ -2954,7 +2966,7 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 		// point — StageLLMRequest lives inside generateTask — so no request row,
 		// reservation or file write is stranded, and the next attention event
 		// raises the situation again once the guard clears.
-		if d.queueNoticeWithheld(situation, domain.ReasonNoTaskSource, now) {
+		if d.queueNoticeWithheld(ctx, situation, domain.ReasonNoTaskSource, now) {
 			d.dropAutoTaskClaim(situation.AgentID)
 			return
 		}
@@ -3835,8 +3847,14 @@ const queueNoticeCooldown = 30 * time.Minute
 // queueNoticeWithheld reports whether a queue notice must be withheld right now,
 // naming the cause for the log.
 //
-// Three guards, broadest first, and they answer different questions:
+// Four guards, broadest first, and they answer different questions:
 //
+//   - the operator (or their deputy) asked for quiet on this agent
+//     (`hap snooze`). An instruction, so it outranks every inference below it,
+//     and it is scoped to these reasons ALONE — that scope is the whole point
+//     of the switch. `hap disable` silences the agent's approvals too, which is
+//     why using it to stop a finished agent's queue notices meant re-enabling
+//     the agent by hand when its pane was reused (#526).
 //   - the agent is waiting on work IT started (domain.BackgroundWorkRunning).
 //     This is the only one that is TRUE EVIDENCE rather than bookkeeping: an
 //     agent with its own shells running does not need a task, and herdr cannot
@@ -3851,8 +3869,19 @@ const queueNoticeCooldown = 30 * time.Minute
 //
 // Only reasons domain.LatchedPerParkedEpisode names reach here; every other
 // escalation on the same event still reaches the operator untouched.
-func (d *Daemon) queueNoticeWithheld(s domain.Situation, reason domain.EscalateReason,
-	now time.Time) bool {
+func (d *Daemon) queueNoticeWithheld(ctx context.Context, s domain.Situation,
+	reason domain.EscalateReason, now time.Time) bool {
+
+	// A read error is NOT a snooze: an unreadable switch must not silence the
+	// operator's queue, which is the direction every other lifecycle read in
+	// this file fails in too.
+	if snoozed, err := d.opt.Store.AgentSnoozed(ctx, s.AgentID); err != nil {
+		slog.Warn("snooze read failed while raising a queue notice",
+			"agent", s.AgentID, "error", err)
+	} else if snoozed {
+		d.noteNoticeWithheld(s.AgentID, reason, "the agent is snoozed")
+		return true
+	}
 	if domain.BackgroundWorkRunning(s.AgentType, s.Content) {
 		d.noteNoticeWithheld(s.AgentID, reason, "the agent is waiting on background work it started")
 		return true
@@ -3996,7 +4025,7 @@ func (d *Daemon) escalateWith(ctx context.Context, s domain.Situation, sig domai
 	// history — and no audit row is written per repeat, since audit_log is never
 	// swept.
 	if autoDismissReason == "" && domain.LatchedPerParkedEpisode(dec.Reason) &&
-		d.queueNoticeWithheld(s, dec.Reason, now) {
+		d.queueNoticeWithheld(ctx, s, dec.Reason, now) {
 		return
 	}
 

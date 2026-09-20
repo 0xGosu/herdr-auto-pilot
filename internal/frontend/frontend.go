@@ -192,6 +192,9 @@ type Status struct {
 	// DisabledAgents contains agent/pane ids whose HAP automation has been
 	// disabled by the operator. They remain visible in MonitoredAgents.
 	DisabledAgents map[string]bool
+	// SnoozedAgents contains agent/pane ids whose QUEUE notices the operator
+	// silenced. Distinct from DisabledAgents: hap still answers their prompts.
+	SnoozedAgents map[string]bool
 	// AgentStats maps agent/pane ids to their lifetime counters (auto-sends,
 	// escalations, operator confirmations/corrections, first-seen). Nil when
 	// the stats query failed; a missing key means a live agent with no stats
@@ -281,6 +284,8 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 		namesErr            error
 		disabled            map[string]bool
 		disabledErr         error
+		snoozed             map[string]bool
+		snoozedErr          error
 		stats               map[string]domain.AgentStats
 		statsErr            = errNotRead
 		cfg                 config.Config
@@ -301,6 +306,7 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 		func() { wss, tabs, locErr = a.Store.HerdrLocations(ctx) },
 		func() { names, namesErr = a.Store.AgentNames(ctx) },
 		func() { disabled, disabledErr = a.Store.DisabledAgents(ctx) },
+		func() { snoozed, snoozedErr = a.Store.SnoozedAgents(ctx) },
 		func() { fleet = a.readFleet(ctx, o) },
 	}
 	if !o.skipStats {
@@ -371,6 +377,9 @@ func (a *App) GetStatus(ctx context.Context, opts ...StatusOption) (Status, erro
 	}
 	if disabledErr == nil {
 		st.DisabledAgents = disabled
+	}
+	if snoozedErr == nil {
+		st.SnoozedAgents = snoozed
 	}
 	// Best-effort, like AgentNames: a stats-query error just leaves it nil.
 	if statsErr == nil {
@@ -476,6 +485,9 @@ func (a *App) now() time.Time {
 
 // AgentDisabled reports the persistent operator-owned automation state.
 func (st Status) AgentDisabled(agentID string) bool { return st.DisabledAgents[agentID] }
+
+// AgentSnoozed reports the persistent operator-owned quiet state.
+func (st Status) AgentSnoozed(agentID string) bool { return st.SnoozedAgents[agentID] }
 
 // StatsFor returns the lifetime counters for an agent id (a zero-valued
 // AgentStats when none are recorded).
@@ -736,6 +748,39 @@ func (a *App) SetAgentDisabled(ctx context.Context, target string, disabled bool
 				return nameErr
 			}
 			err = a.Store.SetAgentDisabled(ctx, agentID, disabled)
+		}
+	}
+	if err != nil {
+		return err
+	}
+	a.nudge(ctx, control.KindReload)
+	return nil
+}
+
+// SetAgentSnoozed silences notices about an agent's QUEUE while leaving
+// everything about its SCREEN alone — its approvals are still answered, its
+// escalations still reach the operator.
+//
+// Mirrors SetAgentDisabled, including naming a live-but-unnamed agent first so
+// the state stays visible and addressable after it exits. It deliberately does
+// NOT share a code path with it: the two switches mean different things and
+// folding them into one call with a flag is how "park this finished agent"
+// became "stop answering this agent" (#526).
+func (a *App) SetAgentSnoozed(ctx context.Context, target string, snoozed bool) error {
+	err := a.Store.SetAgentSnoozed(ctx, target, snoozed)
+	if errors.Is(err, ports.ErrUnknownAgent) {
+		if rerr := a.refuseRemoteTargetUnlessLocal(ctx, target, "snooze/unsnooze"); rerr != nil {
+			return rerr
+		}
+		agentID, rerr := a.liveRosterAgentID(ctx, target)
+		if rerr != nil {
+			return fmt.Errorf("%w (%v)", err, rerr)
+		}
+		if agentID != "" {
+			if _, nameErr := a.Store.EnsureAgentName(ctx, agentID); nameErr != nil {
+				return nameErr
+			}
+			err = a.Store.SetAgentSnoozed(ctx, agentID, snoozed)
 		}
 	}
 	if err != nil {

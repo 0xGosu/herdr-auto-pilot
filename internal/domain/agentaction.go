@@ -116,6 +116,16 @@ const (
 	// another machine would be a row the owner consumes with no writer ever
 	// having taken the owner's lock — the ordering silently gone.
 	AgentActionSetEnabled AgentActionKind = "set_enabled"
+	// AgentActionSetSnoozed silences (or restores) notices about one agent's
+	// QUEUE. A separate kind from set_enabled, never a payload variant of it:
+	// the executors differ, the guarantees differ, and a surface that meant one
+	// and got the other would be the exact conflation the switch exists to end.
+	//
+	// Queued for the ordinary reason rather than set_enabled's: agent_names is
+	// node-keyed and only the owning node can resolve the operator's spelling
+	// of the agent. It takes no automation flock, because unlike a disable it
+	// commits to no delivery either way.
+	AgentActionSetSnoozed AgentActionKind = "set_snoozed"
 )
 
 // AgentActionStatus is where a queued action stands.
@@ -150,7 +160,7 @@ func (s AgentActionStatus) Terminal() bool {
 func ValidAgentActionKind(kind AgentActionKind) bool {
 	switch kind {
 	case AgentActionDeliverReply, AgentActionSendTask, AgentActionSetMode, AgentActionCapture,
-		AgentActionFocus, AgentActionRename, AgentActionSetEnabled,
+		AgentActionFocus, AgentActionRename, AgentActionSetEnabled, AgentActionSetSnoozed,
 		AgentActionAcceptGeneratedTask:
 		return true
 	}
@@ -213,6 +223,16 @@ type RenamePayload struct {
 // re-arming automation on an agent an operator had benched.
 type SetEnabledPayload struct {
 	Disabled bool `json:"disabled"`
+}
+
+// SetSnoozedPayload is the set_snoozed action's arguments.
+//
+// The field is SNOOZED rather than "awake" for the same reason SetEnabledPayload
+// names the restrictive state: a payload that fails to unmarshal, or one written
+// by a surface that forgot the field, asks for the agent's notices to keep
+// flowing rather than silently muting a queue the operator is watching.
+type SetSnoozedPayload struct {
+	Snoozed bool `json:"snoozed"`
 }
 
 // RenameResult is the rename action's outcome.

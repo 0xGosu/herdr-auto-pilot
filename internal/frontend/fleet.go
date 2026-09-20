@@ -30,7 +30,10 @@ type RemoteAgent struct {
 	// too old to trust. Rendered, never acted on.
 	Stale    bool
 	Disabled bool
-	Stats    domain.AgentStats
+	// Snoozed: that machine's operator silenced notices about this agent's
+	// QUEUE. Distinct from Disabled — its prompts are still answered.
+	Snoozed bool
+	Stats   domain.AgentStats
 }
 
 // ShortName is the agent's own name, with no node attached, falling back to
@@ -122,6 +125,7 @@ type fleetReads struct {
 	names     map[domain.NodeAgent]string
 	namesErr  error
 	disabled  map[domain.NodeAgent]bool
+	snoozed   map[domain.NodeAgent]bool
 	stats     map[domain.NodeAgent]domain.AgentStats
 	roster    []domain.RosterAgent
 	published map[string]time.Time
@@ -144,6 +148,7 @@ func (a *App) readFleet(ctx context.Context, o statusOptions) fleetReads {
 		func() { f.here, f.hereErr = a.Store.CountPendingEscalationsOn(ctx, self) },
 		func() { f.names, f.namesErr = a.Store.FleetAgentNames(ctx) },
 		func() { f.disabled, _ = a.Store.DisabledAgentsAll(ctx) },
+		func() { f.snoozed, _ = a.Store.SnoozedAgentsAll(ctx) },
 		func() { f.roster, f.published, f.rosterErr = a.Store.FleetRoster(ctx) },
 	}
 	if !o.skipStats {
@@ -196,7 +201,7 @@ func (a *App) fillFleet(st *Status, f fleetReads) {
 	if f.namesErr == nil {
 		st.FleetNames = f.names
 	}
-	disabled, stats := f.disabled, f.stats
+	disabled, snoozed, stats := f.disabled, f.snoozed, f.stats
 	if f.rosterErr != nil {
 		return
 	}
@@ -224,6 +229,7 @@ func (a *App) fillFleet(st *Status, f fleetReads) {
 			NodeLabel:   domain.NodeLabelOrID(node),
 			Stale:       domain.NodeStale(node, now) || !domain.RosterFresh(published[r.NodeID], now),
 			Disabled:    disabled[key],
+			Snoozed:     snoozed[key],
 			Stats:       stats[key],
 		})
 	}

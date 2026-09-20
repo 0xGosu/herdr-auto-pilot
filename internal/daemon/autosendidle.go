@@ -833,6 +833,16 @@ func (d *Daemon) eligibleIdleAgents(ctx context.Context, src config.TaskSource,
 		if disabled, err := d.opt.Store.AgentDisabled(ctx, a.AgentID); err != nil || disabled {
 			continue
 		}
+		// A snooze is an instruction to leave this agent's QUEUE alone, and an
+		// unattended hand-out is the loudest thing that queue does. A read error
+		// withholds here, unlike in queueNoticeWithheld: this path TYPES INTO A
+		// PANE, so an unreadable switch is not permission to send. It is a
+		// store/listing gate deliberately — no pane read: this loop runs per
+		// parked agent per sweep on the select loop, and the composer proof
+		// belongs at requireIdleForHandout, which already reads the pane.
+		if snoozed, err := d.opt.Store.AgentSnoozed(ctx, a.AgentID); err != nil || snoozed {
+			continue
+		}
 		// The runaway guard's stand-down, and only it: the per-agent disable
 		// just above stays in force whatever [limits] says.
 		if !limitsInert {
