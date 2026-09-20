@@ -950,6 +950,97 @@ func setAgentSnoozed(ctx context.Context, app *frontend.App, out io.Writer,
 	return nil
 }
 
+// declareWait is the AGENT-facing verb of the three per-agent switches: `hap
+// disable` and `hap snooze` are things an operator does TO an agent, this is
+// something an agent says ABOUT ITSELF (#508).
+//
+// Which is why it defaults its target to HERDR_PANE_ID rather than requiring
+// one. An agent id IS its herdr pane id, so an agent running this inside its
+// own pane needs no argument and — more to the point — cannot accidentally
+// name a sibling: the id comes from the environment herdr set, not from
+// anything the model wrote. An operator declaring on someone else's behalf
+// passes --agent explicitly.
+func declareWait(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
+	rest, nodeID, label, err := splitNodeFlag(ctx, app, args)
+	if err != nil {
+		return err
+	}
+	// Parsed by hand rather than with a FlagSet, and the reason is the whole
+	// call shape: `hap wait 20m --reason "cold build"` is what an agent will
+	// write, and flag.Parse stops at the first non-flag argument, so the
+	// duration first would swallow --reason as a second positional. Reordering
+	// is not an answer either — the natural spelling has to work.
+	var (
+		agent, reason string
+		clear         bool
+		positional    []string
+	)
+	for i := 0; i < len(rest); i++ {
+		arg := rest[i]
+		value := func(name string) (string, error) {
+			if v, ok := strings.CutPrefix(arg, name+"="); ok {
+				return v, nil
+			}
+			if i+1 >= len(rest) {
+				return "", fmt.Errorf("%s requires a value", name)
+			}
+			i++
+			return rest[i], nil
+		}
+		switch {
+		case arg == "--clear":
+			clear = true
+		case arg == "--agent" || strings.HasPrefix(arg, "--agent="):
+			if agent, err = value("--agent"); err != nil {
+				return err
+			}
+		case arg == "--reason" || strings.HasPrefix(arg, "--reason="):
+			if reason, err = value("--reason"); err != nil {
+				return err
+			}
+		case strings.HasPrefix(arg, "-"):
+			return fmt.Errorf("unknown flag %q; see `hap help wait`", arg)
+		default:
+			positional = append(positional, arg)
+		}
+	}
+	target := strings.TrimSpace(agent)
+	if target == "" {
+		target = strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
+	}
+	if target == "" {
+		return fmt.Errorf("no agent to declare for: run this inside the agent's own herdr pane, or pass --agent <agent-name-or-pane-id> (see: hap agents)")
+	}
+
+	var d time.Duration
+	switch {
+	case clear:
+		if len(positional) > 0 {
+			return fmt.Errorf("--clear takes no duration; it ends the wait now")
+		}
+	case len(positional) != 1:
+		return fmt.Errorf("usage: hap wait [--node <label|id>] [--agent <agent>] <duration> [--reason <text>]  (or: hap wait --clear)")
+	default:
+		d, err = time.ParseDuration(positional[0])
+		if err != nil {
+			return fmt.Errorf("%q is not a duration: write it with a unit, e.g. 20m, 45m or 1h30m", positional[0])
+		}
+	}
+	if err := domain.ValidateWaitDuration(d); err != nil {
+		return err
+	}
+	if err := app.DeclareAgentWaitOn(ctx, nodeID, target, d, reason); err != nil {
+		return err
+	}
+	if d == 0 {
+		fmt.Fprintf(out, "wait cleared for agent %q%s\n", target, label)
+		return nil
+	}
+	fmt.Fprintf(out, "agent %q%s is waiting for %s\n", target, label, d)
+	fmt.Fprintf(out, "hap will not offer it work or raise notices about its queue until then; its prompts are still answered\n")
+	return nil
+}
+
 func status(ctx context.Context, app *frontend.App, out io.Writer, args []string) error {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	stderrTail := fs.Bool("stderr", false, "also print the captured daemon stderr (the crash output the status line only names)")
@@ -1199,6 +1290,10 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// One clock reading for the whole listing: a declared wait is compared
+	// against it in both loops, and two readings could render the same agent
+	// as waiting in one and lapsed in the other.
+	now := time.Now()
 	if len(st.MonitoredAgents) == 0 {
 		// "Nothing is running" and "nobody has looked" are different answers,
 		// and since the herd is read from what the daemon publishes, the
@@ -1235,13 +1330,18 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 		// is tab-separated and scripts parse it by field number, so inserting
 		// a column would shift cwd, mode and node for every existing reader.
 		// "disabled" wins over "snoozed" — it is the stronger state, and an
-		// agent carrying both is one hap will not act on at all.
+		// agent carrying both is one hap will not act on at all. A declared
+		// wait comes last of the three: it is the weakest and the shortest
+		// lived, and it carries a deadline the other two do not, so it renders
+		// as "waiting 14m" rather than a bare word.
 		automation := "enabled"
-		switch {
+		switch w, waiting := st.AgentWaiting(a.AgentID, now); {
 		case st.AgentDisabled(a.AgentID):
 			automation = "disabled"
 		case st.AgentSnoozed(a.AgentID):
 			automation = "snoozed"
+		case waiting:
+			automation = "waiting " + domain.ShortDuration(w.Remaining(now))
 		}
 		// Appended AFTER cwd, deliberately: inserting it mid-row would shift
 		// cwd from field 6 to field 7 and silently break every existing
@@ -1276,6 +1376,8 @@ func agents(ctx context.Context, app *frontend.App, out io.Writer) error {
 			automation = "disabled"
 		case r.Snoozed:
 			automation = "snoozed"
+		case r.Wait.Active(now):
+			automation = "waiting " + domain.ShortDuration(r.Wait.Remaining(now))
 		}
 		status := r.Status
 		if r.Stale {

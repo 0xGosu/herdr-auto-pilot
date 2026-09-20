@@ -315,7 +315,8 @@ func TestAStaleQueuedRenameIsRefusedRatherThanReplayed(t *testing.T) {
 // Both kinds are bounded, and by the identity clock rather than the screen
 // clock the delivering kinds use.
 func TestAgentStateKindsAreBoundedByTheIdentityClock(t *testing.T) {
-	for _, kind := range []domain.AgentActionKind{domain.AgentActionRename, domain.AgentActionSetEnabled} {
+	for _, kind := range []domain.AgentActionKind{domain.AgentActionRename, domain.AgentActionSetEnabled,
+		domain.AgentActionSetSnoozed, domain.AgentActionDeclareWait} {
 		if got := agentActionStaleBound(kind); got != agentStateStaleAfter {
 			t.Errorf("agentActionStaleBound(%q) = %s, want %s", kind, got, agentStateStaleAfter)
 		}

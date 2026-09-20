@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -12,8 +13,8 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
-// The two queued kinds that change an agent's DATABASE state rather than its
-// pane: rename and set_enabled.
+// The queued kinds that change an agent's DATABASE state rather than its pane:
+// rename, set_enabled, set_snoozed and declare_wait.
 //
 // Neither types anything, so neither needs herdr — which makes "why are these
 // queued at all?" the first question a reader has. The answer is node scoping,
@@ -202,6 +203,85 @@ func (d *Daemon) setAgentSnoozedAction(ctx context.Context, a domain.AgentAction
 		err = d.opt.Store.SetAgentSnoozed(ctx, agentID, p.Snoozed)
 	}
 	return "", err
+}
+
+// declareWaitAction records an agent's own bounded wait on the node that owns
+// it (#508).
+//
+// It is setAgentSnoozedAction's sibling and shares its shape for the same
+// reasons: no automation flock (a wait commits to no delivery either way), and
+// the same identity guard, which reads asymmetrically here too — CLEARING a
+// stranger's wait only restores hap's ordinary behaviour, while DECLARING one
+// withholds work from whoever now owns that pane.
+//
+// The deadline is computed HERE rather than carried: the payload holds a
+// duration, and every gate that reads the row compares it against this
+// daemon's clock, so the deadline has to be minted on that clock or two
+// machines' skew lands in the answer. See domain.DeclareWaitPayload.
+func (d *Daemon) declareWaitAction(ctx context.Context, a domain.AgentAction) (string, error) {
+	var p domain.DeclareWaitPayload
+	if err := json.Unmarshal([]byte(a.Payload), &p); err != nil {
+		return "", fmt.Errorf("the queued wait request could not be read: %w", err)
+	}
+	wait := time.Duration(p.Seconds) * time.Second
+	if err := domain.ValidateWaitDuration(wait); err != nil {
+		return "", err
+	}
+	// A declaration is bounded by its OWN duration, which is tighter than the
+	// agentStateStaleAfter the generic gate applies to this kind (an hour) and
+	// is the only bound that means anything here: the other state kinds go
+	// stale because the operator's belief about which agent this is decays,
+	// while this one's whole content is "I am busy for N minutes". Queued
+	// longer ago than that — an owning daemon that was down — it has nothing
+	// left to say, and honouring it would withhold work from an agent that was
+	// free by the time the row was drained.
+	//
+	// The two sides are different machines' clocks, as they already are in the
+	// generic gate this narrows; the deadline itself is still minted below on
+	// the owner's, which is the clock every reader compares against.
+	//
+	// A CLEAR (Seconds == 0) is deliberately exempt: it has no duration to
+	// outlive, and an agent saying it finished early should land whenever it
+	// arrives.
+	if wait > 0 && !a.CreatedAt.IsZero() && d.opt.Clock.Now().Sub(a.CreatedAt) >= wait {
+		return "", fmt.Errorf("this wait was declared %s ago and asks for %s, so it has already run out; declare a new one",
+			d.opt.Clock.Now().Sub(a.CreatedAt).Round(time.Second), wait)
+	}
+	agentID, err := d.resolveActionTarget(ctx, a)
+	if err != nil {
+		return "", err
+	}
+	verb := "cleared the wait for"
+	if wait > 0 {
+		verb = "declared a wait for"
+	}
+	if err := d.agentStillTheSame(ctx, agentID, a.TerminalID, verb); err != nil {
+		return "", err
+	}
+	var until time.Time
+	if wait > 0 {
+		until = d.opt.Clock.Now().Add(wait)
+	}
+	err = d.opt.Store.SetAgentWait(ctx, agentID, until, p.Reason)
+	if errors.Is(err, ports.ErrUnknownAgent) {
+		// The same live-but-unnamed window rename, set_enabled and set_snoozed
+		// have: name the agent first so the state is visible and addressable,
+		// then set it.
+		if _, nameErr := d.opt.Store.EnsureAgentName(ctx, agentID); nameErr != nil {
+			return "", nameErr
+		}
+		err = d.opt.Store.SetAgentWait(ctx, agentID, until, p.Reason)
+	}
+	if err != nil {
+		return "", err
+	}
+	if wait > 0 {
+		slog.Info("agent declared a bounded wait; its queue is left alone until it lapses",
+			"agent", agentID, "until", until, "reason", p.Reason)
+	} else {
+		slog.Info("agent cleared its declared wait", "agent", agentID)
+	}
+	return "", nil
 }
 
 // resolveActionTarget maps the operator's spelling of an agent to its agent id,

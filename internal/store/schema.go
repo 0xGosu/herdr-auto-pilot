@@ -79,6 +79,8 @@ const createAgentNames = `CREATE TABLE IF NOT EXISTS agent_names (
 	name TEXT NOT NULL,
 	disabled INTEGER NOT NULL DEFAULT 0,
 	snoozed INTEGER NOT NULL DEFAULT 0,
+	wait_until INTEGER NOT NULL DEFAULT 0,
+	wait_reason TEXT NOT NULL DEFAULT '',
 	terminal_id TEXT NOT NULL DEFAULT '',
 	created_at INTEGER NOT NULL,
 	PRIMARY KEY (node_id, agent_id),
@@ -542,6 +544,16 @@ var columnAdds = []columnAdd{
 	// silences the notices about its QUEUE and leaves everything about its
 	// SCREEN alone. Cleared when the agent next works.
 	{"agent_names", "snoozed", `ALTER TABLE agent_names ADD COLUMN snoozed INTEGER NOT NULL DEFAULT 0`},
+	// The AGENT's own "I am deliberately busy until T" (domain.AgentWait,
+	// #508). Beside snoozed rather than folded into it: a snooze has no expiry
+	// and is lifted by the transition to working, and a wait must survive
+	// exactly that flap — a build's own output flips its agent parked →
+	// working → parked, which is what defeated the #526 episode latch. Unix
+	// seconds; 0 = never declared, and a past value reads as lapsed (nothing
+	// ever clears it on a timer — that would be an unconditional periodic
+	// write).
+	{"agent_names", "wait_until", `ALTER TABLE agent_names ADD COLUMN wait_until INTEGER NOT NULL DEFAULT 0`},
+	{"agent_names", "wait_reason", `ALTER TABLE agent_names ADD COLUMN wait_reason TEXT NOT NULL DEFAULT ''`},
 	// Herdr's unique per-terminal id. Herdr reuses compact pane ids, so
 	// this is what tells "same agent" from "new terminal on a recycled
 	// pane id" (issue #158). '' = not yet observed.
@@ -581,7 +593,8 @@ type rebuild struct {
 var rebuilds = []rebuild{
 	{"agent_rate", createAgentRate, "agent_id, consecutive_auto, window_start, count_in_window, paused"},
 	{"error_retries", createErrorRetries, "error_signature, agent_id, retry_count, updated_at"},
-	{"agent_names", createAgentNames, "agent_id, name, disabled, snoozed, terminal_id, created_at"},
+	{"agent_names", createAgentNames,
+		"agent_id, name, disabled, snoozed, wait_until, wait_reason, terminal_id, created_at"},
 	{"agent_roster", createAgentRoster,
 		"agent_id, pane_id, tab_id, workspace_id, agent_type, status, terminal_id, cwd, cwd_read_at, list_seq, seen_at, gone_at"},
 	{"herdr_locations", createHerdrLocations, "kind, id, label, number, workspace_id, seen_at"},

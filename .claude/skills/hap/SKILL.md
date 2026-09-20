@@ -167,13 +167,17 @@ hap enable backend-dev
 hap snooze backend-dev            # its work is done: stop asking about its QUEUE,
                                   # keep answering its prompts; lifts when it works
 hap unsnooze backend-dev
+hap wait 20m --reason "cold cargo build"   # run BY THE AGENT, in its own pane
+hap wait --clear                           # ...it finished early
+hap wait --agent backend-dev 45m           # or declared on its behalf
 hap capture backend-dev           # re-run the capture pipeline for one agent now
 # all take --node <label|id> to reach another machine's agent (see "fleet")
 ```
 
 `cwd` and `mode` are `-` when unreadable. New columns are appended, so existing
 field positions never move. The `automation` column reads
-`enabled` / `disabled` / `snoozed`; `disabled` wins when an agent is both.
+`enabled` / `disabled` / `snoozed` / `waiting <time left>`; `disabled` wins when
+an agent carries more than one.
 
 **`snooze` is not a gentler `disable`.** Disable stops hap answering the agent
 and drops its escalations on the floor, so an agent parked with it needs
@@ -181,6 +185,22 @@ re-enabling by hand before it is useful again. Snooze silences only the notices
 about its QUEUE — `no_task_source`, `task_source_exhausted`, the hand-out
 proposal — and withholds it from the idle poll; everything about its SCREEN is
 unchanged, and it clears itself the moment the agent next works.
+
+**`hap wait` is for the AGENT to say it is busy on purpose.** A fifteen-minute
+cold build or a CI poll leaves a pane herdr reports as idle, which is the same
+signature as wedged — so hap offered the agent more work and eventually
+escalated it as never having started work it was doing all along. A declared
+wait withholds exactly what a snooze does (hand-outs, queue notices) and also
+stops a task already handed out being reclaimed, while its approvals go on
+being answered. It is BOUNDED — at most 2h, and it lapses on its own clock, so
+a wrong one costs a deadline rather than an operator noticing — and unlike a
+snooze it is deliberately NOT lifted when the agent goes back to working: an
+agent waiting on its own shells flips idle/working every time one prints a
+line. Declare it BEFORE starting the long command; an agent blocked on a
+foreground build cannot run anything until it finishes. With no `--agent` it
+declares for the pane it runs in, which is what an agent should do — the id
+comes from herdr's own environment, so an agent cannot name a sibling by
+mistake.
 
 **Start an agy agent in the directory it will work in.** agy scopes its
 permissions to the directory it was STARTED in and asks approval for every file
@@ -1065,8 +1085,8 @@ agent — it is picked up on that agent's next idle.
 ## the LLM fallback (optional)
 
 When no confident learned rule applies, hap can consult a local LLM/agent CLI.
-The model talks to hap's own MCP server (`hap mcp` — tools `get_context` and
-`submit_decision`); its stdout is captured for audit only. Configure it with a
+The model talks to hap's own MCP server (`hap mcp` — tools `get_context`,
+`submit_decision` and `declare_wait`); its stdout is captured for audit only. Configure it with a
 preset (see above) rather than by hand.
 
 `get_context` returns the classified situation (type, options, permission verb,
@@ -1076,6 +1096,11 @@ herdr location (`workspace_id`, `tab_id`, `pane_id`, `agent_id`), its hap-owned
 matching task source it also carries `task_list_path`, `pending_task_count` with
 a truncated `next_pending_task`, and `in_progress_task_count` with a truncated
 `first_in_progress_task` — on **every** consult, not just a task review.
+
+`declare_wait` is the one tool that is not an answer to the pending request:
+it records the same bounded wait `hap wait` does (`minutes`, optional `agent`
+and `reason`; `minutes: 0` ends one), for an agent the model can see is busy on
+purpose. It needs no pending request when `agent` is given.
 
 `submit_decision` enforces a per-situation contract:
 

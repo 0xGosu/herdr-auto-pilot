@@ -1,0 +1,4 @@
+- Added `hap wait <duration>` — an agent can now say it is deliberately busy (a cold build, a CI poll) instead of looking wedged, and hap leaves its queue alone until the wait lapses while still answering its prompts.
+- Fixed a task handed to an agent on a long FOREGROUND build being given up on after an hour, telling the operator to clear a `[-]` the agent was working through.
+- hap now recognizes a codex agent waiting on its own background terminal, so it is no longer offered more work or escalated as having never started.
+- The MCP surface gained `declare_wait`, so a consulted model can record the same bounded wait without a pending decision request.

@@ -107,6 +107,30 @@ func (s *Store) SnoozedAgentsAll(ctx context.Context) (map[domain.NodeAgent]bool
 	return out, rows.Err()
 }
 
+// WaitingAgentsAll returns every node's declared waits, lapsed ones included.
+// A fleet read spans nodes, so it is deliberately NOT scoped to self.
+func (s *Store) WaitingAgentsAll(ctx context.Context) (map[domain.NodeAgent]domain.AgentWait, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT node_id, agent_id, wait_until, wait_reason FROM agent_names WHERE wait_until != 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[domain.NodeAgent]domain.AgentWait{}
+	for rows.Next() {
+		var (
+			k      domain.NodeAgent
+			until  int64
+			reason string
+		)
+		if err := rows.Scan(&k.NodeID, &k.AgentID, &until, &reason); err != nil {
+			return nil, err
+		}
+		out[k] = domain.AgentWait{Until: time.Unix(until, 0), Reason: reason}
+	}
+	return out, rows.Err()
+}
+
 // FleetAgentStats is AgentStats across every node.
 func (s *Store) FleetAgentStats(ctx context.Context) (map[domain.NodeAgent]domain.AgentStats, error) {
 	rows, err := s.db.QueryContext(ctx, `

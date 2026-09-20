@@ -3967,7 +3967,7 @@ const queueNoticeCooldown = 30 * time.Minute
 // queueNoticeWithheld reports whether a queue notice must be withheld right now,
 // naming the cause for the log.
 //
-// Four guards, broadest first, and they answer different questions:
+// Five guards, broadest first, and they answer different questions:
 //
 //   - the operator (or their deputy) asked for quiet on this agent
 //     (`hap snooze`). An instruction, so it outranks every inference below it,
@@ -3975,6 +3975,13 @@ const queueNoticeCooldown = 30 * time.Minute
 //     of the switch. `hap disable` silences the agent's approvals too, which is
 //     why using it to stop a finished agent's queue notices meant re-enabling
 //     the agent by hand when its pane was reused (#526).
+//   - the AGENT declared a bounded wait (domain.AgentWait, `hap wait`). Also
+//     an instruction rather than an inference, so it sits beside the snooze
+//     and above everything below — but it is the agent's word, not the
+//     operator's, which is why it is BOUNDED and the snooze is not. Scoped to
+//     every reason that reaches here, unlike the two guards below: the
+//     argument that narrows those is that their evidence can outlive the work,
+//     and a declaration cannot.
 //   - the agent is waiting on work IT started (domain.BackgroundWorkRunning).
 //     This is the only one that is TRUE EVIDENCE rather than bookkeeping: an
 //     agent with its own shells running does not need a task, and herdr cannot
@@ -4006,6 +4013,26 @@ func (d *Daemon) queueNoticeWithheld(ctx context.Context, s domain.Situation,
 			"agent", s.AgentID, "error", err)
 	} else if snoozed {
 		d.noteNoticeWithheld(s.AgentID, reason, "the agent is snoozed")
+		return true
+	}
+	// The agent's own declaration that it is busy until a deadline (#508).
+	// Read like the snooze above it and unlike the inference below: it is an
+	// INSTRUCTION, so it outranks both, and it is scoped to every reason that
+	// reaches this function rather than to ReasonNoTaskSource alone. The
+	// argument that narrows BackgroundWorkRunning does not apply — an
+	// indicator can outlive the work that painted it (a dev server, a
+	// `tail -f`), which is why withholding the queue-work notices on one would
+	// be unbounded, while a declaration expires on its own and the agent is
+	// asked again the moment it does.
+	//
+	// A read error does NOT withhold, for the snooze's reason: an unreadable
+	// switch must not silence the operator's queue.
+	if wait, err := d.opt.Store.AgentWaitFor(ctx, s.AgentID); err != nil {
+		slog.Warn("declared-wait read failed while raising a queue notice",
+			"agent", s.AgentID, "error", err)
+	} else if wait.Active(now) {
+		d.noteNoticeWithheld(s.AgentID, reason,
+			"the agent declared a wait, "+wait.Remaining(now).Round(time.Second).String()+" left")
 		return true
 	}
 	if noticeCooldownApplies(reason) &&

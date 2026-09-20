@@ -577,6 +577,14 @@ keystroke.
   unstripped), so it costs no herdr round trip. **Do not put it in `internal/classify`** beside the agy
   idle suppression: withholding the idle verdict leaves `SituationUnclassifiable`, which still escalates,
   so it would trade `[no_task_source]` rows for `[unclassifiable]` rows at the same rate.
+  - **codex has an arm now, and it reads a DIFFERENT line from its mode footer.** Verified live
+    (codex-cli 0.155.0): the footer really is `<model> <effort> · <cwd>` with no count slot, but a
+    session holding a background terminal paints `1 background terminal running · /ps to view · /stop
+    to close` as a line of its own above the composer, and it SURVIVES the end of the turn — which is
+    what makes it usable, since both callers only look at parked agents. The `/ps` hint is required,
+    not decoration: the count phrase alone is prose an agent types while reporting what it did, and
+    the footer window is the whole capture on a short pane. Fixtures:
+    `internal/domain/testdata/codex_background_terminal*.txt`, a live pair differing only in that line.
   - **It now has a SECOND caller, and it is narrower than this one** (`reclaimStrandedTasks`, #508) — so
     the contract comment on the predicate names both. It may only ever WITHHOLD something hap would say;
     a caller that would TYPE must prove its precondition positively (`AgyComposerReady`,
@@ -591,6 +599,28 @@ keystroke.
 - **Every suppression names itself once** (`noteNoticeWithheld`, per (agent, reason, CAUSE) — a changed
   cause is new information). `notePending`'s rule: the unlogged skips cost a five-round investigation,
   and a line per event would move the flood into the log.
+- **`hap wait` is a THIRD column again, and the one thing it must not share with `snoozed` is the
+  LIFT.** An agent declares a bounded wait for itself (`domain.AgentWait`, `agent_names.wait_until`,
+  #508) because herdr reports a fifteen-minute cold build as an idle pane — the same signature as
+  wedged, which is how every stall alert in one session was a false positive. It gates the same three
+  places snooze does plus `reclaimStrandedTasks`, and MUST NOT touch the delivery path either.
+  Four rules, each load-bearing:
+  - **It is NOT lifted by the transition to working**, which is the whole reason `SetAgentSnoozed`
+    could not be reused: an agent waiting on its own work flips parked→working→parked every time that
+    work prints a line — the same flap that defeated the #526 episode latch — so a state that clears
+    on it cannot survive the thing it exists to cover. It ends on the CLOCK instead.
+  - **Expiry is READ, never written** (`AgentWait.Active`, asked at every call site against the
+    caller's `now`). A sweep that cleared lapsed rows is an unconditional periodic write, which arms
+    the turso push debounce every tick — the leak the "a periodic write is CONDITIONAL" rule names.
+  - **The queued payload carries a DURATION, not a deadline** (`domain.DeclareWaitPayload`): every
+    gate compares against the OWNING node's clock, so the owner mints the deadline on that clock and
+    two machines' skew never enters the answer.
+  - **`reclaimStrandedTasks`' `staleHandoutTTL` give-up branch is the one a WORKING agent reaches** —
+    its own comment names "an agent that has been busy the whole time" — so it is the FOREGROUND half
+    of #508 item 3, where `BackgroundWorkRunning` cannot help (that agent never parks, and both of
+    the predicate's callers only look at parked agents). A declaration may hold it, but only to
+    `staleHandoutTTL + domain.MaxDeclaredWait`: a wait can be RENEWED, so honouring it there without
+    an absolute ceiling restores the unbounded `[-]` the TTL exists to end.
 - **`hap snooze` is a SEPARATE column from `disabled`, never a second meaning for it.** `hap disable`
   stops hap answering the agent at all — `escalationAutoDismissReason` records its escalations already
   dismissed — so an orchestrator that used it to quiet a finished agent also stopped its approvals being

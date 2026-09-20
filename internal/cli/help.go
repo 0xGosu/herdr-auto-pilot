@@ -484,6 +484,51 @@ func buildCommands() {
 			},
 		},
 		{
+			Name:    "wait",
+			Group:   groupOperate,
+			Summary: "declare that an agent is deliberately busy until a deadline",
+			Usage: []string{
+				"hap wait [--node <label|id>] [--agent <agent>] <duration> [--reason <text>]",
+				"hap wait [--node <label|id>] [--agent <agent>] --clear",
+			},
+			Flags: []FlagDoc{
+				{Name: "--agent <agent>", Desc: "declare for another agent; the default is the herdr pane this command runs in"},
+				{Name: "--reason <text>", Desc: "what is being waited on — shown in `hap agents`, nothing branches on it"},
+				{Name: "--clear", Desc: "end the wait now, for an agent that finished early"},
+				{Name: "--node <label|id>", Desc: "act on an agent that lives on another machine sharing this store (see `hap status`)"},
+			},
+			Details: "For an AGENT to say it is busy on purpose. An agent on a fifteen-minute\n" +
+				"cold build or a CI poll looks exactly like a wedged one — herdr reports\n" +
+				"the same idle pane either way — so hap offered it more work and, after\n" +
+				"enough unstarted hand-outs, escalated it as never having started work it\n" +
+				"was doing all along.\n\n" +
+				"While the wait stands, hap leaves the agent's QUEUE alone: no hand-outs,\n" +
+				"no notices about it having nothing to do, and a task already handed to it\n" +
+				"is not reclaimed. Everything about its SCREEN is unchanged — its\n" +
+				"approvals and questions are still answered, and anything hap cannot\n" +
+				"answer still reaches you.\n\n" +
+				"It is BOUNDED, which is the difference from `hap snooze`: it lapses on\n" +
+				"its own clock and hap starts asking again, so a wait that is wrong costs\n" +
+				"one deadline rather than an operator noticing. It is deliberately NOT\n" +
+				"lifted by the agent going back to working — an agent waiting on its own\n" +
+				"shells flips idle/working every time one prints a line.\n\n" +
+				"Run with no --agent it declares for the pane it runs in, which is what an\n" +
+				"agent should do: the id comes from herdr's own environment, so an agent\n" +
+				"cannot name a sibling by mistake.",
+			Examples: []string{
+				"hap wait 20m --reason \"cold cargo build\"",
+				"hap wait 45m --reason \"waiting on CI for PR #530\"",
+				"hap wait --clear",
+				"hap wait --agent vivid-falcon 30m",
+			},
+			Next: []Hint{
+				{Cmd: "hap agents", Why: "see which agents are waiting and until when"},
+				{Cmd: "hap snooze <agent>", Why: "an agent is finished, not busy — quiet with no deadline"},
+				{Cmd: "hap disable <agent>", Why: "stop hap acting on it at all, prompts included"},
+			},
+			Handler: declareWait,
+		},
+		{
 			Name:    "escalations",
 			Group:   groupOperate,
 			Summary: "list what is waiting for an answer; prune old ones",

@@ -184,7 +184,7 @@ func (im *importer) copySteps() []copyStep {
 		}},
 		{"signature_embeddings", "signature, situation_type, agent_type, model, dims, vector, salient, created_at", "signature", nil, nil},
 		{"signature_snapshots", "signature, pane_excerpt, created_at", "signature", nil, nil},
-		{"agent_names", "node_id, agent_id, name, disabled, snoozed, terminal_id, created_at", "agent_id", nil, stampNode(self)},
+		{"agent_names", "node_id, agent_id, name, disabled, snoozed, wait_until, wait_reason, terminal_id, created_at", "agent_id", nil, stampNode(self)},
 		{"agent_rate", "node_id, agent_id, consecutive_auto, window_start, count_in_window, paused", "agent_id", nil, stampNode(self)},
 		{"error_retries", "node_id, error_signature, agent_id, retry_count, updated_at", "error_signature", nil, stampNode(self)},
 		{"task_handouts", "node_id, source_path, task_text, attempts, updated_at", "source_path, task_text", nil, stampNode(self)},
