@@ -8,6 +8,7 @@ package fakeherdr
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -16,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
 type subscription struct {
@@ -53,6 +56,8 @@ type Server struct {
 	// omitAgentLabels makes pane.list carry no agent field at all, like a
 	// herdr that does not report labels there (see SetPaneListLabels).
 	omitAgentLabels bool
+	// listPanesErr, when set, makes ListPanes fail (see SetListPanesError).
+	listPanesErr error
 
 	// notifications records every notification.show request; notifyShown /
 	// notifyReason are the canned result, defaulting to a displayed toast.
@@ -137,17 +142,18 @@ func (s *Server) serve(conn net.Conn) {
 			continue
 		}
 		if req.Method == "pane.list" {
+			// Kept for the protocol record: hap's subscriber now takes its
+			// listing from the CLI (herdr.PaneLister), so nothing in the
+			// tree calls this any more. Both answers are built from
+			// paneRecordsLocked, so they cannot drift apart.
 			s.mu.Lock()
 			var panes []map[string]any
-			for paneID, wsID := range s.panes {
-				p := map[string]any{"pane_id": paneID, "workspace_id": wsID}
-				if label := s.agents[paneID]; label != "" && !s.omitAgentLabels {
-					p["agent"] = label
+			for _, r := range s.paneRecordsLocked() {
+				p := map[string]any{"pane_id": r.PaneID, "workspace_id": r.WorkspaceID}
+				if r.Agent != "" {
+					p["agent"] = r.Agent
 				}
-				p["agent_status"] = "unknown"
-				if st := s.statuses[paneID]; st != "" {
-					p["agent_status"] = st
-				}
+				p["agent_status"] = r.AgentStatus
 				panes = append(panes, p)
 			}
 			s.mu.Unlock()
@@ -244,6 +250,46 @@ func (s *Server) SocketNotifications() []SocketNotification {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return append([]SocketNotification(nil), s.notifications...)
+}
+
+// paneRecordsLocked renders the current pane set the way herdr's pane.list
+// does. s.mu must be held.
+func (s *Server) paneRecordsLocked() []domain.PaneRecord {
+	records := make([]domain.PaneRecord, 0, len(s.panes))
+	for paneID, wsID := range s.panes {
+		r := domain.PaneRecord{PaneID: paneID, WorkspaceID: wsID, AgentStatus: "unknown"}
+		if label := s.agents[paneID]; label != "" && !s.omitAgentLabels {
+			r.Agent = label
+		}
+		if st := s.statuses[paneID]; st != "" {
+			r.AgentStatus = st
+		}
+		records = append(records, r)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].PaneID < records[j].PaneID })
+	return records
+}
+
+// ListPanes satisfies herdr.PaneLister, standing in for `herdr pane list`.
+// It reads the SAME state the event stream is driven from, so a test that
+// adds, labels or removes a pane moves both without a second registration
+// step — the property the real pair has, where the CLI is a client of the
+// server it is listing.
+func (s *Server) ListPanes(_ context.Context) ([]domain.PaneRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.listPanesErr != nil {
+		return nil, s.listPanesErr
+	}
+	return s.paneRecordsLocked(), nil
+}
+
+// SetListPanesError makes ListPanes fail, the way the CLI fails when herdr
+// is not running (a non-zero exit carrying the error envelope).
+func (s *Server) SetListPanesError(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.listPanesErr = err
 }
 
 // AddPane registers a pane (replayed to future pane.created subscribers and
@@ -447,6 +493,9 @@ case "$1 $2" in
       cat %q.agents 2>/dev/null
     fi
     ;;
+  "pane list")
+    cat %q.panelist 2>/dev/null
+    ;;
   "workspace list")
     cat %q.workspaces 2>/dev/null
     ;;
@@ -474,7 +523,7 @@ case "$1 $2" in
 esac
 exit 0
 `, f.LogPath, f.FailFlag, f.LegacyFlag, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile,
-		f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
+		f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile, f.PaneFile)
 	if err := os.WriteFile(f.BinPath, []byte(script), 0o700); err != nil {
 		return nil, err
 	}
@@ -485,6 +534,11 @@ exit 0
 // agent_not_found (exit 1), as herdr does for an unknown target.
 func (f *FakeCLI) SetAgentGet(content string) error {
 	return os.WriteFile(f.PaneFile+".agentget", []byte(content), 0o600)
+}
+
+// SetPaneList sets what `pane list` prints.
+func (f *FakeCLI) SetPaneList(content string) error {
+	return os.WriteFile(f.PaneFile+".panelist", []byte(content), 0o600)
 }
 
 // SetCreated sets what `workspace create` and `tab create` print.

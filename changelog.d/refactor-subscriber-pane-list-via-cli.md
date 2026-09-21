@@ -1,0 +1,1 @@
+- Changed the event subscriber to take its pane listing from the `herdr` CLI instead of the events socket, so every herdr call outside the event streams and notifications now goes through the CLI.

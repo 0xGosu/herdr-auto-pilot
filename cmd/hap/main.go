@@ -639,7 +639,7 @@ func runDaemon(ctx context.Context, paths config.Paths, out io.Writer, args []st
 		ControlSocketPath: paths.ControlSocketPath(),
 		Store:             st,
 		Herdr:             cliAdapter,
-		Events:            herdr.NewSubscriber(socketPath),
+		Events:            herdr.NewSubscriber(socketPath, cliAdapter),
 		Stream:            events,
 		// Socket first, CLI as the transport backstop: `notification.show`
 		// answers whether the toast was actually painted, which is the

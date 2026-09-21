@@ -24,7 +24,7 @@ func TestSubscriberReceivesTransitions(t *testing.T) {
 	// via the pane.created replay, then watched for status changes (FR-001).
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 16)
@@ -54,7 +54,7 @@ func TestSubscriberIgnoresDoublePlaceholderAgents(t *testing.T) {
 	defer srv.Close()
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 16)
@@ -107,7 +107,7 @@ func TestSubscriberDiscoversNewPanes(t *testing.T) {
 	}
 	defer srv.Close()
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 16)
@@ -145,7 +145,7 @@ func TestSubscriberEmitsDetectedTransition(t *testing.T) {
 	}
 	defer srv.Close()
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 16)
@@ -179,7 +179,7 @@ func TestSubscriberReconnectsWithBackoff(t *testing.T) {
 	defer srv.Close()
 	srv.AddAgentPane("w1:p2", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 16)
@@ -217,7 +217,7 @@ func TestSubscriberRecoversFromSilentlyVanishedPane(t *testing.T) {
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 	srv.AddAgentPane("w1:p9", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 16)
@@ -274,7 +274,7 @@ func TestSubscriberWatchesOnlyAgentPanes(t *testing.T) {
 	srv.AddPane("w1:sh2", "w1")
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sub.Subscribe(ctx, make(chan domain.AgentTransition, 16))
@@ -296,7 +296,7 @@ func TestSubscriberWatchesAPaneOnceAnAgentStartsInIt(t *testing.T) {
 	srv.AddPane("w1:sh", "w1")
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 64)
@@ -343,7 +343,7 @@ func TestSubscriberStopsWatchingAPaneWhoseAgentExited(t *testing.T) {
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 	srv.AddAgentPane("w1:p2", "w1", "codex")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sub.Subscribe(ctx, make(chan domain.AgentTransition, 64))
@@ -373,7 +373,7 @@ func TestSubscriberWatchesEveryPaneWhenPaneListCarriesNoLabels(t *testing.T) {
 	srv.AddPane("w1:sh", "w1")
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 64)
@@ -410,7 +410,7 @@ func TestSubscriberDeliversANewAgentsFirstStatus(t *testing.T) {
 	srv.AddPane("w1:sh", "w1")
 	srv.AddAgentPane("w1:p1", "w1", "claude")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 64)
@@ -446,7 +446,7 @@ func TestSubscriberWithOnlyShellsStillSeesAnAgentStart(t *testing.T) {
 	srv.AddPane("w1:sh", "w1")
 	srv.AddPane("w1:sh2", "w1")
 
-	sub := NewSubscriber(srv.SocketPath)
+	sub := NewSubscriber(srv.SocketPath, srv)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	out := make(chan domain.AgentTransition, 64)
@@ -1317,5 +1317,127 @@ func TestFocusPaneFailure(t *testing.T) {
 	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
 	if err := cli.FocusPane(context.Background(), "1:1", "1-1"); err == nil {
 		t.Error("failing CLI should surface an error from FocusPane")
+	}
+}
+
+func TestCLIListPanes(t *testing.T) {
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The envelope `herdr pane list` really prints (captured live, herdr
+	// 0.8.2), trimmed to the fields the subscriber reads: one agent pane and
+	// one plain shell, which is the distinction the pane set is derived from.
+	if err := fake.SetPaneList(`{"id":"cli:pane:list","result":{"type":"pane_list","panes":[` +
+		`{"agent":"claude","agent_status":"working","pane_id":"w1:p1","tab_id":"w1:t1","workspace_id":"w1"},` +
+		`{"agent_status":"unknown","pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"}` +
+		`]}}`); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	panes, err := cli.ListPanes(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []domain.PaneRecord{
+		{PaneID: "w1:p1", TabID: "w1:t1", WorkspaceID: "w1", Agent: "claude", AgentStatus: "working"},
+		{PaneID: "w1:p2", TabID: "w1:t2", WorkspaceID: "w1", AgentStatus: "unknown"},
+	}
+	if !slices.Equal(panes, want) {
+		t.Fatalf("ListPanes() = %+v, want %+v", panes, want)
+	}
+	if calls := fake.Calls(); !slices.Equal(calls, []string{"pane list"}) {
+		t.Errorf("ListPanes should invoke `pane list` once, got %v", calls)
+	}
+}
+
+func TestCLIListPanesEmptyHerdIsNotAnError(t *testing.T) {
+	// A herd with no panes is a legitimate answer and must stay
+	// distinguishable from a failure: the subscriber waits for discovery on
+	// the first and reconnects on the second.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetPaneList(`{"id":"cli:pane:list","result":{"type":"pane_list","panes":[]}}`); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	panes, err := cli.ListPanes(context.Background())
+	if err != nil {
+		t.Fatalf("empty listing must not error: %v", err)
+	}
+	if len(panes) != 0 {
+		t.Fatalf("ListPanes() = %+v, want none", panes)
+	}
+}
+
+func TestCLIListPanesRefusesAnErrorEnvelope(t *testing.T) {
+	// herdr exits non-zero for a protocol error (verified: server_not_running
+	// exits 1), which run() already turns into an error. This covers the
+	// other direction — an error answered with a ZERO exit — because decoding
+	// its absent "panes" as an empty herd would tell the subscriber there is
+	// nothing to watch instead of that herdr is unreachable.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetPaneList(`{"id":"cli:pane:list","error":` +
+		`{"code":"server_not_running","message":"no herdr server is running"}}`); err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	panes, err := cli.ListPanes(context.Background())
+	if err == nil {
+		t.Fatalf("ListPanes() = %+v, want an error", panes)
+	}
+	if !strings.Contains(err.Error(), "server_not_running") {
+		t.Errorf("error should name herdr's code, got %v", err)
+	}
+}
+
+func TestCLIListPanesRejectsUnparseableOutput(t *testing.T) {
+	// The fake prints nothing when no listing is set, which is what a herdr
+	// that does not answer looks like. It must fail rather than read as an
+	// empty herd.
+	fake, err := fakeherdr.NewFakeCLI(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &CLI{BinPath: fake.BinPath, Timeout: 5 * time.Second}
+	if panes, err := cli.ListPanes(context.Background()); err == nil {
+		t.Fatalf("ListPanes() = %+v, want an error", panes)
+	}
+}
+
+func TestSubscriberReportsAFailedPaneListingRatherThanAnEmptyHerd(t *testing.T) {
+	// The pane listing and the status stream now ride different transports,
+	// so a listing that fails must surface as a reconnect — not as "no panes
+	// to watch", which would park the status loop silently until something
+	// else marked the pane set dirty.
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+	srv.SetListPanesError(fmt.Errorf("herdr pane list: server_not_running"))
+
+	sub := NewSubscriber(srv.SocketPath, srv)
+	if err := sub.runStatus(context.Background(), make(chan domain.AgentTransition, 1)); err == nil {
+		t.Fatal("runStatus should report the failed listing")
+	} else if !strings.Contains(err.Error(), "server_not_running") {
+		t.Errorf("error should carry herdr's reason, got %v", err)
+	}
+	if subs := srv.StatusSubscriptions(); len(subs) != 0 {
+		t.Errorf("nothing should have been subscribed, got %v", subs)
+	}
+}
+
+func TestSubscriberDefaultsToTheCLIWhenNoListerIsGiven(t *testing.T) {
+	// listPanes runs on the reconnect loop, where a nil lister would panic
+	// the daemon path (CLAUDE.md: fail safe, no panics).
+	if sub := NewSubscriber("/tmp/nonexistent.sock", nil); sub.Panes == nil {
+		t.Fatal("NewSubscriber(nil) left no pane lister")
 	}
 }

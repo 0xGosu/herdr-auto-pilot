@@ -75,6 +75,23 @@ type PaneInfo struct {
 	TerminalID     string // herdr's unique per-terminal id; changes when the terminal behind a reused pane id is recreated
 }
 
+// PaneRecord is one row of herdr's live pane listing (`herdr pane list` /
+// the socket's pane.list — the CLI is a client of that same method, so the
+// two return identical rows).
+//
+// It covers EVERY pane, plain shells included, which is what the event
+// subscriber needs: the set it watches is derived from it, and a pane the
+// listing no longer reports is what prunes a stale agent label. Agent is
+// empty for a shell, and a listing that labels NO pane says nothing about
+// agents at all (see herdr.Subscriber.listPanes).
+type PaneRecord struct {
+	PaneID      string
+	TabID       string
+	WorkspaceID string
+	Agent       string // detected agent label; empty for a plain shell
+	AgentStatus string // herdr-reported agent_status; "unknown" for a shell
+}
+
 // Situation is a classified, attention-requiring state of one agent pane.
 type Situation struct {
 	Type        SituationType

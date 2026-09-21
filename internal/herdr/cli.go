@@ -580,6 +580,62 @@ func (c *CLI) PaneInfo(ctx context.Context, paneID string) (domain.PaneInfo, err
 	}, nil
 }
 
+// paneListResponse is the `herdr pane list` envelope (verified live against
+// herdr 0.8.2). The CLI is a client of the socket's pane.list method — the
+// envelope it prints is byte-identical to the one the socket answers — so
+// these are the same rows the event subscriber used to decode itself.
+//
+// Error is populated when herdr answers a protocol error. herdr exits
+// NON-ZERO for those (verified: `server_not_running` exits 1 with the
+// envelope on stderr), so run() already fails first; the field is the guard
+// for an error answered with a zero exit, where the alternative is decoding
+// an absent "panes" as an EMPTY herd. For this listing that is the dangerous
+// direction: the subscriber would read it as "no panes to watch" and wait
+// silently instead of reconnecting.
+type paneListResponse struct {
+	Error *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	Result struct {
+		Panes []struct {
+			PaneID      string `json:"pane_id"`
+			TabID       string `json:"tab_id"`
+			WorkspaceID string `json:"workspace_id"`
+			Agent       string `json:"agent"`
+			AgentStatus string `json:"agent_status"`
+		} `json:"panes"`
+	} `json:"result"`
+}
+
+// ListPanes returns herdr's live pane listing (`pane list`), EVERY pane and
+// not just agent panes — see domain.PaneRecord. It is the subscriber's
+// pane-set source (PaneLister).
+func (c *CLI) ListPanes(ctx context.Context) ([]domain.PaneRecord, error) {
+	out, err := c.run(ctx, "pane", "list")
+	if err != nil {
+		return nil, err
+	}
+	var resp paneListResponse
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &resp); err != nil {
+		return nil, fmt.Errorf("parse pane list output: %w", err)
+	}
+	if resp.Error != nil {
+		return nil, fmt.Errorf("herdr pane list: %s: %s", resp.Error.Code, resp.Error.Message)
+	}
+	panes := make([]domain.PaneRecord, 0, len(resp.Result.Panes))
+	for _, p := range resp.Result.Panes {
+		panes = append(panes, domain.PaneRecord{
+			PaneID:      p.PaneID,
+			TabID:       p.TabID,
+			WorkspaceID: p.WorkspaceID,
+			Agent:       p.Agent,
+			AgentStatus: p.AgentStatus,
+		})
+	}
+	return panes, nil
+}
+
 // workspaceListResponse is the `herdr workspace list` envelope
 // (verified against herdr 0.7).
 type workspaceListResponse struct {

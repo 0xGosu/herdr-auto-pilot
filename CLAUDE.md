@@ -1556,8 +1556,18 @@ where the behaviour could revert.
   parked APPROVAL at idle/done, the same exception pattern as Codex's Plan approval. Despite its "Enter to
   select" footer the digit alone COMMITS, but all paths still answer adaptively via `mcqdeliver.ClaudeRemoteEnv`
   in case a build ships the caret binding, failing closed when the learned label matches no offered environment.
-- One `events.subscribe` per socket connection; status subscriptions require a concrete `pane_id`; existing
-  panes are replayed as `pane_created`.
+- One request per socket connection — herdr answers and CLOSES, so nothing is pipelined or reused (verified
+  live, herdr 0.8.2: a second request on the same connection gets a reset). `events.subscribe` is the one that
+  then keeps streaming; status subscriptions require a concrete `pane_id`; existing panes are replayed as
+  `pane_created`.
+- **The socket carries EVENTS and `notification.show`; everything else is the CLI, the pane LISTING included**
+  (`herdr.PaneLister` → `CLI.ListPanes`). The CLI is itself a client of the same `pane.list` method — the
+  envelope it prints is byte-identical to the socket's — so this costs one process (~3.4ms idle, ~9ms median
+  under load, measured) and buys herdr's CLI-first surface. The accepted consequence is that the subscriber
+  needs BOTH transports: a listing can succeed and the stream that follows it fail, which costs one extra exec
+  per retry, bounded by `loop()`'s 30s ceiling. **So an outage must still be reported by the STREAM, never by an
+  empty listing** — `CLI.ListPanes` refuses a zero-exit error envelope rather than decoding its absent `panes`
+  as an empty herd, which would park the status loop with nothing to watch and no reconnect.
 - **A status subscription costs herdr CPU per pane, so only AGENT panes are watched** (`Subscriber.agentPanes`,
   herdr 0.8.2): with 13 live panes (2 agents) the per-pane subscriptions were ~5.5 points of the server's CPU —
   more than half its load with the daemon up — against ~2.8 for the agent panes alone, while the discovery stream
@@ -1570,6 +1580,9 @@ where the behaviour could revert.
   every agent running at daemon start unwatched; a herd with no agents takes the same path, harmlessly.
   **Test trap:** `fakeherdr.AddPane` is a plain SHELL — a test pushing status must use
   `AddAgentPane` (or `PushAgentDetected` first), exactly as real herdr only reports status for a detected agent.
+  `fakeherdr.Server` answers the listing too (`Server.ListPanes`, the `PaneLister` tests inject) from the SAME
+  state the event stream is driven from, so a pane added, labelled or removed moves both — mirroring it into the
+  `FakeCLI` script instead would need a second registration every test could forget.
 - Adding a pane makes the subscriber reconnect ("pane set changed", 1s backoff) — tests pushing transitions
   right after `AddPane` must wait past the resubscribe.
 - The herdr binary resolves via `HERDR_BIN_PATH` (fallback: `herdr` on PATH); the events socket via
