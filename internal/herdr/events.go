@@ -2,14 +2,27 @@
 // subscriber (IR-001) and the CLI action executor via HERDR_BIN_PATH
 // (IR-002/IR-003).
 //
-// Herdr's socket protocol (observed against herdr 0.7): one
-// events.subscribe request per connection, after which the connection is a
-// pure NDJSON event stream of {"event": name, "data": {...}} frames.
+// Herdr's socket protocol (observed against herdr 0.7): one request per
+// connection — herdr answers and closes, so nothing is ever pipelined or
+// reused (verified live against 0.8.2: a second request on the same
+// connection gets a reset). For events.subscribe the connection then stays
+// open as a pure NDJSON stream of {"event": name, "data": {...}} frames.
 // Herd-wide subscriptions are allowed for pane.created /
 // pane.agent_detected / pane.exited (current panes are replayed on
 // subscribe), but pane.agent_status_changed requires a pane_id filter — so
 // the subscriber runs a discovery connection plus a status connection that
 // is rebuilt whenever the monitored pane set changes.
+//
+// The pane LISTING those two loops are built from goes over the CLI instead
+// (PaneLister → CLI.ListPanes), because herdr's own development is
+// CLI-first and the CLI is itself a client of the same pane.list method —
+// identical rows, one extra process. The accepted consequence is that the
+// subscriber needs BOTH transports: a listing can succeed while the stream
+// that follows it fails. That is benign — it costs one extra exec per
+// retry, bounded by loop()'s 30s ceiling to about two per minute — but it
+// is the reason a herdr outage is still reported by the STREAM, never by an
+// empty listing (see CLI.ListPanes on why a zero-exit error envelope is
+// refused rather than decoded as an empty herd).
 package herdr
 
 import (
@@ -27,6 +40,13 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
 
+// PaneLister reports herdr's live pane set. CLI.ListPanes is the production
+// implementation; tests substitute a fake so the pane set they drive and the
+// one the subscriber reads stay a single source of truth.
+type PaneLister interface {
+	ListPanes(ctx context.Context) ([]domain.PaneRecord, error)
+}
+
 // Subscriber maintains the events.subscribe connections and delivers
 // agent-status transitions; it reconnects with exponential backoff and
 // never sends input while disconnected (FR-023).
@@ -34,6 +54,10 @@ type Subscriber struct {
 	SocketPath string
 	// Dial allows tests to substitute the transport.
 	Dial func(ctx context.Context) (net.Conn, error)
+	// Panes lists the live pane set. Never nil: NewSubscriber falls back to
+	// a default CLI, because listPanes runs on the reconnect loop where a
+	// nil deref would panic the daemon path.
+	Panes PaneLister
 
 	mu    sync.Mutex
 	panes map[string]paneInfo // monitored pane set (FR-001)
@@ -56,10 +80,17 @@ type paneInfo struct {
 	status string
 }
 
-// NewSubscriber creates a subscriber for the given Herdr socket path.
-func NewSubscriber(socketPath string) *Subscriber {
+// NewSubscriber creates a subscriber for the given Herdr socket path, using
+// panes for the pane listing. A nil lister falls back to a default CLI so the
+// zero-configuration caller still works; pass the process's own CLI adapter
+// to inherit its resolved binary path and timeout.
+func NewSubscriber(socketPath string, panes PaneLister) *Subscriber {
+	if panes == nil {
+		panes = NewCLI()
+	}
 	s := &Subscriber{
 		SocketPath: socketPath,
+		Panes:      panes,
 		panes:      map[string]paneInfo{},
 		dirty:      make(chan struct{}, 1),
 	}
@@ -616,31 +647,23 @@ func call(ctx context.Context, dial func(context.Context) (net.Conn, error),
 	return nil
 }
 
-// listPanes queries the live pane set over a short-lived connection, and
-// reports whether the listing labelled any pane with its agent (see runStatus).
+// listPanes queries the live pane set through the CLI, and reports whether
+// the listing labelled any pane with its agent (see runStatus).
 func (s *Subscriber) listPanes(ctx context.Context) (ids []string, labelled bool, err error) {
-	var result struct {
-		Panes []struct {
-			PaneID      string `json:"pane_id"`
-			TabID       string `json:"tab_id"`
-			WorkspaceID string `json:"workspace_id"`
-			Agent       string `json:"agent"`
-			AgentStatus string `json:"agent_status"`
-		} `json:"panes"`
+	panes, err := s.Panes.ListPanes(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("list panes: %w", err)
 	}
-	if err := call(ctx, s.Dial, "hap_pane_list", "pane.list", map[string]any{}, &result); err != nil {
-		return nil, false, err
-	}
-	for _, p := range result.Panes {
+	for _, p := range panes {
 		if !domain.IsPlaceholderAgent(p.Agent, "") {
 			labelled = true
 			break
 		}
 	}
-	ids = make([]string, 0, len(result.Panes))
+	ids = make([]string, 0, len(panes))
 	s.mu.Lock()
 	live := map[string]bool{}
-	for _, p := range result.Panes {
+	for _, p := range panes {
 		ids = append(ids, p.PaneID)
 		live[p.PaneID] = true
 		info := s.panes[p.PaneID]
