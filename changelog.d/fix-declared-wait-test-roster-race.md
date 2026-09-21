@@ -1,1 +1,0 @@
-- Fixed an intermittent failure in the declared-wait tests, where the daemon's first roster publish could land mid-test and make the test's agent disappear.
