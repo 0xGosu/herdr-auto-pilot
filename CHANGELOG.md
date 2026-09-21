@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.57
+
+- Fixed an intermittent failure in the declared-wait tests, where the daemon's first roster publish could land mid-test and make the test's agent disappear.
+
 ## 0.9.56
 
 - Changed the event subscriber to take its pane listing from the `herdr` CLI instead of the events socket, so every herdr call outside the event streams and notifications now goes through the CLI.
