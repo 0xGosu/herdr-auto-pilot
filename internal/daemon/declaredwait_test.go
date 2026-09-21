@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 )
 
 // #508 item 3. An agent blocked on purpose — a cold native build, a CI poll —
@@ -37,20 +38,31 @@ func declareWait(t *testing.T, h *harness, agentID string, d time.Duration) {
 	}
 }
 
-// publishOne names an agent and publishes it as this node's live roster, which
-// is what resolveActionTarget reads: a queued kind only ever acts on an agent
-// the owning daemon can still see.
+// newPublishedHarness starts a daemon whose herd is one parked agent, names it,
+// and publishes it as this node's live roster — which is what
+// resolveActionTarget reads: a queued kind only ever acts on an agent the
+// owning daemon can still see.
 //
-// The fake herdr is told about it FIRST, and that half is load-bearing rather
-// than tidiness: the running daemon republishes the roster from its own agent
-// listing, so a row seeded here alone is wiped by the next sweep and the
-// action then fails with "no agent known as … is running on this machine".
-// It passed on a fast runner and failed on a slow one, which is the whole
-// signature of leaving it out.
-func publishOne(t *testing.T, h *harness, agentID string) {
+// The fake herdr is told about the agent BEFORE the daemon starts, and that
+// ordering is the whole point. The daemon publishes the roster from its own
+// listings, AUTHORITATIVELY, so any listing that lacks the agent retires the
+// row seeded below — and the action then fails with "no agent known as … is
+// running on this machine". Telling the fake after start closes the later
+// sweeps but not the FIRST listing: the startup reconcile lists the herd as
+// soon as Run begins and hands that listing to an asynchronous roster pass, so
+// an empty listing taken before the test installed the agent could land after
+// the test's own publish and retire it. There is no startup-complete signal to
+// wait on instead, so the fix is to make every listing the daemon ever takes
+// agree with the test. It failed about one run in six under GOMAXPROCS=1 and
+// four attempts in six on the macOS runner, at whichever step followed the
+// write (#538).
+func newPublishedHarness(t *testing.T, agentID string) *harness {
 	t.Helper()
+	h := newHarnessWrapped(t, "", func(fh *fakeHerdr) ports.HerdrPort {
+		fh.setAgents(parked(agentID, "idle"))
+		return fh
+	})
 	ctx := context.Background()
-	h.herdr.setAgents(parked(agentID, "idle"))
 	if _, err := h.raw.EnsureAgentName(ctx, agentID); err != nil {
 		t.Fatalf("name agent: %v", err)
 	}
@@ -60,6 +72,7 @@ func publishOne(t *testing.T, h *harness, agentID string) {
 	}}, now); err != nil {
 		t.Fatalf("publish roster: %v", err)
 	}
+	return h
 }
 
 func TestAWaitingAgentRaisesNoQueueNotice(t *testing.T) {
@@ -327,9 +340,8 @@ func TestAParkedAgentsHandoutIsReclaimedOnceTheWaitLapses(t *testing.T) {
 // that queued it would arrive skewed by however far apart two machines'
 // clocks are, and every gate compares against the owner's.
 func TestDeclareWaitActionMintsTheDeadlineOnTheOwningNodesClock(t *testing.T) {
-	h := newHarness(t, "")
+	h := newPublishedHarness(t, "pW5")
 	ctx := context.Background()
-	publishOne(t, h, "pW5")
 
 	before := h.daemon.opt.Clock.Now()
 	if _, err := h.daemon.declareWaitAction(ctx, domain.AgentAction{
@@ -372,9 +384,8 @@ func TestDeclareWaitActionMintsTheDeadlineOnTheOwningNodesClock(t *testing.T) {
 // EXECUTOR rather than only on the surfaces: an unbounded wait is `hap disable`
 // by another name, minus every place that says so to the operator.
 func TestDeclareWaitActionRefusesAnOutOfBoundsDuration(t *testing.T) {
-	h := newHarness(t, "")
+	h := newPublishedHarness(t, "pW6")
 	ctx := context.Background()
-	publishOne(t, h, "pW6")
 
 	for _, seconds := range []int64{
 		int64((domain.MaxDeclaredWait + time.Hour) / time.Second),
@@ -405,9 +416,8 @@ func TestDeclareWaitActionRefusesAnOutOfBoundsDuration(t *testing.T) {
 // after longer than that would withhold work from an agent that was already
 // free.
 func TestAQueuedWaitThatOutlivedItsOwnDurationIsRefused(t *testing.T) {
-	h := newHarness(t, "")
+	h := newPublishedHarness(t, "pW7")
 	ctx := context.Background()
-	publishOne(t, h, "pW7")
 
 	_, err := h.daemon.declareWaitAction(ctx, domain.AgentAction{
 		Kind: domain.AgentActionDeclareWait, Target: "pW7",
