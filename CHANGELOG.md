@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.56
+
+- Changed the event subscriber to take its pane listing from the `herdr` CLI instead of the events socket, so every herdr call outside the event streams and notifications now goes through the CLI.
+
 ## 0.9.55
 
 - Added `hap wait <duration>` — an agent can now say it is deliberately busy (a cold build, a CI poll) instead of looking wedged, and hap leaves its queue alone until the wait lapses while still answering its prompts.
