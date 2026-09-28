@@ -3846,7 +3846,14 @@ func TestLLMFallbackStagingRegateAndPromotion(t *testing.T) {
 	if got := h.herdr.sentInputs()[0]; got != "1" {
 		t.Errorf("promoted LLM action %q, want \"1\"", got)
 	}
-	decs, _ := h.raw.LLMDecisionByRequest(ctx, requestID.get())
+	// Waited for, not read once: the daemon marks the decision accepted only
+	// AFTER the send returns, so a read taken the moment the keystroke lands can
+	// see it still pending — observed under full-suite load.
+	var decs *domain.LLMDecision
+	waitFor(t, 5*time.Second, func() bool {
+		decs, _ = h.raw.LLMDecisionByRequest(ctx, requestID.get())
+		return decs != nil && decs.Status == "accepted"
+	})
 	if decs == nil || decs.Status != "accepted" {
 		t.Errorf("staged decision should be accepted, got %+v", decs)
 	}

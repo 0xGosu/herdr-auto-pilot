@@ -1753,6 +1753,26 @@ type Agents struct {
 	// `hap agent rename` on one is reverted at the next capture — rename such
 	// an agent through Claude's own /rename instead.
 	SyncClaudeSessionName bool `toml:"sync_claude_session_name"`
+
+	// ClaudeTypedInput delivers text to a claude agent as paced keystroke
+	// bursts instead of a paste, whenever Claude would otherwise read it as a
+	// paste: any multi-line message (a task hand-out, the orchestrator's brief)
+	// and any single line long enough to trip Claude's paste heuristic.
+	//
+	// Claude Code wraps a paste in `<pasted_content>` tags and tells its model
+	// that instructions inside them only count where the user's own typed words
+	// direct it to act — so a hand-out that arrives whole as a paste reads as
+	// quoted text with no request attached. Typed, it reads as the operator's
+	// own message, which is how it always read before Claude drew the
+	// distinction.
+	//
+	// Off by default. Short single-line sends (menu digits, `/rename`, one-line
+	// replies) are unchanged either way — they already arrive as typing — and so
+	// is every other agent type. A message starting with `!` or carrying control
+	// characters other than newlines keeps the paste route, because typed
+	// keystrokes would reinterpret it (`!` switches Claude to shell mode).
+	// Read live: a reload applies it to the next send.
+	ClaudeTypedInput bool `toml:"claude_typed_input"`
 }
 
 // PaletteOverrides are optional per-role color overrides for the TUI

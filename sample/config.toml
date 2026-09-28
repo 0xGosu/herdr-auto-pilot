@@ -768,6 +768,29 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
                                   # at once rather than waiting for each one's
                                   # next attention event; after that it runs on
                                   # each agent's ordinary captures.
+claude_typed_input = false        # TYPE what a claude agent would otherwise get
+                                  # as a PASTE — a multi-line task hand-out, the
+                                  # orchestrator's brief, a line too long for
+                                  # one burst. Claude Code wraps a paste in
+                                  # <pasted_content> tags and tells its model the
+                                  # instructions inside only count where the
+                                  # user's own typed words say so, so a hand-out
+                                  # pasted whole reads as quoted text with no
+                                  # request attached. On, hap types it in paced
+                                  # 64-character bursts (well under Claude's
+                                  # paste threshold) and then presses Enter —
+                                  # ~0.5s for a 1,000-character hand-out, ~1.3s
+                                  # for 3,500. If a prompt appears while it
+                                  # types, the Enter is withheld and the send
+                                  # fails with the message left in the composer.
+                                  # Unchanged either way: short single lines
+                                  # (menu digits, /rename, one-line replies —
+                                  # they already arrive as typing) and every
+                                  # other agent type. A message that typing would
+                                  # reinterpret keeps the paste: one starting
+                                  # with `!` (shell mode) or carrying control
+                                  # characters other than newlines.
+                                  # Applies on the next send, no restart needed.
 
 # ── database ────────────────────────────────────────────────────────
 # Where hap keeps its state. "sqlite" (the default) is one local file in the
