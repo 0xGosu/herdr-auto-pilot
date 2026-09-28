@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.60
+
+- Added `[agents] claude_typed_input` (off by default). When it is on, long hand-outs to claude agents — any multi-line message, or a single line too long for one burst — are now typed in paced keystroke bursts instead of pasted, then submitted with Enter. Recent Claude Code builds wrap a paste in `<pasted_content>` and tell the model to treat the instructions inside as untrusted, so a pasted hand-out read as quoted text rather than as a request. Messages starting with `!` (which would switch claude to shell mode) and messages containing control characters other than newlines still go the paste route. Short replies, menu answers and other agent types are unchanged. Turn it on with `hap config set agents.claude_typed_input true`.
+
 ## 0.9.59
 
 - Added an `agent.mode agent=… mode=… [promote=…]` event to `hap stream orchestrator`, announced once per change of an agent's permission mode. `promote=` names the most autonomous mode (`auto` for claude, `acceptEdits` for agy) when the daemon sees an agent in its restrictive mode, and the orchestrator now rotates such agents there on its own. It never leaves `plan`, never touches codex (whose `default` is already unrestricted), and respects a mode an operator set with `hap mode`
