@@ -23,7 +23,7 @@ import (
 // for it. Returns the app, the fake, the agent's short name, and the audit id.
 // seedLocalFSConfigIn writes a config declaring the local_fs provider into dir
 // and returns its path, for a fixture whose task list is a FILE on disk. The
-// package default is the sqlite provider, under which a filesystem path is not
+// package default is the database provider, under which a filesystem path is not
 // a legal list name at all.
 func seedLocalFSConfigIn(t *testing.T, dir string) string {
 	t.Helper()

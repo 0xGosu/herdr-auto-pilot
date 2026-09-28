@@ -157,7 +157,7 @@ func TestGistLocatorRoundTripsThroughParse(t *testing.T) {
 }
 
 // localCfg is the file-backed posture, named explicitly. config.Default() is
-// no longer it: a fresh install defaults to the sqlite provider, so a test
+// no longer it: a fresh install defaults to the database provider, so a test
 // that means "a list that is a file on disk" has to say so.
 func localCfg() config.Config {
 	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderLocalFS}}
@@ -372,10 +372,10 @@ func TestCanonicalIsStableAcrossSpellingsOfOnePath(t *testing.T) {
 }
 
 func sqliteCfg() config.Config {
-	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderSQLite}}
+	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderDatabase}}
 }
 
-// TestResolveSQLiteProviderMintsANodeScopedLocator: the sqlite provider places
+// TestResolveSQLiteProviderMintsANodeScopedLocator: the database provider places
 // a list in the resolving node's namespace, deriving the name per agent exactly
 // like the gist provider, and refuses to mint one when no node is known — a
 // locator in nobody's namespace would be persisted and never found again.
@@ -417,7 +417,7 @@ func TestResolveSQLiteProviderMintsANodeScopedLocator(t *testing.T) {
 				t.Error("a database list is not a file on this machine; Remote must be true so --path is never offered for it")
 			}
 			if got.Egress() {
-				t.Error("the sqlite provider never leaves the machine")
+				t.Error("the database provider never leaves the machine")
 			}
 			if tasklocator.Canonical(got.Locator) != got.Locator {
 				t.Errorf("Canonical(%q) = %q, must be verbatim", got.Locator, tasklocator.Canonical(got.Locator))

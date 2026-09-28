@@ -37,7 +37,7 @@ func newReclaimFixture(t *testing.T, sources ...config.TaskSource) *reclaimFixtu
 
 	now := time.Now().Truncate(time.Millisecond)
 	cfg := config.Default()
-	cfg.TaskSourceProvider.Provider = config.ProviderSQLite
+	cfg.TaskSourceProvider.Provider = config.ProviderDatabase
 	cfg.TaskSources = sources
 	// Excerpt retention off: the two windows are independent settings, and
 	// this pins that an operator keeping every excerpt still reclaims lists.

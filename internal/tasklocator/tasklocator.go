@@ -31,7 +31,7 @@ import (
 const GistScheme = "gist://"
 
 // DBScheme prefixes a locator naming a list kept inside hap's own database (the
-// `sqlite` task-source provider):
+// `database` task-source provider):
 //
 //	db://<node-id>/<name>
 //
@@ -176,7 +176,7 @@ type Resolved struct {
 // nothing on the delivery path can reach it.
 //
 // nodeID is the installation's node id (the store's NodeID), used only by the
-// sqlite provider to place a list in this node's namespace; every hap process
+// database provider to place a list in this node's namespace; every hap process
 // on one machine reads the same id from <state>/node-id, so it does not make
 // the locator process-dependent. Pass "" when no store is at hand — a sqlite
 // source then fails with ErrNodeIDRequired rather than minting a locator in
@@ -211,7 +211,7 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName, nodeID string)
 		if strings.TrimSpace(p.GistID) == "" {
 			return Resolved{}, fmt.Errorf("task source provider %s has no gist_id", p.Name)
 		}
-	case config.ProviderSQLite:
+	case config.ProviderDatabase:
 		if strings.TrimSpace(nodeID) == "" {
 			return Resolved{}, ErrNodeIDRequired
 		}
@@ -230,7 +230,7 @@ func Resolve(cfg config.Config, src config.TaskSource, agentName, nodeID string)
 	if err := config.ValidateStoreFileName(file); err != nil {
 		return Resolved{}, fmt.Errorf("task source file name: %w", err)
 	}
-	if p.Name == config.ProviderSQLite {
+	if p.Name == config.ProviderDatabase {
 		out.Locator = Canonical(DBLocator(nodeID, file))
 	} else {
 		out.Locator = Canonical(GistLocator(p.GistID, file))

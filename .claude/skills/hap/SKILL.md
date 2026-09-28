@@ -446,7 +446,7 @@ hap agents                        # every machine's agents; the LAST field is th
 hap escalations                   # rows carry node=<label>
 hap escalations confirm 42        # an escalation from another machine: "queued for node <label>"
 hap pause --node laptop           # pause THAT machine's daemon (resume likewise)
-hap task --node laptop otter list # another machine's `sqlite`-provider task list
+hap task --node laptop otter list # another machine's `database`-provider task list
 hap rename --node laptop 1 otter  # rename/enable/disable/capture another machine's agent
 ```
 
@@ -473,7 +473,7 @@ agent rather than risk rotating the wrong one here.
 In the TUI, another machine's agents are ordinary rows on the Agents tab: the
 LOCATION column shows the MACHINE for them (a local agent shows its herdr
 `#<workspace>-<tab>` position instead), and `v` `e` `x` `n` `f` all work. `t`
-(see tasks) works too when that agent's task source uses the `sqlite` provider,
+(see tasks) works too when that agent's task source uses the `database` provider,
 since that is the only kind of list that syncs.
 
 ## audit
@@ -646,7 +646,7 @@ tab-separated stdout is unaffected.
 | `tui.disable_check_for_update` | false | turn off the GitHub release check (TUI only, at most every 6h) |
 | `tui.max_instances` | 1 | how many `hap tui` processes may run; starting one closes the oldest past this cap. `0` = no limit |
 | `cli.ai_agent_friendly_output` | true | append the "Next steps" footer to command output |
-| `task_source_provider.provider` | `sqlite` | default storage for every task list: `sqlite` (inside hap's database; syncs under the turso engine), `local_fs` (a markdown file on disk — the only provider where `path` is a filesystem path), or `github_gist`. The default applies to a config file that does not exist yet; an install that already has one is pinned to `local_fs`. |
+| `task_source_provider.provider` | `database` | default storage for every task list: `database` (inside hap's database, whichever engine; syncs under turso or libsql — the old spelling `sqlite` is still accepted), `local_fs` (a markdown file on disk — the only provider where `path` is a filesystem path), or `github_gist`. The default applies to a config file that does not exist yet; an install that already has one is pinned to `local_fs`. |
 | `task_source_provider.env_file` | (none) | file holding `GITHUB_TOKEN` for `github_gist`; read at use time |
 | `task_source_provider.timeout_seconds` | 20 | per remote store call |
 | `task_source_provider.refresh_seconds` | 30 | how long a remote list is cached |
@@ -855,7 +855,7 @@ A task source points an agent at a checklist so idle agents get the next
 unchecked item. `hap config task-source` manages **which list**; `hap task`
 manages the **items inside it**.
 
-Under the default `sqlite` provider the checklist argument is OPTIONAL: leave it
+Under the default `database` provider the checklist argument is OPTIONAL: leave it
 out and each matched agent gets its own list inside hap's database. Give it only
 to share ONE list across the agents a source matches — and then it is a list
 NAME, never a filesystem path. For a markdown file on disk, pass
@@ -930,7 +930,7 @@ paste its hex id. The token lives in the file `env_file` names (`GITHUB_TOKEN=�
 Enabling this sends those sources' task lists to GitHub — task text and nothing
 else.
 
-`provider = "sqlite"` keeps a source's list **inside hap's database** instead:
+`provider = "database"` keeps a source's list **inside hap's database** instead:
 no file, no credential, nothing leaves the machine — and under
 `database.engine = "turso"` those lists sync with everything else, so every
 machine's TUI shows and edits every other machine's queues (`hap task --node

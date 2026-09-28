@@ -478,8 +478,8 @@ func TestSeeTasksOnARemoteAgentWithoutASharedListSaysWhy(t *testing.T) {
 		t.Errorf("tab = %v, want to stay on Agents", m.tab)
 	}
 	if !strings.Contains(m.message, "laptop") ||
-		!strings.Contains(m.message, string(config.ProviderSQLite)) {
-		t.Errorf("message = %q, want it to name the node and the sqlite provider", m.message)
+		!strings.Contains(m.message, string(config.ProviderDatabase)) {
+		t.Errorf("message = %q, want it to name the node and the database provider", m.message)
 	}
 	if strings.Contains(m.message, "Config tab") {
 		t.Errorf("message = %q points at THIS machine's config, where there is nothing to fix", m.message)

@@ -121,7 +121,7 @@ func TestStreamTaskItemsAndDatabaseList(t *testing.T) {
 	app, st := testApp(t)
 	log := withStream(t, app)
 	if err := os.WriteFile(app.ConfigPath, []byte(
-		"[task_source_provider]\nprovider = \"sqlite\"\n\n[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n"), 0o600); err != nil {
+		"[task_source_provider]\nprovider = \"database\"\n\n[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	list := "db://" + st.NodeID() + "/otter.md"
@@ -252,7 +252,7 @@ func TestAFailingStreamNeverFailsTheCommand(t *testing.T) {
 		t.Fatalf("SetField with a failing stream: %v", err)
 	}
 	if err := os.WriteFile(app.ConfigPath, []byte(
-		"[task_source_provider]\nprovider = \"sqlite\"\n\n[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n"), 0o600); err != nil {
+		"[task_source_provider]\nprovider = \"database\"\n\n[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := app.AddTask("otter", "", "first task"); err != nil {

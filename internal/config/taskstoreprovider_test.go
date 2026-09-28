@@ -95,8 +95,8 @@ func TestAFreshConfigDefaultsToSQLite(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.cfg.ResolveProvider(TaskSource{})
-			if got.Name != ProviderSQLite {
-				t.Errorf("provider = %q, want %q", got.Name, ProviderSQLite)
+			if got.Name != ProviderDatabase {
+				t.Errorf("provider = %q, want %q", got.Name, ProviderDatabase)
 			}
 			if got.Egress() {
 				t.Error("the default provider must make no outbound call")
@@ -304,11 +304,11 @@ func TestAnyNonDefaultProviderDetectsEitherLevel(t *testing.T) {
 		// The two postures an operator reaches without touching the setting —
 		// a fresh install on sqlite, an older one pinned to local_fs — must
 		// both stay quiet, or every default install grows a provider column.
-		{"uniform sqlite default", Config{TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite}}, false},
+		{"uniform sqlite default", Config{TaskSourceProvider: TaskSourceProvider{Provider: ProviderDatabase}}, false},
 		{
 			"sqlite default with inheriting sources",
 			Config{
-				TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
+				TaskSourceProvider: TaskSourceProvider{Provider: ProviderDatabase},
 				TaskSources:        []TaskSource{{Agent: "a"}, {Agent: "b"}},
 			},
 			false,
@@ -316,7 +316,7 @@ func TestAnyNonDefaultProviderDetectsEitherLevel(t *testing.T) {
 		{
 			"sqlite default, one source kept on files",
 			Config{
-				TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
+				TaskSourceProvider: TaskSourceProvider{Provider: ProviderDatabase},
 				TaskSources:        []TaskSource{{Agent: "a"}, {Agent: "b", Provider: ProviderLocalFS}},
 			},
 			true,
@@ -324,8 +324,8 @@ func TestAnyNonDefaultProviderDetectsEitherLevel(t *testing.T) {
 		{
 			"an explicit spelling of the default is not a difference",
 			Config{
-				TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
-				TaskSources:        []TaskSource{{Agent: "a", Provider: ProviderSQLite}},
+				TaskSourceProvider: TaskSourceProvider{Provider: ProviderDatabase},
+				TaskSources:        []TaskSource{{Agent: "a", Provider: ProviderDatabase}},
 			},
 			false,
 		},
@@ -380,14 +380,14 @@ func TestTaskSourceProviderRoundTripsThroughSave(t *testing.T) {
 		}
 	})
 
-	t.Run("a fresh config saves the sqlite posture", func(t *testing.T) {
+	t.Run("a fresh config saves the database posture", func(t *testing.T) {
 		// The counterpart to the case above, and the reason it is not vacuous:
 		// the pin is what makes an EXISTING file save local_fs, while a config
 		// that never had a file names the new default.
 		path := filepath.Join(t.TempDir(), "hap.toml")
 		saved := saveAndRead(t, path, loadConfig(t, path))
-		if !strings.Contains(saved, `provider = "sqlite"`) {
-			t.Errorf("a fresh install must save the sqlite posture:\n%s", saved)
+		if !strings.Contains(saved, `provider = "database"`) {
+			t.Errorf("a fresh install must save the database posture:\n%s", saved)
 		}
 	})
 

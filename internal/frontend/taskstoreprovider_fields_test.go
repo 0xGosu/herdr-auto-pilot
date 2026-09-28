@@ -134,13 +134,31 @@ func TestProviderFieldValueNeverRendersEmpty(t *testing.T) {
 			}
 		}
 	}
-	if got := frontend.FieldValue(config.Default(), "task_source_provider.provider"); got != config.ProviderSQLite {
-		t.Errorf("the default provider must render as %q, got %q", config.ProviderSQLite, got)
+	if got := frontend.FieldValue(config.Default(), "task_source_provider.provider"); got != config.ProviderDatabase {
+		t.Errorf("the default provider must render as %q, got %q", config.ProviderDatabase, got)
 	}
 	// A Config assembled in memory never went through Load or Default, and
 	// ResolveProvider answers local_fs there — the posture that needs neither a
 	// store handle nor a node id.
 	if got := frontend.FieldValue(config.Config{}, "task_source_provider.provider"); got != config.ProviderLocalFS {
 		t.Errorf("a zero config must render as %q, got %q", config.ProviderLocalFS, got)
+	}
+}
+
+// TestProviderFieldAcceptsTheRetiredSQLiteSpelling: `sqlite` is the provider's
+// name from before hap supported more than one database engine. Scripts and
+// installed skills still type it, so the write surface takes it — and stores
+// the CURRENT name, which is all a later read ever sees.
+func TestProviderFieldAcceptsTheRetiredSQLiteSpelling(t *testing.T) {
+	app, _ := testApp(t)
+	if _, err := app.SetField(context.Background(), "task_source_provider.provider", "sqlite"); err != nil {
+		t.Fatalf("SetField(sqlite): %v", err)
+	}
+	cfg, err := app.Config()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TaskSourceProvider.Provider != config.ProviderDatabase {
+		t.Errorf("stored provider = %q, want %q", cfg.TaskSourceProvider.Provider, config.ProviderDatabase)
 	}
 }

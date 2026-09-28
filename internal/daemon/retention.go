@@ -190,7 +190,7 @@ func (d *Daemon) cfgLoggingRetention() (time.Duration, bool) {
 // setting — and 7 days is the horizon the feature was asked for.
 const taskListRetentionFloor = 7 * 24 * time.Hour
 
-// pruneOrphanTaskLists reclaims this node's `sqlite`-provider checklists that
+// pruneOrphanTaskLists reclaims this node's `database`-provider checklists that
 // nothing can reach any more, and reports whether it deleted any.
 //
 // A list is a row in task_lists and, before this, was immortal: remove its
@@ -205,7 +205,7 @@ const taskListRetentionFloor = 7 * 24 * time.Hour
 //     deleting its rows would race its writers over lists this node never wrote.
 //     Same reasoning store.PruneAgedRows gives for scoping every statement.
 //  2. It has not been written for the window (floored at taskListRetentionFloor).
-//  3. No configured sqlite source names it explicitly. The provider is read
+//  3. No configured database source names it explicitly. The provider is read
 //     through cfg.ResolveProvider, never by string-matching src.Provider: an
 //     empty Provider IS live inheritance and is never materialized, so a source
 //     that inherits a sqlite default has to count.
@@ -344,7 +344,7 @@ func (d *Daemon) liveAgentNames(ctx context.Context, now time.Time) (map[string]
 // and have its list deleted while it was sitting right there.
 func orphanTaskListReason(cfg config.Config, live map[string]bool, name string) (string, bool) {
 	for _, src := range cfg.TaskSources {
-		if cfg.ResolveProvider(src).Name != config.ProviderSQLite {
+		if cfg.ResolveProvider(src).Name != config.ProviderDatabase {
 			continue
 		}
 		if strings.TrimSpace(src.Path) == name {

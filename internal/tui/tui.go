@@ -850,6 +850,21 @@ type confirmation struct {
 	// own staleness guard, as the task mutations' expected-text does).
 	// Returning false aborts with the returned reason.
 	revalidate func(Model) (string, bool)
+	// alt, when set, is a SECOND affirmative answer on its own key — a
+	// heavier variant of onConfirm the operator must choose deliberately, so
+	// enter/y always keep meaning the lighter action. It shares revalidate and
+	// clearsTaskMarks with the primary answer.
+	alt *confirmAlt
+}
+
+// confirmAlt is a confirmation's second affirmative answer (confirmation.alt).
+type confirmAlt struct {
+	key       string // the one key that selects it; never enter, y or n
+	help      string // its help-line text, e.g. "also delete the list"
+	onConfirm func() tea.Cmd
+	// revalidate re-checks the alternative's OWN precondition after the
+	// shared one passed; nil means the shared check is enough.
+	revalidate func(Model) (string, bool)
 }
 
 // detailView is a full-record overlay opened with `v` on the Agents,
@@ -2863,22 +2878,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "enter", "y", "Y":
 			confirm := m.confirm
 			m.confirm = nil
-			// A refresh can land between the question and the answer, so the
-			// answer is only as good as the state it is re-checked against.
-			if confirm.revalidate != nil {
-				if reason, ok := confirm.revalidate(m); !ok {
-					m.message = reason
-					return m, nil
-				}
-			}
-			if confirm.clearsTaskMarks {
-				m.taskMarks = nil
-			}
-			m.beginAction()
-			return m, confirm.onConfirm()
+			return m.acceptConfirmation(confirm, confirm.onConfirm, nil)
 		case "esc", "n", "N":
 			m.confirm = nil
 			m.message = "cancelled"
+		default:
+			if alt := m.confirm.alt; alt != nil && msg.String() == alt.key {
+				confirm := m.confirm
+				m.confirm = nil
+				return m.acceptConfirmation(confirm, alt.onConfirm, alt.revalidate)
+			}
 		}
 		return m, nil
 	}
@@ -3259,6 +3268,29 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+// acceptConfirmation runs one affirmative answer to confirm: the shared
+// precondition, then the answer's own (extra, may be nil), then the action. A
+// refresh can land between the question and the answer, so the answer is only
+// as good as the state it is re-checked against.
+func (m Model) acceptConfirmation(confirm *confirmation, run func() tea.Cmd,
+	extra func(Model) (string, bool)) (tea.Model, tea.Cmd) {
+
+	for _, check := range []func(Model) (string, bool){confirm.revalidate, extra} {
+		if check == nil {
+			continue
+		}
+		if reason, ok := check(m); !ok {
+			m.message = reason
+			return m, nil
+		}
+	}
+	if confirm.clearsTaskMarks {
+		m.taskMarks = nil
+	}
+	m.beginAction()
+	return m, run()
 }
 
 // beginAction clears the previous durable outcome as soon as a new mutation
@@ -4437,7 +4469,8 @@ func (m Model) deleteTasksPrompt() (tea.Model, tea.Cmd) {
 }
 
 // dropTaskListPrompt deletes a whole checklist from the hap database — the
-// heavier twin of `x`, which on a header retires the SOURCE and keeps the list.
+// heavier twin of `x`, which on a header retires the SOURCE — keeping the
+// list, or with its D answer deleting that list too.
 // Both directions exist because they are genuinely different repairs: a dead
 // [[task_sources]] entry, or a list nothing reads any more.
 //
@@ -4480,16 +4513,20 @@ func (m Model) dropTaskListPrompt() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	app, locator, display := m.app, g.Locator, g.Display
-	drop := m.doResult(func(c context.Context) (string, error) {
-		deleted, err := app.DeleteTaskList(c, locator)
-		if err != nil {
-			return "", err
-		}
-		if !deleted {
-			return fmt.Sprintf("no task list at %s — nothing to delete", display), nil
-		}
-		return fmt.Sprintf("task list %s deleted", display), nil
-	})
+	// Built only when confirmed: doResult counts it in-flight when BUILT, so a
+	// cancelled prompt would otherwise strand the count.
+	drop := func() tea.Cmd {
+		return m.doResult(func(c context.Context) (string, error) {
+			deleted, err := app.DeleteTaskList(c, locator)
+			if err != nil {
+				return "", err
+			}
+			if !deleted {
+				return fmt.Sprintf("no task list at %s — nothing to delete", display), nil
+			}
+			return fmt.Sprintf("task list %s deleted", display), nil
+		})
+	}
 	m.confirm = &confirmation{
 		// Consequence first, in the house style of removeTaskSourcePrompt: the
 		// item count because this is the one moment the operator authorizes
@@ -4511,7 +4548,7 @@ func (m Model) dropTaskListPrompt() (tea.Model, tea.Cmd) {
 			}
 			return fmt.Sprintf("task list %s is no longer listed — re-check and retry", display), false
 		},
-		onConfirm: func() tea.Cmd { return drop },
+		onConfirm: drop,
 	}
 	return m, nil
 }
@@ -4569,9 +4606,15 @@ func (m Model) taskSourceRemovable(g frontend.TaskGroup) (string, bool) {
 }
 
 // removeTaskSourcePrompt confirms, then removes the task source's config
-// entry. The checklist file itself is deliberately left on disk: sources are
-// often hand-written docs hap did not create and could not restore, and
-// re-adding the source brings the list back untouched.
+// entry. enter/y keep the checklist: sources are often hand-written docs hap
+// did not create and could not restore, and re-adding the source brings the
+// list back untouched.
+//
+// D is the second answer, removing the source AND deleting its list, offered
+// only where `X` could delete that list anyway — a list kept in the hap
+// database — and only while no other source uses the same list, which would
+// otherwise keep handing out items from a list this just emptied. A file or a
+// gist is the operator's to delete, never hap's.
 func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
 	// Another machine's header. A task source is a [[task_sources]] entry in
 	// THAT node's config.toml, and config never enters the shared database, so
@@ -4599,18 +4642,35 @@ func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
 	// (its raw, untruncated path plus both selectors) — RemoveTaskSource
 	// re-checks all of them, so a config that shifted underneath aborts
 	// instead of removing a neighbour.
-	remove := m.do(fmt.Sprintf("task source #%d removed (checklist file kept)", g.Index),
-		func(c context.Context) error {
-			return app.RemoveTaskSource(c, g.Index, g.Source)
-		})
+	// Built only when chosen: do/doResult count the command in-flight when it
+	// is BUILT, so building every answer up front strands a count for each one
+	// not taken and makes the next quit wait out the drain timeout.
+	remove := func() tea.Cmd {
+		return m.do(fmt.Sprintf("task source #%d removed (checklist file kept)", g.Index),
+			func(c context.Context) error {
+				return app.RemoveTaskSource(c, g.Index, g.Source)
+			})
+	}
 	// A source with no path configured has no file name to name it by.
 	name := filepath.Base(g.Source.Path)
 	if g.Source.Path == "" {
 		name = "no path configured"
 	}
+	label := fmt.Sprintf("remove task source #%d (%s)? its checklist file is kept", g.Index, name)
+	var alt *confirmAlt
+	if isDBTaskLocator(g.Locator) {
+		if other, shared := m.otherTaskSourceUsing(g.Index, g.Locator); shared {
+			label = fmt.Sprintf("remove task source #%d (%s)? its list is kept — task source #%d uses it too",
+				g.Index, name, other)
+		} else {
+			label = fmt.Sprintf("remove task source #%d (%s)? y keeps its list · D also deletes the list and its %d task(s)",
+				g.Index, name, len(g.Items))
+			alt = m.removeTaskSourceAndListAlt(g)
+		}
+	}
 	m.confirm = &confirmation{
-		label: fmt.Sprintf("remove task source #%d (%s)? its checklist file is kept",
-			g.Index, name),
+		label: label,
+		alt:   alt,
 		// Removing an entry shifts every later config index down one, so a
 		// positional group#item mark would silently retarget a different
 		// source. Unreachable while this path requires an empty mark set, but
@@ -4630,9 +4690,61 @@ func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
 			return fmt.Sprintf("task source #%d changed since it was listed — re-check and retry",
 				g.Index), false
 		},
-		onConfirm: func() tea.Cmd { return remove },
+		onConfirm: remove,
 	}
 	return m, nil
+}
+
+// otherTaskSourceUsing reports another configured source whose list is
+// locator — the case where deleting the list would empty a queue that source
+// still hands out.
+func (m Model) otherTaskSourceUsing(index int, locator string) (int, bool) {
+	for _, g := range m.data.tasks {
+		if g.Index != index && g.Locator == locator {
+			return g.Index, true
+		}
+	}
+	return 0, false
+}
+
+// removeTaskSourceAndListAlt is removeTaskSourcePrompt's D answer: retire the
+// source, then delete the database list it served. RemoveTaskSourceAndList
+// re-checks the entry and the sharing inside the config write, so this
+// revalidate is the early, friendlier form of the same two questions.
+func (m Model) removeTaskSourceAndListAlt(g frontend.TaskGroup) *confirmAlt {
+	app, index, source, locator, display := m.app, g.Index, g.Source, g.Locator, g.Display
+	st := m.data.status
+	// Built only when chosen, for the in-flight reason removeTaskSourcePrompt
+	// gives.
+	run := func() tea.Cmd {
+		return m.doResult(func(c context.Context) (string, error) {
+			deleted, err := app.RemoveTaskSourceAndList(c, index, source, locator, st)
+			if err != nil {
+				return "", err
+			}
+			if !deleted {
+				return fmt.Sprintf("task source #%d removed (its list %s was already gone)", index, display), nil
+			}
+			return fmt.Sprintf("task source #%d removed and task list %s deleted", index, display), nil
+		})
+	}
+	return &confirmAlt{
+		key:       "D",
+		help:      "also delete the list",
+		onConfirm: run,
+		revalidate: func(cur Model) (string, bool) {
+			for _, now := range cur.data.tasks {
+				if now.Index == index && now.Locator != locator {
+					return fmt.Sprintf("task source #%d now uses a different list — re-check and retry", index), false
+				}
+			}
+			if other, shared := cur.otherTaskSourceUsing(index, locator); shared {
+				return fmt.Sprintf("task source #%d now uses %s too, so it was not deleted — re-check and retry",
+					other, display), false
+			}
+			return "", true
+		},
+	}
 }
 
 // confirmDeleteTaskTargets is the shared delete flow behind the list `x`
@@ -7070,6 +7182,7 @@ func (m Model) addTaskSourcePrompt() (tea.Model, tea.Cmd) {
 					return actionResultMsg{err: fmt.Errorf(
 						"expected [<checklist>] [agent] [workspace] — got %d fields (paths with spaces are not supported here; use the CLI)", len(parts))}
 				}
+				provider = config.CanonicalProvider(provider)
 				if provider != "" && !slices.Contains(config.ValidTaskSourceProviders, provider) {
 					return actionResultMsg{err: fmt.Errorf("--provider must be one of %s, got %q",
 						strings.Join(config.ValidTaskSourceProviders, ", "), provider)}
@@ -7275,7 +7388,7 @@ func (m Model) showRemoteAgentTasks(r agentRow) (tea.Model, tea.Cmd) {
 	if k < 0 {
 		m.message = fmt.Sprintf("node %s keeps no task list for %s in the shared database — "+
 			"only sources whose provider is %q are visible from another machine",
-			r.NodeLabel, orDash(r.Name), config.ProviderSQLite)
+			r.NodeLabel, orDash(r.Name), config.ProviderDatabase)
 		m.scrollCursorIntoView() // the hint line shrinks the page
 		return m, nil
 	}
@@ -7867,6 +7980,9 @@ func (m Model) helpLine() string {
 			"  enter: submit  esc: cancel"
 	}
 	if m.confirm != nil {
+		if alt := m.confirm.alt; alt != nil {
+			return "y/enter: confirm  " + alt.key + ": " + alt.help + "  n/esc: cancel"
+		}
 		return "y/enter: confirm  n/esc: cancel"
 	}
 	common := "tab: switch  ↑/↓: select  p: pause  r: resume  rr: full self-prompting  q: quit"

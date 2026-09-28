@@ -844,15 +844,17 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # change the value here and every inheriting source moves with it. hap never
 # writes the inherited value back into a source (that would freeze it).
 #
-# Values: "sqlite" (default) | "local_fs" | "github_gist"
+# Values: "database" (default) | "local_fs" | "github_gist"
+# ("sqlite" is the pre-rename spelling of "database"; it still loads and is
+# rewritten on the next save.)
 #
 # The default applies to a config file that does not exist yet. An install that
 # already has one keeps "local_fs" — hap pins it on load — so no checklist you
 # already have changes where it lives.
 # [task_source_provider]
-# provider = "sqlite"
+# provider = "database"
 
-# ── sqlite (the default) ────────────────────────────────────────────
+# ── database (the default) ──────────────────────────────────────────
 # Keeps each list INSIDE hap's own database (the task_lists table) instead of a
 # file. Under the default engine nothing leaves this machine; under
 # [database] engine = "turso" the lists sync with everything else, so every
@@ -862,11 +864,11 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 # one list across the agents a source matches, or leave it out for one list per
 # agent ("<agent-name>.md"). A list belongs to ONE machine — only its daemon
 # hands items out — so two machines' agents never share a queue.
-# provider = "sqlite"
+# provider = "database"
 
 # ── local_fs ────────────────────────────────────────────────────────
 # Each list is a markdown FILE on this machine and `path` is a filesystem path.
-# This is the only provider where that is true: under sqlite and github_gist a
+# This is the only provider where that is true: under database and github_gist a
 # path-shaped value is refused rather than silently creating a list elsewhere.
 # Set it here to move every inheriting source, or per source with
 # `hap config task-source add --agent <name> --provider local_fs <checklist.md>`.
@@ -874,7 +876,7 @@ sync_claude_session_name = false  # keep a claude agent's hap short name and its
 
 # ── github_gist ─────────────────────────────────────────────────────
 # PRIVACY: this sends the task lists of the sources using it to GitHub. It is
-# the ONLY provider that makes an outbound call — the default ("sqlite") and
+# the ONLY provider that makes an outbound call — the default ("database") and
 # "local_fs" both keep every checklist on this machine. Nothing else is ever
 # sent: no pane content, no learned rules, no audit log.
 #

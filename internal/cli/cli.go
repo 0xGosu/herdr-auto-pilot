@@ -2012,7 +2012,7 @@ func taskSourceLocation(p config.ResolvedProvider, path string) string {
 	}
 	// A list inside a store: a gist file, or a row in the hap database.
 	key := "gist_file"
-	if p.Name == config.ProviderSQLite {
+	if p.Name == config.ProviderDatabase {
 		key = "db_list"
 	}
 	if path == "" {
@@ -2542,6 +2542,7 @@ func taskSource(ctx context.Context, app *frontend.App, out io.Writer, args []st
 		}
 		return fmt.Errorf("usage: hap config task-source [add] [--agent A] [--workspace W] [--template T] [--provider P] [--gist-id ID] [--auto-send-when-idle] [--enable-llm-review-before-auto-send] [--max-tasks N] [<checklist.md>] | list | set <index|agent> <key> <value> | remove <index|agent> (see: hap help config task-source)")
 	}
+	*provider = config.CanonicalProvider(*provider)
 	if *provider != "" && !slices.Contains(config.ValidTaskSourceProviders, *provider) {
 		return fmt.Errorf("--provider must be one of %s, got %q",
 			strings.Join(config.ValidTaskSourceProviders, ", "), *provider)
@@ -2670,9 +2671,9 @@ func describeAddedSource(p config.ResolvedProvider, path string, inherited bool)
 	switch {
 	case !p.Remote():
 		where = path
-	case p.Name == config.ProviderSQLite && path != "":
+	case p.Name == config.ProviderDatabase && path != "":
 		where = fmt.Sprintf("%q in the hap database (shared by every agent this source matches)", path)
-	case p.Name == config.ProviderSQLite:
+	case p.Name == config.ProviderDatabase:
 		where = fmt.Sprintf("one list per matched agent (%q in the hap database, created on first hand-out)",
 			"<agent-name>.md")
 	case path != "":
@@ -2874,7 +2875,7 @@ func taskSourceSet(ctx context.Context, app *frontend.App, out io.Writer, args [
 		// "inherit"/"" clears the override. Without a clearing spelling an
 		// override would be a one-way door: nothing else can put a source back
 		// to following [task_source_provider].
-		name := strings.ToLower(strings.TrimSpace(value))
+		name := config.CanonicalProvider(strings.ToLower(strings.TrimSpace(value)))
 		if name == "inherit" {
 			name = ""
 		}
@@ -3296,7 +3297,7 @@ func taskDropList(ctx context.Context, app *frontend.App, out io.Writer, agent, 
 	}
 	if !isDBLocator(resolved) {
 		return fmt.Errorf("%s is not kept in the hap database, so it is not hap's to delete — remove it yourself "+
-			"(only sources whose provider is %q can be dropped)", tasklocator.Display(resolved), config.ProviderSQLite)
+			"(only sources whose provider is %q can be dropped)", tasklocator.Display(resolved), config.ProviderDatabase)
 	}
 	// A missing list is not a failure here — the caller asked for it to be
 	// gone and it is — so the count degrades to zero rather than aborting.
@@ -3382,7 +3383,7 @@ func taskTarget(args []string) (agent, path, node string, rest []string, err err
 		return "", strings.TrimPrefix(args[0], "--path="), "", args[1:], nil
 	case args[0] == "--node" || strings.HasPrefix(args[0], "--node="):
 		// --node <node> <agent> …: another machine's list, kept in the shared
-		// database by a `sqlite`-provider source. The agent (or list name)
+		// database by a `database`-provider source. The agent (or list name)
 		// that follows is required — a node alone names no list.
 		var rest []string
 		if args[0] == "--node" {

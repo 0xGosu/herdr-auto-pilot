@@ -200,12 +200,12 @@ func TestNodeFlagEqualsFormAndBareFlag(t *testing.T) {
 }
 
 // TestSQLiteProviderNeverPrintsGistFields: the gist id and credential file are
-// gist-only facts, so under provider = "sqlite" no operator surface may print
+// gist-only facts, so under provider = "database" no operator surface may print
 // them as "(not set)" — that reads as a misconfiguration on a healthy install.
 func TestSQLiteProviderNeverPrintsGistFields(t *testing.T) {
 	app, _ := testApp(t)
 	if err := os.WriteFile(app.ConfigPath, []byte(
-		"[task_source_provider]\nprovider = \"sqlite\"\n\n"+
+		"[task_source_provider]\nprovider = \"database\"\n\n"+
 			"[[task_sources]]\nagent = \"otter\"\n\n"+
 			"[[task_sources]]\nagent = \"badger\"\npath = \"shared.md\"\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -219,7 +219,7 @@ func TestSQLiteProviderNeverPrintsGistFields(t *testing.T) {
 		// gist FIELDS are what must not appear.
 		for _, banned := range []string{"gist_id", "gist=", "gist_file", "in gist", "(not set)", "env_file"} {
 			if strings.Contains(out, banned) {
-				t.Errorf("%v printed the gist-only %q under the sqlite provider:\n%s", args, banned, out)
+				t.Errorf("%v printed the gist-only %q under the database provider:\n%s", args, banned, out)
 			}
 		}
 	}

@@ -880,7 +880,7 @@ func New(opt Options) (*Daemon, error) {
 		opt.Clock = ports.SystemClock{}
 	}
 	if opt.TaskStoreFactory == nil {
-		// The store is the sqlite provider's backend, so the default registry
+		// The store is the database provider's backend, so the default registry
 		// carries it when the store can keep lists; a store that cannot leaves
 		// the provider refused at use time rather than served from a file.
 		var lists []taskstore.Option

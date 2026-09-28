@@ -1,5 +1,5 @@
 // Package dbtask implements ports.TaskStore over hap's own database — the
-// `sqlite` task-source provider.
+// `database` task-source provider.
 //
 // A list is a row in the store's task_lists table addressed by
 // db://<node>/<name>, so under the default engine it lives in the local

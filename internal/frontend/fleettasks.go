@@ -12,7 +12,7 @@ import (
 )
 
 // FleetTaskGroups returns the task lists OTHER nodes keep in the shared
-// database (their `sqlite`-provider sources), one group per list, for the
+// database (their `database`-provider sources), one group per list, for the
 // unified Tasks view. This node's own lists are not here — they are configured
 // sources and TaskGroups already shows them from config — and lists kept in
 // files on another machine are not visible at all: only what is in the store
@@ -110,7 +110,7 @@ func (a *App) NodeTaskList(ctx context.Context, nodeRef, target string) (string,
 	}
 	if len(names) == 0 {
 		return "", fmt.Errorf("node %s keeps no task lists in the hap database — only sources whose provider is %q are visible across nodes",
-			nodeRef, config.ProviderSQLite)
+			nodeRef, config.ProviderDatabase)
 	}
 	return "", fmt.Errorf("no task list %q on node %s — it has: %s", target, nodeRef, strings.Join(names, ", "))
 }

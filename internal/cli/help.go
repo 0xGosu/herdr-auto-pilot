@@ -646,7 +646,7 @@ func buildCommands() {
 				"the proof that a menu was standing.\n\n" +
 				"The daemon does this once a day on its own; run it by hand to reclaim now.\n" +
 				"Its daily pass does MORE than this verb: it also deletes finished bookkeeping\n" +
-				"rows and reclaims `sqlite`-provider task lists nothing can reach any more\n" +
+				"rows and reclaims `database`-provider task lists nothing can reach any more\n" +
 				"(`[logging] row_retention_days`). Neither runs here — this verb is the excerpt\n" +
 				"half only. To remove one list now, use `hap task <agent> drop-list`.\n" +
 				"Reclaiming rebuilds the database, which briefly takes a write lock — a running\n" +
@@ -1186,7 +1186,7 @@ func buildCommands() {
 				{Name: "--auto-send-when-idle", Desc: "also hand out tasks on the periodic idle poll, not only on a herdr attention event"},
 				{Name: "--enable-llm-review-before-auto-send", Desc: "let the configured [llm].command revise the task list and pick the task, immediately before the daemon auto-sends one"},
 				{Name: "--max-tasks", Arg: "N", Default: "config default", Desc: "cap on how many items this list may hold before task generation stops refilling it"},
-				{Name: "--provider", Arg: "P", Default: "the [task_source_provider] default (sqlite for a new install)", Desc: "where THIS source's list is stored: sqlite | local_fs | github_gist; omit to inherit the default and keep inheriting it"},
+				{Name: "--provider", Arg: "P", Default: "the [task_source_provider] default (database for a new install)", Desc: "where THIS source's list is stored: database | local_fs | github_gist; omit to inherit the default and keep inheriting it"},
 				{Name: "--gist-id", Arg: "ID", Default: "the [task_source_provider.github_gist] default", Desc: "store this source's list in a specific gist instead of the default one (github_gist only)"},
 			},
 			Details: "Flags must come BEFORE the <checklist.md> path — Go's flag parsing stops at the\n" +
@@ -1198,7 +1198,7 @@ func buildCommands() {
 				"source that names no provider keeps INHERITING the default, so changing the\n" +
 				"default moves it — hap never writes the inherited value into the source.\n" +
 				"The <checklist.md> argument means different things per provider:\n" +
-				"  sqlite       a list NAME inside hap's database (the default). Give one and\n" +
+				"  database     a list NAME inside hap's database (the default). Give one and\n" +
 				"               every agent this source matches shares that list; leave it out\n" +
 				"               and each gets its own \"<agent-name>.md\". A filesystem path is\n" +
 				"               REFUSED here — pass --provider local_fs for a file on disk.\n" +
@@ -1286,7 +1286,7 @@ func buildCommands() {
 			},
 			Flags: []FlagDoc{
 				{Name: "--path", Arg: "FILE", Desc: "operate on any checklist file directly, instead of resolving an agent's configured source"},
-				{Name: "--node", Arg: "NODE", Desc: "operate on another machine's list kept in the shared hap database (a `sqlite`-provider source); NODE is its label or node id, followed by the agent or list name"},
+				{Name: "--node", Arg: "NODE", Desc: "operate on another machine's list kept in the shared hap database (a `database`-provider source); NODE is its label or node id, followed by the agent or list name"},
 				{Name: "--status", Arg: "S", Default: "all", Desc: "list filter: all, pending, or done"},
 				{Name: "--yes, -y", Desc: "send and drop-list: skip the y/N confirmation (required when stdin is not a terminal)"},
 			},
@@ -1319,7 +1319,7 @@ func buildCommands() {
 				"Tasks tab, which renders fleet lists from the shared database, to send remotely.\n" +
 				"Normally you do not need `send`: the daemon hands out the next task by itself.\n" +
 				"`drop-list` deletes the WHOLE list, not a task — only one kept in the hap\n" +
-				"database (a `sqlite`-provider source); a file or a gist is yours to remove. It\n" +
+				"database (a `database`-provider source); a file or a gist is yours to remove. It\n" +
 				"is spelled out in full because `remove` is already the item-level delete. It\n" +
 				"does not stop the list coming back: a source that still names it recreates it\n" +
 				"empty on demand, so drop the source too (`hap config task-source remove`) when\n" +
