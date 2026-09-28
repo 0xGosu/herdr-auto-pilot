@@ -4513,16 +4513,20 @@ func (m Model) dropTaskListPrompt() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	app, locator, display := m.app, g.Locator, g.Display
-	drop := m.doResult(func(c context.Context) (string, error) {
-		deleted, err := app.DeleteTaskList(c, locator)
-		if err != nil {
-			return "", err
-		}
-		if !deleted {
-			return fmt.Sprintf("no task list at %s — nothing to delete", display), nil
-		}
-		return fmt.Sprintf("task list %s deleted", display), nil
-	})
+	// Built only when confirmed: doResult counts it in-flight when BUILT, so a
+	// cancelled prompt would otherwise strand the count.
+	drop := func() tea.Cmd {
+		return m.doResult(func(c context.Context) (string, error) {
+			deleted, err := app.DeleteTaskList(c, locator)
+			if err != nil {
+				return "", err
+			}
+			if !deleted {
+				return fmt.Sprintf("no task list at %s — nothing to delete", display), nil
+			}
+			return fmt.Sprintf("task list %s deleted", display), nil
+		})
+	}
 	m.confirm = &confirmation{
 		// Consequence first, in the house style of removeTaskSourcePrompt: the
 		// item count because this is the one moment the operator authorizes
@@ -4544,7 +4548,7 @@ func (m Model) dropTaskListPrompt() (tea.Model, tea.Cmd) {
 			}
 			return fmt.Sprintf("task list %s is no longer listed — re-check and retry", display), false
 		},
-		onConfirm: func() tea.Cmd { return drop },
+		onConfirm: drop,
 	}
 	return m, nil
 }
@@ -4638,10 +4642,15 @@ func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
 	// (its raw, untruncated path plus both selectors) — RemoveTaskSource
 	// re-checks all of them, so a config that shifted underneath aborts
 	// instead of removing a neighbour.
-	remove := m.do(fmt.Sprintf("task source #%d removed (checklist file kept)", g.Index),
-		func(c context.Context) error {
-			return app.RemoveTaskSource(c, g.Index, g.Source)
-		})
+	// Built only when chosen: do/doResult count the command in-flight when it
+	// is BUILT, so building every answer up front strands a count for each one
+	// not taken and makes the next quit wait out the drain timeout.
+	remove := func() tea.Cmd {
+		return m.do(fmt.Sprintf("task source #%d removed (checklist file kept)", g.Index),
+			func(c context.Context) error {
+				return app.RemoveTaskSource(c, g.Index, g.Source)
+			})
+	}
 	// A source with no path configured has no file name to name it by.
 	name := filepath.Base(g.Source.Path)
 	if g.Source.Path == "" {
@@ -4681,7 +4690,7 @@ func (m Model) removeTaskSourcePrompt(group int) (tea.Model, tea.Cmd) {
 			return fmt.Sprintf("task source #%d changed since it was listed — re-check and retry",
 				g.Index), false
 		},
-		onConfirm: func() tea.Cmd { return remove },
+		onConfirm: remove,
 	}
 	return m, nil
 }
@@ -4704,20 +4713,25 @@ func (m Model) otherTaskSourceUsing(index int, locator string) (int, bool) {
 // revalidate is the early, friendlier form of the same two questions.
 func (m Model) removeTaskSourceAndListAlt(g frontend.TaskGroup) *confirmAlt {
 	app, index, source, locator, display := m.app, g.Index, g.Source, g.Locator, g.Display
-	run := m.doResult(func(c context.Context) (string, error) {
-		deleted, err := app.RemoveTaskSourceAndList(c, index, source, locator)
-		if err != nil {
-			return "", err
-		}
-		if !deleted {
-			return fmt.Sprintf("task source #%d removed (its list %s was already gone)", index, display), nil
-		}
-		return fmt.Sprintf("task source #%d removed and task list %s deleted", index, display), nil
-	})
+	st := m.data.status
+	// Built only when chosen, for the in-flight reason removeTaskSourcePrompt
+	// gives.
+	run := func() tea.Cmd {
+		return m.doResult(func(c context.Context) (string, error) {
+			deleted, err := app.RemoveTaskSourceAndList(c, index, source, locator, st)
+			if err != nil {
+				return "", err
+			}
+			if !deleted {
+				return fmt.Sprintf("task source #%d removed (its list %s was already gone)", index, display), nil
+			}
+			return fmt.Sprintf("task source #%d removed and task list %s deleted", index, display), nil
+		})
+	}
 	return &confirmAlt{
 		key:       "D",
 		help:      "also delete the list",
-		onConfirm: func() tea.Cmd { return run },
+		onConfirm: run,
 		revalidate: func(cur Model) (string, bool) {
 			for _, now := range cur.data.tasks {
 				if now.Index == index && now.Locator != locator {

@@ -5,8 +5,10 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
@@ -44,7 +46,7 @@ func TestRemoveTaskSourceAndListRemovesBoth(t *testing.T) {
 		"otter", "heron")
 
 	deleted, err := app.RemoveTaskSourceAndList(context.Background(), 0, cfg.TaskSources[0],
-		tasklocator.DBLocator(st.NodeID(), "otter.md"))
+		tasklocator.DBLocator(st.NodeID(), "otter.md"), frontend.Status{})
 	if err != nil || !deleted {
 		t.Fatalf("RemoveTaskSourceAndList = %v, %v; want true, nil", deleted, err)
 	}
@@ -74,7 +76,7 @@ func TestRemoveTaskSourceAndListRefusesASharedList(t *testing.T) {
 		"otter")
 
 	_, err := app.RemoveTaskSourceAndList(context.Background(), 0, cfg.TaskSources[0],
-		tasklocator.DBLocator(st.NodeID(), "shared.md"))
+		tasklocator.DBLocator(st.NodeID(), "shared.md"), frontend.Status{})
 	if err == nil || !strings.Contains(err.Error(), "task source #1 also uses") {
 		t.Fatalf("err = %v, want a refusal naming source #1", err)
 	}
@@ -98,7 +100,7 @@ func TestRemoveTaskSourceAndListSeesADerivedSource(t *testing.T) {
 		"otter")
 
 	_, err := app.RemoveTaskSourceAndList(context.Background(), 0, cfg.TaskSources[0],
-		tasklocator.DBLocator(st.NodeID(), "otter.md"))
+		tasklocator.DBLocator(st.NodeID(), "otter.md"), frontend.Status{})
 	if err == nil || !strings.Contains(err.Error(), "task source #1 also uses") {
 		t.Fatalf("err = %v, want the derived source counted as a user of otter.md", err)
 	}
@@ -114,7 +116,7 @@ func TestRemoveTaskSourceAndListRefusesStaleOrForeignTargets(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("a file is not hap's to delete", func(t *testing.T) {
-		_, err := app.RemoveTaskSourceAndList(ctx, 0, cfg.TaskSources[0], "/tmp/otter.md")
+		_, err := app.RemoveTaskSourceAndList(ctx, 0, cfg.TaskSources[0], "/tmp/otter.md", frontend.Status{})
 		if err == nil || !strings.Contains(err.Error(), "not kept in the hap database") {
 			t.Fatalf("err = %v", err)
 		}
@@ -122,11 +124,90 @@ func TestRemoveTaskSourceAndListRefusesStaleOrForeignTargets(t *testing.T) {
 	t.Run("a stale listing touches nothing", func(t *testing.T) {
 		stale := cfg.TaskSources[0]
 		stale.Path = "other.md"
-		_, err := app.RemoveTaskSourceAndList(ctx, 0, stale, tasklocator.DBLocator(st.NodeID(), "otter.md"))
+		_, err := app.RemoveTaskSourceAndList(ctx, 0, stale, tasklocator.DBLocator(st.NodeID(), "otter.md"), frontend.Status{})
 		if err == nil || !strings.Contains(err.Error(), "changed since it was listed") {
 			t.Fatalf("err = %v", err)
 		}
 	})
+	after, _ := app.Config()
+	if len(after.TaskSources) != 1 || !listExists(t, st, "otter.md") {
+		t.Errorf("refusals must leave the source and list in place: %+v", after.TaskSources)
+	}
+}
+
+// TestRemoveTaskSourceAndListPerAgentSources: the per-agent form — one derived
+// source per agent — is the common database setup. heron's source resolves to
+// "otter.md" for otter (resolution never reads selectors), but it is scoped to
+// another KNOWN agent name, so it does not use otter's list and D must work.
+func TestRemoveTaskSourceAndListPerAgentSources(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	cfg := seedDatabaseSources(t, app,
+		"[[task_sources]]\nagent = \"otter\"\n\n[[task_sources]]\nagent = \"heron\"\n")
+	if _, err := st.EnsureTaskList(ctx, st.NodeID(), "otter.md", "otter", "# Tasks\n\n- [ ] a\n", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	named := frontend.Status{AgentNamesKnown: true, AgentNames: map[string]string{"1": "otter", "2": "heron"}}
+
+	deleted, err := app.RemoveTaskSourceAndList(ctx, 0, cfg.TaskSources[0],
+		tasklocator.DBLocator(st.NodeID(), "otter.md"), named)
+	if err != nil || !deleted {
+		t.Fatalf("RemoveTaskSourceAndList = %v, %v; want true, nil", deleted, err)
+	}
+	if listExists(t, st, "otter.md") {
+		t.Error("otter's list must be deleted")
+	}
+}
+
+// TestRemoveTaskSourceAndListCountsATypeSelector is the control for the case
+// above: a derived source scoped by agent TYPE feeds otter when otter is that
+// type, so otter's list is still in use. And with nothing known about the
+// selector at all, the answer must be the safe one — refuse.
+func TestRemoveTaskSourceAndListCountsATypeSelector(t *testing.T) {
+	for name, st := range map[string]frontend.Status{
+		"live agent of that type": {
+			AgentsKnown: true, AgentNamesKnown: true,
+			AgentNames:      map[string]string{"1": "otter"},
+			MonitoredAgents: []domain.AgentTransition{{AgentID: "1", AgentType: "claude"}},
+		},
+		"nothing known": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			app, store := testApp(t)
+			ctx := context.Background()
+			cfg := seedDatabaseSources(t, app,
+				"[[task_sources]]\nagent = \"otter\"\n\n[[task_sources]]\nagent = \"claude\"\n")
+			if _, err := store.EnsureTaskList(ctx, store.NodeID(), "otter.md", "otter", "# Tasks\n\n- [ ] a\n", time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			_, err := app.RemoveTaskSourceAndList(ctx, 0, cfg.TaskSources[0],
+				tasklocator.DBLocator(store.NodeID(), "otter.md"), st)
+			if err == nil || !strings.Contains(err.Error(), "task source #1 also uses") {
+				t.Fatalf("err = %v, want the type-scoped source counted", err)
+			}
+			if !listExists(t, store, "otter.md") {
+				t.Error("the list must survive")
+			}
+		})
+	}
+}
+
+// TestRemoveTaskSourceAndListRefusesAListTheSourceDoesNotUse: the locator must
+// be the source's own list on this node — never another node's, and never one
+// the source stopped using since it was listed.
+func TestRemoveTaskSourceAndListRefusesAListTheSourceDoesNotUse(t *testing.T) {
+	app, st := testApp(t)
+	ctx := context.Background()
+	cfg := seedDatabaseSources(t, app,
+		"[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n", "otter")
+	for _, locator := range []string{
+		tasklocator.DBLocator("b1b1b1b1b1b1b1b1", "otter.md"),
+		tasklocator.DBLocator(st.NodeID(), "heron.md"),
+	} {
+		if _, err := app.RemoveTaskSourceAndList(ctx, 0, cfg.TaskSources[0], locator, frontend.Status{}); err == nil {
+			t.Errorf("%s: want a refusal", locator)
+		}
+	}
 	after, _ := app.Config()
 	if len(after.TaskSources) != 1 || !listExists(t, st, "otter.md") {
 		t.Errorf("refusals must leave the source and list in place: %+v", after.TaskSources)
