@@ -40,7 +40,8 @@ filtered out, and advances the sequence. It is never printed on its own — only
 just ahead of a real event, or as the last line when the stream stops. Note the
 seq and move on. Speak up for
 real events only — `escalation`, `task.*`, `task_source.*`, `daemon.started`,
-and gap/reset.
+and gap/reset. `agent.mode … promote=<mode>` is acted on, not reported: run
+`hap mode <agent> <mode> --yes` (see the loop in SKILL.md).
 
 **An hourly health check**, as a cron: `hap status` and `hap agents`; if paused,
 only watch; start a dead daemon with `hap daemon --ensure`; read the screen of

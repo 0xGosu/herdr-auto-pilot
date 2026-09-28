@@ -800,7 +800,10 @@ func buildCommands() {
 				"  escalation.dismissed id=…        correction id=… escalation=… agent=… [send=…]\n" +
 				"  correction.withdrawn id=… agent=… reason=…\n" +
 				"  pause.on|off scope=…             fsp.on|off\n" +
-				"  rule.streak|reset|deleted sig=…  daemon.started version=…\n\n" +
+				"  rule.streak|reset|deleted sig=…  daemon.started version=…\n" +
+				"  agent.mode agent=… mode=… [promote=…]  (once per change; promote= names\n" +
+				"  the most autonomous mode for an agent the daemon SAW in its restrictive one —\n" +
+				"  claude manual, agy default — never plan, never a mode a hap command set)\n\n" +
 				"An escalation is announced once auto-accept has had its look at it and left it\n" +
 				"for a human — up to a minute after it was raised under full self-prompting, or\n" +
 				"once its threshold has passed under timed auto-accept — so the stream never\n" +

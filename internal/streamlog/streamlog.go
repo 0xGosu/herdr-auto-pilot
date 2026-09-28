@@ -152,7 +152,8 @@ func dsn(path string) string {
 
 // Append records ev and returns the sequence number it was given, or 0 when
 // ev.Dedupe names a mark already set. The mark and the event are written in
-// one transaction, so neither exists without the other.
+// one transaction, so neither exists without the other — and so is the
+// replacement of the scope's previous mark when ev.DedupeScope is set.
 func (l *Log) Append(ctx context.Context, ev domain.StreamEvent) (int64, error) {
 	db, err := l.open()
 	if err != nil {
@@ -175,6 +176,15 @@ func (l *Log) Append(ctx context.Context, ev domain.StreamEvent) (int64, error) 
 		}
 		if n, err := res.RowsAffected(); err != nil || n == 0 {
 			return 0, err
+		}
+		if ev.DedupeScope != "" {
+			// A new value under the scope: the previous one is no longer the
+			// state, so a later return to it is news again.
+			// length(?1): SQLite measures in characters, Go's len in bytes.
+			if _, err := tx.ExecContext(ctx, `DELETE FROM marks WHERE substr(key, 1, length(?1)) = ?1 AND key <> ?2`,
+				ev.DedupeScope, ev.Dedupe); err != nil {
+				return 0, fmt.Errorf("append stream event: %w", err)
+			}
 		}
 	}
 	res, err := tx.ExecContext(ctx, `INSERT INTO events (at, kind, author, fields) VALUES (?, ?, ?, ?)`,
@@ -220,7 +230,7 @@ func (l *Log) ForgetMarks(ctx context.Context, prefix string, keep func(key stri
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := tx.QueryContext(ctx, `SELECT key FROM marks WHERE substr(key, 1, ?) = ?`, len(prefix), prefix)
+	rows, err := tx.QueryContext(ctx, `SELECT key FROM marks WHERE substr(key, 1, length(?1)) = ?1`, prefix)
 	if err != nil {
 		return 0, err
 	}

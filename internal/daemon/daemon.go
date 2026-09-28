@@ -2291,6 +2291,8 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 	delete(d.backgroundWork, a.AgentID)
 	d.forgetSessionRenamePushesLocked(a.AgentID)
 	d.mu.Unlock()
+	// The new tenant's mode is news even when it matches the old one's.
+	d.forgetStreamScope(domain.AgentModeStreamScope(a.AgentID))
 	// sweepInFlight is deliberately left alone: it is a live-goroutine claim
 	// released by its owner's defer, and clearing it here would license a
 	// second concurrent pane interaction.
@@ -2625,6 +2627,9 @@ func (d *Daemon) handleAttention(ctx context.Context, tr domain.AgentTransition)
 	// hand, so the reclaim sweep can ask "is this parked agent actually busy?"
 	// without a herdr round trip on the main loop.
 	d.noteBackgroundWork(situation, tr, now)
+
+	// And again: the mode is in the footer of the capture already in hand.
+	d.noteAgentMode(ctx, tr, agentName, pane)
 
 	// Multi-tab MCQ forms show one question at a time: sweep the remaining
 	// tabs (Right-arrow protocol) so the signature, the escalation, and the

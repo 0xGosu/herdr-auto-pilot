@@ -88,6 +88,54 @@ func TestDedupeDropsTheSecondEvent(t *testing.T) {
 	}
 }
 
+// TestScopedDedupeAnnouncesEachChange: a scoped mark is a VALUE — the same
+// value twice is one event, and returning to an earlier value after a change
+// is news again. Without the replacement the third append would be dropped
+// and a reader would believe the state never went back.
+func TestScopedDedupeAnnouncesEachChange(t *testing.T) {
+	ctx := context.Background()
+	l := newLog(t)
+	scoped := func(value, author string) domain.StreamEvent {
+		e := ev(domain.StreamAgentMode)
+		e.Author, e.DedupeScope, e.Dedupe = author, "agent.mode:p1:", "agent.mode:p1:"+value
+		return e
+	}
+	for i, step := range []struct {
+		value, author string
+		want          bool
+	}{
+		{"manual", "daemon", true},
+		{"manual", "daemon", false}, // unchanged
+		{"auto", "daemon", true},
+		{"manual", "daemon", true}, // back again: a change
+		// A mark written by ANOTHER author blocks the same value: the
+		// orchestrator's own set makes the daemon's reading a duplicate.
+		{"auto", "orchestrator", true},
+		{"auto", "daemon", false},
+	} {
+		seq, err := l.Append(ctx, scoped(step.value, step.author))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := seq != 0; got != step.want {
+			t.Fatalf("step %d (%s by %s): appended = %v, want %v", i, step.value, step.author, got, step.want)
+		}
+	}
+	// Only the current value is marked, and another scope is untouched.
+	other := ev(domain.StreamAgentMode)
+	other.DedupeScope, other.Dedupe = "agent.mode:p2:", "agent.mode:p2:manual"
+	if _, err := l.Append(ctx, other); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]bool{
+		"agent.mode:p1:auto": true, "agent.mode:p1:manual": false, "agent.mode:p2:manual": true,
+	} {
+		if seen, err := l.Seen(ctx, key); err != nil || seen != want {
+			t.Errorf("Seen(%s) = %v, %v; want %v", key, seen, err, want)
+		}
+	}
+}
+
 // A prune must never let the counter go back: a reader resuming from a seq it
 // already handled would otherwise be handed a DIFFERENT event under that
 // number.

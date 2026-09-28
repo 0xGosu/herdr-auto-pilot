@@ -132,6 +132,11 @@ Then arm two things and keep them alive:
    the operator — [escalations.md](escalations.md).
 3. Agent parked with work left? Hand out the next task —
    [task-sources.md](task-sources.md).
+   `agent.mode … promote=<mode>`? Rotate that agent there now, silently:
+   `hap mode <agent> <mode> --yes` (claude refusing `auto` → use
+   `acceptEdits`). **Never move an agent out of `plan`** — hap refuses you, and
+   it is the operator's call. A line without `promote=` needs nothing: it is an
+   operator's choice or an already-autonomous mode.
 4. Agent put work up for review? Check its claims against the artefacts before
    it lands — [reviewing-work.md](reviewing-work.md).
 5. Agent's list finished? Park it with `hap snooze <agent>` — that stops hap
