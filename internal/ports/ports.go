@@ -28,6 +28,17 @@ type AgentAwareSender interface {
 	SendToAgent(ctx context.Context, paneID, agentType, input string) error
 }
 
+// ClaudeTypedInputSetter is implemented by Herdr adapters that can deliver text
+// to a claude agent as keystrokes rather than a paste ([agents]
+// claude_typed_input). Claude wraps a paste in `<pasted_content>` tags and its
+// model treats the instructions inside as untrusted, so a hand-out pasted into
+// the composer reads as quoted text rather than the operator's request. The
+// daemon — the one process that sends — type-asserts it on every config
+// (re)load; an adapter without it keeps pasting.
+type ClaudeTypedInputSetter interface {
+	SetClaudeTypedInput(on bool)
+}
+
 // SubmitRetryWaiter is implemented by adapters whose SendToAgent spawns
 // asynchronous submit-retry workers (extra Enters pressed while an idle
 // agent's status has not moved). One-shot processes type-assert and wait

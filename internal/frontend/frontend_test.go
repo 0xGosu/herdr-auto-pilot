@@ -2483,6 +2483,8 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 		"tui.max_instances":               "2",
 		"cli.ai_agent_friendly_output":    "false",
 		"agents.sync_claude_session_name": "true",
+		// true: the opt-in value is the one that changes delivery.
+		"agents.claude_typed_input": "true",
 		// The action seeds ship OFF, so the sample is the opt-in value: it is
 		// the setting that changes behaviour, and the one worth round-tripping.
 		"safety.enable_never_auto_action_seeds": "true",

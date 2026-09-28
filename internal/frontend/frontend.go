@@ -2685,6 +2685,11 @@ var ConfigFields = []ConfigFieldDef{
 	// value. Off by default: the unnamed-session direction TYPES `/rename`
 	// into the agent's composer.
 	{Key: "agents.sync_claude_session_name", TUIEditable: true},
+	// Types what a claude agent would otherwise receive as a PASTE (a
+	// multi-line hand-out, a very long line), because Claude wraps a paste in
+	// `<pasted_content>` and its model then treats the instructions inside as
+	// untrusted. Off by default; read live by the daemon on reload.
+	{Key: "agents.claude_typed_input", TUIEditable: true},
 	// Where task lists are stored, by DEFAULT — each [[task_sources]] entry may
 	// override it (`hap config task-source set <index> provider …`), and one that does
 	// not keeps FOLLOWING this value, so changing it here really moves every
@@ -3097,6 +3102,8 @@ func FieldValue(cfg config.Config, key string) string {
 		return strconv.FormatBool(cfg.CLI.AIAgentFriendlyOutput)
 	case "agents.sync_claude_session_name":
 		return strconv.FormatBool(cfg.Agents.SyncClaudeSessionName)
+	case "agents.claude_typed_input":
+		return strconv.FormatBool(cfg.Agents.ClaudeTypedInput)
 	case "task_source_provider.provider":
 		// Resolved rather than read raw, so a Config built in memory (or one
 		// predating the section) renders the provider actually in force instead
@@ -3799,6 +3806,13 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("agents.sync_claude_session_name must be true or false, got %q", value)
 			}
 			cfg.Agents.SyncClaudeSessionName = v
+			return nil
+		case "agents.claude_typed_input":
+			v, err := strconv.ParseBool(value)
+			if err != nil {
+				return fmt.Errorf("agents.claude_typed_input must be true or false, got %q", value)
+			}
+			cfg.Agents.ClaudeTypedInput = v
 			return nil
 		}
 		return fmt.Errorf("unknown config field %q", key)

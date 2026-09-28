@@ -1255,6 +1255,18 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 	d.fspCeilingLatched = false
 	d.mu.Unlock()
 
+	// How text reaches a claude composer lives in the herdr ADAPTER (only it
+	// knows paste from keystrokes), so the key is pushed there rather than read
+	// at each send site — every send path, present and future, gets it through
+	// ports.SendToAgent. Applied on the first load too: the daemon is the one
+	// process that sends, so this is the only place it needs to happen.
+	if s, ok := d.opt.Herdr.(ports.ClaudeTypedInputSetter); ok {
+		s.SetClaudeTypedInput(cfg.Agents.ClaudeTypedInput)
+	}
+	if !first && prev.Agents.ClaudeTypedInput != cfg.Agents.ClaudeTypedInput {
+		slog.Info("claude typed input changed", "claude_typed_input", cfg.Agents.ClaudeTypedInput)
+	}
+
 	// A false→true flip of the session-name sync has nothing to act on until
 	// some agent's next attention event, which for a parked herd can be hours
 	// away: the sync is a side effect of a CAPTURE, and neither this reload nor

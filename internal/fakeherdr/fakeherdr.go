@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
@@ -68,6 +69,24 @@ type Server struct {
 	// protocol error instead of a result.
 	notifyErrCode string
 	notifyErrMsg  string
+
+	// sentTexts records every pane.send_text request, in arrival order.
+	sentTexts []SocketSentText
+	// sendTextOK is how many pane.send_text requests succeed before the rest
+	// answer sendTextErrCode (negative = all succeed; see SetSendTextFailure).
+	sendTextOK      int
+	sendTextErrCode string
+	sendTextErrMsg  string
+	// sendTextUnknown makes pane.send_text answer the way a herdr that does not
+	// know the method does (see SetSendTextUnsupported).
+	sendTextUnknown bool
+}
+
+// SocketSentText is one pane.send_text request the fake received.
+type SocketSentText struct {
+	PaneID string
+	Text   string
+	At     time.Time
 }
 
 // NewServer starts a fake events socket in dir.
@@ -85,6 +104,7 @@ func NewServer(dir string) (*Server, error) {
 		statuses:     map[string]string{},
 		notifyShown:  true,
 		notifyReason: "shown",
+		sendTextOK:   -1,
 	}
 	go s.accept()
 	return s, nil
@@ -112,6 +132,8 @@ func (s *Server) serve(conn net.Conn) {
 				Body          string         `json:"body"`
 				Position      string         `json:"position"`
 				Sound         string         `json:"sound"`
+				PaneID        string         `json:"pane_id"`
+				Text          *string        `json:"text"`
 			} `json:"params"`
 		}
 		if err := json.Unmarshal(scanner.Bytes(), &req); err != nil {
@@ -139,6 +161,10 @@ func (s *Server) serve(conn net.Conn) {
 				})
 			}
 			conn.Write(append(resp, '\n'))
+			continue
+		}
+		if req.Method == "pane.send_text" {
+			conn.Write(s.answerSendText(req.ID, req.Params.PaneID, req.Params.Text))
 			continue
 		}
 		if req.Method == "pane.list" {
@@ -241,6 +267,59 @@ func (s *Server) SetNotificationError(code, message string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.notifyErrCode, s.notifyErrMsg = code, message
+}
+
+// answerSendText records one pane.send_text request and renders herdr's
+// answer, mirroring real herdr's shapes (verified against 0.9.0): an unknown
+// method and a malformed request are both `invalid_request` with an EMPTY id
+// (herdr rejects them before it has read one), a refused operation echoes the
+// id with its own code.
+func (s *Server) answerSendText(id, paneID string, text *string) []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reply := func(v map[string]any) []byte {
+		b, _ := json.Marshal(v)
+		return append(b, '\n')
+	}
+	if s.sendTextUnknown {
+		return reply(map[string]any{"id": "", "error": map[string]any{
+			"code": "invalid_request", "message": "invalid request: unknown variant `pane.send_text`"}})
+	}
+	if text == nil {
+		return reply(map[string]any{"id": "", "error": map[string]any{
+			"code": "invalid_request", "message": "invalid request: missing field `text`"}})
+	}
+	if s.sendTextOK >= 0 && len(s.sentTexts) >= s.sendTextOK {
+		return reply(map[string]any{"id": id, "error": map[string]any{
+			"code": s.sendTextErrCode, "message": s.sendTextErrMsg}})
+	}
+	s.sentTexts = append(s.sentTexts, SocketSentText{PaneID: paneID, Text: *text, At: time.Now()})
+	return reply(map[string]any{"id": id, "result": map[string]any{"type": "ok"}})
+}
+
+// SocketSentTexts returns every pane.send_text request that succeeded, in
+// order.
+func (s *Server) SocketSentTexts() []SocketSentText {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]SocketSentText(nil), s.sentTexts...)
+}
+
+// SetSendTextFailure lets the first `ok` pane.send_text requests succeed and
+// answers every later one with a herdr error (code, message). A negative ok
+// restores "all succeed".
+func (s *Server) SetSendTextFailure(ok int, code, message string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sendTextOK, s.sendTextErrCode, s.sendTextErrMsg = ok, code, message
+}
+
+// SetSendTextUnsupported makes pane.send_text answer as a herdr without the
+// socket method does.
+func (s *Server) SetSendTextUnsupported(unknown bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sendTextUnknown = unknown
 }
 
 // SocketNotifications returns every notification.show request received so

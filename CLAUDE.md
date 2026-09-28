@@ -1490,6 +1490,44 @@ where the behaviour could revert.
   Both fall back to the legacy `agent send` only on exit status 2 — herdr rejecting the VERB — which keeps
   `min_herdr_version = 0.7.0` honest. A pane-level failure exits 1 with a JSON error body and is returned
   as-is, so a real delivery error is never retried as a second send.
+- **A PASTE into claude reaches its model as untrusted quoted text, so `[agents] claude_typed_input` TYPES
+  what would be one** (`internal/herdr/typed.go`, verified against Claude Code 2.1.283). Claude wraps a paste
+  in `<pasted_content>` and its system prompt says instructions inside count only where the user's own typed
+  words direct it — a hand-out pasted whole carries no user words at all. Its tokenizer calls two things a
+  paste: bracketed-paste markers (`agent prompt`), and an UNBRACKETED run over 800 UTF-16 units arriving in ONE
+  read — a long `pane send-text` included. The session transcript (`~/.claude/projects/*/*.jsonl`) records the
+  wrap and is the proof: a four-line `agent prompt` arrived wrapped whole. The typed route is a third arm AHEAD
+  of the two above, claude-only and off by default, pushed into the adapter on every reload
+  (`ports.ClaudeTypedInputSetter`) so every send path gets it through `ports.SendToAgent`:
+  - **The PACING holds the line, not the burst size.** Unpaced, herdr's socket answers in under a millisecond
+    and one Claude read stall right after the first burst piled 3,400 chars into a single read — 16- and
+    64-char bursts both came out pasted. Bursts are 64 UTF-16 units, burst STARTS 20ms apart, the first
+    followed by a 100ms settle; 10ms spacing passed every live run, a saturated CPU included.
+  - Only what is a paste TODAY is rerouted: multi-line, or one line over 512 BYTES (bytes bound UTF-16 units
+    from above, and the margin survives the threshold moving between builds). A short line keeps the burst
+    route every digit and `/rename` rule was verified on.
+  - **Never type what keystrokes would reinterpret** (`claudeTypedBody`) — such text keeps the paste. A
+    leading `!` is SHELL mode (verified for a lone key and a burst alike: the rest runs outside Claude's
+    permission prompts), and every control character but LF is a key (CR submits, Tab is bound, ESC starts a
+    sequence). LF is Claude's `chat:newline` (ctrl+j): in claude it inserts a line break, unlike the
+    submitting newline the multi-line bullet above describes. `?` only opens the shortcuts panel as a LONE
+    key, which a burst of two or more characters never is.
+  - **Only the FIRST burst may change transport** (socket unreachable, or a herdr that does not know
+    `pane.send_text` → `pane send-text` per burst). After a burst lands, a failure returns with NO Enter and
+    no retry — the composer holds half a message, and a retry would type it again behind the first half.
+  - **The Enter is the one keystroke a modal can capture, so it gets its own last look**
+    (`typedSubmitRefusal`). The paste route carried its Enter inside the same request; this one follows the
+    last burst by the whole typing time, and a prompt raised in that window would have its highlighted option
+    committed. It is withheld on a status that moved TO `blocked` since `send()`'s raw snapshot (keyed on the
+    change, so an agent the operator chose to send to while blocked is unaffected) or on a standing form.
+    A burst needs no such look — its digits arrive inside a multi-character run, never as a lone key.
+  - **Accepted cost: the send blocks its caller for the typing time** — ~0.5s for 1,000 characters, ~1.3s for
+    3,500 — and three send sites run on the select loop. That is the price of the pacing; the burst gap is
+    the speed knob (10ms is the tested alternative), never the burst size.
+  - **Test trap:** the daemon's fake herdr implements no setter, so only
+    `TestReloadPushesClaudeTypedInputToTheHerdrAdapter` proves the key reaches the adapter.
+    `TestRealClaudeTypedInputArrivesAsTyping` pairs a pasted CONTROL (it must come back wrapped, or the case
+    skips — a build that wraps nothing proves nothing) with the typed send, both read from the transcript.
 - **`pane send-keys shift+tab` is ACCEPTED and delivers a bare TAB** (herdr 0.7.5) — herdr validates the key
   name, exits 0, and writes `0x09`; `backtab`, `btab` and `S-Tab` are rejected outright, so no key NAME works.
   The chord must be its raw encoding, CSI Z (`domain.ShiftTab` = `"\x1b[Z"`), through `pane send-text` — the
@@ -1560,8 +1598,10 @@ where the behaviour could revert.
   live, herdr 0.8.2: a second request on the same connection gets a reset). `events.subscribe` is the one that
   then keeps streaming; status subscriptions require a concrete `pane_id`; existing panes are replayed as
   `pane_created`.
-- **The socket carries EVENTS and `notification.show`; everything else is the CLI, the pane LISTING included**
-  (`herdr.PaneLister` → `CLI.ListPanes`). The CLI is itself a client of the same `pane.list` method — the
+- **The socket carries EVENTS, `notification.show` and TYPED input; everything else is the CLI, the pane
+  LISTING included** (`herdr.PaneLister` → `CLI.ListPanes`). Typed input (`pane.send_text`, one request per
+  burst — see the claude paste bullet) is the exception on cost: a hand-out is dozens of writes and a `herdr`
+  process measured ~42ms each, which is a second of spawns per 1,000 characters on the select loop. The CLI is itself a client of the same `pane.list` method — the
   envelope it prints is byte-identical to the socket's — so this costs one process (~3.4ms idle, ~9ms median
   under load, measured) and buys herdr's CLI-first surface. The accepted consequence is that the subscriber
   needs BOTH transports: a listing can succeed and the stream that follows it fail, which costs one extra exec

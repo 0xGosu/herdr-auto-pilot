@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -28,6 +29,7 @@ var (
 	_ ports.ChordSender             = (*CLI)(nil)
 	_ ports.AgentAwareSender        = (*CLI)(nil)
 	_ ports.SubmitRetryWaiter       = (*CLI)(nil)
+	_ ports.ClaudeTypedInputSetter  = (*CLI)(nil)
 )
 
 const (
@@ -54,6 +56,20 @@ type CLI struct {
 	// startBusyDelay overrides agentStartBusyDelay in tests (0 = default).
 	startBusyDelay time.Duration
 
+	// SocketPath is herdr's control socket, the transport for TYPED input
+	// (see typed.go); empty means type through the CLI.
+	SocketPath string
+	// dialSocket overrides the typed-input socket transport in tests.
+	dialSocket func(ctx context.Context) (net.Conn, error)
+	// typedGap / typedSettle override the typed-input pacing in tests
+	// (0 = default).
+	typedGap, typedSettle time.Duration
+	// typeClaude is [agents] claude_typed_input, pushed in by the daemon on
+	// every config (re)load (SetClaudeTypedInput). Atomic: sends to different
+	// panes run concurrently with a reload.
+	typeClaude atomic.Bool
+	typedSeq   atomic.Uint64
+
 	// sendShape caches which text-submission CLI shape this herdr supports
 	// (see submitText). Atomic: concurrent sends to different panes share it.
 	sendShape atomic.Int32
@@ -73,7 +89,14 @@ func NewCLI() *CLI {
 	if bin == "" {
 		bin = "herdr"
 	}
-	return &CLI{BinPath: bin, Timeout: 15 * time.Second}
+	return &CLI{BinPath: bin, Timeout: 15 * time.Second, SocketPath: SocketPath()}
+}
+
+// SetClaudeTypedInput switches how text reaches a claude agent
+// (ports.ClaudeTypedInputSetter): on, a message Claude would receive as a
+// PASTE is typed in paced keystroke bursts instead (see typed.go).
+func (c *CLI) SetClaudeTypedInput(on bool) {
+	c.typeClaude.Store(on)
 }
 
 func (c *CLI) run(ctx context.Context, args ...string) (string, error) {
@@ -110,6 +133,7 @@ func (c *CLI) Send(ctx context.Context, paneID, input string) error {
 type sendBehavior struct {
 	codexDoubleEnter bool // delayed extra Enter, only after an explicit one
 	retrySubmit      bool // status-gated exponential retry Enters
+	typeClaude       bool // type what claude would read as a paste (typed.go)
 }
 
 // SendToAgent hardens submission per agent type. Codex treats rapidly injected
@@ -120,12 +144,14 @@ type sendBehavior struct {
 // additionally get status-gated retry Enters: when the agent was idle/done
 // before the send and its status has not moved afterwards, Enter is pressed
 // again with exponential backoff until the status changes (submitRetryMax
-// attempts max).
+// attempts max). With [agents] claude_typed_input on, Claude also gets text it
+// would read as a paste TYPED instead (see submitText).
 func (c *CLI) SendToAgent(ctx context.Context, paneID, agentType, input string) error {
 	kind := strings.ToLower(strings.TrimSpace(agentType))
 	return c.send(ctx, paneID, input, sendBehavior{
 		codexDoubleEnter: kind == "codex",
 		retrySubmit:      kind == "codex" || kind == "claude",
+		typeClaude:       kind == "claude" && c.typeClaude.Load(),
 	})
 }
 
@@ -133,13 +159,18 @@ func (c *CLI) send(ctx context.Context, paneID, input string, b sendBehavior) er
 	// Snapshot BEFORE the send; only a cleanly idle/done agent arms the
 	// retry loop — a blocked agent's standing menu must never receive stray
 	// Enters (they could commit a default option).
-	preStatus, retry := "", false
+	// snapshot is the raw status (any value), which the typed route compares
+	// against before its own Enter; preStatus is the retry loop's baseline.
+	preStatus, snapshot, retry := "", "", false
 	if b.retrySubmit {
-		if st, ok := c.probeAgentStatus(ctx, paneID); ok && st != "" && !domain.AgentBusy(st) {
-			preStatus, retry = st, true
+		if st, ok := c.probeAgentStatus(ctx, paneID); ok {
+			snapshot = st
+			if st != "" && !domain.AgentBusy(st) {
+				preStatus, retry = st, true
+			}
 		}
 	}
-	explicitEnter, err := c.submitText(ctx, paneID, input)
+	explicitEnter, err := c.submitText(ctx, paneID, input, b.typeClaude, snapshot)
 	if err != nil {
 		return err
 	}
@@ -208,7 +239,16 @@ const (
 // issued itself (the typed route and the legacy fallback) rather than an Enter
 // herdr encoded into the same request. Callers that harden submission — the
 // codex second Enter — must only act when an explicit Enter was pressed.
-func (c *CLI) submitText(ctx context.Context, paneID, input string) (explicitEnter bool, err error) {
+//
+// typeClaude adds a third route AHEAD of the other two, for a claude agent under
+// [agents] claude_typed_input: a body Claude would receive as a paste — any
+// multi-line body, or a single line long enough to trip its paste heuristic —
+// is typed in paced bursts instead (claudeTypedBody decides; anything it
+// declines keeps the route below).
+//
+// snapshot is the agent status send() read before anything was written ("" when
+// unknown); the typed route compares against it before its Enter.
+func (c *CLI) submitText(ctx context.Context, paneID, input string, typeClaude bool, snapshot string) (explicitEnter bool, err error) {
 	// Route on the BODY, not the raw string. A trailing newline is not
 	// multi-line content — it is the submit this function performs itself — and
 	// nothing upstream trims it: domain.DeliverOutbound returns the chosen
@@ -217,6 +257,11 @@ func (c *CLI) submitText(ctx context.Context, paneID, input string) (explicitEnt
 	// (including a menu digit) down the paste route, which is exactly the
 	// silent wrong-answer this split exists to prevent.
 	body := strings.TrimRight(input, "\r\n")
+	if typeClaude {
+		if text, ok := claudeTypedBody(body); ok {
+			return c.submitKeystrokes(ctx, paneID, text, snapshot)
+		}
+	}
 	if strings.Contains(body, "\n") {
 		return c.submitPasted(ctx, paneID, body)
 	}
