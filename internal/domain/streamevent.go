@@ -25,6 +25,13 @@ type StreamEvent struct {
 	// the same key is dropped. Used where the emitter re-examines state on a
 	// timer and must fire once per resource ("escalation:<id>").
 	Dedupe string
+	// DedupeScope, when set, makes Dedupe a VALUE rather than a one-shot: the
+	// scope is a key prefix holding at most one mark, and an append carrying a
+	// different mark under it replaces the old one (in the same transaction)
+	// instead of being refused. So a state is announced each time it CHANGES,
+	// never twice in a row — whichever process observed it first. Dedupe must
+	// start with DedupeScope.
+	DedupeScope string
 	// Rendered is the pre-rendered field list as the log stores it. Set on
 	// events READ from the log; Line prefers it over Fields.
 	Rendered string
@@ -70,6 +77,9 @@ const (
 	StreamRuleReset           = "rule.reset"
 	StreamRuleDeleted         = "rule.deleted"
 	StreamDaemonStarted       = "daemon.started"
+	// StreamAgentMode reports an agent's permission mode, once per change
+	// (AgentModeStreamEvent).
+	StreamAgentMode = "agent.mode"
 )
 
 // StreamStr and StreamInt build a payload field.

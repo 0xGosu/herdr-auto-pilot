@@ -30,13 +30,6 @@ var (
 // for the retained floor (see the settled flag in streamOrchestrator).
 var streamGapRecheck = time.Minute
 
-// streamProbeAfter is how long a stream that has suppressed events, and
-// written nothing since, waits before writing a "# suppressed" notice. The
-// notice is the probe that notices a vanished reader (see streamOrchestrator);
-// the wait keeps a burst of the orchestrator's own work to one line rather than
-// one per poll. A variable so tests can shorten it.
-var streamProbeAfter = 10 * time.Second
-
 // streamBatch is how many events one read returns; a full batch is followed by
 // another read at once rather than a poll wait, so a long replay is not paced.
 const streamBatch = 500
@@ -105,18 +98,40 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 	}
 
 	var lastErr string
-	// A write is the ONLY way this loop learns its reader went away — a closed
-	// pipe answers the next write with EPIPE (or SIGPIPE on stdout), and nothing
-	// else. Suppressing self-authored events removed writes, so a window in which
-	// the orchestrator authored everything (its Monitor died while the agent kept
-	// working) would follow a log nobody reads, forever. suppressed counts the
-	// events skipped since the last write; once it is non-zero and
-	// streamProbeAfter has passed since that write, one "# suppressed" notice is
-	// owed, and its failure ends the stream exactly as an event line's does. A
-	// stream that is genuinely IDLE still cannot tell — that predates the filter,
-	// and closing it would mean a heartbeat on every quiet stream.
-	var suppressed int64
-	lastWriteAt := time.Now()
+	// suppressed counts the self-authored events skipped since the last write,
+	// through seq suppressedThrough. They are owed ONE "# suppressed" notice, and
+	// it is never written on its own: every line of output wakes the reader, and
+	// a notice announcing only the reader's own work is exactly the echo the
+	// filter exists to remove — observed live as an orchestrator waking to say
+	// "that was my own dismissal, nothing to act on" after each of its actions.
+	// So the notice rides IN FRONT of the next line that is written anyway (an
+	// event or a "# gap", in one write so the reader gets one chunk), or is the
+	// stream's last line when it is stopped, where it still hands a resuming
+	// reader the seq it reached.
+	//
+	// Accepted cost: a write is the only way this loop learns its reader went
+	// away (a closed pipe answers with EPIPE, or SIGPIPE on stdout), so a stream
+	// whose Monitor died while only the orchestrator was acting now follows the
+	// log until the next event someone else writes — the limit a genuinely idle
+	// stream always had, and closing it would mean a heartbeat on every quiet one.
+	var suppressed, suppressedThrough int64
+	write := func(text string) bool {
+		if suppressed > 0 {
+			text = suppressedNotice(suppressed, suppressedThrough) + text
+			suppressed = 0
+		}
+		_, err := io.WriteString(out, text)
+		return err == nil
+	}
+	// finish writes the notice still owed when the stream is stopped. Never
+	// called on a failed write: that reader is gone. A failure here needs no
+	// handling — the stream is ending either way.
+	finish := func() error {
+		if suppressed > 0 {
+			_, _ = io.WriteString(out, suppressedNotice(suppressed, suppressedThrough))
+		}
+		return nil
+	}
 	// settled means the previous read came back empty AND its gap check found
 	// nothing, so the cursor had reached the head. From there an empty read
 	// cannot hide a gap — only an event appended AND aged past the retention
@@ -134,8 +149,10 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 			// had not reached, and they must be reported, never skipped.
 			last, gap, checkErr := prunedUnder(ctx, app, cursor, evs)
 			if gap {
-				fmt.Fprintf(out, "# gap missed=%d..%d (pruned while you were reading — re-survey with hap)\n",
-					cursor+1, last)
+				if !write(fmt.Sprintf("# gap missed=%d..%d (pruned while you were reading — re-survey with hap)\n",
+					cursor+1, last)) {
+					return nil // the reader went away
+				}
 				cursor = last
 			}
 			checkedAt = time.Now()
@@ -144,7 +161,7 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		if err != nil {
 			settled = false
 			if ctx.Err() != nil {
-				return nil
+				return finish()
 			}
 			// A transient read failure (a busy database) must not end a stream
 			// an agent is watching; say it once per distinct error and retry.
@@ -166,25 +183,14 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		// on a full batch it happened to author.
 		for _, ev := range evs {
 			if *includeSelf || ev.Author != domain.OrchestratorAuthor {
-				if _, err := fmt.Fprintln(out, ev.Line()); err != nil {
+				if !write(ev.Line() + "\n") {
 					return nil // the reader went away
 				}
-				suppressed, lastWriteAt = 0, time.Now()
 			} else {
 				suppressed++
+				suppressedThrough = ev.Seq
 			}
 			cursor = ev.Seq
-		}
-		// Asked on every pass, not only after a batch: the owed probe must still
-		// be written on the idle ticks that follow the last suppressed event, and
-		// before the full-batch continue, so a long self-authored replay probes
-		// too.
-		if suppressed > 0 && time.Since(lastWriteAt) >= streamProbeAfter {
-			if _, err := fmt.Fprintf(out, "# suppressed %d self-authored event(s) through seq=%d (--include-self shows them)\n",
-				suppressed, cursor); err != nil {
-				return nil // the reader went away
-			}
-			suppressed, lastWriteAt = 0, time.Now()
 		}
 		if len(evs) == streamBatch {
 			continue
@@ -197,10 +203,15 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		}
 		select {
 		case <-ctx.Done():
-			return nil
+			return finish()
 		case <-time.After(wait):
 		}
 	}
+}
+
+// suppressedNotice is the one line owed for a run of self-authored events.
+func suppressedNotice(n, through int64) string {
+	return fmt.Sprintf("# suppressed %d self-authored event(s) through seq=%d (--include-self shows them)\n", n, through)
 }
 
 // prunedUnder reports the last seq of events pruned beneath the cursor that
@@ -209,16 +220,22 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 // false when nothing was lost — and when the floor could not be read (err),
 // since a failed read is not evidence of a gap; nor is it evidence of NONE,
 // which is why the caller keeps checking until a read succeeds.
+//
+// The head is read BEFORE the floor. The other order races an append on an
+// empty log: floor reads 0, an event lands, head reads 1, and that event —
+// never pruned — is reported as a gap and skipped. Read first, the head can
+// only be older than the floor, and an append after it makes the floor
+// non-zero.
 func prunedUnder(ctx context.Context, app *frontend.App, cursor int64, batch []domain.StreamEvent) (last int64, gap bool, err error) {
+	head, err := app.Stream.Head(ctx)
+	if err != nil {
+		return 0, false, err
+	}
 	floor, err := app.Stream.Floor(ctx)
 	if err != nil {
 		return 0, false, err
 	}
 	if floor == 0 { // nothing retained: everything up to the head is gone
-		head, err := app.Stream.Head(ctx)
-		if err != nil {
-			return 0, false, err
-		}
 		floor = head + 1
 	}
 	last = floor - 1

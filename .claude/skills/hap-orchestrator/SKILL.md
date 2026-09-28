@@ -118,9 +118,9 @@ Then arm two things and keep them alive:
   you handled. `# gap` or `# reset` means events really were lost: re-survey from
   scratch. Your own actions never come back at you: events `by=orchestrator` are
   suppressed (`--include-self` if you ever need to see them), so anything the
-  Monitor reports is something else moved — **except a `# suppressed …` line,
-  which is not an event and not something to report.** It only confirms some of
-  yours were filtered out, and advances the seq: note the seq, say nothing;
+  Monitor reports is something else moved. A `# suppressed …` line never arrives
+  alone — only just ahead of a real event, or as the last line when the stream
+  stops — and is not something to report: note its seq, say nothing about it;
 - an hourly health-check cron: `hap status`, `hap agents`, restart a dead
   daemon with `hap daemon --ensure`, unblock anything stuck, report only if
   something needed action.
@@ -132,6 +132,11 @@ Then arm two things and keep them alive:
    the operator — [escalations.md](escalations.md).
 3. Agent parked with work left? Hand out the next task —
    [task-sources.md](task-sources.md).
+   `agent.mode … promote=<mode>`? Rotate that agent there now, silently:
+   `hap mode <agent> <mode> --yes` (claude refusing `auto` → use
+   `acceptEdits`). **Never move an agent out of `plan`** — hap refuses you, and
+   it is the operator's call. A line without `promote=` needs nothing: it is an
+   operator's choice or an already-autonomous mode.
 4. Agent put work up for review? Check its claims against the artefacts before
    it lands — [reviewing-work.md](reviewing-work.md).
 5. Agent's list finished? Park it with `hap snooze <agent>` — that stops hap

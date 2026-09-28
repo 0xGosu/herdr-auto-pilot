@@ -38,7 +38,7 @@ const streamQueueSize = 1024
 // write lock, and the loop serves every agent.
 type streamState struct {
 	once    sync.Once
-	queue   chan domain.StreamEvent
+	queue   chan streamOp
 	dropped atomic.Bool
 
 	mu sync.Mutex
@@ -53,53 +53,120 @@ type streamState struct {
 	lastForget time.Time
 }
 
+// streamOp is one queued write to the event log: an event to append, or —
+// when forget is set — a dedupe scope to clear. They share one queue so a
+// forget and the append that follows it land in the order they were made.
+type streamOp struct {
+	ev     domain.StreamEvent
+	forget string
+}
+
 // emitStream queues one daemon-authored event for the stream writer and
 // returns at once. Best-effort (ports.StreamLog): the change is already
 // committed, so a full queue drops the event with a warning.
-func (d *Daemon) emitStream(_ context.Context, kind string, fields ...domain.StreamField) {
+func (d *Daemon) emitStream(ctx context.Context, kind string, fields ...domain.StreamField) {
+	d.emitStreamEvent(ctx, domain.StreamEvent{Kind: kind, Fields: fields})
+}
+
+// emitStreamEvent is emitStream for an event carrying more than a kind and
+// fields (a dedupe pair); the daemon stamps author and time.
+func (d *Daemon) emitStreamEvent(_ context.Context, ev domain.StreamEvent) {
+	if d.opt.Stream == nil {
+		return // before the clock: a daemon with no stream may carry none
+	}
+	ev.At, ev.Author = d.opt.Clock.Now(), streamAuthor
+	d.queueStreamOp(streamOp{ev: ev})
+}
+
+// forgetStreamScope queues the removal of every dedupe mark under scope, so
+// the next event carrying one is announced whatever it says.
+func (d *Daemon) forgetStreamScope(scope string) {
+	d.queueStreamOp(streamOp{forget: scope})
+}
+
+func (d *Daemon) queueStreamOp(op streamOp) {
 	if d.opt.Stream == nil {
 		return
 	}
 	d.stream.once.Do(func() {
-		d.stream.queue = make(chan domain.StreamEvent, streamQueueSize)
+		d.stream.queue = make(chan streamOp, streamQueueSize)
 		if !d.spawn(d.runStreamWriter) {
 			slog.Debug("orchestrator stream: daemon shutting down; not starting the writer")
 		}
 	})
-	ev := domain.StreamEvent{At: d.opt.Clock.Now(), Kind: kind, Author: streamAuthor, Fields: fields}
 	select {
-	case d.stream.queue <- ev:
+	case d.stream.queue <- op:
 		d.stream.dropped.Store(false)
 	default:
 		if !d.stream.dropped.Swap(true) {
-			slog.Warn("orchestrator stream: the writer is behind; dropping events until it catches up", "kind", kind)
+			what := op.ev.Kind
+			if op.forget != "" {
+				what = "forget:" + op.forget
+			}
+			slog.Warn("orchestrator stream: the writer is behind; dropping events until it catches up", "kind", what)
 		}
 	}
 }
 
-// runStreamWriter appends queued events in order until shutdown, then drains
+// runStreamWriter applies queued writes in order until shutdown, then drains
 // what is already queued.
 func (d *Daemon) runStreamWriter() {
-	write := func(ev domain.StreamEvent) {
-		if _, err := d.opt.Stream.Append(context.WithoutCancel(d.shutdownCtx), ev); err != nil {
-			slog.Warn("could not record an orchestrator stream event", "kind", ev.Kind, "error", err)
+	write := func(op streamOp) {
+		ctx := context.WithoutCancel(d.shutdownCtx)
+		if op.forget != "" {
+			if _, err := d.opt.Stream.ForgetMarks(ctx, op.forget, func(string) bool { return false }); err != nil {
+				slog.Warn("could not forget orchestrator stream marks", "scope", op.forget, "error", err)
+			}
+			return
+		}
+		if _, err := d.opt.Stream.Append(ctx, op.ev); err != nil {
+			slog.Warn("could not record an orchestrator stream event", "kind", op.ev.Kind, "error", err)
 		}
 	}
 	for {
 		select {
-		case ev := <-d.stream.queue:
-			write(ev)
+		case op := <-d.stream.queue:
+			write(op)
 		case <-d.shutdownCtx.Done():
 			for {
 				select {
-				case ev := <-d.stream.queue:
-					write(ev)
+				case op := <-d.stream.queue:
+					write(op)
 				default:
 					return
 				}
 			}
 		}
 	}
+}
+
+// noteAgentMode announces the permission mode this capture positively shows,
+// once per change (domain.AgentModeStreamEvent) — so the orchestrator learns an
+// agent is sitting in its restrictive mode and can promote it.
+//
+// Read off the capture already in hand, like noteBackgroundWork, so it costs no
+// herdr round trip; the write goes through the off-loop writer. The capture is
+// usually a consuming delta that shows no footer, and that is UNKNOWN, never a
+// mode, so nothing is said. There is deliberately NO in-memory "last mode"
+// check in front of the log's dedupe: a hap command in another process moves
+// the mark too, and a cache here could not see it — the operator setting a mode
+// back would then never be announced.
+//
+// The orchestrator's own pane is never announced: its mode is not something
+// it should be steering by reading its own stream.
+func (d *Daemon) noteAgentMode(ctx context.Context, tr domain.AgentTransition, agentName, pane string) {
+	if d.opt.Stream == nil || d.isOrchestrator(tr) {
+		return
+	}
+	mode, ok := domain.AgentModeFromPane(tr.AgentType, pane)
+	if !ok {
+		return
+	}
+	name := agentName
+	if name == "" {
+		name = tr.AgentID
+	}
+	d.emitStreamEvent(ctx, domain.AgentModeStreamEvent(tr.AgentID, name, tr.AgentType, mode, true))
 }
 
 // emitChecklistDiff announces the item-level changes one daemon task-list

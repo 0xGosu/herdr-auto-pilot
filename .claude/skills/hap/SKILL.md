@@ -253,6 +253,12 @@ itself reports the target mode, so:
   only `manual`, `acceptEdits` and `plan`. hap notices when the rotation
   closes, rotates the agent **back to where it started**, and names the cycle
   it observed.
+- **The orchestrator may not leave `plan`** (`HAP_ACTOR=orchestrator`, or run in
+  its pane): `hap mode` refuses it out of plan mode against the LIVE pane, and
+  refuses it any mode change while automation is paused or the agent is
+  disabled. The operator is unaffected. The mode a set leaves the agent in is
+  recorded on the event stream as `agent.mode … by=<you>` whenever the pane
+  confirmed it.
 - **`bypassPermissions`** (`--dangerously-skip-permissions`) is reported but
   cannot be set — the cycle does not pass through it. agy's flag of the same
   name paints no indicator, so such an agy reports whatever its cycle shows
@@ -1385,7 +1391,16 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
   index — re-list) · `task.created|updated|deleted|moved` · `tasklist.created|deleted`
   (database lists only) · `escalation` · `escalation.dismissed` · `correction` ·
   `correction.withdrawn` (a safety control refused that answer; nothing was sent) ·
-  `pause.on|off` · `fsp.on|off` · `rule.streak|reset|deleted` · `daemon.started`.
+  `pause.on|off` · `fsp.on|off` · `rule.streak|reset|deleted` · `daemon.started` ·
+  `agent.mode agent=… mode=… [promote=…]` (once per change of mode).
+- **`agent.mode`** is read off the captures the daemon already takes, so it
+  arrives when an agent next paints its footer (launch, a turn boundary) — not
+  the instant an operator presses Shift+Tab. `promote=<mode>` appears only when
+  the daemon SAW the agent in its restrictive mode (claude `manual`, agy
+  `default`) and names the most autonomous mode to rotate it into (`auto`,
+  `acceptEdits`); never on `plan`, never on codex (its `default` is already
+  unrestricted), and never on a mode a `hap mode` command set — that mode is
+  the setter's choice, and the daemon's matching reading is not re-announced.
 - **An escalation is announced once auto-accept has left it for a human** — up to
   a minute after it was raised under full self-prompting, or once its threshold
   passed under timed auto-accept (a row with no suggestion: at the next sweep).
@@ -1402,10 +1417,11 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
 - **Your own actions are not printed** — events `by=orchestrator` are
   suppressed, so the stream carries only what you have not already done
   yourself. They still take their sequence numbers, so `--resume` never replays
-  them and a run of them is not a `# gap`. After such a run with nothing else
-  printed, one `# suppressed N self-authored event(s) through seq=S` line (at
-  most one per 10s) notes it — that write is how the stream notices its reader
-  has gone; ignore it. `--include-self` prints them when you are debugging what
+  them and a run of them is not a `# gap`. Such a run is noted by one
+  `# suppressed N self-authored event(s) through seq=S` line, which is never
+  printed on its own: it arrives just ahead of the next real event (or as the
+  last line when the stream stops), so your own work alone prints nothing and
+  never wakes you. Ignore it beyond noting the seq. `--include-self` prints them when you are debugging what
   an emitter writes.
 - **Per machine:** an action taken on another fleet node appears in that
   machine's stream; a hand edit to `config.toml` or a task file is not an event.

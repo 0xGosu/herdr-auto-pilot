@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -39,6 +40,22 @@ var ErrModeUnreadable = errors.New("could not read the agent's mode from its pan
 // modals — a standing plan approval renders "shift+tab to approve with this
 // feedback" — so pressing anyway would answer the modal.
 var ErrModeUnsafe = errors.New("agent is not at its composer; refusing to send keystrokes")
+
+// ErrModePlanHeld refuses the ORCHESTRATOR rotating an agent out of plan mode.
+// Plan is the operator's "think before touching anything"; only they may end
+// it. Enforced here, against the LIVE read, rather than left to the skill: the
+// agent.mode event the orchestrator acts on describes a capture from earlier,
+// and the operator may have switched the agent to plan since.
+var ErrModePlanHeld = errors.New("the agent is in plan mode, which only the operator may leave")
+
+// ErrModePaused refuses the orchestrator changing a mode while the herd is
+// paused, the refusal every other pane-reaching orchestrator action carries.
+var ErrModePaused = errors.New("automation is paused; the orchestrator may not change an agent's mode")
+
+// ErrModeAgentDisabled refuses the orchestrator changing the mode of an agent
+// the operator disabled — every other pane-reaching orchestrator action goes
+// through WithAgentAutomation, which refuses the same agent.
+var ErrModeAgentDisabled = errors.New("automation is disabled for this agent; the orchestrator may not change its mode")
 
 // ModeReport is what one agent's mode read resolved to.
 type ModeReport struct {
@@ -306,6 +323,35 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 	change.From = current
 	change.Mode = current
 
+	if a.Author == domain.OrchestratorAuthor {
+		if current == domain.AgentModePlan && want != domain.AgentModePlan {
+			return change, fmt.Errorf("%w: %s", ErrModePlanHeld, change.Label(target))
+		}
+		// Read error = paused: the orchestrator is an LLM, and "we could not
+		// ask" must not become permission to press keys.
+		kill, err := a.Store.LatestKillEvent(ctx)
+		if err != nil || domain.KillStateActive(kill) {
+			return change, ErrModePaused
+		}
+		if disabled, err := a.Store.AgentDisabled(ctx, agent.AgentID); err != nil || disabled {
+			return change, fmt.Errorf("%w: %s", ErrModeAgentDisabled, change.Label(target))
+		}
+	}
+	// Whatever happens from here, the mode the pane ends in is recorded under
+	// this caller's name — so the daemon's later reading of the same mode is a
+	// duplicate, never an agent.mode line with promote= for a mode the
+	// operator (or the orchestrator itself) just chose. Only a VERIFIED mode:
+	// after a press no settled read has confirmed, change.Mode is the reading
+	// from before it, and recording that would put a mode the agent may have
+	// left on the stream under a human's name. unverified is raised by every
+	// delivered chord and lowered by every settled read.
+	unverified := false
+	defer func() {
+		if !unverified {
+			a.recordAgentMode(ctx, &change)
+		}
+	}()
+
 	// bypassPermissions is entered with --dangerously-skip-permissions at
 	// launch and is not part of the Shift+Tab rotation, so an agent sitting in
 	// it can never leave. Caught here rather than by the press ceiling: the
@@ -341,6 +387,8 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 		if !domain.ComposerReadyForMode(agent.AgentType, pane) {
 			return change, ErrModeUnsafe
 		}
+		// A failed send may still have written the chord.
+		unverified = true
 		if err := chord.SendChord(ctx, change.PaneID, domain.ShiftTab); err != nil {
 			return change, fmt.Errorf("sending shift+tab to %s: %w", change.PaneID, err)
 		}
@@ -359,7 +407,7 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 			return change, ErrModeUnreadable
 		}
 		before := change.Mode
-		change.Mode = current
+		change.Mode, unverified = current, false
 		if change.Mode == want {
 			return change, nil
 		}
@@ -370,7 +418,7 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 		// mode". The ceiling is what bounds a genuinely deaf agent.
 		if change.Mode != before && seen[change.Mode] {
 			offered := sortedModes(seen)
-			a.restoreMode(ctx, chord, agent.AgentType, &change, opts, maxPresses)
+			unverified = !a.restoreMode(ctx, chord, agent.AgentType, &change, opts, maxPresses)
 			return change, fmt.Errorf("%s does not offer %s mode — its shift+tab cycle is %s",
 				change.Label(target), want, strings.Join(offered, " -> "))
 		}
@@ -379,9 +427,26 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 	if change.Mode == want {
 		return change, nil
 	}
-	a.restoreMode(ctx, chord, agent.AgentType, &change, opts, maxPresses)
+	unverified = !a.restoreMode(ctx, chord, agent.AgentType, &change, opts, maxPresses)
 	return change, fmt.Errorf("agent %s is still in %s mode after %d shift+tab presses (wanted %s)",
 		change.Label(target), change.Mode, change.Presses, want)
+}
+
+// recordAgentMode puts the mode a set left the agent in on the event stream,
+// authored by the caller. Only a mode the pane positively reported is recorded.
+func (a *App) recordAgentMode(ctx context.Context, change *ModeChange) {
+	if a.Stream == nil || change.Mode == domain.AgentModeUnknown {
+		return
+	}
+	name := change.AgentName
+	if name == "" {
+		name = change.AgentID
+	}
+	ev := domain.AgentModeStreamEvent(change.AgentID, name, change.AgentType, change.Mode, false)
+	ev.Author, ev.At = a.Author, a.now()
+	if _, err := a.Stream.Append(context.WithoutCancel(ctx), ev); err != nil {
+		slog.Warn("could not record an orchestrator stream event", "kind", ev.Kind, "error", err)
+	}
 }
 
 // restoreMode rotates the agent back to the mode it started in after a failed
@@ -393,25 +458,29 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 // is not showing its composer. It is bounded by the same ceiling — restoring
 // costs at most one more rotation — and it stops the moment the pane reports
 // the starting mode.
-func (a *App) restoreMode(ctx context.Context, chord ports.ChordSender, agentType string, change *ModeChange, opts ModeOptions, maxPresses int) {
+//
+// It reports whether change.Mode is still VERIFIED — false once a press went
+// out that no settled read confirmed.
+func (a *App) restoreMode(ctx context.Context, chord ports.ChordSender, agentType string, change *ModeChange, opts ModeOptions, maxPresses int) (verified bool) {
 	for range maxPresses {
 		if change.Mode == change.From {
-			return
+			return true
 		}
 		pane, err := a.readModePane(ctx, change.PaneID)
 		if err != nil || !domain.ComposerReadyForMode(agentType, pane) {
-			return
+			return true
 		}
 		if err := chord.SendChord(ctx, change.PaneID, domain.ShiftTab); err != nil {
-			return
+			return false
 		}
 		change.Presses++
 		_, mode, settled, err := a.awaitModeChange(ctx, agentType, change.PaneID, change.Mode, opts)
 		if err != nil || !settled {
-			return
+			return false
 		}
 		change.Mode = mode
 	}
+	return true
 }
 
 // sortedModes renders an observed cycle deterministically for an error message.

@@ -15,6 +15,9 @@ written by `llm.learn_from_user_command`.
   scope question asks how far that autonomy reaches: ordinary reversible work is already
   delegated — escalate only the genuinely irreversible (deleting data, force-pushing shared
   branches, dropping databases, production deploys, another node's or the operator's own work).
+  When the agent pauses to re-confirm a merge/release/cleanup the operator's own prompt already
+  ordered step by step, pick the option that carries it out as ordered (e.g. "Yes, carry it to
+  merge"), never "Stop before merging".
 - Approve a temporary live daemon swap to measure a fix when the herd and orchestrator stay running and restoration is planned; choose “Yes, swap and measure.”
 - **Approve a permission prompt for THIS command only — pick the plain “Yes, run command”.** The
   “always allow …” options widen a one-off approval into a standing rule the operator never asked

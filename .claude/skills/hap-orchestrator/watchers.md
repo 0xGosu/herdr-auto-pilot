@@ -36,9 +36,12 @@ Two lines in that output are bookkeeping, not signal. `# gap` and `# reset` mean
 events really were lost — re-survey the herd from scratch. **`# suppressed N
 self-authored event(s) through seq=N` is neither an event nor something to
 report to the operator**: it only confirms that events you authored were
-filtered out, and advances the sequence. Note the seq and move on. Speak up for
+filtered out, and advances the sequence. It is never printed on its own — only
+just ahead of a real event, or as the last line when the stream stops. Note the
+seq and move on. Speak up for
 real events only — `escalation`, `task.*`, `task_source.*`, `daemon.started`,
-and gap/reset.
+and gap/reset. `agent.mode … promote=<mode>` is acted on, not reported: run
+`hap mode <agent> <mode> --yes` (see the loop in SKILL.md).
 
 **An hourly health check**, as a cron: `hap status` and `hap agents`; if paused,
 only watch; start a dead daemon with `hap daemon --ensure`; read the screen of

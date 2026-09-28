@@ -254,15 +254,9 @@ func TestStreamNewestEventSuppressedStillAdvancesTheCursor(t *testing.T) {
 
 	out, _ := startStream(t, app, "--resume", "1")
 	waitForOutput(t, out, "# hap stream orchestrator head=3 floor=1\n")
-	deadline := time.Now().Add(5 * time.Second)
-	for rec.cursor.Load() < newest {
-		if time.Now().After(deadline) {
-			t.Fatalf("the cursor stalled at %d and never passed the suppressed seq %d — "+
-				"a suppressed event it does not step over is re-read on every poll forever",
-				rec.cursor.Load(), newest)
-		}
-		time.Sleep(time.Millisecond)
-	}
+	// A suppressed event the cursor does not step over is re-read on every
+	// poll forever.
+	waitForCursor(t, rec, newest)
 
 	// The retention sweep now takes every event the cursor has passed, and a
 	// visible one arrives behind it. A cursor left at 1 reports
@@ -409,14 +403,99 @@ func (w *closingWriter) Write(p []byte) (int, error) {
 	return w.syncBuffer.Write(p)
 }
 
-// TestStreamNoticesAVanishedReaderAcrossSuppressedEvents: a write is the only
-// signal that the reader went away, so a window in which the orchestrator
-// authored EVERY event — its Monitor died while the agent kept working — must
-// still produce one, or the stream follows a log nobody reads forever.
-func TestStreamNoticesAVanishedReaderAcrossSuppressedEvents(t *testing.T) {
+// waitForCursor waits until the stream has read past seq — the only witness
+// that a batch it printed nothing for was actually consumed.
+func waitForCursor(t *testing.T, rec *cursorRecordingLog, seq int64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for rec.cursor.Load() < seq {
+		if time.Now().After(deadline) {
+			t.Fatalf("the cursor stalled at %d and never passed seq %d", rec.cursor.Load(), seq)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestStreamSelfWorkAloneWritesNothing: every line wakes the reader, so a run
+// of the orchestrator's own work must produce NO output on its own — not even
+// the "# suppressed" notice, which used to be written 10s after each burst and
+// woke the orchestrator to say it had nothing to act on. The notice rides in
+// front of the next foreign event instead, as one line, naming the last
+// suppressed seq.
+func TestStreamSelfWorkAloneWritesNothing(t *testing.T) {
 	app, log := streamApp(t)
+	rec := &cursorRecordingLog{Log: log}
+	app.Stream = rec
+	out, stop := startStream(t, app)
+	waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
+	banner := out.String()
+	now := time.Now()
+	appendSelfEvent(t, log, domain.StreamTaskUpdated, now)
+	last := appendSelfEvent(t, log, domain.StreamCorrection, now)
+	waitForCursor(t, rec, last)
+	time.Sleep(100 * time.Millisecond) // many polls with nothing new
+	if got := out.String(); got != banner {
+		t.Fatalf("the orchestrator's own work alone produced output, which wakes it for nothing:\n%s", got)
+	}
+
+	fsp := appendEvent(t, log, domain.StreamFSPOn, now)
+	waitForOutput(t, out, " fsp.on by=operator\n")
+	time.Sleep(50 * time.Millisecond)
+	if err := stop(); err != nil {
+		t.Fatalf("stream returned %v on cancel, want nil", err)
+	}
+	want := banner +
+		fmt.Sprintf("# suppressed 2 self-authored event(s) through seq=%d (--include-self shows them)\n", last) +
+		fmt.Sprintf("%d ", fsp)
+	if got := out.String(); !strings.HasPrefix(got, want) || strings.Count(got, "# suppressed") != 1 {
+		t.Fatalf("want exactly one notice directly ahead of the foreign event, got:\n%s", got)
+	}
+}
+
+// TestStreamStopWritesTheOwedNotice: a stream stopped with self-authored
+// events still unannounced ends with the notice, so the seq it reached is not
+// lost to a reader resuming from its last line — and one with nothing owed
+// adds nothing.
+func TestStreamStopWritesTheOwedNotice(t *testing.T) {
+	for _, owed := range []bool{true, false} {
+		t.Run(fmt.Sprintf("owed=%v", owed), func(t *testing.T) {
+			app, log := streamApp(t)
+			rec := &cursorRecordingLog{Log: log}
+			app.Stream = rec
+			out, stop := startStream(t, app)
+			waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
+			now := time.Now()
+			last := appendEvent(t, log, domain.StreamPauseOn, now)
+			waitForOutput(t, out, " pause.on by=operator\n")
+			if owed {
+				last = appendSelfEvent(t, log, domain.StreamTaskUpdated, now)
+			}
+			waitForCursor(t, rec, last)
+			if err := stop(); err != nil {
+				t.Fatalf("stream returned %v on cancel, want nil", err)
+			}
+			got := out.String()
+			notice := fmt.Sprintf("# suppressed 1 self-authored event(s) through seq=%d (--include-self shows them)\n", last)
+			if owed && !strings.HasSuffix(got, notice) {
+				t.Fatalf("a stopped stream dropped the notice it owed:\n%s", got)
+			}
+			if !owed && strings.Contains(got, "# suppressed") {
+				t.Fatalf("a stopped stream owing nothing wrote a notice:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestStreamNoticesAVanishedReaderAtTheNextForeignEvent: a write is the only
+// signal that the reader went away, and the orchestrator's own work no longer
+// writes anything — so a stream whose Monitor died while only the orchestrator
+// was acting learns it at the next event somebody else writes, and the owed
+// notice goes out in that same write.
+func TestStreamNoticesAVanishedReaderAtTheNextForeignEvent(t *testing.T) {
+	app, log := streamApp(t)
+	rec := &cursorRecordingLog{Log: log}
+	app.Stream = rec
 	t.Cleanup(cli.SetStreamPollInterval(5 * time.Millisecond))
-	t.Cleanup(cli.SetStreamProbeAfter(20 * time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	out := &closingWriter{}
@@ -425,50 +504,82 @@ func TestStreamNoticesAVanishedReaderAcrossSuppressedEvents(t *testing.T) {
 	waitForOutput(t, &out.syncBuffer, "# hap stream orchestrator head=0 floor=0\n")
 	out.closed.Store(true)
 	now := time.Now()
+	var last int64
 	for _, kind := range []string{domain.StreamTaskUpdated, domain.StreamCorrection, domain.StreamEscalationDismissed} {
-		appendSelfEvent(t, log, kind, now)
+		last = appendSelfEvent(t, log, kind, now)
+	}
+	waitForCursor(t, rec, last)
+	time.Sleep(50 * time.Millisecond)
+	if got := out.attempted.String(); got != "" {
+		t.Fatalf("self-authored events alone attempted a write:\n%s", got)
 	}
 
+	fsp := appendEvent(t, log, domain.StreamFSPOn, now)
 	select {
 	case err := <-done:
 		if err != nil {
 			t.Fatalf("stream returned %v when its reader went away, want nil", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("the stream never noticed its reader was gone across a batch it suppressed entirely")
+		t.Fatal("the stream never noticed its reader was gone at the next foreign event")
 	}
-	// The control: had the stream tried to print any of those events it would
-	// have noticed through that line, and the test would prove nothing about
-	// the probe. What ended it must be the notice.
-	if !strings.Contains(out.attempted.String(), "# suppressed ") {
-		t.Fatalf("the stream exited without attempting the suppressed notice:\n%s", out.attempted.String())
-	}
-	if lines := eventLines(out.attempted.String()); len(lines) != 0 {
-		t.Fatalf("a self-authored event was printed, so the reader was detected the old way: %v", lines)
+	want := fmt.Sprintf("# suppressed 3 self-authored event(s) through seq=%d (--include-self shows them)\n%d ", last, fsp)
+	if got := out.attempted.String(); !strings.HasPrefix(got, want) {
+		t.Fatalf("want the notice and the foreign event in one attempted write, got:\n%s", got)
 	}
 }
 
-// TestStreamProbeIsOneLinePerBurst is the other half: the probe must not undo
-// the suppression it guards. A live reader gets ONE notice for a burst of the
-// orchestrator's own work, not one per poll, and none at all while an event it
-// is owed keeps being printed.
-func TestStreamProbeIsOneLinePerBurst(t *testing.T) {
+// TestStreamOwedNoticeRidesAheadOfAGap: a "# gap" line is written output too,
+// so a notice owed when one is found goes out in the SAME write, ahead of it —
+// the suppressed seqs are all below the gap, so that is also seq order.
+func TestStreamOwedNoticeRidesAheadOfAGap(t *testing.T) {
 	app, log := streamApp(t)
-	t.Cleanup(cli.SetStreamProbeAfter(50 * time.Millisecond))
+	pl := newPruneOnDemandLog(log)
+	app.Stream = pl
+	// A caught-up stream skips the floor query until this passes.
+	t.Cleanup(cli.SetStreamGapRecheck(time.Millisecond))
 	out, stop := startStream(t, app)
 	waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
-	now := time.Now()
-	appendSelfEvent(t, log, domain.StreamTaskUpdated, now)
-	last := appendSelfEvent(t, log, domain.StreamCorrection, now)
-	waitForOutput(t, out, fmt.Sprintf("# suppressed 2 self-authored event(s) through seq=%d", last))
-	time.Sleep(200 * time.Millisecond) // several probe intervals with nothing new
-	appendEvent(t, log, domain.StreamFSPOn, now)
-	waitForOutput(t, out, " fsp.on by=operator\n")
-	time.Sleep(200 * time.Millisecond)
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	// Aged as well: the gap check reads the retained FLOOR, so a surviving
+	// event below the hole would hide it.
+	self := appendSelfEvent(t, log, domain.StreamTaskUpdated, old)
+	waitForCursor(t, &pl.cursorRecordingLog, self)
+	// Two events the stream never reaches: aged out between two polls. The
+	// lock keeps the stream from reading between the appends and the prune.
+	pl.mu.Lock()
+	appendEvent(t, log, domain.StreamPauseOn, old)
+	lost := appendEvent(t, log, domain.StreamPauseOff, old)
+	pl.arm.Store(true)
+	pl.mu.Unlock()
+	waitForOutput(t, out, "# gap ")
 	if err := stop(); err != nil {
 		t.Fatalf("stream returned %v on cancel, want nil", err)
 	}
-	if n := strings.Count(out.String(), "# suppressed"); n != 1 {
-		t.Fatalf("got %d suppressed notices, want exactly one for one burst:\n%s", n, out.String())
+	want := fmt.Sprintf("# suppressed 1 self-authored event(s) through seq=%d (--include-self shows them)\n"+
+		"# gap missed=%d..%d ", self, self+1, lost)
+	if got := out.String(); !strings.Contains(got, want) || strings.Count(got, "# suppressed") != 1 {
+		t.Fatalf("want the owed notice directly ahead of the gap, exactly once, got:\n%s", got)
 	}
+}
+
+// pruneOnDemandLog prunes every event older than a day just before the first
+// read after arm is set. Holding mu keeps every read out.
+type pruneOnDemandLog struct {
+	cursorRecordingLog
+	mu  sync.Mutex
+	arm atomic.Bool
+}
+
+func newPruneOnDemandLog(log *streamlog.Log) *pruneOnDemandLog {
+	return &pruneOnDemandLog{cursorRecordingLog: cursorRecordingLog{Log: log}}
+}
+
+func (p *pruneOnDemandLog) Since(ctx context.Context, after int64, limit int) ([]domain.StreamEvent, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.arm.CompareAndSwap(true, false) {
+		_, _ = p.Prune(ctx, time.Now().Add(-24*time.Hour))
+	}
+	return p.cursorRecordingLog.Since(ctx, after, limit)
 }
