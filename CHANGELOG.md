@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.58
+
+- Renamed the task-list provider `sqlite` to `database`, since the lists live in whichever database engine hap runs on (sqlite, turso or libsql). Existing configs keep working: `sqlite` is migrated on load, rewritten as `database` on the next config save, and still accepted by `hap config set`, `hap config task-source` and the TUI. A config saved this way reads as an unknown provider to an older hap, so rolling back means setting the key back to `sqlite`.
+- Added a `D` answer when retiring a task source from the TUI Tasks tab (`x` on a header): it removes the source and deletes its checklist in one step. It is offered only for lists kept in the hap database that no other source uses. `y` still keeps the list, and local files and gists are never deleted.
+
 ## 0.9.57
 
 - Fixed an intermittent failure in the declared-wait tests, where the daemon's first roster publish could land mid-test and make the test's agent disappear.
