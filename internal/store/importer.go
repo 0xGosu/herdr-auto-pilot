@@ -188,7 +188,7 @@ func (im *importer) copySteps() []copyStep {
 		{"agent_rate", "node_id, agent_id, consecutive_auto, window_start, count_in_window, paused", "agent_id", nil, stampNode(self)},
 		{"error_retries", "node_id, error_signature, agent_id, retry_count, updated_at", "error_signature", nil, stampNode(self)},
 		{"task_handouts", "node_id, source_path, task_text, attempts, updated_at", "source_path, task_text", nil, stampNode(self)},
-		// The WHOLE content of the sqlite task-source provider, not bookkeeping:
+		// The WHOLE content of the database task-source provider, not bookkeeping:
 		// every [[task_sources]] entry on this machine names db://<node>/<name>,
 		// and a copy without these rows reports success over checklists that
 		// ReadTaskList can no longer find. Stamped like every node-owned row, so

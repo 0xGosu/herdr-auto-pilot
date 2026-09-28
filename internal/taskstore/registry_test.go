@@ -262,10 +262,10 @@ func (fakeTaskLists) EnsureTaskList(context.Context, string, string, string, str
 func (fakeTaskLists) ListTaskLists(context.Context) ([]domain.StoredTaskList, error) { return nil, nil }
 
 func sqliteCfg() config.Config {
-	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderSQLite}}
+	return config.Config{TaskSourceProvider: config.TaskSourceProvider{Provider: config.ProviderDatabase}}
 }
 
-// TestRegistrySQLiteProviderNeedsTheStore: with a store the sqlite provider
+// TestRegistrySQLiteProviderNeedsTheStore: with a store the database provider
 // mints db://<this node>/<name> and serves it; without one it is refused at use
 // time — never silently served from a file.
 func TestRegistrySQLiteProviderNeedsTheStore(t *testing.T) {

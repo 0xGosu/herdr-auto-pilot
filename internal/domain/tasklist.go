@@ -1372,7 +1372,7 @@ func inferClaudeNextTask(transcript string) InferredTask {
 }
 
 // StoredTaskList is a checklist kept INSIDE hap's database rather than in a
-// file — the `sqlite` task-source provider's storage. It belongs to one node
+// file — the `database` task-source provider's storage. It belongs to one node
 // (the machine whose daemon hands its items out) and is addressed by a name
 // inside that node's namespace, exactly as a gist file is addressed inside its
 // gist; under a shared (turso) store every node's lists are visible everywhere.

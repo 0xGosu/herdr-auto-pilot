@@ -158,7 +158,7 @@ func taskSourceRows(out string) []string {
 }
 
 // TestTaskSourceListIsQuietOnTheSQLiteDefault is the other half of the
-// compatibility promise: a FRESH install runs on the sqlite provider without
+// compatibility promise: a FRESH install runs on the database provider without
 // ever configuring it, so it must not grow a provider column either. Without
 // this case the predicate could be written as "anything but local_fs" and
 // every new install would print storage detail nobody asked for.

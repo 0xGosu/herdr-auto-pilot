@@ -15,7 +15,7 @@ import (
 )
 
 // TestSQLiteProviderKeepsTheListInTheStore drives the REAL registry (no
-// TaskStoreFor seam): a source under provider = "sqlite" resolves to
+// TaskStoreFor seam): a source under provider = "database" resolves to
 // db://<this node>/<name>, `add` creates the list in the store and every later
 // op mutates it there, and the Tasks view groups it like any source. The
 // source names its list explicitly — the derived per-agent form is created
@@ -24,13 +24,13 @@ func TestSQLiteProviderKeepsTheListInTheStore(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	if err := os.WriteFile(app.ConfigPath, []byte(
-		"[task_source_provider]\nprovider = \"sqlite\"\n\n[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n"), 0o600); err != nil {
+		"[task_source_provider]\nprovider = \"database\"\n\n[[task_sources]]\nagent = \"otter\"\npath = \"otter.md\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
 	items, _, err := app.AddTask("otter", "", "first task")
 	if err != nil {
-		t.Fatalf("add through the sqlite provider: %v", err)
+		t.Fatalf("add through the database provider: %v", err)
 	}
 	if len(items) != 1 || items[0].Text != "first task" {
 		t.Fatalf("items = %+v", items)
@@ -145,7 +145,7 @@ func TestTaskTargetsAcceptEitherSpellingOfTheAgent(t *testing.T) {
 	app, st := testApp(t)
 	ctx := context.Background()
 	if err := os.WriteFile(app.ConfigPath, []byte(
-		"[task_source_provider]\nprovider = \"sqlite\"\n\n[[task_sources]]\nagent = \"a1\"\n"), 0o600); err != nil {
+		"[task_source_provider]\nprovider = \"database\"\n\n[[task_sources]]\nagent = \"a1\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := st.AssignAgentName(ctx, "a1", "lively-mole"); err != nil {

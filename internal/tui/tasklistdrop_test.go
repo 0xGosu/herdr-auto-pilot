@@ -18,7 +18,7 @@ import (
 
 var dropListNow = time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
 
-// dropListModel is taskAppModel on the DEFAULT (sqlite) provider, with an
+// dropListModel is taskAppModel on the DEFAULT (database) provider, with an
 // EXPLICIT list name so the group carries a real db:// locator.
 //
 // A DERIVED source (no path) deliberately renders as a template group with no

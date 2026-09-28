@@ -37,7 +37,7 @@ var gistTokenKeys = []string{"GITHUB_TOKEN", "GH_TOKEN"}
 type Registry struct {
 	cfg config.Config
 
-	// lists is the store capability behind the sqlite provider; nil when the
+	// lists is the store capability behind the database provider; nil when the
 	// caller has no store (then a sqlite source is refused at use time, never
 	// silently served from a file).
 	lists ports.TaskListStore
@@ -51,8 +51,8 @@ type Registry struct {
 // Option configures a Registry.
 type Option func(*Registry)
 
-// WithTaskLists makes the sqlite provider servable: lists is the store the
-// task_lists rows live in, and its node id is the namespace a sqlite source's
+// WithTaskLists makes the database provider servable: lists is the store the
+// task_lists rows live in, and its node id is the namespace a database source's
 // derived locator is minted in.
 func WithTaskLists(lists ports.TaskListStore) Option {
 	return func(r *Registry) {
@@ -180,7 +180,7 @@ func (r *Registry) backend(p config.ResolvedProvider) (ports.TaskStore, error) {
 	if !p.Remote() {
 		return r.local, nil
 	}
-	if p.Name == config.ProviderSQLite {
+	if p.Name == config.ProviderDatabase {
 		return r.dbStore()
 	}
 	// ONE validator for every use-time rule — unknown provider, unsupported
@@ -211,11 +211,11 @@ func (r *Registry) backend(p config.ResolvedProvider) (ports.TaskStore, error) {
 	return s, nil
 }
 
-// dbStore is the sqlite provider's backend, or the one error every surface
+// dbStore is the database provider's backend, or the one error every surface
 // prints when this process has no store to keep lists in.
 func (r *Registry) dbStore() (ports.TaskStore, error) {
 	if r.db == nil {
-		return nil, fmt.Errorf("provider=%s keeps task lists in the hap database, which this process has not opened", config.ProviderSQLite)
+		return nil, fmt.Errorf("provider=%s keeps task lists in the hap database, which this process has not opened", config.ProviderDatabase)
 	}
 	return r.db, nil
 }

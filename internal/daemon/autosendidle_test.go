@@ -1877,12 +1877,12 @@ func TestAutoSendIdleAttendedSourceStillEscalatesWithNoLearnedRule(t *testing.T)
 }
 
 // TestAutoSendIdleHandsOutFromASQLiteProviderList: a source under
-// provider = "sqlite" keeps its list in the store, and the idle hand-out reads
+// provider = "database" keeps its list in the store, and the idle hand-out reads
 // and reserves it THERE — through the registry's database backend, never a
 // file. The prompt is the remote form (no --path: there is no file to point
 // the agent at), and the reservation lands in the task_lists row.
 func TestAutoSendIdleHandsOutFromASQLiteProviderList(t *testing.T) {
-	cfg := "[task_source_provider]\nprovider = \"sqlite\"\n\n" +
+	cfg := "[task_source_provider]\nprovider = \"database\"\n\n" +
 		"[[task_sources]]\nagent = \"agent-db\"\nenable_auto_send_task_when_idle = true\n"
 	h := newHarness(t, cfg)
 	h.herdr.setPane(autoSendIdlePane)

@@ -116,7 +116,7 @@ func TestBootstrapWritesWhereItRegisters(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := os.Stat(filepath.Join(stateDir, "tasks", name+".md")); err == nil {
-			t.Error("the confirm wrote a local bootstrap file under the sqlite provider")
+			t.Error("the confirm wrote a local bootstrap file under the database provider")
 		}
 		cfg, err := config.Load(app.ConfigPath)
 		if err != nil {

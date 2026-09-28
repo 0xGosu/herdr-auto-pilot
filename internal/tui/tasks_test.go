@@ -239,7 +239,7 @@ func TestRefreshDataPopulatesTasks(t *testing.T) {
 // path.
 // seedLocalFSConfigIn writes a config declaring the local_fs provider into dir
 // and returns its path, for a fixture whose checklist is a FILE on disk. The
-// package default is the sqlite provider, under which a filesystem path is not
+// package default is the database provider, under which a filesystem path is not
 // a legal list name at all — so a fixture that writes a .md and points a source
 // at it has to say which backend it means.
 func seedLocalFSConfigIn(t *testing.T, dir string) string {

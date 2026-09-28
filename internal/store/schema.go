@@ -202,7 +202,7 @@ const createTaskHandouts = `CREATE TABLE IF NOT EXISTS task_handouts (
 	PRIMARY KEY (node_id, source_path, task_text)
 );`
 
-// task_lists holds the checklists of the `sqlite` task-source provider: one
+// task_lists holds the checklists of the `database` task-source provider: one
 // row per (node, name), the whole markdown list as one blob, and a revision the
 // writers compare-and-swap on. Node-owned like every other operational table,
 // but unlike them an OPERATOR on another node may edit a row (the unified

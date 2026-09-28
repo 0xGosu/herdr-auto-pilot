@@ -53,8 +53,8 @@ func TestFreshInstallAddsAPathlessSourceAndRoundTripsItsTasks(t *testing.T) {
 	if got := cfg.TaskSources[0].Provider; got != "" {
 		t.Errorf("provider = %q, want the inheritance left empty", got)
 	}
-	if got := cfg.ResolveProvider(cfg.TaskSources[0]).Name; got != config.ProviderSQLite {
-		t.Errorf("resolved provider = %q, want %q", got, config.ProviderSQLite)
+	if got := cfg.ResolveProvider(cfg.TaskSources[0]).Name; got != config.ProviderDatabase {
+		t.Errorf("resolved provider = %q, want %q", got, config.ProviderDatabase)
 	}
 
 	for _, item := range []string{"alpha", "beta"} {
@@ -88,7 +88,7 @@ func TestFreshInstallRefusalNamesTheWayOut(t *testing.T) {
 	app, _ := testApp(t)
 	_, err := run(t, app, "config", "task-source", "add", "--agent", "brave-otter", "/tmp/tasks.md")
 	if err == nil {
-		t.Fatal("a filesystem path under the sqlite provider must be refused")
+		t.Fatal("a filesystem path under the database provider must be refused")
 	}
 	for _, want := range []string{"--provider " + config.ProviderLocalFS, "omit the path"} {
 		if !strings.Contains(err.Error(), want) {

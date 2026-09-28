@@ -2,7 +2,9 @@ package frontend
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
@@ -255,4 +257,87 @@ func (a *App) DeleteTaskList(ctx context.Context, locator string) (bool, error) 
 		return false, err
 	}
 	return a.deleteList(ctx, cfg, locator)
+}
+
+// RemoveTaskSourceAndList retires task source #index exactly as
+// RemoveTaskSource does, then deletes the list it served, locator — the TUI's
+// "remove the source AND its checklist" answer. Only a list kept in the hap
+// database qualifies, for the reason deleteList gives: a file or a gist is the
+// operator's, not hap's.
+//
+// The ORDER is the safety property. Deleting first and then losing the
+// source's stale-listing check would leave a configured source that recreates
+// the list empty on its next write; removing first means a refused removal
+// has touched nothing. For the same reason the list must not still be named by
+// any OTHER source — checked inside the same config update, so the answer is
+// about the config actually written — or the delete would empty a list that is
+// still handed out. A failed delete after a committed removal is reported as
+// exactly that, so the operator knows the source is already gone.
+//
+// deleted is false when the list was already absent.
+func (a *App) RemoveTaskSourceAndList(ctx context.Context, index int, expected config.TaskSource,
+	locator string) (deleted bool, err error) {
+
+	if _, ok := tasklocator.ParseDB(locator); !ok {
+		return false, fmt.Errorf("%s is not kept in the hap database, so it is not hap's to delete — "+
+			"remove the source alone and delete the list yourself", tasklocator.Display(locator))
+	}
+	var before config.Config
+	err = a.UpdateConfig(ctx, func(cfg *config.Config) error {
+		if err := checkTaskSourceUnchanged(*cfg, index, expected); err != nil {
+			return err
+		}
+		before = *cfg
+		remaining := *cfg
+		remaining.TaskSources = slices.Delete(slices.Clone(cfg.TaskSources), index, index+1)
+		nodeID := a.taskStores(*cfg).NodeID()
+		if nodeID == "" {
+			// Without it no database source resolves, so the sharing check
+			// below would pass by default — and the delete could not run anyway.
+			return fmt.Errorf("this process has no hap database open, so %s cannot be deleted from here",
+				tasklocator.Display(locator))
+		}
+		if other, ok := sourceNamingList(remaining, nodeID, locator); ok {
+			if other >= index {
+				other++ // name it by the index the operator is looking at
+			}
+			return fmt.Errorf("task source #%d also uses %s, so the list was kept and nothing was removed — "+
+				"remove the source alone, or retire both sources first", other, tasklocator.Display(locator))
+		}
+		cfg.TaskSources = remaining.TaskSources
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	deleted, err = a.deleteList(ctx, before, locator)
+	if err != nil {
+		return false, fmt.Errorf("task source #%d removed, but its list %s was not deleted: %w",
+			index, tasklocator.Display(locator), err)
+	}
+	return deleted, nil
+}
+
+// sourceNamingList reports the index of a source in cfg that resolves to
+// locator, if any. A derived (one-list-per-agent) source has no locator of its
+// own, so it is resolved for the agent whose derived file name the list
+// carries — the only agent through which it could name this list. A source
+// that does not resolve at all cannot name it.
+//
+// It resolves through tasklocator directly rather than the App's registry: the
+// registry is cached per source list, and cfg here is a hypothetical one.
+func sourceNamingList(cfg config.Config, nodeID, locator string) (int, bool) {
+	want := tasklocator.Canonical(locator)
+	ref, _ := tasklocator.ParseDB(locator)
+	agent := strings.TrimSuffix(ref.Name, ".md")
+	for i, src := range cfg.TaskSources {
+		res, err := tasklocator.Resolve(cfg, src, "", nodeID)
+		if errors.Is(err, tasklocator.ErrAgentNameRequired) && agent != "" {
+			res, err = tasklocator.Resolve(cfg, src, agent, nodeID)
+		}
+		if err == nil && tasklocator.Canonical(res.Locator) == want {
+			return i, true
+		}
+	}
+	return 0, false
 }

@@ -725,20 +725,56 @@ type Embedding struct {
 const (
 	ProviderLocalFS    = "local_fs"
 	ProviderGitHubGist = "github_gist"
-	// ProviderSQLite keeps a source's checklist INSIDE hap's own database
-	// (the task_lists table) rather than in a file. Under the default sqlite
-	// engine that is the local database; under engine = "turso" the rows sync
-	// with everything else, so every machine's TUI sees — and can edit — every
-	// other machine's queues. Lists are node-scoped: the daemon that owns a
-	// node is the only one handing its items out.
-	ProviderSQLite = "sqlite"
+	// ProviderDatabase keeps a source's checklist INSIDE hap's own database
+	// (the task_lists table) rather than in a file, whichever [database]
+	// engine that is. Under the default sqlite engine it is the local
+	// database; under turso or libsql the rows sync with everything else, so
+	// every machine's TUI sees — and can edit — every other machine's queues.
+	// Lists are node-scoped: the daemon that owns a node is the only one
+	// handing its items out.
+	ProviderDatabase = "database"
+	// DeprecatedProviderSQLite is ProviderDatabase's name from before hap
+	// supported more than one database engine. Load rewrites it (the next Save
+	// then drops it from disk) and every write surface accepts it as an alias
+	// through CanonicalProvider, so a script or an installed skill still
+	// spelling it keeps working. It is deliberately NOT in
+	// ValidTaskSourceProviders: nothing offers it.
+	DeprecatedProviderSQLite = "sqlite"
 )
 
 // ValidTaskSourceProviders are the values a provider key accepts, in display
 // order. Mirrors ValidThemes: `hap config set` and the TUI picker validate
 // against it, while a hand-edited config.toml still LOADS an unrecognized
 // value and fails at use time (see ValidateTaskSource).
-var ValidTaskSourceProviders = []string{ProviderLocalFS, ProviderGitHubGist, ProviderSQLite}
+var ValidTaskSourceProviders = []string{ProviderLocalFS, ProviderGitHubGist, ProviderDatabase}
+
+// CanonicalProvider maps a retired provider spelling to its current name and
+// returns every other value unchanged — an unrecognized one included, since
+// rejecting it is the validator's job and needs the value as written. Every
+// surface that accepts a provider name passes it through here first.
+func CanonicalProvider(name string) string {
+	if name == DeprecatedProviderSQLite {
+		return ProviderDatabase
+	}
+	return name
+}
+
+// canonicalizeProviders rewrites every EXPLICIT provider spelling through
+// CanonicalProvider and reports whether anything changed. An empty per-source
+// provider is the live inheritance link and stays empty (see
+// normalizeTaskSources).
+func (c *Config) canonicalizeProviders() bool {
+	changed := false
+	if p := CanonicalProvider(c.TaskSourceProvider.Provider); p != c.TaskSourceProvider.Provider {
+		c.TaskSourceProvider.Provider, changed = p, true
+	}
+	for i := range c.TaskSources {
+		if p := CanonicalProvider(c.TaskSources[i].Provider); p != c.TaskSources[i].Provider {
+			c.TaskSources[i].Provider, changed = p, true
+		}
+	}
+	return changed
+}
 
 // Database engines.
 const (
@@ -1084,7 +1120,7 @@ type ResolvedProvider struct {
 // path, an empty path derives one list per matched agent, and `--path` cannot
 // reach the list. It is the single definition, so every call site that asks
 // "is this a file?" agrees. It does not mean the calls leave the machine —
-// the sqlite provider's rows live in hap's own database — which is why the
+// the database provider's rows live in hap's own database — which is why the
 // rules that exist for a NETWORK backend (the Windows lock refusal, the
 // credential file) are gated on the gist provider by name instead.
 func (r ResolvedProvider) Remote() bool { return r.Name != ProviderLocalFS }
@@ -1141,7 +1177,7 @@ func (c Config) AnyNonDefaultProvider() bool {
 			return true
 		}
 	}
-	return top != ProviderLocalFS && top != ProviderSQLite
+	return top != ProviderLocalFS && top != ProviderDatabase
 }
 
 // TaskSource points an agent or workspace at a declared next-task list (FR-011).
@@ -1287,8 +1323,11 @@ const DefaultMaxTasks = 20
 // `hap config set task_source_provider.provider github_gist` would then move
 // nothing at all, silently, for every install that already had a config. An
 // empty provider key IS the inheritance; keep it empty.
-// (TestInheritedProviderIsNeverMaterialized pins this.)
+// (TestInheritedProviderIsNeverMaterialized pins this.) Rewriting an EXPLICIT
+// retired spelling (canonicalizeProviders) is not materializing anything, so
+// Save always writes the current name.
 func (c *Config) normalizeTaskSources() {
+	c.canonicalizeProviders()
 	for i := range c.TaskSources {
 		if c.TaskSources[i].MaxTasks <= 0 {
 			c.TaskSources[i].MaxTasks = DefaultMaxTasks
@@ -1376,7 +1415,7 @@ func ValidateTaskSource(cfg Config, src TaskSource) error {
 	// path-shaped value corrupts silently rather than failing.
 	if name := strings.TrimSpace(src.Path); name != "" {
 		if err := ValidateStoreFileName(name); err != nil {
-			// Naming the way OUT matters most under the sqlite provider,
+			// Naming the way OUT matters most under the database provider,
 			// because that is the DEFAULT for a new install: the first thing a
 			// fresh operator does is point a source at a markdown file, and
 			// "this is not a store file name" says what is wrong without
@@ -1449,7 +1488,7 @@ func ValidateResolvedProvider(cfg Config, index int, src TaskSource) error {
 			p.Name, strings.Join(ValidTaskSourceProviders, ", "))
 	}
 	if !p.Egress() {
-		// local_fs needs nothing; the sqlite provider needs only the store,
+		// local_fs needs nothing; the database provider needs only the store,
 		// which the task-store registry checks for when it builds the backend.
 		return nil
 	}
@@ -1816,7 +1855,7 @@ func Default() Config {
 		// otherwise: no file lock behind every read-modify-write, one list per
 		// agent derived rather than hand-pathed, and — under the turso engine —
 		// visible across the fleet. It stays on this machine either way; the
-		// sqlite provider makes no outbound call (only github_gist does, see
+		// database provider makes no outbound call (only github_gist does, see
 		// ResolvedProvider.Egress).
 		//
 		// This default reaches an install ONLY through a config file that does
@@ -1826,7 +1865,7 @@ func Default() Config {
 		// Named explicitly rather than left to the zero value so FieldValue
 		// renders something for the registry parity test, and so an operator
 		// reading a saved config sees the posture they are running under.
-		TaskSourceProvider: TaskSourceProvider{Provider: ProviderSQLite},
+		TaskSourceProvider: TaskSourceProvider{Provider: ProviderDatabase},
 		// The local file unless the operator says otherwise, named for the
 		// same two reasons as the provider above.
 		Database: Database{Engine: EngineSQLite},
@@ -2101,6 +2140,14 @@ func Load(path string) (Config, error) {
 		legacy := Default()
 		legacy.TaskSourceProvider.Provider = ProviderLocalFS
 		return legacy, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	// Renamed provider `sqlite` → `database`. Done FIRST, directly after the
+	// decode, so no later return path (the auto-accept validation keeps the
+	// decoded config) can hand a caller the retired spelling — which would read
+	// as an unknown provider at use time and take every task list dark.
+	if cfg.canonicalizeProviders() {
+		warnOnce("task source provider `sqlite` is renamed to `database`; the next config save rewrites it",
+			"path", path)
 	}
 	// Every deprecated/removed key is probed from THIS ONE decode. The probes
 	// exist because a key absent from the Config struct is indistinguishable

@@ -440,7 +440,7 @@ type EnsureCreator interface {
 	Ensure(ctx context.Context, locator, initial string) (created bool, err error)
 }
 
-// TaskListStore is the OPTIONAL store capability behind the `sqlite`
+// TaskListStore is the OPTIONAL store capability behind the `database`
 // task-source provider: checklists kept as rows in hap's own database, so that
 // under a shared (turso) store every node's lists are visible — and editable —
 // from every other node's TUI and CLI.

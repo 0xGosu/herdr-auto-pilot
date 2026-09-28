@@ -866,7 +866,7 @@ func freshSourcePromptModel(t *testing.T) (Model, *frontend.App) {
 // documented default, and the prompt used to have no way to express it —
 // positionally the checklist comes first, so an operator with no path to give
 // had nothing to type in its place, an empty input was refused, and a
-// filesystem path is refused by the sqlite provider. --agent is the way in.
+// filesystem path is refused by the database provider. --agent is the way in.
 func TestTUIAddPathlessSourceOnAFreshInstall(t *testing.T) {
 	m, app := freshSourcePromptModel(t)
 	msg := submitSourcePrompt(t, m, "--agent brave-otter")
@@ -892,8 +892,8 @@ func TestTUIAddPathlessSourceOnAFreshInstall(t *testing.T) {
 	if src.Provider != "" {
 		t.Errorf("provider = %q, want the inheritance left empty", src.Provider)
 	}
-	if got := cfg.ResolveProvider(src).Name; got != config.ProviderSQLite {
-		t.Errorf("resolved provider = %q, want %q", got, config.ProviderSQLite)
+	if got := cfg.ResolveProvider(src).Name; got != config.ProviderDatabase {
+		t.Errorf("resolved provider = %q, want %q", got, config.ProviderDatabase)
 	}
 }
 
@@ -906,7 +906,7 @@ func TestTUIAddLocalFileSourceOnAFreshInstall(t *testing.T) {
 	if err := os.WriteFile(path, []byte("- [ ] alpha\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// Without --provider this is refused by the sqlite provider's store-file
+	// Without --provider this is refused by the database provider's store-file
 	// rule, and the refusal must name the way out rather than only the fault.
 	msg := submitSourcePrompt(t, m, path+" brave-otter")
 	if msg.err == nil {

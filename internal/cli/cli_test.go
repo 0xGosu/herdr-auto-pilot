@@ -59,7 +59,7 @@ func localFSApp(t *testing.T) (*frontend.App, *store.Store) {
 }
 
 // localFSCfg is config.Default() for a fixture whose sources are FILES on
-// disk. Default() means the sqlite provider now, under which a filesystem path
+// disk. Default() means the database provider now, under which a filesystem path
 // is not a legal list name — so a test that saves a path-bearing source has to
 // declare the file backend.
 func localFSCfg() config.Config {

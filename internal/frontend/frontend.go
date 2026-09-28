@@ -3657,7 +3657,7 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 			// an unrecognized value and fails at use time, because coercing it
 			// would silently create local checklist files for sources the
 			// operator believes are remote.
-			p := strings.ToLower(strings.TrimSpace(value))
+			p := config.CanonicalProvider(strings.ToLower(strings.TrimSpace(value)))
 			if p == "" {
 				cfg.TaskSourceProvider.Provider = ""
 				return nil

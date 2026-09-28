@@ -827,7 +827,7 @@ keystroke.
       `migrateNodeScoped`/`migrateExplicitID` MIRROR the lists in `nodescope_test.go` and are pinned to
       them by `TestMigrateScopeListsMatchTheGuard`: a table that gains a `node_id` elsewhere and is not
       added here comes over WHOLE, silently. The same test walks the REAL schema: every table must be
-      copied or named with a reason in `migrateNotCopied` — `task_lists` (the whole `sqlite` task provider)
+      copied or named with a reason in `migrateNotCopied` — `task_lists` (the whole `database` task provider)
       was once in neither, and a migration reported success over lost checklists.
     - **Knowledge is never scoped.** `signatures`, `signature_embeddings`, `signature_snapshots` and
       `decisions` carry no `node_id` on purpose (rules graduate on the FLEET's evidence), so filtering them
@@ -1608,7 +1608,7 @@ where the behaviour could revert.
 | `internal/store/libsql` | the libsql engine's transport: Hrana client (`hrana.go`, its only HTTP), `Batch`/`Tx` pipelines, a direct `database/sql` handle over `sqlbridge.Backend`; `hranafake` is the in-process test server |
 | `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
 | `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |
-| `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `sqlite` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |
+| `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `database` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |
 | `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
 | `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
 | `internal/streamlog` | machine-local SQLite event log behind `hap stream orchestrator` (its own file, NOT a store table) |

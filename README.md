@@ -510,7 +510,7 @@ hap config task-source set backend-dev max-tasks 40
 hap config task-source remove <index|agent>
 ```
 
-The checklist argument is optional under the default `sqlite` provider (leave it
+The checklist argument is optional under the default `database` provider (leave it
 out for one derived list per matched agent, give a NAME to share one list) and
 required under `local_fs`, where it is a filesystem path. See
 [Where task lists are stored](#where-task-lists-are-stored).
@@ -567,7 +567,7 @@ agent can keep a checklist as a file on disk while another's lives in a gist:
 
 ```toml
 [task_source_provider]
-provider = "github_gist"                     # "sqlite" (default) | "local_fs" | "github_gist"
+provider = "github_gist"                     # "database" (default) | "local_fs" | "github_gist"
 env_file = "~/.config/hap/task_source.env"   # holds GITHUB_TOKEN; read at use time
 timeout_seconds = 20
 refresh_seconds = 30
@@ -601,7 +601,8 @@ matched agent shares one list; leave it out and each gets its own
 `env_file` names (`GITHUB_TOKEN=…`, `gist` scope, mode `0600`), is read when hap
 reaches the store, and never enters `config.toml`.
 
-The default provider, **`sqlite`**, keeps a source's checklist **inside hap's own
+The default provider, **`database`** (spelled `sqlite` before hap supported
+more than one database engine — that spelling still loads), keeps a source's checklist **inside hap's own
 database** instead of a file. Nothing leaves the machine under the default
 engine; under the [central database](#central-database-turso-or-any-libsql-server) those lists sync
 with everything else, so the Tasks tab and `hap task --node <machine> <agent> …`
@@ -770,7 +771,10 @@ longer be serving anyone: either **no live agent matches** its selectors, or
 **every task is finished** (`[-]` counts as unfinished). Both *unknowns* refuse
 too, since neither is evidence of safety: an agent list herdr will not answer is
 not an empty herd, and a checklist that will not read is not an empty checklist.
-The checklist file stays on disk. To retire a source the guard refuses, use the
+`y` keeps the checklist; when the list lives in the hap database (the `database`
+provider) and no other source uses it, **`D`** removes the source *and* deletes
+that list in one step. A `local_fs` file or a gist is yours, so it always stays
+where it is. To retire a source the guard refuses, use the
 *Config* tab's `x` or `hap config task-source remove`, which are unguarded by
 design.
 
@@ -928,7 +932,7 @@ retires exactly the unified list it shows — `--node <label>` scopes it to one)
 rename, enable, disable, focus or capture a remote agent with `--node <label>`,
 which files the request for the owning daemon; curate learned rules, which are
 shared; pause or resume a machine (`hap pause --node laptop`); read and edit its
-`sqlite`-provider task lists (`hap task --node laptop <agent> list`), including
+`database`-provider task lists (`hap task --node laptop <agent> list`), including
 reordering them from the TUI's Tasks tab. Changing a remote agent's permission
 MODE is still refused — that one reads the pane it is about to press into, so it
 belongs to the machine watching it.
@@ -940,7 +944,7 @@ startup, so one machine's restart never reclaims another's in-flight work.
 Learned rules converge by content. What is left to last-write-wins is narrow
 and self-healing: two machines learning the same rule in one sync window, an
 operator racing the owning daemon on one escalation (re-validated before any
-keystroke, so never a double delivery), or an edit to a `sqlite` task list
+keystroke, so never a double delivery), or an edit to a `database` task list
 during that machine's hand-out.
 
 **What to know.**
@@ -954,7 +958,7 @@ during that machine's hand-out.
 - **Config stays local.** `config.toml` — task sources, LLM setup, rules,
   `[database]` itself — is never written to the database; each machine keeps
   its own file. Task lists stay files on their machine unless a source selects
-  the `sqlite` provider.
+  the `database` provider.
 - Every machine should run the same embedding model: learned rules are shared,
   and a machine with a different model re-embeds every rule on start.
 - **Privacy.** This puts the **whole store** — pane excerpts included — in the

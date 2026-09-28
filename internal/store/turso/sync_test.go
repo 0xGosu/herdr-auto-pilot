@@ -237,7 +237,7 @@ func TestTwoFreshNodesPrepareTheSchemaWithoutWedging(t *testing.T) {
 }
 
 // TestTwoNodesShareASQLiteProviderTaskList: a list one node keeps in the
-// database (the `sqlite` task-source provider) reaches the other node through
+// database (the `database` task-source provider) reaches the other node through
 // sync, the other node edits it in place — the unified Tasks view — and the
 // edit comes back to the owner, revision intact, so the owner's next hand-out
 // compare-and-swaps against the operator's version rather than a stale one.
