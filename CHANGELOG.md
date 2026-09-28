@@ -8,6 +8,13 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.59
+
+- Added an `agent.mode agent=… mode=… [promote=…]` event to `hap stream orchestrator`, announced once per change of an agent's permission mode. `promote=` names the most autonomous mode (`auto` for claude, `acceptEdits` for agy) when the daemon sees an agent in its restrictive mode, and the orchestrator now rotates such agents there on its own. It never leaves `plan`, never touches codex (whose `default` is already unrestricted), and respects a mode an operator set with `hap mode`
+- `hap mode` now refuses the orchestrator out of plan mode (checked against the live pane) and refuses it any mode change while automation is paused or the agent is disabled; every set is recorded on the event stream under its author
+- Fixed the orchestrator waking up to its own actions: `hap stream orchestrator` no longer prints a standalone `# suppressed …` line after a run of self-authored events. The notice now goes out just ahead of the next event someone else writes, or as the last line when the stream is stopped. Trade-off: a stream whose reader died while only the orchestrator was acting now notices at the next foreign event rather than within 10 seconds
+- Fixed `hap stream orchestrator` occasionally reporting a false `# gap` (and skipping that event) when an event landed on an empty or fully pruned log at the moment the stream checked for pruning
+
 ## 0.9.58
 
 - Renamed the task-list provider `sqlite` to `database`, since the lists live in whichever database engine hap runs on (sqlite, turso or libsql). Existing configs keep working: `sqlite` is migrated on load, rewritten as `database` on the next config save, and still accepted by `hap config set`, `hap config task-source` and the TUI. A config saved this way reads as an unknown provider to an older hap, so rolling back means setting the key back to `sqlite`.
