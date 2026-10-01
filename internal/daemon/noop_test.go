@@ -315,3 +315,38 @@ func TestSuggestionActionMapsNoopDisplay(t *testing.T) {
 		}
 	}
 }
+
+// TestReplayedWorkingIsNotAHumanCheckIn: after herdr's events_lost the
+// subscriber re-reads every watched agent's status from pane.list and replays
+// it. A replayed "working" is where the agent IS, not a move anyone made — an
+// agent hap prompted a minute ago that has worked ever since reads exactly the
+// same — so it must not reset the runaway counter. agent-live is the control: a
+// real working transition the daemon did not cause DOES reset, and since both
+// travel one channel in order, seeing it reset proves the replay was handled.
+func TestReplayedWorkingIsNotAHumanCheckIn(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	for _, id := range []string{"agent-replayed", "agent-live"} {
+		if err := h.raw.UpdateAgentRate(ctx, domain.AgentRate{AgentID: id, ConsecutiveAuto: 3}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h.events.ch <- domain.AgentTransition{
+		AgentID: "agent-replayed", PaneID: "agent-replayed",
+		AgentType: "claude", Status: "working", Replayed: true,
+	}
+	h.push("agent-live", "working")
+
+	waitFor(t, 3*time.Second, func() bool {
+		rate, err := h.raw.GetAgentRate(ctx, "agent-live")
+		return err == nil && rate.ConsecutiveAuto == 0
+	})
+	rate, err := h.raw.GetAgentRate(ctx, "agent-replayed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rate.ConsecutiveAuto != 3 {
+		t.Errorf("a replayed working reset the runaway counter to %d, want 3", rate.ConsecutiveAuto)
+	}
+}

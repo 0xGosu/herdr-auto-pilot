@@ -47,6 +47,13 @@ type AgentTransition struct {
 	// (Herdr events never set it) and exists so the audit trail names why the
 	// task went out.
 	AutoIdleSend bool
+	// Replayed marks a status the subscriber RE-READ from pane.list rather
+	// than an event herdr sent (herdr.Subscriber's replay after a resubscribe
+	// or events_lost). It states where the agent IS, not that it just moved
+	// there, so it is no evidence of who caused the move: a replayed
+	// "working" must not count as a human check-in. Transient, like the two
+	// above.
+	Replayed bool
 }
 
 // WorkspaceInfo is display metadata for one Herdr workspace.

@@ -1596,8 +1596,24 @@ where the behaviour could revert.
   in case a build ships the caret binding, failing closed when the learned label matches no offered environment.
 - One request per socket connection — herdr answers and CLOSES, so nothing is pipelined or reused (verified
   live, herdr 0.8.2: a second request on the same connection gets a reset). `events.subscribe` is the one that
-  then keeps streaming; status subscriptions require a concrete `pane_id`; existing panes are replayed as
-  `pane_created`.
+  then keeps streaming; status subscriptions require a concrete `pane_id`. Before herdr 0.9.0 existing panes
+  were replayed as `pane_created`; 0.9.0+ starts a subscription with LIVE events only (verified on 0.9.3), so
+  `pane.list` on every (re)subscribe is the only way to learn of a pane that predates the stream.
+- **`events_lost` is a resubscribe, not an outage** (herdr 0.9.2+, `errEventsLost`). A reader that falls behind
+  the retained history gets an error with its subscription's request id and the stream is CLOSED; the evicted
+  events are never resent. `loop()` resubscribes at once at INFO (a repeat within `eventsLostQuietWindow` takes
+  the ordinary backoff, or an overloaded herdr gets a re-list and a subscribe per round — and the healthy-stretch
+  reset runs FIRST, or a ladder an old outage ratcheted survives into that repeat). A STATUS overrun sets `resync`,
+  so the next `runStatus` replays EVERY watched agent's current status from its fresh listing; it is stored
+  before the `errPaneSetChanged` mapping, which a racing dirty signal would otherwise take. A DISCOVERY overrun
+  only marks the pane set dirty: the re-list alone recovers a lost `pane.agent_detected` (the pane is newly
+  watched, so replayed) or `pane.exited`, and each connection reads at its own position, so replaying every
+  agent there would only cost an overloaded herdr a capture per parked agent. What comes back is current STATE,
+  never the missed history — so every replayed transition is marked `Replayed`, and the daemon never counts a
+  replayed `working` as a human check-in (it would reset `max_consecutive_auto_prompts` herd-wide per overrun).
+  **Test trap:** `fakeherdr` replays `pane.created` on subscribe by default (herdr < 0.9.0), which recovers a
+  missed detection by itself — an `events_lost` case must call `SetSubscribeReplay(false)` or it passes on
+  code that does no resync at all.
 - **The socket carries EVENTS, `notification.show` and TYPED input; everything else is the CLI, the pane
   LISTING included** (`herdr.PaneLister` → `CLI.ListPanes`). Typed input (`pane.send_text`, one request per
   burst — see the claude paste bullet) is the exception on cost: a hand-out is dozens of writes and a `herdr`
