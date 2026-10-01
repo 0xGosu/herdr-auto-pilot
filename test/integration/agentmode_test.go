@@ -4,6 +4,8 @@ package integration
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
+	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
 
 // requireClaude gates on the same env var and binary check the other
@@ -314,15 +317,118 @@ func TestRealClaudeModeRefusesAStandingModal(t *testing.T) {
 	}
 }
 
+// shiftTabKeyNameFixedIn is the first herdr release whose `pane send-keys
+// shift+tab` writes a real Shift+Tab (CSI Z) rather than a bare TAB — herdr
+// #1561, "preserve Shift when sending shift+tab". Verified with `cat -v` in a
+// pane: 0.8.0 writes a TAB, 0.8.2 writes `^[[Z` (there is no 0.8.1 release).
+const shiftTabKeyNameFixedIn = "0.8.2"
+
+// runningHerdrVersion asks the SERVER the suite drives for its version. It is
+// the server that turns a key name into bytes, and since herdr 0.9.0 a client
+// may be newer than the server it talks to, so `herdr --version` would answer
+// for the wrong process.
+func runningHerdrVersion() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, herdrBin(), "status", "server", "--json").Output()
+	if err != nil {
+		return "", fmt.Errorf("herdr status server --json: %w", err)
+	}
+	return serverVersionFromStatus(out)
+}
+
+// serverVersionFromStatus reads the version out of `herdr status server --json`
+// (the same shape from 0.7.5 through 0.9.3). Anything that is not a release
+// version is an error: the caller must not read "unknown" as "old" or "new".
+func serverVersionFromStatus(out []byte) (string, error) {
+	var st struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		return "", fmt.Errorf("parse herdr status server --json: %w", err)
+	}
+	if !updatecheck.IsRelease(st.Version) {
+		return "", fmt.Errorf("herdr server reports no release version (%q)", st.Version)
+	}
+	return st.Version, nil
+}
+
+// skipShiftTabTripwire decides the tripwire from the version probe's result:
+// skip only on a server KNOWN to carry the fix. A probe that failed runs it,
+// so an unreadable version is never read as new.
+func skipShiftTabTripwire(version string, probeErr error) bool {
+	return probeErr == nil && updatecheck.Compare(version, shiftTabKeyNameFixedIn) >= 0
+}
+
+// TestShiftTabKeyNameGate pins the version gate: it never reads an unknown
+// server as old or new. It needs no herdr, but sits behind the integration tag
+// with the helpers it covers, so it runs only with the live suite.
+func TestShiftTabKeyNameGate(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  string
+		want    string
+		wantErr bool
+		skip    bool
+	}{
+		{name: "0.7.5 still broken", status: `{"running":true,"version":"0.7.5","protocol":17}`, want: "0.7.5"},
+		{name: "0.8.0 still broken", status: `{"running":true,"version":"0.8.0"}`, want: "0.8.0"},
+		{name: "0.8.2 fixed it", status: `{"running":true,"version":"0.8.2"}`, want: "0.8.2", skip: true},
+		{name: "0.9.3 fixed", status: `{"running":true,"version":"0.9.3","protocol":22}`, want: "0.9.3", skip: true},
+		{name: "compared numerically, not as text", status: `{"version":"0.10.0"}`, want: "0.10.0", skip: true},
+		{name: "a v prefix is accepted", status: `{"version":"v0.8.2"}`, want: "v0.8.2", skip: true},
+		{name: "a pre-release of the fix counts as fixed", status: `{"version":"0.8.2-rc1"}`, want: "0.8.2-rc1", skip: true},
+		{name: "no version is unknown, not old", status: `{"running":true}`, wantErr: true},
+		{name: "dev build is unknown", status: `{"version":"dev"}`, wantErr: true},
+		{name: "not json", status: `status: running`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := serverVersionFromStatus([]byte(tc.status))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("want an error, got version %q", got)
+				}
+				if skipShiftTabTripwire(got, err) {
+					t.Fatal("an unreadable version skipped the tripwire; it must run it")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("version = %q, want %q", got, tc.want)
+			}
+			if skip := skipShiftTabTripwire(got, nil); skip != tc.skip {
+				t.Fatalf("skipShiftTabTripwire(%q) = %v, want %v", got, skip, tc.skip)
+			}
+		})
+	}
+}
+
 // TestRealShiftTabKeyNameIsStillBroken is a TRIPWIRE on the workaround, not a
 // test of hap. It asserts the thing that forced SendChord to exist: herdr
 // ACCEPTS `pane send-keys shift+tab` and the agent does not react.
 //
-// If herdr ever fixes this, the test FAILS — which is the signal to simplify
-// SendChord back to a key name. Until then it documents, against a live herdr,
-// why the raw escape is not an over-complication.
+// herdr 0.8.2 fixed the key name, so the tripwire only runs against an older
+// server and SKIPS from 0.8.2 on. The workaround stays regardless:
+// min_herdr_version is 0.7.0, and CSI Z through send-text works on every
+// version. Dropping it is a min_herdr_version bump to 0.8.2 first. An
+// UNKNOWN server version runs the tripwire, so a failure still gets looked at.
+// On an older server, a failure here means the key name works there too.
 func TestRealShiftTabKeyNameIsStillBroken(t *testing.T) {
 	requireClaude(t)
+	// Asked BEFORE the agent starts, so a skip spends no tokens.
+	version, verr := runningHerdrVersion()
+	if skipShiftTabTripwire(version, verr) {
+		t.Skipf("herdr %s delivers `shift+tab` as a real Shift+Tab (fixed in %s); "+
+			"the CSI Z workaround stays only because min_herdr_version is 0.7.0",
+			version, shiftTabKeyNameFixedIn)
+	}
+	if verr != nil {
+		t.Logf("could not read the running herdr version (%v); running the tripwire", verr)
+	}
 	cli := herdr.NewCLI()
 	pane := startClaudeAgent(t, cli, t.TempDir())
 
@@ -337,11 +443,17 @@ func TestRealShiftTabKeyNameIsStillBroken(t *testing.T) {
 	}
 	time.Sleep(3 * time.Second)
 	after, _ := readMode(t, cli, pane, "claude")
+	if after != before && verr != nil {
+		t.Fatalf("herdr's `shift+tab` key name WORKS (%s -> %s) on a server whose "+
+			"version could not be read (%v) — fix runningHerdrVersion, not "+
+			"shiftTabKeyNameFixedIn.", before, after, verr)
+	}
 	if after != before {
-		t.Fatalf("herdr's `shift+tab` key name now WORKS (%s -> %s). "+
-			"domain.ShiftTab's raw CSI Z escape and herdr.CLI.SendChord can be "+
-			"replaced with a plain `pane send-keys shift+tab` — update the note in "+
-			"CLAUDE.md's herdr gotchas when you do.", before, after)
+		t.Fatalf("herdr's `shift+tab` key name WORKS (%s -> %s) on herdr %s, which "+
+			"this gate believed predates the %s fix — lower shiftTabKeyNameFixedIn "+
+			"and the note in CLAUDE.md's herdr gotchas. domain.ShiftTab and "+
+			"herdr.CLI.SendChord stay until min_herdr_version passes it.",
+			before, after, version, shiftTabKeyNameFixedIn)
 	}
 	t.Logf("confirmed: `pane send-keys shift+tab` still no-ops (mode stayed %s)", before)
 }

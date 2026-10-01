@@ -39,6 +39,9 @@ itself offers `shift+tab to auto-approve file edits`, that chord works:
 herdr agent send-keys <pane> shift+tab   # then verify the footer says accept-edits
 ```
 
+The `shift+tab` key name needs herdr 0.8.2 or later; older releases send a bare TAB.
+On those, send the raw chord instead: `herdr pane send-text <pane> $'\e[Z'`.
+
 `acceptEdits` is the cure for edit-approval stalls: hap does not answer agy's
 `Accept this file edit?` modal, so without it every edit blocks.
 
