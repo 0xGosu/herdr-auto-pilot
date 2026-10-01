@@ -1441,3 +1441,126 @@ func TestSubscriberDefaultsToTheCLIWhenNoListerIsGiven(t *testing.T) {
 		t.Fatal("NewSubscriber(nil) left no pane lister")
 	}
 }
+
+// drainTransitions empties out without blocking, so a later assertion sees
+// only what arrived after this point.
+func drainTransitions(out <-chan domain.AgentTransition) {
+	for {
+		select {
+		case <-out:
+		default:
+			return
+		}
+	}
+}
+
+// waitSubscribesAbove waits for the fake to count more than before
+// subscriptions of subscriptionType: the stream that got events_lost
+// resubscribed. Waited for rather than read once, because the status loop
+// replays from its listing BEFORE it sends the new subscribe.
+func waitSubscribesAbove(t *testing.T, srv *fakeherdr.Server, subscriptionType string, before int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.Subscribes(subscriptionType) > before {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Errorf("%s subscribes = %d after events_lost, want more than %d",
+		subscriptionType, srv.Subscribes(subscriptionType), before)
+}
+
+// TestSubscriberResyncsStatusAfterEventsLost: herdr 0.9.2+ answers a reader
+// that fell behind with events_lost and closes the stream, and the status
+// change it evicted is never sent again. The resubscribe must replay the
+// pane's CURRENT status from pane.list — for a pane already watched, which the
+// newly-watched replay alone never covers. The status is changed silently and
+// never pushed, so only the replay can deliver it.
+func TestSubscriberResyncsStatusAfterEventsLost(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.SetSubscribeReplay(false) // herdr 0.9.0+
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+	srv.SetStatusSilently("w1:p1", "working")
+
+	sub := NewSubscriber(srv.SocketPath, srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 64)
+	go sub.Subscribe(ctx, out)
+	if got := waitStatusSubs(t, srv, []string{"w1:p1"}); !slices.Equal(got, []string{"w1:p1"}) {
+		t.Fatalf("before: status subscriptions = %v, want [w1:p1]", got)
+	}
+	time.Sleep(300 * time.Millisecond)
+	drainTransitions(out)
+	before := srv.Subscribes("pane.agent_status_changed")
+
+	srv.SetStatusSilently("w1:p1", "blocked") // the evicted event
+	srv.LoseEvents("pane.agent_status_changed")
+
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case tr := <-out:
+			if tr.PaneID == "w1:p1" && tr.Status == "blocked" && tr.AgentType == "claude" {
+				if !tr.Replayed {
+					t.Errorf("a status re-read from pane.list must be marked Replayed: %+v", tr)
+				}
+				waitSubscribesAbove(t, srv, "pane.agent_status_changed", before)
+				return
+			}
+		case <-deadline:
+			t.Fatal("the status change lost with events_lost was never replayed")
+		}
+	}
+}
+
+// TestSubscriberRecoversAMissedAgentStartAfterEventsLost: an overrun on the
+// DISCOVERY stream can evict a pane.agent_detected, and herdr 0.9.0+ replays
+// nothing to the new subscription — so discovery must make the status loop
+// re-list the pane set, or the new agent is never watched at all.
+func TestSubscriberRecoversAMissedAgentStartAfterEventsLost(t *testing.T) {
+	srv, err := fakeherdr.NewServer(testutil.SocketDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	srv.SetSubscribeReplay(false) // herdr 0.9.0+
+	srv.AddAgentPane("w1:p1", "w1", "claude")
+
+	sub := NewSubscriber(srv.SocketPath, srv)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	out := make(chan domain.AgentTransition, 64)
+	go sub.Subscribe(ctx, out)
+	if got := waitStatusSubs(t, srv, []string{"w1:p1"}); !slices.Equal(got, []string{"w1:p1"}) {
+		t.Fatalf("before: status subscriptions = %v, want [w1:p1]", got)
+	}
+	time.Sleep(300 * time.Millisecond)
+	drainTransitions(out)
+	before := srv.Subscribes("pane.agent_detected")
+
+	srv.AddAgentPaneSilently("w1:p2", "w1", "codex", "idle") // the evicted start
+	srv.LoseEvents("pane.agent_detected")
+
+	want := []string{"w1:p1", "w1:p2"}
+	if got := waitStatusSubs(t, srv, want); !slices.Equal(got, want) {
+		t.Fatalf("after events_lost: status subscriptions = %v, want %v", got, want)
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case tr := <-out:
+			if tr.PaneID == "w1:p2" && tr.Status == "idle" && tr.AgentType == "codex" {
+				waitSubscribesAbove(t, srv, "pane.agent_detected", before)
+				return
+			}
+		case <-deadline:
+			t.Fatal("the agent whose start was lost with events_lost never had its status replayed")
+		}
+	}
+}

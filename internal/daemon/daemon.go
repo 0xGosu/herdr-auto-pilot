@@ -2006,7 +2006,11 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 			last, ours = ln, true
 		}
 		d.mu.Unlock()
-		if paused || !ours || now.Sub(last) > 10*time.Second {
+		// A REPLAYED status is a snapshot, not a transition: an agent hap
+		// prompted a minute ago and that has worked ever since reads
+		// "working" there too, and counting that as a check-in would reset
+		// the runaway counter across the herd on every herdr events_lost.
+		if !tr.Replayed && (paused || !ours || now.Sub(last) > 10*time.Second) {
 			d.registerHumanInteraction(ctx, tr.AgentID)
 		}
 		// The agent resumed: a pending delayed capture would read a pane

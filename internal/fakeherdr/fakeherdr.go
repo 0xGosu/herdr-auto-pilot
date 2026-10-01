@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,9 @@ type subscription struct {
 
 type clientConn struct {
 	conn net.Conn
+	// id is the events.subscribe request id, which herdr echoes on an error
+	// it sends mid-stream (see LoseEvents).
+	id   string
 	subs []subscription
 }
 
@@ -59,6 +63,12 @@ type Server struct {
 	omitAgentLabels bool
 	// listPanesErr, when set, makes ListPanes fail (see SetListPanesError).
 	listPanesErr error
+	// noSubscribeReplay suppresses the pane.created replay on subscribe, as
+	// herdr 0.9.0+ does (see SetSubscribeReplay).
+	noSubscribeReplay bool
+	// subscribes counts accepted events.subscribe requests per subscription
+	// type (see Subscribes).
+	subscribes map[string]int
 
 	// notifications records every notification.show request; notifyShown /
 	// notifyReason are the canned result, defaulting to a displayed toast.
@@ -102,6 +112,7 @@ func NewServer(dir string) (*Server, error) {
 		panes:        map[string]string{},
 		agents:       map[string]string{},
 		statuses:     map[string]string{},
+		subscribes:   map[string]int{},
 		notifyShown:  true,
 		notifyReason: "shown",
 		sendTextOK:   -1,
@@ -215,13 +226,21 @@ func (s *Server) serve(conn net.Conn) {
 			continue
 		}
 
-		cc := &clientConn{conn: conn, subs: req.Params.Subscriptions}
+		cc := &clientConn{conn: conn, id: req.ID, subs: req.Params.Subscriptions}
 		s.mu.Lock()
 		s.conns[conn] = cc
-		// Real herdr replays existing panes to pane.created subscribers.
+		seen := map[string]bool{}
+		for _, sub := range cc.subs {
+			if !seen[sub.Type] {
+				seen[sub.Type] = true
+				s.subscribes[sub.Type]++
+			}
+		}
+		// herdr before 0.9.0 replays existing panes to pane.created
+		// subscribers; 0.9.0+ starts with live events only.
 		var replays [][]byte
 		for _, sub := range cc.subs {
-			if sub.Type == "pane.created" {
+			if sub.Type == "pane.created" && !s.noSubscribeReplay {
 				for paneID, wsID := range s.panes {
 					replays = append(replays, wrap("pane_created", map[string]any{
 						"type": "pane_created",
@@ -480,6 +499,69 @@ func (s *Server) broadcast(eventType string, data map[string]any, paneID string)
 			cc.conn.Write(frame)
 			break
 		}
+	}
+}
+
+// SetSubscribeReplay controls the pane.created replay to a new subscription.
+// On (the default) mirrors herdr before 0.9.0; off mirrors 0.9.0+, where a
+// subscription starts with live events only (verified live on 0.9.3) — so a
+// missed detection can be recovered from pane.list alone.
+func (s *Server) SetSubscribeReplay(on bool) {
+	s.mu.Lock()
+	s.noSubscribeReplay = !on
+	s.mu.Unlock()
+}
+
+// Subscribes reports how many events.subscribe requests have named
+// subscriptionType, so a test can tell that a stream resubscribed.
+func (s *Server) Subscribes(subscriptionType string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.subscribes[subscriptionType]
+}
+
+// SetStatusSilently moves a pane's status WITHOUT emitting
+// pane.agent_status_changed: a status change whose event a subscriber never
+// read (see LoseEvents). pane.list reports the new status.
+func (s *Server) SetStatusSilently(paneID, status string) {
+	s.mu.Lock()
+	s.statuses[paneID] = status
+	s.mu.Unlock()
+}
+
+// AddAgentPaneSilently registers an agent pane WITHOUT emitting pane.created
+// or pane.agent_detected: an agent start whose events a subscriber never read
+// (see LoseEvents). pane.list reports it, labelled, with status.
+func (s *Server) AddAgentPaneSilently(paneID, workspaceID, agentLabel, status string) {
+	s.mu.Lock()
+	s.panes[paneID] = workspaceID
+	s.agents[paneID] = agentLabel
+	s.statuses[paneID] = status
+	s.mu.Unlock()
+}
+
+// LoseEvents is herdr 0.9.2+ overrunning a slow reader: every live connection
+// holding a subscription of subscriptionType ("" = every connection) is sent
+// an error carrying its subscription's request id and code "events_lost", then
+// closed — the documented shape, never a silent skip.
+func (s *Server) LoseEvents(subscriptionType string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for conn, cc := range s.conns {
+		if subscriptionType != "" && !slices.ContainsFunc(cc.subs, func(sub subscription) bool {
+			return sub.Type == subscriptionType
+		}) {
+			continue
+		}
+		frame, _ := json.Marshal(map[string]any{
+			"id": cc.id, "error": map[string]any{
+				"code":    "events_lost",
+				"message": "event subscription fell behind retained history; resubscribe and resync with session.snapshot",
+			},
+		})
+		conn.Write(append(frame, '\n'))
+		conn.Close()
+		delete(s.conns, conn)
 	}
 }
 

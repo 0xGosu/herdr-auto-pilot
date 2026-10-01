@@ -8,8 +8,9 @@
 // connection gets a reset). For events.subscribe the connection then stays
 // open as a pure NDJSON stream of {"event": name, "data": {...}} frames.
 // Herd-wide subscriptions are allowed for pane.created /
-// pane.agent_detected / pane.exited (current panes are replayed on
-// subscribe), but pane.agent_status_changed requires a pane_id filter — so
+// pane.agent_detected / pane.exited (current panes were replayed on
+// subscribe before herdr 0.9.0; 0.9.0+ sends live events only), but
+// pane.agent_status_changed requires a pane_id filter — so
 // the subscriber runs a discovery connection plus a status connection that
 // is rebuilt whenever the monitored pane set changes.
 //
@@ -35,6 +36,7 @@ import (
 	"net"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
@@ -69,6 +71,12 @@ type Subscriber struct {
 	// (runStatus), so they need no lock. See runStatus.
 	watched    map[string]string
 	subscribed bool
+
+	// resync is set when the STATUS stream reports events_lost: herdr evicted
+	// status events this reader had not consumed, so every watched pane's
+	// status is suspect, not only a newly watched one's. The next runStatus
+	// replays them all from the pane.list it takes. See errEventsLost.
+	resync atomic.Bool
 }
 
 type paneInfo struct {
@@ -162,6 +170,41 @@ func (s *Subscriber) Subscribe(ctx context.Context, out chan<- domain.AgentTrans
 // hap went BLIND to status events for that long after a normal split.
 var errPaneSetChanged = errors.New("pane set changed")
 
+// errEventsLost is herdr telling a subscriber it fell behind (herdr 0.9.2+):
+// the server answers the subscription's request id with error code
+// "events_lost" and CLOSES the connection, rather than skipping the evicted
+// events silently as earlier releases did. History is shared across event
+// types, so an overrun is reported even when nothing this subscription
+// filters for was evicted.
+//
+// It is a protocol signal, not an outage — herdr's documented recovery is to
+// resubscribe and reconcile from an authoritative read, which is what the
+// pane.list on every (re)subscribe already is. So loop() resubscribes at once
+// at INFO. A status-stream overrun sets resync, so the next subscribe replays
+// EVERY watched agent's current status (a missed status change); a discovery
+// overrun marks the pane set dirty, so the status loop re-lists it (a missed
+// pane.agent_detected or pane.exited) — herdr 0.9.0+ no longer replays
+// existing panes to a new discovery subscription, so that listing is the
+// only way back. What is restored is current STATE, never
+// the lost history: an agent that went working and back to idle inside the
+// gap is replayed once, as idle.
+var errEventsLost = errors.New("herdr dropped events for this subscriber (events_lost)")
+
+// eventsLostCode is the error code herdr 0.9.2+ sends with errEventsLost.
+const eventsLostCode = "events_lost"
+
+// eventsLostQuietWindow bounds the immediate resubscribe: an overrun after a
+// quiet stretch is routine, but a second one inside the window means herdr is
+// overrunning this reader repeatedly (or during subscription setup), and
+// reconnecting at once would add a pane.list and a subscribe per round to the
+// load that caused it. That one falls through to the ordinary backoff.
+const eventsLostQuietWindow = time.Minute
+
+// loopHealthyStretch is how long a connection must stay up before loop()
+// treats it as healthy and resets the backoff. A var only so a test can
+// shorten it.
+var loopHealthyStretch = time.Minute
+
 // loop runs fn with exponential backoff, resetting the backoff after a
 // connection that stayed healthy for a while.
 //
@@ -169,9 +212,18 @@ var errPaneSetChanged = errors.New("pane set changed")
 // Debug and leaves the backoff where it was, so pane churn can neither fill the
 // log nor slow reconnection. It reconnects immediately — there is nothing to
 // back off from.
+//
+// herdr's events_lost (errEventsLost) is exempt too, but only once per
+// eventsLostQuietWindow: it reconnects at once and logs at INFO. It does not
+// itself reset the backoff (an overrun during subscription setup is no
+// evidence of a healthy connection), but the healthy-stretch reset is applied
+// first, so a stream that ran for a while before overrunning still clears a
+// ladder an old outage left behind. A repeat inside the window takes the
+// ordinary backoff and WARN.
 func (s *Subscriber) loop(ctx context.Context, name string, fn func(context.Context) error) {
 	backoff := time.Second
 	const maxBackoff = 30 * time.Second
+	var lastLost time.Time
 	for {
 		if ctx.Err() != nil {
 			return
@@ -194,8 +246,17 @@ func (s *Subscriber) loop(ctx context.Context, name string, fn func(context.Cont
 				"loop", name, "error", err)
 			continue
 		}
-		if time.Since(started) > time.Minute {
+		if time.Since(started) > loopHealthyStretch {
 			backoff = time.Second // healthy stretch: reset the backoff
+		}
+		if errors.Is(err, errEventsLost) {
+			repeat := !lastLost.IsZero() && time.Since(lastLost) < eventsLostQuietWindow
+			lastLost = time.Now()
+			if !repeat {
+				slog.Info("herdr dropped events for this subscriber; resubscribing and resyncing from pane.list",
+					"loop", name, "error", err)
+				continue
+			}
 		}
 		slog.Warn("herdr event connection lost; reconnecting with backoff",
 			"loop", name, "error", err, "backoff", backoff.String())
@@ -211,16 +272,16 @@ func (s *Subscriber) loop(ctx context.Context, name string, fn func(context.Cont
 	}
 }
 
-// runDiscovery watches the herd-wide pane lifecycle: pane.created replays
-// existing panes on subscribe, pane.agent_detected attaches agent labels,
-// pane.exited removes panes.
+// runDiscovery watches the herd-wide pane lifecycle: pane.created announces
+// panes (and, before herdr 0.9.0, replays existing ones on subscribe),
+// pane.agent_detected attaches agent labels, pane.exited removes panes.
 func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTransition) error {
 	subs := []map[string]string{
 		{"type": "pane.created"},
 		{"type": "pane.agent_detected"},
 		{"type": "pane.exited"},
 	}
-	return s.stream(ctx, "hap_discovery", subs, func(frame eventFrame) error {
+	err := s.stream(ctx, "hap_discovery", subs, func(frame eventFrame) error {
 		var d eventData
 		if err := json.Unmarshal(frame.Data, &d); err != nil {
 			slog.Warn("undecodable discovery event ignored", "error", err)
@@ -248,9 +309,11 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 			}
 			s.upsertPane(d.PaneID, d.WorkspaceID, d.TabID, domain.CanonicalAgentType(d.Agent))
 			// Surface the discovery as a transition so the daemon can name
-			// the agent immediately — herdr replays agent_detected for
-			// existing panes on subscribe, so this also covers agents that
-			// predate the daemon. The daemon takes no action on "detected".
+			// the agent immediately. herdr before 0.9.0 replays
+			// agent_detected for existing panes on subscribe, so there this
+			// also covers agents that predate the daemon; on 0.9.0+ those
+			// reach it through the startup reconcile and pane.list. The
+			// daemon takes no action on "detected".
 			if d.Agent != "" {
 				tr := domain.AgentTransition{
 					AgentID:     d.PaneID,
@@ -274,6 +337,18 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 		}
 		return nil
 	})
+	if errors.Is(err, errEventsLost) {
+		// A pane.agent_detected or pane.exited may be among the evicted
+		// events, and a new discovery subscription replays nothing (herdr
+		// 0.9.0+), so make the status loop re-list the pane set now. That
+		// alone recovers them: a missed new agent is newly watched and so
+		// replayed, a missed exit is pruned by the listing. No resync — each
+		// connection has its own read position, so the status stream lost
+		// nothing, and replaying every agent would only cost herdr a capture
+		// per parked agent while it is already overloaded.
+		s.signalDirty()
+	}
+	return err
 }
 
 // runStatus subscribes to pane.agent_status_changed for every live AGENT pane;
@@ -302,6 +377,12 @@ func (s *Subscriber) runDiscovery(ctx context.Context, out chan<- domain.AgentTr
 // already covers. A duplicate (the event did arrive) is harmless, since the
 // daemon coalesces captures per pane.
 //
+// The one exception is herdr's events_lost (errEventsLost): the status events
+// it evicted are never resent, so the next subscribe — even a first one —
+// replays EVERY watched agent, not only the newly watched. Replayed
+// transitions are marked Replayed, so the daemon never reads one as a human
+// check-in.
+//
 // The filter needs pane.list to REPORT agent labels (herdr 0.8.2 does). A
 // listing that carries none at all — a herdr that does not report them, or a
 // herd with no agent running — subscribes every pane, exactly as before:
@@ -318,12 +399,15 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		paneIDs = s.agentPanes(allPanes)
 	}
 	labels := s.labels(paneIDs)
+	// After events_lost every watched agent's status is suspect, so all of
+	// them are replayed, not only the newly watched (see errEventsLost).
+	resync := s.resync.Swap(false)
 	var fresh []string
-	if s.subscribed {
+	if s.subscribed || resync {
 		for _, id := range paneIDs {
 			// New to the stream, or watched before only as a shell: either
 			// way the detection's status update was not seen as an agent's.
-			if prev, ok := s.watched[id]; labels[id] != "" && (!ok || prev == "") {
+			if prev, ok := s.watched[id]; labels[id] != "" && (resync || !ok || prev == "") {
 				fresh = append(fresh, id)
 			}
 		}
@@ -400,6 +484,12 @@ func (s *Subscriber) runStatus(ctx context.Context, out chan<- domain.AgentTrans
 		}
 		return nil
 	})
+	// Recorded BEFORE the pane-set mapping below: a dirty signal racing the
+	// overrun cancels streamCtx too, and returning errPaneSetChanged without
+	// the flag would drop the replay this overrun needs.
+	if errors.Is(err, errEventsLost) {
+		s.resync.Store(true)
+	}
 	if ctx.Err() == nil && streamCtx.Err() != nil {
 		return fmt.Errorf("resubscribing: %w", errPaneSetChanged)
 	}
@@ -436,6 +526,9 @@ func (s *Subscriber) stream(ctx context.Context, reqID string, subs []map[string
 			continue
 		}
 		if frame.Error != nil {
+			if frame.Error.Code == eventsLostCode {
+				return fmt.Errorf("%w: %s", errEventsLost, frame.Error.Message)
+			}
 			return fmt.Errorf("herdr socket error: %s: %s", frame.Error.Code, frame.Error.Message)
 		}
 		if frame.Event == "" {
@@ -512,8 +605,10 @@ func (s *Subscriber) labels(ids []string) map[string]string {
 	return out
 }
 
-// replayStatus builds a transition from pane.list's snapshot for each newly
-// watched pane that reported a real agent and status (see runStatus).
+// replayStatus builds a transition from pane.list's snapshot for each pane in
+// ids that reported a real agent and status — the newly watched panes, or
+// every watched one after events_lost (see runStatus). Each is marked
+// Replayed: it is current state, not evidence of a change.
 func (s *Subscriber) replayStatus(ids []string) []domain.AgentTransition {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -526,7 +621,7 @@ func (s *Subscriber) replayStatus(ids []string) []domain.AgentTransition {
 		out = append(out, domain.AgentTransition{
 			AgentID: id, AgentType: info.agentLabel, PaneID: id,
 			TabID: info.tabID, WorkspaceID: info.workspaceID,
-			Status: info.status, At: time.Now(),
+			Status: info.status, At: time.Now(), Replayed: true,
 		})
 	}
 	return out
