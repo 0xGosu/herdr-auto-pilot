@@ -104,8 +104,11 @@ Three traps, each of which already cost a shipped regression:
   listing (`publishLiveRoster`), which is what `TestRealClaudeModeCycle` lacked while it failed.
 
 Cases worth knowing beyond their names: `TestRealShiftTabKeyNameIsStillBroken` is a
-**tripwire** — it FAILS if herdr's `shift+tab` key name starts working, the signal to delete
-`domain.ShiftTab`/`CLI.SendChord`. `TestRealClaudeOneQuestionMultiSelectMCQDelivery` FAILS
+**tripwire** gated on the RUNNING server's version (`herdr status server --json`): below 0.8.2 it
+FAILS if the `shift+tab` key name starts working; from 0.8.2, which fixed the key name, it skips;
+an unreadable version runs it (unknown is never read as old or new).
+`domain.ShiftTab`/`CLI.SendChord` STAY until `min_herdr_version` reaches 0.8.2 — CSI Z works on
+every version, the key name only on newer ones. `TestRealClaudeOneQuestionMultiSelectMCQDelivery` FAILS
 (does not skip) when a form is on screen but `MultiTabForm` misses it, so that detection
 regression can never pass silently. `TestRealClaudeConsult` needs a path OUTSIDE claude's
 auto-approved dirs (`/tmp`, `/workspaces`, `~/.claude`) to elicit a prompt. The mode-cycle
@@ -1528,11 +1531,13 @@ where the behaviour could revert.
     `TestReloadPushesClaudeTypedInputToTheHerdrAdapter` proves the key reaches the adapter.
     `TestRealClaudeTypedInputArrivesAsTyping` pairs a pasted CONTROL (it must come back wrapped, or the case
     skips — a build that wraps nothing proves nothing) with the typed send, both read from the transcript.
-- **`pane send-keys shift+tab` is ACCEPTED and delivers a bare TAB** (herdr 0.7.5) — herdr validates the key
-  name, exits 0, and writes `0x09`; `backtab`, `btab` and `S-Tab` are rejected outright, so no key NAME works.
-  The chord must be its raw encoding, CSI Z (`domain.ShiftTab` = `"\x1b[Z"`), through `pane send-text` — the
-  right transport precisely because it is not paste-aware, so the bytes pass through untouched
-  (`CLI.SendChord`, `ports.ChordSender`). This is why `frontend.SetAgentMode` is an open loop re-reading the
+- **Before herdr 0.8.2, `pane send-keys shift+tab` is ACCEPTED and delivers a bare TAB** — herdr validates
+  the key name, exits 0, and writes `0x09`; `backtab`, `btab` and `S-Tab` are rejected outright, so no key
+  NAME works there. 0.8.2 fixed it (herdr #1561; verified with `cat -v` in a pane: 0.8.0 writes a TAB, 0.8.2
+  through 0.9.3 write `^[[Z`). hap still sends the raw encoding, CSI Z (`domain.ShiftTab` = `"\x1b[Z"`),
+  through `pane send-text` because `min_herdr_version` is 0.7.0 — the right transport precisely because it is
+  not paste-aware, so the bytes pass through untouched (`CLI.SendChord`, `ports.ChordSender`). Switching to
+  the key name is a `min_herdr_version` bump first. This is why `frontend.SetAgentMode` is an open loop re-reading the
   pane after every press: a green exit code is not evidence a chord landed.
 - **An agent's permission mode is READABLE ONLY FROM ITS PANE, and only positively** — neither `agent list` nor
   `pane get` carries a mode field, so `domain.AgentModeFromPane` parses the composer footer. **Absence is

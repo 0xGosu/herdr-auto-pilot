@@ -45,11 +45,11 @@ marked **unverified**.
    - Verified with `/usr/bin/cat -v`, which shows `^[[Z`. The same test shows herdr's `tab`
      key name emits a bare TAB.
    - It also cycled agy's mode, and a bare TAB (`send-text $'\t'`) did not.
-   - This contradicts the herdr-0.7.5 note in `CLAUDE.md`, and
-     `TestRealShiftTabKeyNameIsStillBroken` should now FAIL on 0.8.2.
+   - The `CLAUDE.md` note now records the 0.8.2 fix (herdr #1561), and
+     `TestRealShiftTabKeyNameIsStillBroken` skips from 0.8.2, gated on
+     `herdr status server --json`.
    - Keep `domain.ShiftTab` and `CLI.SendChord` anyway: `min_herdr_version` is 0.7.0, and
      CSI Z through `pane send-text` works on every version.
-   - This is a separate follow-up, not phase-1 scope.
 7. **agy renders inline, not on the alternate screen.** The launching shell line
    (`root ➜ /tmp/… $ agy --model …`) stays above the banner. A long session therefore scrolls
    into herdr's host scrollback, and `recent` reads return it.
@@ -587,9 +587,9 @@ The following do **not** need an agy branch:
   choice, and every hand-out branch requires the IDLE situation. A generated-task `--send` is
   not covered, because `refuseIfAgentBusy` reads herdr's status only (which reads idle under an
   agy modal). Phase 3's composer-ready proof closes that path.
-- `TestRealShiftTabKeyNameIsStillBroken` should now fail on herdr 0.8.2 (§1.6). Run
-  `HAP_ITEST_CLAUDE=1` to confirm, then update the `CLAUDE.md` gotcha. Keep the CSI Z path
-  for older herdr.
+- Resolved: `TestRealShiftTabKeyNameIsStillBroken` is now gated on the running server's
+  version and skips from herdr 0.8.2 (§1.6). The `CLAUDE.md` gotcha is updated. The CSI Z
+  path stays for older herdr.
 
 ---
 
