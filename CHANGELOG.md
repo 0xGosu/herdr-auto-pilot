@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.62
+
+- Fixed hap missing agent status changes and newly started agents after herdr 0.9.2+ reports `events_lost` to a subscriber that fell behind. hap now resubscribes immediately instead of waiting out a reconnect backoff with a warning, then replays every watched agent's current status from a fresh pane listing. Back-to-back overruns within a minute still back off, so an overloaded herdr is not hammered
+
 ## 0.9.61
 
 - Changed the Shift+Tab key-name tripwire in the integration suite to check the running herdr server's version: it now skips on herdr 0.8.2 and later, which fixed `pane send-keys shift+tab`, instead of failing. hap still sends the raw Shift+Tab escape, so mode switching keeps working on every supported herdr from 0.7.0
