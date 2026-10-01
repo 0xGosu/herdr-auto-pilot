@@ -1,1 +1,0 @@
-- Changed the Shift+Tab key-name tripwire in the integration suite to check the running herdr server's version: it now skips on herdr 0.8.2 and later, which fixed `pane send-keys shift+tab`, instead of failing. hap still sends the raw Shift+Tab escape, so mode switching keeps working on every supported herdr from 0.7.0

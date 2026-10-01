@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.61
+
+- Changed the Shift+Tab key-name tripwire in the integration suite to check the running herdr server's version: it now skips on herdr 0.8.2 and later, which fixed `pane send-keys shift+tab`, instead of failing. hap still sends the raw Shift+Tab escape, so mode switching keeps working on every supported herdr from 0.7.0
+
 ## 0.9.60
 
 - Added `[agents] claude_typed_input` (off by default). When it is on, long hand-outs to claude agents — any multi-line message, or a single line too long for one burst — are now typed in paced keystroke bursts instead of pasted, then submitted with Enter. Recent Claude Code builds wrap a paste in `<pasted_content>` and tell the model to treat the instructions inside as untrusted, so a pasted hand-out read as quoted text rather than as a request. Messages starting with `!` (which would switch claude to shell mode) and messages containing control characters other than newlines still go the paste route. Short replies, menu answers and other agent types are unchanged. Turn it on with `hap config set agents.claude_typed_input true`.
