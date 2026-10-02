@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.63
+
+- Fixed the devcontainer's post-create step so the FAISS build finds a linkable BLAS (`libopenblas-dev`), and pinned golangci-lint to the Go toolchain it was built with so a newer image Go no longer silently disables the `unused` linter
+- Changed the devcontainer's herdr config/state volumes to be per-container, so two checkouts no longer share one herdr state
+
 ## 0.9.62
 
 - Fixed hap missing agent status changes and newly started agents after herdr 0.9.2+ reports `events_lost` to a subscriber that fell behind. hap now resubscribes immediately instead of waiting out a reconnect backoff with a warning, then replays every watched agent's current status from a fresh pane listing. Back-to-back overruns within a minute still back off, so an overloaded herdr is not hammered
