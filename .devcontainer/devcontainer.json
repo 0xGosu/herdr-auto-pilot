@@ -10,17 +10,13 @@
   "privileged": true,
   "mounts": [
     // Mount the herdr config and state to a volume to persist across container rebuilds
-    "source=herdr-config,target=/root/.config/herdr,type=volume",
-    "source=herdr-state,target=/root/.local/state/herdr,type=volume",
+    "source=herdr-config-${devcontainerId},target=/root/.config/herdr,type=volume",
+    "source=herdr-state-${devcontainerId},target=/root/.local/state/herdr,type=volume",
     // Enable docker dind
-    {
-      "source": "dind-var-lib-docker-${devcontainerId}",
-      "target": "/var/lib/docker",
-      "type": "volume"
-    }
+    "source=dind-var-lib-docker-${devcontainerId},target=/var/lib/docker,type=volume"
   ],
   // the run args will be passed to docker run command
-  "runArgs": ["--label", "DEVCONTAINER_REF=${devcontainerId}"],
+  "runArgs": ["--label", "DEVCONTAINER_ID=${devcontainerId}"],
 
   // Use 'forwardPorts' to make a list of ports inside the container available locally.
   "forwardPorts": [],
@@ -28,12 +24,13 @@
   "appPort": [],
 
   // Use 'initializeCommand' to run commands in the host before the container is created.
-  "initializeCommand": "docker pull gelmium/devcontainer:latest;echo DEVCONTAINER_REF=${devcontainerId} > .devcontainer/.env",
+  "initializeCommand": "docker pull gelmium/devcontainer:latest;echo DEVCONTAINER_ID=${devcontainerId} > .devcontainer/.env",
 
   // Use 'postCreateCommand' to run commands after the container is created.
-  // scripts/devcontainer-postcreate.sh installs hap's native runtime deps
-  // (libopenblas0 for FAISS, cmake for scripts/setup-native.sh); keep project
-  // setup steps there, not inline.
+  // scripts/devcontainer-postcreate.sh installs hap's native build deps
+  // (libopenblas-dev for FAISS, cmake for scripts/setup-native.sh) and CI's
+  // golangci-lint behind a toolchain-pinning wrapper; keep project setup steps
+  // there, not inline.
   "postCreateCommand": "bash -i -c 'post_create_command' || true; bash scripts/devcontainer-postcreate.sh || true",
 
   // A command to run each time the container is successfully started.
@@ -43,7 +40,7 @@
   "customizations": {
     "codespaces": {
       // "repositories": {
-      //   "gelmium/template-base-all-project": {
+      //   "gelmium/template-base-agentic-coding": {
       //     "permissions": "read-all"
       //   }
       // }
@@ -55,20 +52,22 @@
         "ckolkman.vscode-postgres",
         "ms-azuretools.vscode-containers",
         "esbenp.prettier-vscode",
-        "GitHub.copilot",
-        "GitHub.copilot-chat",
         "anthropic.claude-code",
         "openai.chatgpt",
+        "Prisma.prisma",
         "yoavbls.pretty-ts-errors",
         "redhat.vscode-yaml",
         "ms-python.python",
         "ms-python.black-formatter",
-        "meta.pyrefly",
+        "ms-pyright.pyright",
         "golang.Go"
       ],
       "settings": {
         "editor.dragAndDrop": false,
-        "prettier.configPath": "/root/.prettierrc"
+        "prettier.configPath": "/root/.prettierrc",
+        // ms-python.python also installs Pylance; turn it off so the Pyright extension runs
+        // (Pyright disables itself when Pylance is active)
+        "python.languageServer": "None"
       }
     }
   },
