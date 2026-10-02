@@ -1,0 +1,2 @@
+- Fixed the devcontainer's post-create step so the FAISS build finds a linkable BLAS (`libopenblas-dev`), and pinned golangci-lint to the Go toolchain it was built with so a newer image Go no longer silently disables the `unused` linter
+- Changed the devcontainer's herdr config/state volumes to be per-container, so two checkouts no longer share one herdr state
