@@ -1,1679 +1,281 @@
 # CLAUDE.md
 
-Herd Auto Prompter (**hap**) — a Go plugin for the herdr terminal multiplexer that
-watches every agent pane, auto-answers when a learned rule is confident, and escalates
-to the operator (or a local LLM CLI) when not. `CONTRIBUTING.md` has the full ground
-rules; this file is the day-to-day working reference.
+Herd Auto Prompter (**hap**): a Go plugin for the herdr terminal multiplexer. It watches every agent pane,
+auto-answers when a learned rule is confident, and escalates to the operator (or a local LLM CLI) otherwise.
 
-**How to read the architecture rules.** Each names the identifier that implements it and
-states which way it must fail. The full rationale — mechanism, measured numbers, the
-incident that produced it — is the doc comment on that identifier, which is usually
-richer than what is here; go read it before changing anything the rule covers. What this
-file adds is reach: the hazard is normally in a file you had no reason to open, and the
-**test traps** are the reason each of these regressions shipped green. Find the guarding
+**How to use this file.** Each rule names the identifier that implements it and the direction it must fail.
+The rationale (mechanism, measurements, incident) lives in that identifier's doc comment — read it before
+changing anything a rule covers. This file only adds what the code cannot tell you: couplings across files,
+**test traps** (why a regression shipped green), and facts verified against external tools. Find guarding
 tests with `grep -rn "func Test<Topic>" --include=*_test.go`.
 
-## Skills (`.claude/skills/`)
-
-Prefer these for how-to detail.
-- **`herdr`** — drive herdr from inside it (workspaces, tabs, panes, agents, waits).
-- **`hap`** — operate the plugin via its CLI: status, tasks, escalations, config, safety
-  rules, task sources.
-- **`hap-development-local`** — the local dev loop: link the working tree, rebuild,
-  hot-swap the daemon (`hap daemon --ensure`), live-test against a real agent.
-
-The hap skill also ships in the binary: `hap --skill` prints it,
-`hap skill install <claude|codex|agy|agents>...` (or the TUI Config tab) installs it.
+Skills (`.claude/skills/`): `herdr` (drive herdr), `hap` (operate via CLI), `hap-development-local` (link,
+rebuild, hot-swap the daemon with `hap daemon --ensure`, live-test). `hap --skill` prints the hap skill.
 
 ## Build, test, lint
 
-The semantic matcher links native code (llama.cpp via CGO, FAISS behind bleve's `vectors`
-tag), so **the native deps are needed once** and the `vectors cpu` tags always — a build
-without both fails to link.
-
 ```sh
 bash scripts/check-submodule-gitlink.sh        # submodule must be a gitlink, not a symlink (#265)
-bash scripts/setup-native.sh                   # one-time: submodules + llama-go libs + FAISS → /usr/local/lib
-go build -tags "vectors cpu" ./...             # CGO; needs a C/C++ toolchain
-go test -tags "vectors cpu" ./... -count=1     # what CI runs
+bash scripts/setup-native.sh                   # one-time native deps (llama.cpp, FAISS)
+go build -tags "vectors cpu" ./...             # both tags always, or it fails to link
+go test -tags "vectors cpu" ./... -count=1     # what CI runs; run before every Go commit
 gofmt -l . | grep -v submodule && go vet -tags "vectors cpu" ./...
 golangci-lint run --build-tags "vectors,cpu"
 ```
 
-- The real-model embedder test skips unless `models/all-minilm-l6-v2-q8_0.gguf` exists
-  (download once from the HF repo in `release.yml`, or set `HAP_TEST_EMBED_MODEL`).
-- Golden classifier fixtures: `internal/classify/testdata/`; regenerate with
-  `UPDATE_GOLDEN=1 go test ./internal/classify/` and review the diff.
-- Run the full suite before every commit that touches Go code.
-- **On a loaded machine, export `HAP_TEST_TIMEOUT_SCALE` (CI uses `4`) or cap `-p`.** `testutil.Scale`'s
-  fallback counts CORES and says so: it cannot see load from outside the process, and `go test ./...`
-  runs `-p = GOMAXPROCS` binaries against those same cores. That is the whole of #431's "red locally,
-  green serialized, green in CI, a different test each run" — `internal/daemon`'s waits are floored
-  (`waitForFloor`) so an ordinary run is unaffected, but a busy box still wants the knob.
-- Profiling (opt-in, any verb): `HAP_PROFILE_DIR=<dir> [HAP_PROFILE_SECONDS=60] hap daemon --restart` writes
-  ROLLING `<verb>-<pid>.cpu.pprof` / `.heap.pprof` windows (`internal/profiling`) — the files are always the latest
-  complete window, so an idle daemon hours in can be read with `go tool pprof -top bin/hap <file>`. The detached
-  daemon inherits the environment; nothing is written or listened on when the variable is unset. Each window also
-  writes `<verb>-<pid>.mem.txt` (Go memory classes, plus `/proc/self/status` on Linux): the heap profile sees only LIVE Go
-  objects, a few MB of a resident set mostly made of file-backed pages, freed-but-unreturned Go heap and native
-  memory (Turso engine, FAISS, llama.cpp) — "go resident" is what to subtract from RssAnon to find the native part.
-- Pipeline smoke test (fake herdr → real daemon → real LLM CLI):
-  `go build -o /tmp/e2e ./e2e_harness && /tmp/e2e <short-dir> <hap-bin> <config-dir> <state-dir>`.
+- Real-model embedder test needs `models/all-minilm-l6-v2-q8_0.gguf` (or `HAP_TEST_EMBED_MODEL`).
+- Golden fixtures: `UPDATE_GOLDEN=1 go test ./internal/classify/`, then review the diff.
+- **Loaded machine: export `HAP_TEST_TIMEOUT_SCALE` (CI uses 4) or cap `-p`** — `testutil.Scale` counts
+  cores, not load; that is #431's "different test fails each run".
+- Profiling: `HAP_PROFILE_DIR=<dir> [HAP_PROFILE_SECONDS=60] hap daemon --restart` (`internal/profiling`).
+- Pipeline smoke: `go build -o /tmp/e2e ./e2e_harness && /tmp/e2e <short-dir> <hap-bin> <config-dir> <state-dir>`.
 
-## Local integration suite (real herdr + claude)
+### Integration suite (real herdr + agents)
 
-`test/integration/` drives an **actual running herdr** (and, with `HAP_ITEST_CLAUDE=1` /
-`HAP_ITEST_CODEX=1` / `HAP_ITEST_AGY=1`, a real agent CLI), gated by the `integration` build tag so
-`go test ./...` and CI never run them. Each case **skips** (never fails) when its
-dependency is absent.
+`test/integration/`, build tag `integration`; cases skip when a dependency is absent. **Run once after any
+feature, before the PR** — the unit suite fakes herdr.
 
 ```sh
-go test -tags integration ./test/integration/ -v                    # from inside herdr, or set HERDR_BIN_PATH
-HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v -timeout 20m  # spends tokens
-HAP_ITEST_AGY=1 go test -tags integration ./test/integration/ -run TestRealAgy -v  # Gemini tokens
-go test -tags "integration vectors cpu" ./test/integration/ -v      # + the real-model semantic case
+go test -tags integration ./test/integration/ -v                                   # inside herdr, or HERDR_BIN_PATH
+HAP_ITEST_CLAUDE=1 go test -tags integration ./test/integration/ -v -timeout 20m   # also HAP_ITEST_CODEX / HAP_ITEST_AGY
+go test -tags "integration vectors cpu" ./test/integration/ -v                     # + real-model semantic case
 ```
 
-**Recommended: run this once after finishing any feature**, before the PR — the unit suite
-fakes herdr, so only this catches real CLI-shape drift.
+Traps:
+- A test asserting a CONFIRM runs its own daemon via `testDaemon.App`; an `App` without `DaemonInfo` reads as
+  "no daemon". Never point one at the operator's live store (under turso it pushes to their cloud DB).
+- A scratch pane the daemon classifies must SCROLL (`fillViewportSh`): `--source recent` is empty for a pane
+  that fits on screen.
+- Wait for content (`waitForPaneText`), never sleep.
+- The operator's own daemon watches scratch panes too: agy cases `quietOperatorDaemon`; a front end needs a
+  published roster (`publishLiveRoster`).
+- `TestRealShiftTabKeyNameIsStillBroken` is a version-gated tripwire. `TestRealClaudeConsult` needs a path
+  outside claude's auto-approved dirs. Mode-cycle cases are the only check that the Shift+Tab encoding and
+  the mode-indicator labels still work.
 
-Three traps, each of which already cost a shipped regression:
+## Commits, branches, changelog, release
 
-- **Anything asserting a CONFIRM must run its own daemon; an `App` with no `DaemonInfo` is
-  the trap.** `AssessDaemonHealth` derives `Running` from `DaemonInfo`, so nil reads as "no
-  daemon" whatever is actually up and `requireLiveDaemonFor` refuses while naming a daemon
-  that IS running. `testDaemon.App` is the one correct wiring — and it deliberately holds NO
-  herdr adapter, so keystrokes landing at all is the proof delivery went through the daemon.
-  Never point such a test at the operator's live store: under turso that pushes scratch rows
-  to their cloud database.
-- **A scratch pane the DAEMON will classify must SCROLL.** `pane read --source recent`
-  returns EMPTY for a pane whose output still fits on screen (verified live, herdr 0.8.2);
-  a live claude pane returns kilobytes, which is why production never meets this. Use
-  `fillViewportSh` — its filler is digit-free because a salient masked mostly to
-  placeholders trips the over-masking floor, the same failure by the other door.
-- **Wait for a pane's CONTENT (`waitForPaneText`), never sleep.** `pane run` only hands the
-  command to the shell, and the startup reconcile classifies an unpainted pane as empty,
-  whose escalation then stops the injected transition re-capturing. A 1s sleep held in
-  isolation and lost under full-suite load.
+- Format `#<issue> <type>: <subject>` (Conventional Commit; `#0` if no issue). Types `feat fix docs test
+  refactor chore`; breaking `feat!:`. Hooks must run — no `--no-verify`.
+- Never commit to `main`. Non-trivial work: `git-worktree` skill (`worktree-agent-noN` beside the repo);
+  remove it and delete the branch (local + origin) after merge. If others may be working in the tree, stage
+  only your own changes and move to a fresh worktree.
+- **Changelog is MANDATORY, as a fragment, never an edit to `CHANGELOG.md`, never a version number:**
+  ```sh
+  cat > changelog.d/$(git branch --show-current | tr / -).md <<'EOF'
+  - Fixed the thing that used to happen
+  EOF
+  ```
+  Flat verb-first one-liners, what it means for the reader; mark **Breaking.** Auto-release assembles them.
+  For minor/major, run `bash scripts/assemble-changelog.sh X.Y.0` in the same PR (release refuses to tag
+  otherwise). (`CONTRIBUTING.md`'s changelog paragraph is stale; this section wins.)
+- **Release** (`.github/workflows/auto-release.yml`): `version` in `herdr-plugin.toml` TRAILS releases.
+  Patch: just merge — never bump by hand. Minor/major: set `version` inside the feature PR.
+  - Never put `[skip ci]`-family keywords in a squash-merge message that should release (suppresses the
+    tag build). Keep `[skip release]` out of ordinary merges.
+  - Release build failed after tagging → re-run `release.yml`, never auto-release.
+  - Tagged manifest version must equal the tag; verify with `gh release view vX.Y.Z` (3 binaries, 3
+    tarballs, model, SHA256SUMS). Never edit `internal/buildinfo.Version`. Bump `min_herdr_version` only
+    when adopting new herdr APIs.
 
-- **On a working machine the OPERATOR's daemon watches the scratch panes too.** It answers agy forms
-  (under full self-prompting within seconds), so the agy cases `hap disable` their pane
-  (`quietOperatorDaemon`) — and it reads `--source recent`, the same consuming delta, which is why
-  the agy hand-out case goes through the operator path (visible reads only) rather than the idle poll.
-  A front end also needs a PUBLISHED roster to resolve any target (#386): `modeApp` publishes herdr's
-  listing (`publishLiveRoster`), which is what `TestRealClaudeModeCycle` lacked while it failed.
-
-Cases worth knowing beyond their names: `TestRealShiftTabKeyNameIsStillBroken` is a
-**tripwire** gated on the RUNNING server's version (`herdr status server --json`): below 0.8.2 it
-FAILS if the `shift+tab` key name starts working; from 0.8.2, which fixed the key name, it skips;
-an unreadable version runs it (unknown is never read as old or new).
-`domain.ShiftTab`/`CLI.SendChord` STAY until `min_herdr_version` reaches 0.8.2 — CSI Z works on
-every version, the key name only on newer ones. `TestRealClaudeOneQuestionMultiSelectMCQDelivery` FAILS
-(does not skip) when a form is on screen but `MultiTabForm` misses it, so that detection
-regression can never pass silently. `TestRealClaudeConsult` needs a path OUTSIDE claude's
-auto-approved dirs (`/tmp`, `/workspaces`, `~/.claude`) to elicit a prompt. The mode-cycle
-cases DISCOVER a session's cycle rather than assuming `AgentModesFor`, and are the only check
-that the Shift+Tab chord ENCODING still reaches an agent and that the mode INDICATOR still
-renders the labels the parser matches — both live in the agent's build, not herdr's.
-
-## Commits
-
-Format: `#<issue> <type>: <subject>` — a Conventional Commit prefixed with a GitHub issue
-reference; a commit-msg hook rejects anything else. Types: `feat`, `fix`, `docs`, `test`,
-`refactor`, `chore`; breaking → `feat!:`.
-
-- Let the pre-commit hooks run (large files, secrets, whitespace, line endings) — no
-  `--no-verify`.
-- Never commit directly to `main`. Branch (`feat/…`, `fix/…`), open a PR.
-- For any non-trivial change use the **`git-worktree`** skill (`worktree-agent-noN` beside the
-  repo); remove it and delete the branch (local + origin) after merge.
-- If the repo has many uncommitted changes, or another agent may be working in parallel:
-  pause, stage only your own changes, and move to a new worktree from `main` that includes them.
-
-## Changelog (MANDATORY)
-
-**Every change gets an entry, patch releases included.** Entries are **fragments in
-`changelog.d/`**, never edits to `CHANGELOG.md`, and **never a version number**:
-
-```sh
-cat > changelog.d/$(git branch --show-current | tr / -).md <<'EOF'
-- Fixed the thing that used to happen
-EOF
-```
-
-- **Why fragments:** every PR used to insert its section at the top of one shared file, so two
-  open PRs always conflicted even when unrelated — and each had to GUESS its version, which is
-  only knowable when the release is cut.
-- On merge, auto-release runs `scripts/assemble-changelog.sh <version>` inside the same commit
-  that bumps `herdr-plugin.toml`. CI fails any PR that changes releasing code without a fragment.
-- **Minor/major is the manual exception**: no bump commit is created to assemble into, so run
-  `bash scripts/assemble-changelog.sh X.Y.0` in that same PR and commit the result. The release
-  refuses to tag while unassembled fragments remain.
-- Style: flat verb-first one-liners (`Added …`, `Fixed …`), no sub-sections. Write what it MEANS
-  for the reader — GitHub already generates a list of PR titles. Mark breaking changes
-  **Breaking.**
-
-## Version bump & release
-
-Releases are **automated on merge to main** with a bump-then-tag model
-(`.github/workflows/auto-release.yml`); `version` in `herdr-plugin.toml` is the single source of
-truth and always names a version whose release exists — it TRAILS releases, never leads them.
-Load-bearing: `install.sh` downloads the assets named by the manifest version, so a manifest
-pointing at an unreleased version 404s every install.
-
-- **Patch (the default)** — just merge; the workflow auto-merges a bump PR (marked
-  `[skip release]`) and tags it. Never bump the manifest for patch work.
-- **Minor/major** — overwrite `version` in `herdr-plugin.toml` INSIDE your feature PR; the
-  workflow finds it untagged and tags the merge commit. (The same branch self-heals a crashed run
-  that bumped but never tagged.)
-- Doc/workflow-only pushes (`**.md`, `docs/**`, `.github/**`) and merge commits containing
-  `[skip release]` do not release.
-- **Never put `[skip ci]`-family keywords ANYWHERE in a squash-merge message** of a PR that should
-  release: GitHub suppresses ALL workflows for that ref, including the tag push, so the release
-  silently never builds. `[skip release]` is our own marker — safe on tagged commits, but keep it
-  out of ordinary merge messages.
-- Between the bump merge and publishing (~15 min) main's manifest names a version with no assets,
-  so install.sh **falls back to the newest earlier release that has assets** and warns loudly.
-  Refused for an explicit `HAP_VERSION` pin, under `HAP_NO_FALLBACK` (any NON-EMPTY value —
-  set-but-empty means unset), and on a checksum mismatch (corruption is never answered with a
-  downgrade). `--ref vX.Y.Z` is NOT a refusal: it pins the git clone, which install.sh cannot see.
-  Detached HEAD is not a usable signal either, because auto-release tags the bump commit on main.
-- If the release BUILD fails after the tag exists, re-run the failed release.yml run; do not re-run
-  auto-release (it would advance versions).
-
-`release.yml` (tag-driven) builds on THREE native runners (CGO cannot cross-compile; Intel macOS is
-deliberately unsupported): three binaries, a native tarball per platform (FAISS shared libs, plus
-libomp on macOS, rpath'd to `<plugin>/lib`), the sha256-pinned embedding model, and `SHA256SUMS`.
-install.sh treats the binary and native tarball as REQUIRED and the model as optional (BM25
-fallback).
-
-**The invariant: the tagged commit's manifest version and the git tag MUST match.** Verify with
-`gh release view vX.Y.Z` — 3 binaries, 3 tarballs, the model, SHA256SUMS. `internal/buildinfo.Version`
-is stamped by ldflags — never edit by hand. Bump `min_herdr_version` only when adopting new herdr
-APIs. Assets can 504 for a minute after publishing; install.sh retries through that window.
-
-## Architecture rules (enforced)
+## Architecture rules
 
 ### Boundaries
-
-- **`internal/domain` stays pure** — no imports of herdr/SQLite/LLM/adapter packages
-  (`TestDomainPurity`). Side effects live behind `internal/ports`.
-- **Optional capabilities are optional interfaces** — add a port interface (see `LocatorPort`,
-  `InspectorPort`) and type-assert at the call site, degrading gracefully; don't grow `HerdrPort`
-  and break every fake.
-  - **Test trap:** the daemon suite's `failingStore` embeds the `ports.StorePort` INTERFACE, so a
-    type-asserted capability not forwarded there is silently off suite-wide. `RowRetentionPort` is
-    separate from `RetentionPort` for the same reason.
-- **Fail safe on the daemon path** — no panics; every error resolves to escalate + audit + log.
-  Wrap new handler/adapter calls in `logging.Guard`.
-- **Safety controls are never bypassed** — LLM submissions and learned rules alike are re-gated
-  through kill switch, never-auto patterns, rate guard and retry ceiling. New destructive-command
-  shapes go in `internal/domain/testdata/irreversible_corpus.txt` (CI fails if seed patterns miss one).
-- **Don't stall the main loop** — the select loop serves all agents; anything shelling out repeatedly
-  (LLM CLI, deep pane reads) belongs in a goroutine funnelling results back through a channel
-  (`consultLLM` / `llmResults`).
-- **Egress has exactly four exceptions, all opt-in and off by default** — `internal/updatecheck`,
-  the `github_gist` task backend (task text only), the `turso` engine (syncs the WHOLE store to
-  the operator's Turso Cloud database) and the `libsql` engine (the WHOLE store on the operator's own
-  libsql server; its HTTP is `internal/store/libsql/hrana.go` ALONE — the protocol types, the stream
-  and `hranafake` stay HTTP-free so the store suite can import them). `internal/privacy` bans the
-  GitHub and Turso SDKs by import path as well as `net/http`, because the walker checks DIRECT
-  imports — an adapter using only an SDK would egress while passing (the Turso SDK does its HTTP
-  inside the SDK, so no first-party import betrays it). The gist adapter must keep using `github.WithURLs` and `github.WithTimeout` (not a `*url.URL`
-  or a hand-built transport), or `net/url` and the no-remote-dial scan need widening.
+- `internal/domain` stays pure (`TestDomainPurity`); side effects behind `internal/ports`.
+- Optional capabilities are optional port interfaces, type-asserted at the call site — don't grow `HerdrPort`.
+  **Test trap:** the daemon suite's `failingStore` embeds `ports.StorePort`, so a capability not forwarded
+  there is silently off suite-wide.
+- Daemon path never panics; errors → escalate + audit + log, under `logging.Guard`.
+- Safety controls (kill switch, never-auto, rate guard, retry ceiling) re-gate LLM and learned answers
+  alike. New destructive shapes → `internal/domain/testdata/irreversible_corpus.txt`.
+- Nothing that shells out repeatedly runs on the select loop (pattern: `consultLLM` / `llmResults`).
+- Egress: only `internal/updatecheck`, the `github_gist` backend, the `turso` engine and the `libsql` engine
+  (HTTP only in `internal/store/libsql/hrana.go`), all opt-in. `internal/privacy` enforces by import path.
+  The gist adapter must keep `github.WithURLs` / `github.WithTimeout`.
 
 ### Config surface
+- Every config.toml writer is a `hap config` subcommand; every key is reachable from the CLI (scalars in
+  `frontend.ConfigFields`, list/map sections via `configListCommands`; both registry tests also fail on
+  stale entries). Moved spellings print their note on **stderr** (stdout is parsed).
+- List editors: every `[[task_sources]]` field has a `set` key; removal compares the WHOLE entry; inserts
+  respect `config.CaptureDelay`'s first-match order; a new task source is always APPENDED (its index is a
+  public selector) — in both `AddTaskSource` and `addTaskSourceIfAbsent`. `hap config env` never prints values.
 
-- **Everything that writes config.toml is a `hap config` subcommand**, which is why it is the ONLY
-  visible command in the help's Configure group. Topics are TWO-word registry entries resolved
-  longest-spelling-first in `cli.Run` — that is what makes `hap config rules --help` reach the
-  topic's own page. `hap task` is deliberately NOT here: it edits checklist ITEMS, not config. Old
-  top-level spellings still resolve (`Command.MovedFrom`) and print their migration note on
-  **stderr** — these verbs print tab-separated listings that scripts parse.
-- **Every config key is reachable from the CLI** — the TUI is a convenience, not a capability.
-  SCALARs go in `frontend.ConfigFields`; ARRAY/MAP sections cannot be a `config set` key (an element
-  is addressed by POSITION, a map entry by NAME) so each gets a verb named in `configListCommands`.
-  Both registry tests fail on a STALE entry too. Four rules bind the list editors:
-  - **A long-lived list ELEMENT's own fields are held to the same standard** — every
-    `[[task_sources]]` field has a `set` key, because settable-only-at-creation means
-    remove-and-re-add: retyping every other field and renumbering every later source to change one.
-  - **Removal compares the WHOLE entry the caller listed**, never one field — a one-field guard
-    passes on the wrong element exactly when a listing has gone stale, and duplicate-ish entries are
-    legitimate.
-  - **An insert must respect the daemon's lookup order** — `config.CaptureDelay` takes the first rule
-    matching the agent type and `"*"` matches everything, so a specific rule appended after a wildcard
-    one is configured, listed, and never read.
-  - **`[[task_sources]]` inverts that: a new source is always APPENDED.** Its index is a public
-    selector (`hap task 2 …`, `{task_source_index}` in delivered prompts, every listing/set/remove),
-    so inserting elsewhere re-points every selector after it — including commands already in an
-    agent's scrollback. Binds BOTH creating surfaces: `AddTaskSource` and `addTaskSourceIfAbsent`
-    (accepting an LLM task suggestion registers a source as a side effect).
-  - Secrets are a DISPLAY rule, not an exemption: `hap config env` never prints a value and reads it
-    from stdin unless `--value` is passed.
+### Front end decides, daemon does
+Anything reaching a live pane or a node-local identifier is queued to `agent_actions` for the owning node
+(`daemon.executeAgentAction`). Generated-task confirms are queued unconditionally
+(`queueGeneratedTaskConfirm`); pane access is received via `ports.TaskSendHost`. Keep `ConfirmGeneratedTask`
+/ `AcceptGeneratedTask` separate (`automated` skips `ResolveEscalation` + `InsertCorrection`);
+`CorrectionID` stays 0 on queued rows; `side_effect` is marked inside `Send`. `refuseIfAgentBusy` must keep
+`domain.SuggestionStaleMarker` (the TUI's offer keys on it). Orchestrator-authored actions
+(`domain.OrchestratorAuthor`) are screened (`daemon.actionScreen`) and refused while paused.
+**Test trap:** `internal/daemon` cannot import `internal/frontend`, so daemon tests drive a FAKE seam; the
+real confirm is proven only in `internal/frontend`, and TUI/CLI suites must drain through the real confirm.
 
-### A front end decides; the DAEMON does
-
-Anything that reaches a live pane, or is keyed by an identifier only one machine can resolve, is
-written to `agent_actions` for the OWNING node and executed there (`domain.AgentAction`,
-`daemon.executeAgentAction`). A generated-task confirm is the widest case and the reason this is not
-only about panes: it matches a pane id against a herd (herdr recycles pane ids, so every machine has a
-pane `1`), mints an `agent_names` row in a node-keyed table, writes a checklist, and registers a
-`[[task_sources]]` entry in a config.toml that **never enters the shared database**.
-
-- **Queued UNCONDITIONALLY, local rows included** (`queueGeneratedTaskConfirm`). The `isSelf` fast path
-  the per-agent verbs use is wrong here because this path ends in a pane send: in-process it leaves a
-  TUI or CLI holding a herdr adapter, and a front end and a daemon typing into one pane is the race
-  none of the delivery guards can see. Accepted cost: `hap confirm <id>` without `--send` needs a live
-  daemon.
-- **The pane access is RECEIVED, never held** (`ports.TaskSendHost`) — the checklist, config and
-  reserve→send→roll-back ORDERING stay in `internal/frontend`; only `cmd/hap`'s daemon wiring can build
-  the closure that reaches a pane.
-- **`ConfirmGeneratedTask` and `AcceptGeneratedTask` are two seams on purpose**: the automatic path
-  passes `automated=true`, skipping BOTH `ResolveEscalation` and `InsertCorrection` — a machine's
-  decision to act is not evidence the suggestion was right. `author` is threaded from the queued row,
-  not the daemon's own App.
-- **`CorrectionID` stays 0 on the queued row**; populating it arms `finishWithdrawn`, whose refusal
-  DELETES the correction the first attempt wrote.
-- **`side_effect` is marked inside the host's `Send`, not before the seam** — a row carrying it is
-  FAILED at next start rather than replayed, which is true after keystrokes and false before them. The
-  FSP path is handed `taskSendHost(0)` and the zero guard is load-bearing: marking action 0 writes
-  against a row that does not exist.
-- **The staleness gate moved WITH the pane access** — `refuseIfAgentBusy` lives in the daemon, and its
-  refusal carries `domain.SuggestionStaleMarker` because `AwaitAgentAction` flattens every sentinel
-  through `errors.New`. That one is ACTIONABLE: the TUI offers to add the tasks to the list instead,
-  keyed on `errors.Is`, and dropping the marker breaks the offer SILENTLY.
-- **The manual hand-out moved the same way** (`send_task`): `SendTaskToAgentOn` carries the agent's
-  NAME, never a pane id, and the executor re-derives everything from the owning node's config and a
-  live listing. Its idle re-check fails CLOSED and TERMINALLY — "we could not ask" is not "it is idle",
-  and an operator blocking on the row must not wait three sweeps. `taskSourceRenderFor` matches by
-  LOCATOR, not agent alone, or one source's item renders through another's template. `hap task send`
-  is local-only; the TUI's Tasks tab can hand out a remote node's item.
-- The operator path is deliberately NOT screened (`screen` is nil): the daemon's own sends are screened
-  because no human saw the text; here one has, and their confirm has always been the gate. **The one
-  exception is the orchestrator** (`domain.OrchestratorAuthor`, set by `cmd/hap` when HERDR_PANE_ID is the
-  orchestrator's pane): an LLM's confirm is not a human's, so its generated-task confirms and `task send`
-  get the daemon's `screenOutbound` (`daemon.actionScreen`) and all three executors refuse it while the herd
-  is paused (`refuseOrchestratorWhilePaused`). Keyed on the queued row's AUTHOR, so an operator is untouched.
-- **Test trap:** `internal/daemon` may not import `internal/frontend`, so its tests drive a FAKE seam
-  and prove only the EXECUTOR's guards. The confirm's own behaviour is proved in `internal/frontend`;
-  the TUI and CLI suites run a stand-in drain calling the REAL confirm, or their "the tasks file was
-  written" assertions check nothing.
-
-### Multi-tab forms and auto-accept
-
-- **A multi-tab form's baseline is the swept AGGREGATE, so nothing may compare it to one frame.**
-  `sweepFrames` walks every tab and `AggregateMCQFrames` joins them into the `Situation.Content` that
-  mints the signature and is stored as `pane_excerpt`; anything re-reading the pane later holds a
-  SINGLE frame, and a `choice` salient is STRUCTURED so the mismatch reads as proof the situation moved
-  on. Guard 3 did exactly this and auto-dismissed EVERY multi-tab escalation as `auto_dismiss_stale` —
-  deterministic, never intermittent, invisible because it looked like the feature working. Compare
-  FRAME-WISE instead: same tab count, live `ExtractAgentMCQForm` equal to one of
-  `AggregatedMCQFrames(excerpt)`. Guard 3 widens that two ways because it runs after a WAIT, and **each
-  widening buys a gate — all four load-bearing:**
-  - `NormalizeMCQFrame` folds the caret AND the preview box (on a preview tab the box is a FUNCTION of
-    the focused option, so folding the caret alone fixes nothing).
-  - The suggestion must be a series of exactly `AnswerCount` digits, checked against each captured
-    tab's `domain.MultiSelectTab` mode — otherwise `deliver.Deliver` falls to the plain-menu path and
-    maps the reply against whichever tab is visible, and a comma group (`1,3`) on a later tab is caught
-    only after earlier tabs are already committed: a half-answered form. Such rows really exist and were
-    simply unreachable while the guard always said no: `unfamiliar_options` leaves a wrong-shaped LLM
-    answer pending WITH the answer attached, and is not in `autoAcceptExcludedReasons`.
-  - `domain.MCQFormFullyUnanswered` — asked BEFORE the comparison, since `NormalizeMCQFrame` folds the
-    marks away and delivery retypes EVERY tab from tab 1.
-  - `domain.LooksLikeAggregatedMCQ` plus the `excerptTruncationMarker` prefix — treating "not a
-    complete aggregate" as "some other capture" drops straight back into the original bug.
-
-  All four refuse as `heldStillUnevaluable` (PENDING), never `heldStillNo`: a malformed answer, a
-  half-answered form and a mangled capture each need a human. **Note:** every other multi-tab fixture
-  here renders options without previews — `internal/domain/testdata/mcq_preview_*.txt` is the only pair
-  reproducing the layout, which is why this shipped green.
-- **A swept AGGREGATE is the one capture whose HEAD is load-bearing, so it gets its own storage budget**
-  (`aggregateMaxRunes`, `excerptBudget`). Every other excerpt is a pane TAIL, which is why
-  `truncateTailRunes` keeps the tail; an aggregate is the opposite shape, so shearing the head does not
-  degrade the capture but DESTROYS it — it becomes unparseable, and `mcqFormHeldStill`
-  then answers `heldStillUnevaluable` on every sweep forever at Debug level only — neither delivered nor
-  dismissed. Three bounds: the budget gate is a **strict parse**, never `LooksLikeAggregatedMCQ` (which
-  stays the READER's evidence of a mangled row); `SaveSignatureSnapshot` deliberately keeps the smaller
-  cap because `signature_snapshots` has NO retention path; and `duplicatePendingEscalation` still passes
-  `snapshotMaxRunes` as its `snapshotCap` ARGUMENT, where it is a fuzzy-dedup threshold rather than a
-  storage budget.
-  - **Test trap:** the seeder `seedAgedSweptEscalation` was the only writer of that column that skipped
-    truncation, which is why every existing test was blind.
-- **An option label stops at the preview column** (`trimPreviewColumn`) — a pane is one flat grid, so a
-  preview box lands inside the option's own line and line-anchored parsing gave labels that changed on
-  every caret move, minting a new signature each time. The cut only removes a SUFFIX, so a `[ ]`/`[✔]`
-  prefix always survives; a bare `─` is excluded from the glyph set because agents draw separator rules
-  with it.
-  - **A label that trims to nothing is recovered from the next row, never dropped**
-    (`wrappedOptionLabel`) — dropping it loses a choice the agent is really offering, so the option set
-    reads one short and "2" maps to nothing. Recovery takes the FIRST continuation row only and requires
-    that row to carry a preview column, because an ordinary menu's indented line is a DESCRIPTION (the
-    repo's own 3-tab fixture renders that way).
-  - Wrapped rows are deliberately NOT stitched into one label: a terminal wrap is lossy in a way that
-    depends on where the text ends relative to the gutter, so no separator rule is correct at every width.
-- **A checkbox tab is answered by TOGGLING, so its baseline is a safety control.** A blind digit is not
-  idempotent — over a pane already carrying an attempt's toggles it CLEARS them and the advance submits
-  an empty answer. The rule is `checked ⊆ chosen`, enforced at DELIVERY (`domain.CheckedOutside` in
-  `daemon.reverifyMultiSelect`, `frontend.verifyTabBaseline`, per keystroke in `mcqdeliver.toggleTab`).
-  CAPTURE only records — refusing there strands every form hap itself half-answered. The signature folds
-  checkbox state away (`domain.NormalizedOptionSet`), so a half-delivered form still matches the rule
-  learned for the untouched one. **The widened
-  baseline needs evidence**: it applies only where this daemon recorded its own attempt at this
-  pane+signature (`markToggleAttempt`, in-memory, lost across restarts — fails safe); without it a tab
-  must be completely clean, or the rule also accepts an operator halfway through ticking that form.
-- **The last look before a claim is COMPLETE** (`claimBlockedBy`) — everything above
-  `ClaimForAutoAccept` is a herdr shell-out with a budget in SECONDS, so it re-asks all three controls
-  broadest-first: kill switch (FR-017, not FSP-specific, fails closed on a read error), mode + ceiling
-  latch (`stillPermitted`), and `accept_generated_task` for a generated-task row (a SEPARATE opt-in
-  resolved once per sweep). `retireNoopEscalation` takes the same look — Guard 1a returns before ANY
-  dismissal precisely so pausing the herd never destroys the queue it protects.
-  - **A content-safety refusal is not a delivery fault** — tagged `errOutboundRefused` and handled like
-    `errAgentDisabled`. It used to enter the retry budget, so the same never-auto match was refused
-    `maxAutoAcceptAttempts` times and the row dismissed as `auto_accept_failed`, deleting exactly the
-    escalation FR-015 says must always reach a human. Such a refusal is permanent by nature, so a budget
-    could only ever end there.
-  - **The compensating revert needs an obligation of its own.** `auto_accepting` is TRANSIENT and
-    filtered out of both the operator's queue and the candidate query, and the only automatic reclaim
-    runs at daemon START — so a failed `revertClaim` hides the escalation from everyone until a restart.
-    Failed reverts are retried every tick (`retryAutoAcceptRevert`), NOT gated on the kill switch: it is
-    bookkeeping about a claim already abandoned. Only a non-nil error is a failure; `false, nil` means
-    another writer moved the row.
-- **Every auto-accept refusal names itself once** — `notePending` logs at INFO per (row, reason). Before
-  it, Guard 1b and the pane-busy skip produced no output at ANY level, which is why the
-  truncated-aggregate bug took a five-round investigation. Per (row, reason), not per sweep — a changed
-  reason is new information. All call sites sit AFTER `stillEligible` is set: an INELIGIBLE row
-  `continue`s before that, so logging one there would be pruned and re-logged every minute forever.
+### Multi-tab forms and auto-accept (`internal/daemon/autoaccept.go`)
+- A swept form's baseline is an AGGREGATE (`AggregateMCQFrames`); never compare it to one frame — compare
+  frame-wise (`mcqFormHeldStill`). Its four gates refuse as `heldStillUnevaluable`, never `heldStillNo`.
+  **Test trap:** `internal/domain/testdata/mcq_preview_*.txt` is the only preview-layout fixture.
+- An aggregate's HEAD is load-bearing: its own budget (`aggregateMaxRunes`, `excerptBudget`); the gate is a
+  strict parse. **Test trap:** `seedAgedSweptEscalation` used to skip truncation.
+- Option labels: `trimPreviewColumn`, `wrappedOptionLabel`.
+- Checkbox tabs: `checked ⊆ chosen` enforced at DELIVERY in three places (`domain.CheckedOutside` in
+  `reverifyMultiSelect`, `frontend.verifyTabBaseline`, `mcqdeliver.toggleTab`), never at capture.
+- `claimBlockedBy` is the complete last look before a claim. Content-safety refusals are `errOutboundRefused`
+  (not a delivery fault, no retry budget). Failed reverts retry every tick (`retryAutoAcceptRevert`).
+  `notePending` logs each refusal once per (row, reason), placed after `stillEligible` is set.
 
 ### Full self-prompting (FSP)
+- FSP may widen the YES side of Guard 3, never the NO side: `mcqSalientHeldStill`, `unstructuredHeldStill`
+  decline to `heldStillUnevaluable`. The option set alone is never sufficient identity;
+  `domain.LiveMCQMatchesSalient` must mask both sides.
+- `@noop` under FSP is retired (`ReasonAutoDismissNoop`), still honouring kill switch / disable / pause.
+- `honour_limits = false` makes `[limits]` inert as one CLAUSE per gate (`domain.RateLimits.Inert`;
+  `limitsInert` / `limitsInertFor`), never an early return — `sweepAllowed`, `autoAcceptAgentSuppressed`,
+  `eligibleIdleAgents` share the disable/kill checks. Test these guards directly.
+- A busy pane is `domain.ReasonPaneBusy`, never `ReasonRateLimited`. `fspCeilingReached` ignores `Paused` and
+  only reads deliverable rows; `continue`, not `break`, after a stand-down. The stand-down latches in memory
+  first and writes config off the loop. `autoAcceptNeedsFinalize` is a map id→was-FSP.
+- Generated tasks are screened on the RENDERED prompt, and again inside the seam via its `screen` callback.
+  **Test trap:** only a `frontend` test proves the real seam calls it.
+- Every status check on the generated-task path must allow the daemon-owned row (the early
+  `audit.Status != "escalated"` check included). **Test trap:** shipped green on a fake seam.
+- Every generated-task hand-out gets a ledger row (`recordTaskReservation`), operator's included.
+- Orchestrator (`daemon/orchestrator.go`): filtered at EVERY ingest point (`isOrchestrator` /
+  `withoutOrchestrator`); identity is `<state>/orchestrator.json`; created only fail-closed
+  (`domain.OrchestratorLaunch`, `orchestratorPermitted`).
+- A generated task may not name another agent (`domain.StripForeignAgentGeneratedLines`, node-local
+  `AgentNames`, all-dropped branch above `declined`).
 
-**FSP may widen the YES side of Guard 3, never the NO side.** Two extra evidence paths, both reached
-ONLY after the ordinary comparison refused, both gated on the `fsp bool`, and both required to resolve
-to `heldStillUnevaluable` (PENDING) when they decline — a fallback answering `heldStillNo` turns a
-widening into a queue-destroying dismissal.
-
-- `mcqSalientHeldStill` answers a row truncated past its head using the byte-intact blocks
-  (`domain.SurvivingMCQFrames`), keeping the SAME frame-wise relation the intact path uses. **The option
-  set alone is NOT sufficient identity and must never become the only gate**: it is the union over every
-  tab and every AskUserQuestion form ends in a generated `Submit answers`/`Cancel` tab, so a pane parked
-  on ANY form's Submit tab is a subset of ANY other form's set. `domain.LiveMCQMatchesSalient` is only a
-  cheap extra conjunct catching option drift, and must derive BOTH sides through `MaskVolatile` — the
-  stored salient was masked, so an unmasked live side silently no-ops for every label carrying a path or
-  number. Three further gates are not optional: tab count = series length; form fully unanswered; and
-  **no token may be a comma group**, since the missing blocks carry no select mode to verify against. A
-  capture with NO surviving block stays pending — a deliberate limit.
-- `unstructuredHeldStill` answers a PANE-TAIL row via `domain.TailSimilarWithin`, which aligns both
-  salients from the TAIL before comparing. The mismatch is structural, not statistical: the baseline
-  comes from a `--source recent` CONSUMING DELTA while every re-read is `--source visible`, so symmetric
-  Jaccard is dominated by content only the longer side ever had — the documented reason idle and
-  generated-task rows never auto-accept. Aligning on the TAIL rather than testing containment is what
-  keeps it safe: a screen that moved on paints its new content at the BOTTOM, inside the compared window.
-  `domain.MinTailCompareRunes` is the floor, load-bearing for the same reason `min_salient_chars` is.
-  `fspTailHeldStillJitterPercent` is a **separate constant** from `staleDeferredSendJitterPercent` at the
-  same value — the loosening is the alignment, not the tolerance. Running after `SignatureHeldStill`
-  refused, it must re-ask the two refusals its caller did not: either side over-masked (repeated
-  placeholders share almost every trigram, so they clear any tolerance at any window — the magnet
-  failure by a door the length floor does not cover), or a fresh salient that has become structured.
-
-Outside Guard 3, a `@noop` suggestion under FSP is RETIRED (`ReasonAutoDismissNoop`) rather than left
-pending: the sentinel means SEND NOTHING and can never become deliverable, so under a mode whose premise
-is that nobody reads the queue it would sit forever. It is the only auto-accept path acting with no pane
-evidence, and can afford to — nothing is typed, nothing is learned. It still honours the kill switch,
-per-agent disable and runaway pause.
-
-**The two opt-in keys are OFF by default, and each buys one narrow thing** —
-`full_self_prompting.honour_limits` and `…accept_generated_task`.
-
-- **`honour_limits = false` means the whole `[limits]` section is INERT, and inertness is one CLAUSE in
-  each gate, never an early return.** The key used to skip only the mode's pre-check, so the ordinary
-  path kept running the runaway guard: an agent at `max_consecutive_auto_prompts` was escalated
-  `rate_limited` AND paused until a human checked in — and `rate_limited` is in
-  `autoAcceptExcludedReasons`, making that escalation permanently operator-only. `domain.RateLimits.Inert`
-  short-circuits `CheckRate` ahead of the `Paused` branch and gates the FR-014 retry ceiling in `Decide`
-  (`limits.max_error_retries` is in the same section, so without that `retry_exhausted` is never raised).
-  Deliveries still ADVANCE the counters. Resolve it through `limitsInert`, or `limitsInertFor` when an
-  `fspActive` answer is in hand — a per-AGENT loop must use the latter, since `fspActive` owns the
-  once-per-episode degradation warning.
-  **The three gates reading `rate.Paused` are SHARED** — `sweepAllowed`, `autoAcceptAgentSuppressed`,
-  `eligibleIdleAgents` each carry the per-agent disable (and `sweepAllowed` the kill switch and never-auto
-  screen) in the same run of checks — so inertness relaxes the pause clause ALONE. An early return at the
-  top of any of them is a safety bypass that still passes an end-to-end test, because the disable is
-  re-checked at delivery; drive these guards DIRECTLY in tests.
-- **A busy pane is not a runaway ceiling** — `domain.ReasonPaneBusy`, not `ReasonRateLimited`, at all four
-  `acquirePane` failure sites. Borrowing the ceiling's tag pauses the agent over a lock the in-flight
-  interaction releases on its own, and `autoAcceptExcludedReasons` then refuses the row forever.
-  `pane_busy` is deliberately NOT excluded — `d.paneBusy` and Guard 3's re-read gate the retry.
-- **The ceiling check must not read a PAUSE as a ceiling** — `CheckRate`'s first branch answers
-  `rate_limited` for a paused agent, but `fspCeilingReached` runs BEFORE Guard 1b, which already suppresses
-  those. Copy the rate with `Paused` cleared; only the two counters decide, or one paused agent switches
-  the mode off for the whole herd.
-- **The ceiling is only read on a row that could actually be DELIVERED.** `ConsecutiveAuto` is reset only
-  by human interaction, so a killed agent carries a saturated one forever while its leftover escalation is
-  still a candidate — standing the mode down over a row nothing could have sent, re-tripping after every
-  re-enable (the latch clears on reload), and skipping the `autoAcceptOne` bookkeeping that would retire
-  that row, so the livelock has no end. Hence the `live`/`autoAcceptParked` gate before the check, and
-  `continue` rather than `break` after a stand-down so remaining candidates still register in
-  `stillEligible` (a `break` hands them to `pruneAutoAcceptState`, silently resetting delivery budgets and
-  absence counts). The two ceilings are tested SEPARATELY so the stand-down can name which tripped, and
-  the per-minute one honours the window rollover.
-- **The stand-down latches in memory FIRST, writes config second, off the select loop** — `UpdateConfig`
-  nudges the daemon's own control socket, so an inline write blocks that loop on a round trip to itself.
-  The latch stops the noticing sweep immediately, is checked inside `fspActive` so both entry points
-  honour it through one gate, de-duplicates the write and the notification, and clears on reload.
-- **The attribution is written at FINALIZE, and the finalize RETRY must carry it** —
-  `autoAcceptNeedsFinalize` is `map[int64]bool` (id → was-FSP), not a set, or the flag is dropped on
-  exactly the rows whose bookkeeping already failed once. Claim time is NOT an option:
-  `ReclaimAbandonedAutoAccepts` would strand a true flag on a row nothing delivered. The store ORs the
-  column, so a replay can only ever set it.
-- **A generated task is screened TWICE, and the second one is the real gate.** The text is authored by the
-  generator LLM AFTER the decision that raised the escalation, so no safety control has seen it — the
-  operator's confirm was the gate, and this feature removes it. The screens run in the fork, before the
-  seam, on the RENDERED `DeclaredTask.Prompt()` rather than the stored text (stored items keep line breaks
-  as the literal two-character `\n`, which a line-anchored rule cannot match while the real newline
-  reaching the pane can — screening the stored form fails OPEN). A hit reverts the claim and leaves the
-  row escalated (FR-015). The daemon-side `generatedTaskUnsafe` can only render with the DEFAULT template
-  since the target source is chosen inside the seam, so the seam is handed a `screen func(string) error`
-  and calls it with the EXACT prompt immediately before the send, BEFORE the reservation.
-  **Test trap:** the daemon's tests drive a FAKE seam, so only a `frontend` test proves the real path
-  calls the callback.
-- **A generated-task acceptance is the DAEMON's row to finalize** — `automated` makes
-  `frontend.acceptGeneratedTask` skip BOTH `ResolveEscalation` and `InsertCorrection`. The seams
-  (`Options.AcceptGeneratedTask` / `DisableFSP`) are optional function fields wired in `cmd/hap`, so
-  `internal/daemon` still does not import `internal/frontend`; a nil seam returns the claim rather than
-  stranding the row. **EVERY status check on that path has to know it**, including the cheap early-out
-  above the claim (`audit.Status != "escalated"`) — missing THAT one is destructive: the error reaches
-  `autoAcceptDeliveryFailed`, which burns an attempt per sweep and DISMISSES the escalation, so the
-  feature deletes the very suggestions it exists to act on. It shipped green because the daemon tests wire
-  a FAKE seam. The call runs INSIDE `WithAgentAutomation` like every other delivery.
-- **EVERY generated-task hand-out gets a ledger row, the operator's included**
-  (`recordTaskReservation`). A crash between the `[-]` and the send used to strand the item: the audit row
-  is reclaimed at startup but the marker is not, so the retry reads it as taken, burns its budget, and the
-  escalation is DISMISSED. The operator path recorded nothing on the ground that a human was present to
-  read the error — **that premise died with the queued confirm**, since the send now happens on a machine
-  they may not be sitting at. Accepted cost and likeliest support question: `agentsAwaitingHandout` allows
-  ONE unconfirmed hand-out per agent, so a confirmed agent is withheld from the idle poll until it goes
-  `working` or ages out at `staleHandoutTTL`. `TerminalID` comes from `liveAgentFor`, which is what tells
-  a RECYCLED pane apart.
-- **The mode is re-asked immediately before the claim** (`stillPermitted`); `WithAgentAutomation` covers
-  the per-AGENT disable at delivery, not the global mode.
-
-**The orchestrator is IGNORED unconditionally and CREATED only fail-closed** (`daemon/orchestrator.go`).
-`full_self_prompting.orchestrator_agent_command` keeps an interactive claude session named `orchestrator` alive
-while the mode is on; it watches `hap stream orchestrator`.
-
-- **Disabled is not ignored.** A disabled agent is still captured, classified and audited on every event, so
-  the orchestrator is filtered at every INGEST point (`handleTransition` after `noteRosterTransition`,
-  `handleAttention`, `reconcileAttentionWith`, the sweep listing after `publishRoster`, the session-name flip
-  pass) by `isOrchestrator`/`withoutOrchestrator`. A new pass over the agent listing must go through the filter.
-- **The identity is `<state>/orchestrator.json`, never `agent_names.terminal_id`** — that column is rewritten on
-  a recycled pane and carries name + disable onto the new tenant. Loaded before the first event; a recycled pane
-  (same pane, different terminal) releases identity, name and disable (`observeOrchestrator`).
-  - **The ensure pass observes FIRST, against the OLD identity.** A pane recycled while the daemon was down
-    still carries the old name + disable; once a new orchestrator is recorded nothing compares that pane again,
-    so an operator's agent stays disabled and its escalations are auto-dismissed as `agent_disabled`.
-  - A just-opened pane is filtered by pane id alone while it starts (`provisionalOrchestrator`) — **in memory
-    only**: persisted, a crash mid-start leaves an identity no recycled pane can contradict.
-- **Creation fails closed**: mode on, not stood down, kill switch clear (read error = paused), argv[0] = claude
-  (`domain.OrchestratorLaunch` — herdr starts by KIND), `ports.AgentLauncher` present. "Mode on" is the operator's
-  switch, deliberately NOT `fspActive`'s preconditions. Off the loop, one pass at a time, ≤3 spawns/hour, doubling
-  backoff. A failed `agent start` re-probes `AgentByName` before counting as a failure, so a readiness timeout
-  never spawns a second session — and a real failure CLOSES the pane it opened, or every backoff step leaks a tab.
-  An ADOPTED session is never briefed.
-- **The mode is re-asked before each step that acts** (`orchestratorPermitted`: the start, the brief), from the
-  LIVE config — `agent start` alone may take two minutes.
-- **The brief never types into a modal**: it needs `ClaudeSessionFromPane` to prove an EMPTY composer, and is
-  delivered without `WithAgentAutomation` on purpose (the agent is disabled by design). A fresh claude renders its
-  transcript at the TOP of a tall pane, so a short read never sees a delivered brief (see
-  `TestRealOrchestratorAgentStart`).
-
-- **A generated task may not name ANOTHER agent** (`domain.StripForeignAgentGeneratedLines`, applied once
-  in `handleTaskGenOutcome`). The generator is told `Agent: {agent_name}` on one line and handed ~5000
-  chars of pane as ground truth, and `DefaultNextTaskTemplate` renders `hap task {agent_name} list` into
-  every hand-out — so a sibling's name, a pre-rename scrollback or a recycled tenant puts a foreign name
-  in front of the model as fact, and it comes back as this agent's work (#508). Neither outbound screen
-  can catch it: both are never-auto patterns plus the irreversible heuristic, identity-blind by
-  construction, and the OPERATOR's own confirm is screened by nothing at all. Four bounds: line-wise on
-  the RAW text before normalization, the same contract `StripNoopGeneratedLines` states (the confirm path
-  must normalize exactly ONCE); the known set is `AgentNames`, this NODE's, never `FleetAgentNames`;
-  matching is on NAME BOUNDARIES against that set, never a pattern over the adjective-animal shape, which
-  fires on prose; and the all-dropped branch sits **ABOVE** the `declined` branch, or `- @noop` beside one
-  foreign line reports "the model declined" and parks the agent on a noop rule it never asked for.
-  Applied before the row is stored, so the FSP accept and the operator confirm inherit one clean
-  suggestion.
-
-**Accepted limitation, not a bug:** a generated-task escalation is `idle`-typed, so its baseline salient is
-unstructured pane-tail and Guard 3 usually answers `heldStillUnevaluable` — the row waits for the operator.
-
-### Queue notices, snooze, and the operator at the keyboard
-
-**A notice about an agent's QUEUE is not a question about its SCREEN, and only the first kind may ever
-be withheld.** `domain.LatchedPerParkedEpisode` names them — `noop_vs_pending_tasks`,
-`task_source_exhausted` and now `no_task_source`. `daemon.queueNoticeWithheld` is the ONE gate they all
-pass, asking four things broadest-first; every other escalation on the same event reaches the operator
-untouched, and a bug in any of this can only ever be an operator seeing too few notices, never a
-keystroke.
-
-- **`ReasonNoTaskSource` was excluded from the latch because "nothing has reported it flooding". It has
-  now been reported** (#526: 454 rows in one day, four for one agent inside three minutes). Latching it
-  was necessary and is NOT sufficient, and the reason is the trap: **the episode latch is cleared by the
-  transition to `working`** (`handleTransition`, `noteIdleAgents`), and an agent waiting on its own
-  background shells flips parked→working→parked every time one prints a line. Each flip re-arms the
-  latch. The excerpt dedup cannot help either — that keys on a screen these agents repaint.
-- **The wall-clock cooldown AND the background-work evidence are scoped to `no_task_source` ALONE**
-  (`noticeCooldownApplies` gates both), and widening either is a regression two existing tests already
-  catch: the other two ask the operator to QUEUE WORK, which they do many times a day, and the hand-out
-  proposal is precisely the row that gets the agent working again — a `tail -f` or a dev server would
-  otherwise withhold it for as long as that process lives. `no_task_source` asks them to REGISTER A
-  SOURCE — configuration, performed on their own clock.
-- **The cooldown is NOT pruned in `noteIdleAgents`' new-episode block, and the comment there says why.**
-  That block is reached whenever `idleSince` carries no mark — which the WORKING transition deletes — so
-  a pruning line there is hit on the first sweep after every flap and collapses the 30-minute bound back
-  to the cadence #526 measured. A genuine recycle is handled where it is actually known,
-  `resetRecycledPaneState`, which compares terminal ids; the map is in memory, so the only recycle it can
-  ever need to survive is one this daemon observed. **Test trap:** the guarding test passed on the broken
-  code until it drove the RE-PARK as well as the working flip.
-- **`domain.BackgroundWorkRunning` is the only one of the four that is EVIDENCE rather than
-  bookkeeping.** herdr reports a pane with three of its own shells running as `idle`, identical to one
-  waiting for a human. Claude paints it as a `·`-separated SEGMENT of the mode line (`⏵⏵ auto mode on ·
-  2 shells · ← for agents`, verified live 2.1.252) — not a line of its own, which is why
-  `claudeModeLabel` already truncates at the first `·`; agy's own count is in the status bar
-  (`· N task(s) ·`). It reads `Situation.Content`, which is the RAW pane (`classify.Classify` stores it
-  unstripped), so it costs no herdr round trip. **Do not put it in `internal/classify`** beside the agy
-  idle suppression: withholding the idle verdict leaves `SituationUnclassifiable`, which still escalates,
-  so it would trade `[no_task_source]` rows for `[unclassifiable]` rows at the same rate.
-  - **codex has an arm now, and it reads a DIFFERENT line from its mode footer.** Verified live
-    (codex-cli 0.155.0): the footer really is `<model> <effort> · <cwd>` with no count slot, but a
-    session holding a background terminal paints `1 background terminal running · /ps to view · /stop
-    to close` as a line of its own above the composer, and it SURVIVES the end of the turn — which is
-    what makes it usable, since both callers only look at parked agents. The `/ps` hint is required,
-    not decoration: the count phrase alone is prose an agent types while reporting what it did, and
-    the footer window is the whole capture on a short pane. Fixtures:
-    `internal/domain/testdata/codex_background_terminal*.txt`, a live pair differing only in that line.
-  - **It now has a SECOND caller, and it is narrower than this one** (`reclaimStrandedTasks`, #508) — so
-    the contract comment on the predicate names both. It may only ever WITHHOLD something hap would say;
-    a caller that would TYPE must prove its precondition positively (`AgyComposerReady`,
-    `ClaudeComposerReady`) rather than read a `false` here as permission.
-  - **The evidence is recorded at CLASSIFY time and read from memory** (`noteBackgroundWork` beside
-    `noteAgyWorkspace`; `backgroundWorkFor`). `autoSendIdleTasks` runs ON the main loop and its own doc
-    already names its inline per-row writes as the reason it is no longer "only cheap reads", so a
-    per-row herdr shell-out there is a stall — and not a rare one, since a parked agent in a
-    thirteen-minute build is past `reclaimGrace` on all thirteen sweeps. A NEGATIVE observation DELETES
-    the entry rather than storing a false, so `backgroundWorkFresh` only ever bounds "no capture has
-    been taken at all"; an agent whose own work prints nothing for that long is reclaimed as before.
-- **Every suppression names itself once** (`noteNoticeWithheld`, per (agent, reason, CAUSE) — a changed
-  cause is new information). `notePending`'s rule: the unlogged skips cost a five-round investigation,
-  and a line per event would move the flood into the log.
-- **`hap wait` is a THIRD column again, and the one thing it must not share with `snoozed` is the
-  LIFT.** An agent declares a bounded wait for itself (`domain.AgentWait`, `agent_names.wait_until`,
-  #508) because herdr reports a fifteen-minute cold build as an idle pane — the same signature as
-  wedged, which is how every stall alert in one session was a false positive. It gates the same three
-  places snooze does plus `reclaimStrandedTasks`, and MUST NOT touch the delivery path either.
-  Four rules, each load-bearing:
-  - **It is NOT lifted by the transition to working**, which is the whole reason `SetAgentSnoozed`
-    could not be reused: an agent waiting on its own work flips parked→working→parked every time that
-    work prints a line — the same flap that defeated the #526 episode latch — so a state that clears
-    on it cannot survive the thing it exists to cover. It ends on the CLOCK instead.
-  - **Expiry is READ, never written** (`AgentWait.Active`, asked at every call site against the
-    caller's `now`). A sweep that cleared lapsed rows is an unconditional periodic write, which arms
-    the turso push debounce every tick — the leak the "a periodic write is CONDITIONAL" rule names.
-  - **The queued payload carries a DURATION, not a deadline** (`domain.DeclareWaitPayload`): every
-    gate compares against the OWNING node's clock, so the owner mints the deadline on that clock and
-    two machines' skew never enters the answer.
-  - **`reclaimStrandedTasks`' `staleHandoutTTL` give-up branch is the one a WORKING agent reaches** —
-    its own comment names "an agent that has been busy the whole time" — so it is the FOREGROUND half
-    of #508 item 3, where `BackgroundWorkRunning` cannot help (that agent never parks, and both of
-    the predicate's callers only look at parked agents). A declaration may hold it, but only to
-    `staleHandoutTTL + domain.MaxDeclaredWait`: a wait can be RENEWED, so honouring it there without
-    an absolute ceiling restores the unbounded `[-]` the TTL exists to end.
-- **`hap snooze` is a SEPARATE column from `disabled`, never a second meaning for it.** `hap disable`
-  stops hap answering the agent at all — `escalationAutoDismissReason` records its escalations already
-  dismissed — so an orchestrator that used it to quiet a finished agent also stopped its approvals being
-  answered, and both agents needed re-enabling by hand when their panes were reused. Snooze adds exactly
-  three gates (`queueNoticeWithheld`, `eligibleIdleAgents`, the `ActionGenerateTask` arm) and MUST NOT
-  touch `WithAgentAutomation`, `deliverreply.go`, `autoaccept.go` or `generatedtask.go`'s barrier — that
-  is the whole difference. It clears on the transition to working through a **conditional** store write
-  (`ClearAgentSnoozeIfSet`): unconditional, it would report a write on every turn boundary of every
-  working agent and arm the turso push debounce each time.
-- **"Idle" is not "unattended": `domain.OperatorTyping` looks for a human.** An operator with a
-  half-written message in the composer is present, and typing there appends to their draft and submits
-  it. **`known == false` is UNKNOWN and is the COMMON case** — the classification read is a consuming
-  delta that usually shows no footer — so a guard that withheld on unknown would withhold nearly every
-  hand-out. It withholds only on proof. Asked at task generation (`generateTask`, ABOVE
-  `HasPendingLLMConsult` so a refusal strands no `llm_requests` row) and at every unattended send, from a
-  `--source visible` read (`operatorTypingRefusal`), whose unreadable case deliberately fails OPEN —
-  the opposite of `agyComposerRefusal`, which proves a positive precondition. agy is SUBSUMED rather than
-  exempt: `AgyComposerReady` already proves a bare caret, which is strictly stronger, so asking again
-  would only cost a second herdr shell-out at all five shared call sites.
-  - **The auto-accept path asks in `claimBlockedBy`, not in `autoAcceptDeliver`**, because the
-    OPERATOR's own `--send` goes through the latter and a human who just looked at the screen must not
-    be refused for the draft they are holding. Refusing at the claim also leaves the row PENDING with
-    `notePending` naming the reason, rather than burning a delivery attempt.
-  - **codex answers UNKNOWN outright, and that is a refusal rather than a gap**: it renders suggestion
-    text on the caret line of an EMPTY composer, and reading that as a draft would silently withhold
-    every hand-out from every parked codex agent. Finish it only with a live sample of both states.
-- **An orchestrator-authored reply gets the PROSE screen** (`deliverReplyScreen`): `screenOutboundStrict`
-  plus `actionRefused`, never the suspected-irreversible heuristic. The heuristic corroborates a
-  destructive verb against a data target across a line or two because it reads a PENDING PANE OPERATION,
-  so over narration it refuses work for DISCUSSING it — observed live refusing a `resolve --action`
-  carrying review-fix instructions because "without deleting the PK row" was followed by "table", which
-  stalled a pull request for three hours. The operator's arm is UNCHANGED. What is kept, and the
-  difference from a `send_task` hand-out: the ACTION rules, because a reply is routinely a MENU LABEL and
-  a widening option picked by an LLM is exactly what they refuse.
-- **A refused queued action raises its own escalation** (`escalateRefusedAction`, `queued_action_refused`)
-  and emits `correction.withdrawn`. Before it, a refusal set `agent_actions.error`, deleted the
-  correction, logged one line and told only the process that queued it — which for the orchestrator is a
-  terminal its own skill has just told that refusals are final. The row carries NO suggestion (the text a
-  safety control refused is exactly what a confirm would type), and it is raised for `errOutboundRefused`
-  only: `errEscalationClosed` withdraws too, but there the row is already resolved. Two bounds:
-  `finishWithdrawn` REPORTS whether it recorded, and a failed withdrawal leaves the row running for the
-  startup reclaim to requeue — announcing there would put a second row in front of the operator for one
-  refusal; and an identical repeat is deduped in memory (`refusalEscalated`), because the author this
-  exists for is an LLM. **It must RESOLVE `a.Target` first**: that field is the operator's SPELLING, and
-  `send_task` queues an agent NAME, so filing the row under it writes an `audit_log.agent_id` that joins
-  to nothing — on precisely the kind whose refusal has no other row at all.
+### Queue notices, snooze, wait, operator presence
+- Only queue notices (`domain.LatchedPerParkedEpisode`) may be withheld, through `daemon.queueNoticeWithheld`.
+  The cooldown and background-work evidence apply to `no_task_source` ALONE (`noticeCooldownApplies`); the
+  cooldown is not pruned in `noteIdleAgents`' new-episode block. **Test trap:** drive the re-park, not just
+  the working flip.
+- `domain.BackgroundWorkRunning` may only WITHHOLD; read from memory (`backgroundWorkFor`), never a
+  per-row shell-out. Don't move it into `internal/classify`.
+- `hap wait` (`domain.AgentWait`) is lifted by the CLOCK, not by working; expiry is read, never written;
+  payload carries a duration. `hap snooze` is separate from `disabled`; it gates only `queueNoticeWithheld`,
+  `eligibleIdleAgents` and the `ActionGenerateTask` arm, and must not touch
+  `WithAgentAutomation`, `deliverreply.go`, `autoaccept.go`, or `generatedtask.go`'s barrier; it clears via
+  `ClearAgentSnoozeIfSet`.
+- `domain.OperatorTyping`: `known == false` is common and withholds nothing. Asked in `generateTask` ABOVE
+  `HasPendingLLMConsult` (no stranded `llm_requests` row); auto-accept asks in
+  `claimBlockedBy`, not `autoAcceptDeliver`. codex answers unknown on purpose.
+- Orchestrator replies get the prose screen (`deliverReplyScreen`). Refused queued actions escalate
+  (`escalateRefusedAction`) after resolving `a.Target`.
 
 ### Task sources and hand-outs
+- `enable_auto_send_task_when_idle` skips learning gates, never safety ones (`domain.Decide`).
+- A hand-out is confirmed only by a `working` transition (`task_reservations`, `reclaimStrandedTasks`); one
+  unconfirmed hand-out per agent (`agentsAwaitingHandout`). `staleHandoutTTL` is asked before
+  `BackgroundWorkRunning`. **Test trap:** only the reservation ID and the second send discriminate.
+- A pending escalation never benches an agent from the idle poll; don't key on the audit `Trigger`.
+- An empty per-source `provider` is the inheritance and must never be materialized (`normalizeTaskSources`
+  runs on Load AND Save). The top-level provider IS pinned in `Load` before the decode.
+  **Test trap:** file-backed fixtures declare it (`localFSApp` / `localFSCfg`); `testApp` stays on the default.
+- A locator is never a file outside `internal/taskstore/local`: mutate via the store
+  (`frontend.mutateList` / `mutateTask`, `daemon.mutateTaskList`). Compare locators (`isBootstrapList`),
+  canonicalized only by `tasklocator.Canonical`. Guard: `TestOnlyTheLocalBackendTouchesATaskListAsAFile`;
+  remote-path tests belong in `remote_confirm_test.go`.
+- A task list is never created blank (`newListHeader`, `ports.EnsureCreator`, `gist.Store.put` →
+  `ErrBlankContent`): GitHub answers 422 `missing_field` on `files`. **Test trap:** `fakeGist` must keep
+  emulating that 422.
 
-- **`enable_auto_send_task_when_idle` skips the LEARNING gates, never the safety ones.** A declared task
-  from a flagged source resolves ahead of any learned noop precedence and bypasses the shadow-mode and
-  confidence gates (`domain.Decide`, keyed on the `idleHandout` predicate — the VERIFIED classified
-  situation plus the RESOLVED action, never a sweep-time flag). The flag is an operator instruction about a
-  QUEUE; a learned action is an inference about a SCREEN, and every idle screen mints its own signature, so
-  per-signature graduation means the feature never delivers unattended. The bypass sits AFTER the variance
-  guard, rate guard and irreversibility heuristic and before nothing else; kill switch, never-auto,
-  per-agent disable and the optional pre-delivery LLM review all still apply at delivery.
-- **An unattended hand-out is only "delivered" once the agent works.** `agent send` proves herdr took the
-  keystrokes, not that the agent acted, so the `[-]` is recorded in `task_reservations` and confirmed only
-  by a `working` transition; `reclaimStrandedTasks` returns an unconfirmed item to `[ ]` once its agent is
-  parked again past `reclaimGrace`. Four bounds: the daemon releases ONLY a `[-]` it holds a ledger row for;
-  **one unconfirmed hand-out per agent** (`agentsAwaitingHandout`), since confirmation is per-agent and a
-  second hand-out lets one resumption confirm — and so strand — the untaken first; confirm and reclaim both
-  compare `terminal_id`, because an agent id IS a recycled pane id; and an item handed out `maxTaskHandouts`
-  times without ever being started is left `[-]` and escalated rather than resent forever.
-  - **"Parked" is not "finished", and that cost every stall alert in one session** (#508). herdr reports an
-    agent sitting on a fifteen-minute cold build as `idle`, so `!autoSendParked` does not save it: the
-    two-minute grace expired under an agent that was working, the item was reclaimed and re-handed, and
-    `maxTaskHandouts` later it was escalated `task_never_started` for work it was doing all along. A parked
-    agent whose pane POSITIVELY shows work it started (`domain.BackgroundWorkRunning`) is held `awaiting`
-    instead. It DEFERS, never exempts: `staleHandoutTTL` is asked FIRST and unconditionally, or a dev
-    server or `tail -f` would pin an item at `[-]` for as long as that process lives. **Test trap:** the
-    obvious assertions cannot see the bug — without the guard the same sweep reclaims AND re-hands, so the
-    row count and the `[-]` marker both look untouched; only the reservation's ID and the second send
-    discriminate.
-- **A pending escalation never benches an agent from the idle poll** — `eligibleIdleAgents` has no
-  escalation gate, deliberately: gating on one deadlocks the feature against itself, since a pending task is
-  what raises `noop_vs_pending_tasks`, which then blocks the poll that would deliver it. **Do not reach for
-  the audit `Trigger` to tell "the poll's own" escalations apart either** — `daemon.trigger` derives it from
-  `tr.AutoIdleSend`, so EVERY escalation on a poll-driven episode is stamped `auto-idle-send:`, the common
-  shape for exactly the parked agents this is for. **The bound on an undeliverable task is per ITEM, not per
-  agent**: a failed send rolls back to `[ ]` and records NO reservation, so nothing can age it —
-  `deliverAutonomousClaimed` counts the attempt (`RecordTaskHandoutAttempt`) and at the cap leaves it `[-]`
-  and escalates. Since the poll ignores `episodeHandled` on purpose, `Daemon.pollRedrive` widens the
-  interval (1, 2, 4 … capped at 15m) for an agent whose episodes keep not sending — a delay, never a bench.
-- **An inherited task-source provider is a live link, never a snapshot.** An empty per-source `provider` IS
-  the inheritance and must NEVER be materialized: `normalizeTaskSources` runs on **Load AND Save**, so
-  filling it in "like we do for `max_tasks`" stamps the current default onto every existing source the first
-  time any surface writes config — and the operator's later `hap config set task_source_provider.provider`
-  then moves nothing, silently, for every install that already had a config. It fails no obvious test.
-  Misconfiguration is detected at USE time (`ValidateResolvedProvider`), never at `Load`, and never coerced
-  — coercing an unrecognized provider to `local_fs` resolves gist-shaped names against the daemon's cwd and
-  CREATES local files while the operator believes their lists are remote. A missing `gist_id` is
-  deliberately not a write-time rule either: it would make the keys order-dependent to set.
-  - **The TOP-LEVEL key is the opposite: it IS materialized, and that is what made flipping its default
-    safe.** `Default()` names `sqlite` and `Load` pins `local_fs` the moment the config FILE exists — before
-    the decode, so an explicit key still wins and EVERY return carries the pin, including the two error
-    paths and the `AutoAccept.validate()` branch that keeps the decoded config. A post-decode pin misses
-    that third one silently, so a typo in the file would move an install's storage backend.
-    `ResolveProvider`'s literal fallback stays `local_fs` (reached only by an in-memory `Config{}`), and
-    `AnyNonDefaultProvider` asks whether the config is MIXED rather than "anything but local_fs", since
-    there are now TWO postures an operator reaches without touching the setting.
-  - **Test trap:** `internal/cli` and `internal/frontend` fixtures whose list is a FILE now declare it
-    (`localFSApp`/`localFSCfg`) rather than riding on the default — a suite where every test runs on a local
-    file, where a locator IS a path, is the single reason the locator-is-not-a-path bugs kept shipping
-    green. `testApp` deliberately stays on the DEFAULT.
-- **A task-list locator is never handled as a FILE outside the local backend.** `taskfile.Mutate`,
-  `MutateWithin` and `WriteFileAtomic` take a path; a locator is not one. Under a remote provider it is a
-  `gist://<id>/<file>` URI that `os.Stat` can only fail on, and the failure reads like a missing file rather
-  than like code looking in the wrong place. Every checklist mutation goes through the STORE
-  (`frontend.mutateList`/`mutateTask`, `daemon.mutateTaskList`), and there is deliberately NO local
-  `mutateTaskFile` alias to reach for; `internal/taskstore/local` is the one exemption. **The hazard is that
-  the local twin of a store method passes every test** — three shipped: a send-time reservation left on
-  `taskfile.Mutate` created the list, registered the source, CLAIMED the escalation and died with nothing
-  sent; `pickAppendTarget`'s `os.ReadFile` silently degraded from "the source with pending work" to "the
-  first source"; and the bootstrap exclusion compared absolutized paths, so an agent's own list read as
-  external and the append path duplicated every task un-numbered.
-  - Comparison is on canonical LOCATORS (`isBootstrapList`) — **plus a declared path**, not optional: a
-    DERIVED source resolves to `DerivedFileName(agent)`, byte-identical to what the bootstrap registers, so
-    locator equality alone excludes the most idiomatic gist setup and `addTaskSourceIfAbsent` then refuses
-    to register a second source, failing every retry after the tasks were written. Never compare the
-    declared spelling ALONE either: the same file name in a different gist is a different list. The
-    bootstrap locator's own resolution error is DEFERRED past the append early-return, so a misconfigured
-    remote default beside a healthy `local_fs` source still works.
-  - Two guards cover different halves: `TestOnlyTheLocalBackendTouchesATaskListAsAFile` bans the path-taking
-    MUTATORS by construction (matched on the selector, so a function value is caught and a dot-import of
-    `taskfile` refused), while the READ half needs behavior — hence `App.TaskStoreFor`, the test-only seam
-    standing a remote backend up in-process. Changes here belong in `remote_confirm_test.go`.
-  - The reservation rollback takes `context.WithoutCancel`: a remote store uses the caller's ctx, and the
-    likeliest cause of the failed send it undoes — the operator quitting — is the same cancellation that
-    would abort the release and strand the item at `[-]`.
-- **A task-list locator is canonicalized in exactly one place** — `tasklocator.Canonical`. A second copy
-  forgetting that a scheme'd locator returns verbatim fails SILENTLY: `filepath.Abs` does not error, it
-  returns `<cwd>/gist:/id/file`, and each hap process has a different cwd.
-- **A task list is never created BLANK.** GitHub refuses `""`, `"\n"` and `" "` alike with
-  `422 Validation Failed {Resource:Gist Field:files Code:missing_field}` — a blank body reads as "this entry
-  carries no file", the entry is dropped, and the request fails for an empty `files` map, so the error names
-  `files` and never the content. `newListHeader` is the ONE seed every create-on-demand path passes to
-  `ensureList`, enforced in THREE places: `frontend.ensureList` refuses a blank seed for EVERY backend (a
-  local file takes one happily, so guarding only where it breaks means the next caller is green through the
-  whole unit suite and fails for the first `github_gist` operator — exactly how the generated-task confirm
-  shipped seeding `""`); `ports.EnsureCreator` states it as the interface contract; and `gist.Store.put`
-  refuses with `ErrBlankContent` on EVERY write path. Only the CREATE is closed.
-  **Test trap:** the unit suite could not catch any of this until `fakeGist` was taught to answer a blank
-  write with GitHub's real 422.
+### Store, nodes, sync
+- Node-owned rows carry `node_id`; every operational statement filters `node_id = self`
+  (`TestEveryNodeOwnedStatementIsNodeScoped`, by AST — SQL must be a literal at the call site, not a const or
+  struct field). Store suite runs under `HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql|libsql_replica`.
+  Turso two-node tests need `tursodb` on PATH; `HAP_TURSO_TEST_URL`/`_TOKEN` and `HAP_LIBSQL_TEST_URL`/`_TOKEN`
+  target real servers.
+- `signatures`, `signature_embeddings`, `signature_snapshots`, `decisions` are fleet-wide — **never add a
+  `node_id`**. `embedder.ModelIDFor` is the fleet identity; anything comparing a row's model must use it.
+- `store.importer.copyAll` is the ONE copier between engines. `migrateNodeScoped` / `migrateExplicitID` mirror
+  `nodescope_test.go` (`TestMigrateScopeListsMatchTheGuard`); every table is copied or listed in
+  `migrateNotCopied`. Source node selects, destination node stamps.
+- libsql replica (`internal/store/libsqlreplica`): never a TEMP table in server SQL (sqld refuses it — add
+  such shapes to `hranafake.sqldRefuses`; run `TestLiveSyncStatementShapes` after changing sync SQL); a
+  replay never uses INSERT OR REPLACE; tables prefixed `hap_` stay local; push-wins columns are covered by
+  `TestPushWinsCoversEveryEscalationTransition`. Server errors keep `domain.LibSQLServerErrorPrefix`.
+- Schema DDL on a shared DB only under the lease (`turso.PrepareSharedSchema`); a definitive loss latches.
+  **Test trap:** `schema_lease_test.go` skips without `tursodb` (and no CI job installs it); use the fake
+  `SchemaSyncer` (`schema_lease_latch_test.go`).
+- `database.sync_paused` is read LIVE and gates server round trips only — shutdown push included, local
+  checkpoint not; `checkFleetSyncWedged` refuses while paused; unpausing pushes.
+- A periodic write must be CONDITIONAL (each write arms the 2s turso push): `rosterRowUnchanged` MIRRORS
+  `upsertRosterRow` field for field; read-only transactions report no write (`txWrote`). `domain.NodeHeartbeat`
+  is bounded above by `daemon.actionStaleAfter`.
+- A wedged sync restarts with `--restart`, never `--ensure` (`checkFleetSyncWedged`), only for process-local
+  faults (`domain.SyncFailureProcessLocal`).
+- Retention (`PruneAgedRows`): `audit_log` and `decisions` are never swept; roster rows only with a tombstone.
+  **Test trap:** `kill_events` survivors are per SCOPE — seed non-global rows.
+- Front ends poll a change token (`Store.Revision`, `frontend.App.ChangeKey`), one poll in flight. Config
+  never enters the database; front ends draw ids from the daemon with no local fallback.
 
-### Store, nodes and sync
+### agy
+herdr never reports an agy modal as blocked; forms are parsed structurally (`internal/domain/agy.go`,
+`docs/designer/agy-support.md`).
+- A reply to an agy form is KEYS (agy commits on the digit alone; a trailing Enter answers the next screen).
+  Every send path must ask `domain.AgyFormSituation` and route to `mcqdeliver.Agy` — today `daemon.act`
+  (ahead of the action-review rewrite), the LLM promotion in `handleLLMOutcome`, and `deliver.Deliver`.
+  Every verified answer must `recaptureAfterAgyAnswer`, or the form stalls after question 1.
+- Anything else typed into agy needs `domain.AgyComposerReady` — asked by `deliverAutonomousClaimed`, the LLM
+  promotion, `deliver.Deliver`, `refuseIfAgentBusy`, `requireIdleForHandout`, `actionTaskSendHost.Send`.
+  A new hand-out path must ask it too.
+  **Test trap:** `fakeHerdr` has no `SendToAgent`, so the proof lives at call sites.
+- Never set `MCQKind`/`AnswerCount` on an agy situation.
 
-- **The store is node-scoped, and the Turso engine is daemon-owned, gated and never cancelled.** Several
-  machines may share one database and a herdr pane id repeats on every one, so it is never an identity
-  alone. Node-owned rows carry `node_id` (`store.LoadNodeID`); machine-local natural keys are composite
-  (`agent_names(node_id, agent_id)` with `UNIQUE(node_id, name)`, `agent_rate`, `error_retries`,
-  `task_handouts`, `agent_roster`, `herdr_locations`, `roster_meta`); INTEGER keys get node bits under turso
-  (`store.TimeOrderedIDs` via `s.nextID()` — NULL under sqlite so AUTOINCREMENT still assigns). Every
-  OPERATIONAL statement filters `node_id = self`; FLEET reads span nodes and return `node_id`.
-  `TestEveryNodeOwnedStatementIsNodeScoped` enforces it by AST walk with an exemption map that must stay
-  live; the store suite runs FIVE times (`HAP_STORE_TEST_MODE=sqlite|proxy|turso|libsql|libsql_replica` — `libsql` is the direct server handle, `libsql_replica` the daemon's replica; both run on
-  `hranafake`, an in-process Hrana server over SQLite). Two-node sync tests in
-  `internal/store/turso` need `tursodb` on PATH (skip otherwise); `HAP_TURSO_TEST_URL` +
-  `HAP_TURSO_TEST_TOKEN` point them at a REAL database instead — its hap tables must start empty, so run
-  them one at a time and wipe between. The libsql live tests (`HAP_LIBSQL_TEST_URL` + `HAP_LIBSQL_TEST_TOKEN`)
-  are NON-DESTRUCTIVE by design — a scratch table, created and dropped — because the only real servers a
-  developer has hold live data.
-- **`libsql` is a SEPARATE engine from `turso`, not a transport of it** (`internal/store/libsql`). turso's
-  replica syncs over Turso's own protocol (`/pull-updates`, `/export`), which a plain sqld answers with 404
-  (verified against sqld 0.24); libsql speaks Hrana (`/v2/pipeline`), which every libsql server — Turso
-  Cloud included — serves. Everything above the connection is shared (`store.Engine.Shared()`, the daemon
-  owns the handle and serves `store.sock`, node-bit ids, identical schema, the lease in
-  `turso.PrepareSharedSchema` over the `SchemaSyncer` interface). What differs, each load-bearing:
-  - **The daemon's store is a LOCAL REPLICA** (`internal/store/libsqlreplica`, below). It replaced an
-    engine with no local copy, where every statement was a round trip on the daemon's event loop (~230 ms
-    to a remote provider: a ~20 s start, seconds per `hap` verb) and an unreachable server was a dead store.
-    `internal/store/libsql` is now its transport (`Batch`/`Tx`), plus a `database/sql` handle straight onto
-    the server that the SERVER's schema lease (`PrepareServer`) and `hap migrate` use. The per-request
-    timeout (`libsql.DefaultTimeout`) is what bounds a hung server.
-  - **That direct handle's Pull is a change check and its Push a reachability check** — never no-ops, because
-    the schema lease reads them as proof. Pull compares the server's `replication_index` and answers
-    "changed" when the server reports none, the direction a change token must fail in.
-  - **Every server error is prefixed `domain.LibSQLServerErrorPrefix`**, which `syncRemoteFaults` vetoes:
-    sqld relays SQLite's own `database is locked`, a PROCESS-LOCAL shape, so without it a busy server
-    restarts the daemon every cooldown.
-  - **The legacy import never runs automatically** — an install upgraded from the old no-copy engine had
-    deliberately NOT folded its local file in, and doing it on upgrade would publish a history the operator
-    chose to keep; `hap migrate --to libsql` does it deliberately, straight into the server.
-  - Hrana's execute takes ONE statement; the schema's batches are resent as a `sequence` on sqld's
-    `SQL_MANY_STATEMENTS` (asking the server, never splitting SQL here). Integers travel as STRINGS and are
-    parsed with `ParseInt` — node-bit ids live past 2^53. An idle stream expires in ~10 s (`STREAM_EXPIRED`),
-    harmless because a connection holds a baton only inside a transaction.
-  - `hasOpenEscalation` asks the store, never filters the fleet queue by agent id in Go — that would let
-    another machine's pane `1` block this one's reconcile.
-  - **There is ONE copier between the two engines** (`store.importer.copyAll`), and both the automatic
-    legacy import and `hap migrate` go through it. Re-allocating ids in ascending old-id order, remapping
-    every cross reference and omitting the in-flight rows is the hard part; a second implementation that
-    drifted would corrupt the database it writes into. Four direction-specific rules:
-    - **The two ends of node scope are ASYMMETRIC on purpose: the SOURCE's node selects, the
-      DESTINATION's stamps.** A shared database holds every node's rows and a local file belongs to one
-      machine, so `--to sqlite` filters `migrateNodeScoped` on the SOURCE's node ("which rows are mine to
-      take") while `stampNode` writes the DESTINATION's ("whose they are now"). Getting either backwards
-      fails silently in its own way: filtering on the destination's selects NOTHING when the two differ,
-      and stamping the source's copies a history that every operational query — all scoped to
-      `node_id = self` — then refuses to show, so the migration reports success over an empty
-      `hap escalations`. `--all-nodes` therefore FLATTENS the fleet into one node, which is what makes it a
-      consolidation rather than an archive (and why colliding agent names lose the second copy).
-      `migrateNodeScoped`/`migrateExplicitID` MIRROR the lists in `nodescope_test.go` and are pinned to
-      them by `TestMigrateScopeListsMatchTheGuard`: a table that gains a `node_id` elsewhere and is not
-      added here comes over WHOLE, silently. The same test walks the REAL schema: every table must be
-      copied or named with a reason in `migrateNotCopied` — `task_lists` (the whole `database` task provider)
-      was once in neither, and a migration reported success over lost checklists.
-    - **Knowledge is never scoped.** `signatures`, `signature_embeddings`, `signature_snapshots` and
-      `decisions` carry no `node_id` on purpose (rules graduate on the FLEET's evidence), so filtering them
-      would silently downgrade what the destination knows.
-    - **A destination with no allocator still gets EXPLICIT ids** (`nextID`, counting from that table's
-      `MAX(id)`), rather than falling back to AUTOINCREMENT: the ascending-order property is the whole
-      reason the copy list is walked in old-id order, and SQLite advances `sqlite_sequence` for an explicit
-      rowid above the maximum, so later inserts continue after the copied rows.
-    - **The re-run guard is an EMPTY destination, not `legacy_imports`.** That table is keyed by node and
-      records one origin, so gating on it would make the round trip this feature exists for impossible;
-      migrate writes it as a RECORD (which also stops the automatic import re-folding the same local file)
-      and refuses on `ErrDestinationNotEmpty` instead. Merging is not available at all — every id is
-      re-allocated, so `INSERT OR IGNORE` cannot recognize a row it already wrote under a different one.
+### Claude session-name sync (`[agents] sync_claude_session_name`)
+Read only from a proven composer; absence is UNKNOWN. Quiescence is asked in `applyClaudeSession` and again
+live in `pushSessionRename` — not a third time. `NormalizeAgentName` and `SuffixedAgentName` must stay fixed
+points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the listing AND backdate
+`d.idleSince`); flip tests expose the composer only through `--source visible`.
 
-    `cmd/hap/migrate.go` holds the preconditions because it is the only package that may open BOTH engines:
-    every other process reaches a turso store through the daemon's proxy, and the command's own precondition
-    is that no daemon is running. Going UP it also asks `NodeBitsCollision` before writing, as the daemon does at start
-    (`refuseNodeBitsCollision`) — with its own remedy, since regenerating THIS machine's id strands the local
-    file's rows under the old one and the copy then takes nothing. It backs the destination up **before either handle is opened** and takes
-    the `-wal`/`-shm` sidecars with it (a copy from under an open handle loses whatever the WAL had not
-    folded in), and under turso it honours `database.sync_paused` by skipping the framing pull/push — ONLY those:
-    `PrepareSharedSchema` still pulls (and pushes when it leads a schema migration), deliberately, since that
-    pull is what the collision check reads peers from. Never tell the operator nothing went over the wire.
-    **Under libsql the pause REFUSES** (`runMigrateLibSQL`), in both directions and before `libsql.Open`: that
-    copy runs on the server's direct handle, so there is no optional round trip to skip, and a check placed after
-    the schema lease or the collision check would already have reached the server. The key was
-    `turso_sync_paused` until it was made engine-neutral; the old spelling migrates at Load (presence-probed, so
-    an explicit canonical `false` beats a stale legacy `true`) and is NOT accepted by `hap config set`.
-- **The libsql engine's replica is turso's offline behaviour rebuilt over Hrana, by LOGICAL row replay**
-  (`internal/store/libsqlreplica`). The local SQLite file is the authority, and the network is still
-  reached only through `internal/store/libsql` (`Batch`/`Tx`, which pipeline many statements into
-  one or two round trips). Every rule below fails silently:
-  - **Capture is suppressed while pulled rows are applied** (`hap_sync_applying`, checked in each
-    `hap_ob_*` trigger's WHEN). Without it, every pulled row is re-captured and re-pushed, and two
-    nodes echo each other through the server forever. A push also TAGS the change-log entries it
-    caused with its node id (the marker row, its seq recorded in `hap_push_marks` under the per-push
-    token), so the node does not pull its own writes back. Both halves are covered by `TestPulledRowsAreNotRePushed`.
-  - **Never a TEMP table (or `temp.`) in anything sent to the server.** sqld classifies every statement
-    before SQLite sees it and REFUSES `CREATE TEMP TABLE` ("unsupported statement", `SQL_PARSE_ERROR`) —
-    shipped in v0.9.49, it failed every push in production while the in-process fake accepted it. The
-    push's bookkeeping is ordinary tables keyed by a per-push token (`hap_push_marks`, `hap_push_keys`,
-    written and deleted inside the push's own transaction). `hranafake.sqldRefuses` now refuses the shapes
-    a real sqld refuses; add to it whenever a live server rejects something the fake accepted, and run
-    `TestLiveSyncStatementShapes` (scratch tables only) against a real server after changing any sync SQL.
-  - **A push tags ONLY the keys it sent** (`hap_push_keys` under the per-push token, rendered by the
-    server's own `json_array`), never "every entry after my marker". The bare range relies on the server serializing the whole
-    transaction; one that let another node's writes commit inside it would get them tagged as this node's,
-    and that node's pull would skip them for good. `hranafake` serializes everything, so no test there can
-    tell the two apart — the narrowing is the guarantee, not a test.
-  - **Conflicts resolve by LATEST EDIT, per column — never by push order** (`clock.go`, `merge.go`). Every
-    edit is stamped with a hybrid logical clock (`hap_hlc`: ms << 16 plus a counter, never below a clock
-    already seen) into `hap_clock` — per (table, key, column), plus a row register (`col = ''`) that an
-    insert and a delete stamp. A column's effective clock is the later of its own and the row's; a tie goes
-    to the node id, and on a pull to the server. Four rules, each load-bearing:
-    - **The comparison runs INSIDE the server's transaction** (`pushStmts`: `CASE WHEN … NOT EXISTS (a
-      server clock >= mine)`), so two replicas pushing one row concurrently resolve the same way whichever
-      commits first. Deciding client-side from a prior read is the race this avoids.
-    - **A push READS BACK its keys in the same transaction and merges them** (`pushItems`/`mergeBack`). The
-      pull skips the entries a push tagged as its own, so a column the push LOST would otherwise stay at
-      this replica's value forever.
-    - **The server stamps writes that did not come through a push** (`hap_ck_*`, standing aside while
-      `hap_sync_pushing` holds a row) — an older hap's or `hap migrate`'s writes take part with the
-      server's time instead of reading as "never edited".
-    - **Pruned clocks read as the FLOOR** (`clock_floor`, raised by `PruneChangelog`): a machine back after
-      longer than retention cannot win with an edit older than every clock the fleet still keeps.
-    - **Clocks are corrected to the SERVER's time and bounded by `MaxClockLead`.** "Latest edit wins" is only
-      as honest as the clocks: one machine an hour fast would win every conflict for an hour, and — since a
-      pull lifts the HLC to what it saw — drag every peer's clock along. So each pull measures this node's
-      offset from the server (`noteServerClock`, stored as `hap_hlc.off`, warned about past 30 s) and every
-      stamp uses corrected time — except inside a 2 s DEADBAND, since the measurement carries up to half a
-      round trip of noise and correcting by it would reorder edits on machines whose clocks agree; a pulled clock lifts the HLC no further than corrected now + the lead; the
-      server stores no pushed clock beyond ITS now + the lead; and a pushed key's local clocks take what the
-      server stored (the replica's own ceiling cannot do that — it is computed from the clock in doubt).
-      Remaining limit: a clock that jumps ahead while the node is OFFLINE stamps those edits ahead until the
-      next pull, and they win against everything up to the reconnect.
-    - **An escalation's OUTCOME and every `agent_actions` column are the exception: LAST PUSH wins**
-      (`pushWins`: `audit_log.status`, `actor`, `suggestion`, `rationale`, `while_fsp_mode_on`;
-      `pushWinsTables`: `agent_actions`, table-wide so a new column is covered unlisted). Acting on an escalation has already touched
-      a live pane, so the outcome a node pushed must be what the fleet keeps; an older decision whose edit
-      merely stamped later must not roll it back. A push writes such a column only when this replica
-      CHANGED it and has not pushed that yet (`hap_clock.pushed = 0`, replica-only) — writing it on every
-      push of the row would let an unrelated edit (retention blanking `pane_excerpt`) push a stale status
-      over another node's dismiss. A pull takes the server's value unless the column is changed-here.
-      `TestPushWinsCoversEveryEscalationTransition` scans the store's SQL: a statement that moves
-      `audit_log.status` may set only these columns, or it would pair one node's status with another's
-      actor. The `AND status = 'escalated'` guards still only see the local replica.
-  - **The server's change log is written by TRIGGERS, not by the push** (`hap_cl_*`). That is what
-    makes `hap migrate`'s and an older hap's direct writes visible to replicas. Both logs
-    carry KEYS only, and each side fetches the current row. That is why the log needs no BLOB
-    encoding and why several changes to one row cost one fetch.
-  - **Push and Pull hold `syncMu`.** A push landing between a pull's fetch and its apply would merge
-    against clocks the fetch did not see.
-  - **Every table not named `sqlite_*` or `hap_*` replicates, keyed by its PRIMARY KEY** (never the
-    rowid). A table with no primary key is REFUSED at `Prepare`. Keep the `hap_` prefix for anything
-    that must stay local.
-  - **DDL does not ride the replay.** The local file is migrated by the store. The server is migrated
-    through the schema lease by `PrepareServer`, the first time the server answers. Columns replay
-    by the INTERSECTION of the two sides (`table.shared`), so an additive migration on either side
-    keeps both syncing.
-  - **A re-seed is a VERBATIM mirror, deliberately not `store.importer.copyAll`.** That copier
-    re-allocates ids and scopes by node for a move BETWEEN engines, and every later change-log key
-    would miss. It pushes first and keeps outbox keys.
-  - **A cursor is published at seed time, not just on the throttle.** Retention prunes below the
-    cursors it can SEE, so an unregistered node had its entries pruned by the first peer to tidy up,
-    and re-seeded.
-  - **A missing logging trigger is a LOGGING GAP, not just a missing trigger** (`ensureChangelog`, also
-    checked on every pull in the same round trip). A table REBUILT by a migration (create/copy/drop/
-    rename — the drop takes its triggers) or created by a node that does not install them has writes in
-    no log, and recreating the trigger cannot recover them. The repair raises `pruned_through` past
-    everything logged, so EVERY replica re-seeds, including those that never saw the gap.
-  - **A table the replica was never seeded with is seeded on the next pull** (`seeded:<table>` in
-    `hap_sync_state`): an older build skips log entries for a table it lacks, and its cursor moves past them.
-  - **A replay never uses INSERT OR REPLACE** (it resets every column the replaying side does not know). A
-    UNIQUE collision is handled by PARKING the batch's own rows (a suffix on their unique values), then a
-    key upsert, then a real DELETE of any conflicting row outside the batch. A pulled row blocked by an
-    unpushed local change is decided BEFORE any parking, or its park suffix is stranded in the replica.
-  - **A push is OWED at start and after every failed push** (`runFleetSync`'s `payOwed`, on the pull tick). The
-    debounce is armed only by a NEW write, so outbox rows a previous process or a failed push left behind would
-    otherwise wait for the next write — on an idle node, indefinitely. Paused, nothing is paid; the resume nudge
-    covers it.
-  - **A replica is bound to ONE server** (`checkServerIdentity`: a random `hap_sync_meta.server_id`, recorded at
-    seed). Meeting a different one — `libsql_url` changed, state dir kept — drops the outbox, clocks and sync
-    state (said loudly, with the unpushed count) and re-seeds; replaying server A's outbox into server B, or
-    skipping B's seed because of A's bootstrapped marker, is what this prevents. A seeded replica with no
-    recorded identity is treated the same. Pull and Push therefore seed an unseeded replica themselves.
-  - **A push's UNIQUE conflict-delete runs only where the push's value for that constraint WINS**
-    (`winsCond`, the same clock test the column UPDATE applies). Unconditional, a stale edit proposing a value
-    another row holds deleted that row and then lost the UPDATE anyway.
-  - **Trigger repair re-reads the server's tables first** — a trigger missing because its table was DROPPED
-    would otherwise be recreated on a table that does not exist, failing every pull forever.
-  - Accepted limit: retention runs only on replica nodes, so a fleet that later drops every replica keeps
-    its triggers writing a log nothing prunes (drop `hap_cl_*` and `hap_changelog` by hand).
-  - Under turso only the daemon opens the file (the sync engine allows one process); other processes get a
-    `database/sql` driver over `<state>/store.sock` (`internal/store/sqlbridge`), lazily dialled so
-    `hap config` works with no daemon.
-  - The adapter gates the SDK (statements read-lock, Push/Pull/Checkpoint write-lock, transactions hold the
-    lock, rows returned EAGERLY) over a FIXED pre-warmed pool, with sync ops on a background context —
-    verified: unguarded they flood `database is locked`, and a Push cancelled mid-flight hangs the engine
-    for good. Every pooled connection gets `turso.PageCacheKiB` of page cache — at warm-up, and again whenever a
-    bridge session takes a connection (`sqlbridge.Executor.SetConnInit`), which is what reaches one database/sql
-    opened to replace a discarded one; a refusal is logged, never fatal. The engine default is
-    2000 KiB PER CONNECTION, kept for the daemon's life across the whole pool, duplicating the kernel's page
-    cache. The engine clamps anything under 200 pages up to 200 and reads it back as `200`, so the constant
-    sits at that floor.
-  - **Schema DDL on a shared database is issued only by the SCHEMA LEASE holder**
-    (`turso.PrepareSharedSchema` / `AcquireSchemaLease`), which must be RE-PROVEN between migration steps,
-    failing closed with `ErrSchemaLeaseLost` — a background renewal alone is starved by a step's own write
-    lock. Two identical ALTERs wedge the loser SILENTLY, and elapsed time is never ownership: a node that
-    cannot establish the lease fails closed rather than migrating blind.
-    - **A DEFINITIVE loss is LATCHED** (`leaseHold.lost`, asked first in `check` and never cleared, #431).
-      The renewal goroutine runs the SAME check and its answer goes nowhere but the log, so a takeover it
-      observed used to be re-derived from scratch at the next step boundary — and a boundary whose PULL
-      then failed transiently fell through to `tolerate()`, which returns nil while the last confirmed
-      renewal is younger than the TTL. The migration carried on issuing DDL beside the new owner: the
-      exact wedge the lease exists to prevent. A transient failure is still forgiven; only `RowsAffected
-      == 0` latches. **Test trap:** every case in `schema_lease_test.go` needs `tursodb` and SKIPS
-      without it, which is why this one is written against a fake `SchemaSyncer`
-      (`schema_lease_latch_test.go`) — a regression only CI can see is one nobody sees.
-  - `fleetRun` runs every sync op off the loop and waits for it OR shutdown; `turso.DB.Close` waits a
-    bounded time and refuses to close underneath an in-flight op.
-  - **`database.sync_paused` gates the SERVER round trips only (turso AND libsql), and it is the one `[database]` key
-    read LIVE** (`daemon.fleetSyncPaused` off `d.snapshot()`, not captured at loop start like
-    `FleetSyncInterval`) — a pause reachable only through `--restart` costs the herd the in-flight work it
-    exists to protect, which is why `hap config set` suppresses the section's usual restart note for this
-    key alone and `hap help daemon` states the exception. Four things the gate must NOT do:
-    - **the shutdown push is gated too** — it is the one cloud call outside the loop's ordinary path, so a
-      paused node would otherwise reach Turso Cloud exactly once, at exit;
-    - **the pull tick still runs its LOCAL half** (`fleetPausedTick`): a sync database never checkpoints
-      itself, so gating the whole pull path grows the replica's WAL for the length of the pause — an engine
-      change, which is precisely what this key promises not to be. Its checkpoint is gated on the WAL bound
-      ALONE, never `fleetPull`'s pull counter: that counter does not advance while paused and starts at 0,
-      so `pulls%fleetCheckpointEveryPulls == 0` is true on EVERY tick of a daemon that started paused;
-    - **`checkFleetSyncWedged` refuses while paused.** A pause freezes `lastError`, the failure count and
-      both timestamps while the outage clock keeps running, so a node that happened to be failing when it
-      was paused meets every bound minutes later and restarts itself, again every `fleetRecoveryRetryInterval`
-      — elapsed time is evidence of an outage only while something is still trying;
-    - **lifting the pause pushes**, via the loop's own `fleetPushNow` nudge. Every write during the pause
-      armed a debounce timer that fired into the gate and was NOT re-armed, so without it the queued rows
-      wait for an unrelated write — on a quiet machine the node heartbeat, and never the operator's own act.
-    Reporting is one choke point: `daemonhealth.FleetSyncHealth.Paused` short-circuits `Degraded`, from which
-    `IsolatedFor`, `Isolated`, `DiagLines` and both `frontend` banners fall silent; only `Line` carries its own
-    paused branch. A deliberate pause reported as failing is how an operator learns to ignore the banner that
-    means a real outage — but it is still SAID (`hap status`, `FleetSyncPaused`), because a herd off the wire
-    looks exactly like a quiet one.
-  - **A front end's full refresh fans its reads out, and only ONE tick poll is ever in flight.** Under a
-    shared engine every read is a round trip over the daemon's socket, so `GetStatus`, the
-    rule listing and the TUI's `refreshDataProgress` issue independent reads together
-    (`frontend.Concurrently`; each writes only its own variables, assembled after the wait). A tick used to
-    start a poll regardless, which over a far server queued ~6 full refreshes behind the proxy's 2-connection
-    pool on the first paint alone (`pollStarted`, bounded by `pollInFlightLimit`). A FAILED refresh still
-    carries exactly the reads before the failing one in the old sequential order — the TUI replaces its data
-    wholesale. Progress is PULLED (`loadTracker`, repainted by the 1s clock tick) so a refresh stays one
-    command yielding one `refreshMsg`; until the first lands the body is the loading screen, never "no
-    agents detected".
-  - **A front end polls a change token, not the data** (`Store.Revision` → `ports.RevisionReporter`,
-    `frontend.App.ChangeKey`, `tui.Model.poll`). Under turso it is the executor's counter
-    (`sqlbridge.Executor.Revision`, a `rev` request over a POOLED connection), bumped AFTER every committed
-    write and every pull that `changed` — so sampling it before a read can only cost an extra refresh, never
-    miss one — and prefixed with an epoch because a restarted daemon counts from zero. Under sqlite it is
-    the file's and WAL's size+mtime. The key adds config.toml and local checklist files; a **gist** source
-    answers "cannot tell" (no local trace), as does a store without the port, and both keep the old
-    re-read-every-tick behaviour. What a refresh derives from the CLOCK is re-read on `refreshBackstop`, and
-    an open agent detail always re-reads (its permission mode comes from the PANE). The unconditional 2s
-    re-read was the TUI's whole idle cost and serving it most of the daemon's while one was open.
-  - Config never enters the database. Front ends draw ids from the daemon with NO local fallback: two
-    processes minting locally in one millisecond collide, so an insert with no id fails with the reason
-    (`failedID`).
-- **A periodic write is CONDITIONAL, or it is a leak** — every store write arms a **2s-debounced turso
-  push**, so a writer firing more often than that never coalesces: one tick, one row, one push to Turso
-  Cloud, forever, on an idle install. Two writers were that shape:
-  - **`PublishRoster` compares before it writes** (`rosterRowUnchanged`), which **MIRRORS
-    `upsertRosterRow`'s CASE arms field for field — the two must change together**, or a field added to the
-    UPDATE alone silently stops being published. Three exclusions, each reasoned: `seen_at` advances by
-    construction (including it makes every row dirty — the whole bug), `cwd`/`cwd_read_at` are never written
-    by a publish, and `gone_at` is COMPARED rather than excluded so a returning agent is republished. A
-    **recycled** id is never skipped — its row was DELETEd earlier in the same transaction, so `existing`
-    describes a row that no longer exists, and the gate is on `recycledIDs` structurally rather than on the
-    coincidence that `terminal_id` is in the compare set. Roster FRESHNESS is `roster_meta.published_at`
-    (`domain.RosterFresh`), never a per-row `seen_at` — and the stamp is itself a write, so a publish that
-    changed nothing re-stamps only once it is `domain.RosterRestampAfter` old, a constant bounded ABOVE by
-    the one-minute sweep so an unwatched herd's every sweep still stamps. A changed row stamps at once.
-  - **Only a transaction that WROTE reports a write** (`sqlbridge.Session.txWrote`) — COMMIT used to
-    report unconditionally, so every read-only transaction armed a push. Any successful Exec counts,
-    whatever it affected: DDL reports 0 rows and must still reach the other nodes.
-  - **`domain.NodeHeartbeat` is a SEPARATE constant from `daemonhealth.HeartbeatInterval` — deliberately
-    slower, but BOUNDED ABOVE by `daemon.actionStaleAfter`.** The file answers "is this daemon hung" and
-    must be fast; the row answers "is this machine still out there", and no reader asks with more precision
-    than `domain.NodeStale` (three beats). `maybeUpsertNode` throttles it and its FIRST call always writes,
-    which is why `Run`'s startup call goes THROUGH the throttle rather than around it. **The ceiling is why
-    it is 30s and not the minute the write reduction alone would prefer**: three beats is also the gate
-    `requireLiveDaemonFor` refuses a remote confirm on, while a confirm vouches for a SCREEN whose
-    deliverable life is `actionStaleAfter` — so a confirm the gate accepts must still be one the daemon can
-    honour, and a minute inverts that silently. (`domain` cannot import `daemon`, so a test is what makes
-    the ceiling enforceable.)
-- **A wedged sync engine is REPAIRED once and SAID always, and the two halves have opposite defaults.** A
-  failing `Push`/`Pull` used to be `logging.Guard` + Warn + `return nil`: the daemon kept running, the herd
-  looked quiet, and every fleet read this node served was silently half a fleet short. Observed live (macOS,
-  hap 0.9.4) as a TLS handshake failing every tick with `last pull never, last push never` while the TUI
-  showed six escalations and named them all local.
-  - **The counter spans BOTH directions and the anchor is the last SUCCESS** — a node that pulls fine and
-    cannot push is just as isolated. Isolation measures from `max(LastPullAt, LastPushAt)`, falling back to
-    `FirstFailureAt`, the ONLY anchor a daemon that has never synced has, which is the exact shape the
-    incident was reported in. `FleetSyncIsolatedAfter` is a CLOCK, not a boolean on `LastError`: a fresh
-    failure is `DaemonWarn` and only five minutes without a success is `DaemonError`. The banner leads with
-    the CONSEQUENCE ("this machine is NOT exchanging rows with the other nodes"), never the TLS text.
-  - **The automatic restart is gated on the fault being PROCESS-LOCAL, and unknown means NO**
-    (`domain.SyncFailureProcessLocal`, remote shapes checked FIRST so a TLS error nested in a dial timeout
-    reads as the timeout). Restarting on a remote that is merely down costs the herd its in-flight captures
-    and consults every cooldown, forever, and buys nothing. Both bounds must clear
-    (`fleetRecoveryMinFailures` AND `fleetRecoveryMinOutage`).
-  - **It spawns `--restart`, NOT the `--ensure` the upgrade handoff uses, and this is the trap.**
-    `EnsureFresh` does NOTHING when the running holder already matches the version and path it would start
-    — precisely a restart as the SAME binary — so an `--ensure` successor bows out and a daemon that then
-    stepped aside leaves the herd unmonitored. `checkFleetSyncWedged` latches `fleetRecoveryOrdered` and
-    keeps running rather than taking `handedOff`.
-  - **The latch is released by EVIDENCE, not by time** — a marker file written BEFORE the spawn (the
-    successor may read it first) and deleted by the first successful sync. An unwritable marker REFUSES the
-    restart, because without it an unfixable fault becomes a restart loop abandoning in-flight work every
-    cooldown, strictly worse than the isolation; a failed spawn clears it.
-  - **An unbootstrapped node is a THIRD state, not a degraded one.** `openTurso` retries the first bootstrap
-    forever and `daemonlock.Acquire` runs BEFORE it, so a wrong URL or rejected token leaves `hap status`
-    reporting a running daemon that has not begun monitoring anything — worse than isolation, which at least
-    answers for its own herd. Its own banner and remedy, on the same clock; `openTurso` records
-    `FirstFailureAt` because nothing else on that path has one.
-  - `internal/fdprobe` is instrumentation, not a control — fd exhaustion was the leading explanation and was
-    never MEASURED. `OpenKnown` is separate from `Open` because macOS has no `/proc/self/fd` and rendering
-    its zero as "0 open" reports the opposite of what happened; `Exhausted` is a real syscall and the only
-    field that is proof.
-- **Retention has TWO windows, and the exemptions are the safety control.** `PruneAuditExcerpts` blanks one
-  COLUMN; `PruneAgedRows` deletes finished bookkeeping ROWS (default 30 days). Both share the daemon's one
-  daily throttle, taken before either config is read so switching one off cannot change the other's cadence.
-  - **`agent_roster` is swept only because `agent_roster_tombstones` exists, and the trap it answers is still
-    live**: a retired row was itself the resurrection guard. `upsertRosterRow`'s INSERT arm hardcodes
-    `gone_at = 0` and only its ON CONFLICT arm honours `authoritative`, so with nothing recording the
-    retirement a non-authoritative EVENT takes the insert path and revives an agent herdr no longer reports
-    — `LiveRoster` then hands a dead agent to the idle poll and `hap task send` until the next
-    authoritative publish re-retires it. (A plain delete was
-    tried, #395, and backed out, #398.) Four bounds:
-    - **The prune requires the tombstone, per row.** A retired row without one (legacy or damaged database)
-      is the last guard left, so it is KEPT; `migrate` re-derives missing tombstones on EVERY open, since the
-      wide row is the only place that information still exists.
-    - **Discriminated by TERMINAL id, and storing it without reading it is the silent half of the bug** —
-      once the wide row is gone the tombstone is the only record of which terminal was retired. A DIFFERENT,
-      non-empty terminal is a genuinely new agent and is admitted; an empty terminal on EITHER side blocks
-      ("unobserved is never evidence").
-    - **Admitting DELETES the tombstone**, or a survivor keeps the OLD terminal at this agent's own
-      retirement and the comparison silently stops discriminating.
-    - **The tombstone is permanent, deliberately** — "this terminal on this pane is retired" is true forever,
-      and a grace period needs a bound on transition staleness the protocol does not offer.
-
-    `hap gc` does not reclaim roster rows because it does not call `PruneAgedRows` at all — pre-existing;
-    the daily sweep is what bounds the table.
-  - **`audit_log` and `decisions` are never swept** — the row survives its blanked column so `hap audit`
-    history stays complete, and `decisions` feeds `CountDecisionsForSignature`, so deleting from it changes
-    LEARNED BEHAVIOUR rather than reclaiming space.
-  - Every other exclusion is a row some path still acts on, never one that merely looks recent: a
-    non-terminal `agent_actions` row is the control queue (and even a terminal one is what
-    `AwaitAgentAction` returns as `Result`/`Error` — the ONLY way the surface that queued it learns whether
-    it landed); `pending` `llm_requests`/`llm_decisions` rows are the retry guard and an un-re-gated
-    decision; unprocessed `corrections`/`llm_retries` rows are queued work. `corrections` additionally needs
-    `NOT EXISTS` over `agent_actions.correction_id` — that reference has no foreign key behind it and is
-    what makes `UnprocessedCorrections` withhold a correction whose delivery is still queued.
-  - **An unconfirmed `task_reservations` row survives at any age** — it is what `reclaimStrandedTasks` needs
-    to return an item to `[ ]`, and a `[-]` with no ledger row is treated as somebody else's.
-  - **The newest `kill_events` row survives PER SCOPE, not per node.** The table carries a SECOND stream (the
-    FSP toggles `recordFSPToggle` writes, including the daemon's ceiling stand-down), so a survivor guard
-    keyed on `MAX(id)` alone deletes a standing global PAUSE the moment any newer FSP row exists —
-    `KillStateActive` reads false and the herd resumes with nothing logged. **Test trap:** this shipped green
-    because the first version of the test seeded only `global` rows.
-  - **A finished consult's payloads go on their OWN grace (`LLMPayloadGrace`), never at the status
-    transition** — neither `GetLLMRequest` nor `LLMDecisionByRequest` filters on status, so
-    `mcpserver.resolveRequest` serving an explicit `request_id` would be handed an EMPTY context. Separate
-    from the operator's window precisely because that one may be 0.
-  - **The cutoff is FLOORED at `RowRetentionFloor`, because 0 is a supported setting** — otherwise a terminal
-    `agent_actions` row is deletable in the same second it is written, while `AwaitAgentAction` is still
-    polling it for the only outcome signal it can get. A **separate constant** from `LLMPayloadGrace` at the
-    same value, the way `PruneAuditExcerpts` has `AuditExcerptDedupMargin`: that one bounds a COLUMN blank
-    against a live reader, this one a ROW delete against a poller.
-  - **Every statement is issued at its OWN call site rather than from a table of queries** —
-    `TestEveryNodeOwnedStatementIsNodeScoped` flattens a CALL's SQL argument, so a query reached through a
-    struct field flattens to `" ? "` and the whole sweep falls outside the guard, silently, in the one file
-    where an unscoped DELETE does the most damage. Hoisting SQL into package consts does NOT fix that; only a
-    direct literal at the call site does.
-
-### agy (Antigravity CLI)
-
-**herdr never reports an agy modal as blocked, so every agy form is recognized structurally and
-PARKED at idle/done** (`internal/domain/agy.go`, corpus and design in
-`docs/designer/agy-support.md`). Each parser requires the form's own anchors AND its key-hint
-line at the true bottom of the capture — agy renders inline, so its whole transcript is in every
-read and an earlier form is always somewhere above.
-
-- **A reply to an agy approval or question is KEYS, never submitted text**
-  (`domain.AgyFormSituation` → `mcqdeliver.Agy`). Every generic path types the reply and then
-  Enter, and agy commits on the digit alone, so that Enter answers the NEXT screen (on a
-  two-question form, option 1 of question 2, unseen). All four send paths route agy forms to the
-  keyed deliverer — `daemon.act` (ahead of the action-review rewrite), the LLM promotion (on the
-  RE-CLASSIFIED type), `deliver.Deliver` (the operator's `--send` and auto-accept) — and the
-  action-review outcome refuses one outright. A new send path must ask `AgyFormSituation` too. The
-  deliverer's rules are all load-bearing:
-  - **one key, then re-read; a key is never pressed twice** — a repeated digit answers whatever
-    the first one opened. Numbered forms get the digit, the review panel `y`/`n` (never `shift+a`),
-    the trust prompt arrows verified row by row and only then Enter;
-  - **the live form must be the DECIDED one** (`AgyForm.SameAs` against the decision's excerpt) —
-    question 2 can offer the same labels as question 1;
-  - **a question's Write-in row is refused as a verdict** (`domain.ErrAgyNotAnswerable` →
-    `deliver.ErrReplyWithheld`, which auto-accept maps to `errOutboundRefused` — without it the
-    refusal burns the attempt budget and DISMISSES the row);
-  - **every verified answer re-captures the pane** (`recaptureAfterAgyAnswer`, from the keyed-form
-    bodies AND `autoAcceptDeliver`): agy draws the next question IN PLACE with no status change,
-    so nothing else would ever look at it — the form stalled after question 1, silently.
-- **Anything else typed into agy needs a proven EMPTY composer** (`domain.AgyComposerReady`,
-  `daemon.agyComposerRefusal`): herdr says idle under every agy modal, so a status check lets a
-  hand-out land in a standing approval, a picker, the survey or the operator's draft. Asked by
-  `deliverAutonomousClaimed`, the LLM promotion, `deliver.Deliver`, `refuseIfAgentBusy` (with the
-  stale marker, so the TUI offers to queue instead), `requireIdleForHandout` and
-  `actionTaskSendHost.Send`. A new hand-out path must ask it too. **Test trap:** the daemon's
-  `fakeHerdr` has no `SendToAgent`, which is why the proof lives at the call sites and not in the
-  herdr adapter — there it would be invisible to every daemon test.
-- **Never set `MCQKind`/`AnswerCount` on an agy situation, and keep `ParseMCQForm` false for agy**:
-  each agy question is its own situation (the next one's options are not rendered until this one is
-  answered), and `EffectiveAnswerCount() > 1` routes into `sweepFrames` and `mcqdeliver.ClaudeTabs`,
-  which press Right/Left into the pane BEFORE they refuse.
-- Setup (sign-in, terms) and operator UI (pickers, panels, slash popup, the Tab-amend field, the
-  survey) classify **unclassifiable**, ahead of every rule including the operator's — no consult,
-  no suggestion, no keystroke. Enter on the terms screen flips the data-sharing consent.
-- The agy approval `PermissionVerb` carries the command UNMASKED on purpose:
-  `IrreversibleScanContent` reads it raw alongside the 40-line pane tail, and `MaskVolatile` turns
-  `of=/dev/sda` into `of=<path>` — the tail usually carries the raw command too, but a long
-  wrapped command can push it out, and the verb is then the only raw copy.
-- **Modes (`default → acceptEdits → plan`) are read loosely and pressed strictly.** The READ
-  (`AgyAgentMode`) is not gated on an empty composer — a working agy or one holding a draft still
-  paints its mode, and `hap agents` should show it — but the PRESS gate (`ComposerReadyForMode`) is
-  `AgyComposerReady`. Two things the pane cannot say: `--dangerously-skip-permissions` paints no
-  indicator (such an agent reads `default` at launch), and a status bar with no model segment carries
-  no mode (UNKNOWN, never default). agy's `default` is its MOST restrictive mode, codex's its least.
-- **Session ids come from the print-mode JSON envelope only** (`llm.ExtractSessionID`): herdr reports
-  no `agent_session` for agy, and `--conversation` resumes an existing id rather than naming a new one,
-  so nothing is injected. The id is read from a line that DECODES as the envelope, never by searching
-  for the key, so an id quoted in the response (escaped inside the envelope) is never taken.
-
-### Claude session-name sync
-
-**A Claude CONVERSATION name is read only from a proven composer, and its ABSENCE is never evidence.**
-`[agents] sync_claude_session_name` (off by default) keeps an agent's hap name and the name `/rename` paints
-in Claude's composer byte-identical: a named session is folded, adopted, and pushed BACK when the fold or a
-collision changed it; an unnamed one is sent `/rename <hap name>`.
-
-- **It is not the terminal title** — `terminal_title_stripped` carries Claude's churning conversation
-  SUMMARY, so adopting it renames every agent after a sentence that changes on its own (Claude Code 2.1.252).
-- **"No composer" is UNKNOWN, never "unnamed"** — the classification read is a consuming delta that routinely
-  shows no footer, and the push direction reads "unnamed" as its TRIGGER, so the alternative overwrites an
-  operator's chosen name.
-- **The push is a DELIVERY**: `acquirePane`, kill switch + per-agent disable re-asked inside the goroutine,
-  never-auto over the exact text, a `--source visible` re-read before AND after the send, a proven-EMPTY
-  composer (`ClaudeComposerReady` proves the sandwich, not that it is blank), a ceiling per (agent, terminal,
-  name), and `d.spawn` so shutdown drains it.
-- **QUIESCENCE is asked twice, and the second time against LIVE state.** Both questions — parked
-  (`sessionRenameParked`: `idle`/`done`; `blocked` is a modal where Enter is rebound, and an empty status
-  fails closed) and `ComposerEmpty` — are asked at the TOP of `applyClaudeSession`, the one seam all three
-  entry points share, gating BOTH directions including the store-only adopt. They are asked again inside
-  `pushSessionRename` from `liveAgentFor`, NOT `tr.Status`: the capture's status is seconds old on the
-  attention path and a whole pass old on the others, and claude QUEUES input while it works rather than
-  refusing it. A failed listing refuses — "we could not ask" is not "it is idle". The tenancy compare
-  (`recycledSince`) fails OPEN on an unknown id, because event-socket transitions carry no `terminal_id` and
-  a strict compare would refuse every production rename. Order is deliberate: status first (cheaper, skips
-  the read), composer proof LAST, because typing changes on one keypress while status changes at a turn
-  boundary.
-- **A just-parked agent is not a quiet one** (`sessionRenameSettle`, via `sessionSyncReady`). The complaint
-  this feature earned is a rename typed into a session the operator opened seconds ago: the composer is empty
-  because they have not typed the FIRST character yet, so both quiescence checks pass and the push races
-  their first keypress. No re-read closes a sub-second race; waiting does. The evidence is `d.idleSince`, and
-  an ABSENT or foreign mark is UNSETTLED — exactly the state a brand-new agent is in.
-  - **It gates ADOPTION too**, though adoption types nothing: what it buys is that the two names are never
-    knowingly left disagreeing, which is the CHARACTER-IDENTICAL contract this feature exists to hold.
-    Accepted cost: an escalation inside that window calls the agent by its generated name.
-  - **It is asked in exactly TWO places, and a third copy is a hazard rather than defence in depth.**
-    `startSessionRename` deliberately carries none — the shared gate already answered over the capture and
-    `pushSessionRename` re-asks against LIVE state, which is strictly stronger. A copy over the stale `tr`
-    could only agree with the gate that just ran, and it made the mutation deleting the REAL check pass.
-  - **The live re-check asks "parked LONG ENOUGH", not just "parked"** — an agent can park AGAIN in the gap
-    the goroutine spends on herdr, a NEW spell the pre-spawn check knew nothing about.
-  - **The constant is not the knob it looks like** — `d.idleSince` is written only by the 60s sweep and a
-    deferral's first backoff step is also 60s, so the effective wait is ~1–2 minutes whatever
-    `sessionRenameSettle` says. Lowering it changes almost nothing; 0 removes the gate.
-- **A refusal DEFERS; it never burns a push.** `maxSessionRenamePushes` bounds KEYSTROKES at a pane that never
-  takes the rename; `maxSessionSyncDeferrals` bounds READS at a pane that is never ready. Conflating them is
-  destructive: every refusal used to burn one of the three, so an operator who was mid-draft three times
-  running permanently disabled their own rename — the exact person the gates are for. `pushSessionRename`
-  returns `typed bool` and the release refunds by DECREMENT (never by writing back a snapshot, which hands a
-  concurrent claim its budget too). The one branch that must arm NOTHING is a send that happened but did not
-  verify: a deferral there turns the ceiling into "three pushes per interval, forever".
-- **The retry is the sweep's, not a timer's** — `sessionSyncDeferred` is a `pollRedrive`-shaped map re-examined
-  off the existing 1-minute ticker at 1→2→4→8→15 minutes, and `nextAt` is load-bearing because the ticker has
-  no phase relationship to when a deferral was armed. The pass shares `sessionSyncPassRunning` with the flip
-  pass so two passes never walk the herd typing at once — which means a false→true flip arriving while a retry
-  holds the latch MUST be coalesced (`sessionSyncFlipPending`) rather than dropped: nothing else re-runs the
-  one-shot live-herd sync, and the retry pass only visits agents that already carry a deferral. It is handed
-  BOTH slices: the whole listing is what the map is PRUNED against (an agent withheld from `rest` has not
-  vanished), while only `rest` may be touched.
-- **The `!ok` capture arms a retry, and the aligned fast path is what makes that affordable.** "No composer in
-  this capture" is the NORMAL state for a quiescent pane and the state the operator's own scenario sits in, so
-  leaving it to the next capture leaves the feature with no retry at all for the case it exists for. That arms
-  one deferral per claude agent, which the `sess.Name == agentName` fast path ABOVE the gate clears on the
-  first retry. Without the fast path, every settled agent that happens to be mid-turn arms a retry instead.
-- **`NormalizeAgentName` must stay a FIXED POINT**, or the pushed name is re-folded on the next capture and
-  the two trade spellings forever. Same for `SuffixedAgentName`; collisions are idempotent via
-  `domain.AgentNameDerivedFrom`. An identical pair must cost no pane read — the at-send screen also refuses
-  the redundant push, so only a read COUNT catches its removal.
-- **Turning the key ON drives its own one-shot pass, because a config change re-captures NOTHING.** Neither
-  `reloadWith` nor its `reconcileAttention` schedules a capture for an already-parked agent, so a flip on a
-  settled herd did nothing until each agent next went working→parked. `syncClaudeSessionNamesNow` walks the
-  live agents once instead, and four bounds are load-bearing: it reads `--source visible`, never `ReadPane`'s
-  consuming delta (which would swallow the delta a pending classification capture is about to take, and is
-  also the only reason the flip sees a composer at all); clearing `episodeHandled` is NOT the alternative,
-  since that re-drives the whole herd through classify→decide→act, raising escalations and spending LLM
-  consults for a naming feature; the trigger is gated on `!first`, because `reloadWith` also runs inside
-  `New()` (so a daemon STARTED with the key on keeps the pre-fix behaviour for agents whose escalation row
-  survived the restart); and the latch is released by the goroutine's defer AND by hand when `spawn` refuses,
-  or one shutdown-race flip disables the pass for the process. Both entry points share `applyClaudeSession`,
-  so a gate added to either is added to both.
-- **Test traps:** every gate fails CLOSED, so a push case that forgets `parkedAndSettled` (pin the listing AND
-  backdate `d.idleSince`) passes for the wrong reason — hence the ceiling test asserts EXACTLY the ceiling
-  rather than "no more than". And the flip tests wrap the fake so the composer is visible ONLY through
-  `--source visible`; without that the capture path could produce the same rename and none would discriminate.
-
-### Semantic matching
-
-- **A knowledge rebuild runs under `tightGC`** (`daemon/memory.go`) — loading every signature and building a
-  fresh index is the daemon's one large allocation burst (~40MB against a live heap of a few MB), and at the
-  default GC target it set the daemon's high-water mark and held ~80MB resident for its first minute. The
-  target is lowered only for the burst and the heap handed back at its end; a process-wide GOGC=25 was measured
-  at roughly double the idle daemon's CPU. It only ever LOWERS (an operator's tighter GOGC stays), overlapping
-  rebuilds nest, and GOGC=off is not touched at all.
-- **Semantic matching degrades, never blocks** — situations resolve via embedding + vector search over the
-  MASKED salient (`daemon.resolveSignature`, `internal/match`, `internal/embedder`), falling back to
-  normalized BM25, then exact hash. `SignatureResult.Raw` is the never-remapped content hash (the LLM drift
-  check depends on it); `signature_embeddings` is the source of truth and the bleve index under
-  `<state>/match-index` is a disposable cache (mem-only scorch does NOT serve KNN — keep it disk-backed).
-  Embed calls are stall-guarded and latch a degraded mode after 5 consecutive failures.
-- **Attention events are delay-captured** — the classification read waits `[[capture_delay]]` (10s on an
-  agent's first event, 2000ms after) via a per-pane `time.AfterFunc`, so the agent TUI has painted and bursts
-  coalesce (latest wins, one capture per burst). Daemon tests inherit a 1ms wildcard rule from the harness.
-- **Learned signatures are FLEET-WIDE, and the embedding model's id is the only thing that scopes them.**
-  `signatures`, `signature_embeddings` and `signature_snapshots` carry NO `node_id`, and `decisions` is
-  deliberately absent from `nodeScopedTables` so rules graduate on the fleet's evidence. A peer's rule becomes
-  matchable HERE through `fleetPull` → `RefreshKnowledge`, which rebuilds the whole bleve index from the store
-  rather than adding rows — which is also what makes a rule DELETED elsewhere disappear here. **Do not add a
-  `node_id` to any of them.**
-  - **`embedder.ModelIDFor` is therefore a fleet-wide identity, and both halves are load-bearing.** It digests
-    the model FILE. `filepath.Base` failed BOTH ways at once, silently — *not unique enough*: two different
-    384-dim models installed as `model.gguf` shared an id, so `Reconcile` KEPT foreign vectors and cosine
-    compared across unrelated models, which no downstream equality filter can catch because the strings agree;
-    *not stable enough*: a renamed copy of the bundled model gave one node a different id for the same model,
-    so each node read the other's rows as stale and re-embedded them, an unbounded rewrite ping-pong through
-    Turso Cloud plus a permanent "N rules need re-compute" nag. Unreadable falls back to the base name, never
-    `""` (an empty id compares unequal to every row, so drift could never clear) — and that fallback is NOT
-    cached, or an install whose model arrives later keeps the legacy scheme for the process's life.
-  - **The id is hashed once per MACHINE, not per process** (`embedder.SetModelIDCacheDir`, `<state>/model-ids.json`,
-    set by every hap process in `cmd/hap`): streaming the ~25 MB model through SHA-256 cost every
-    `hap status` / `hap agents` ~50ms on an idle devbox and several hundred ms on a busy one. An entry is trusted
-    only while size, mtime, inode, device AND ctime match what was hashed — ctime is the one fact user space cannot
-    set, so a model rewritten in place with its mtime restored (`cp -p`, `touch -r`) is still re-hashed at the next
-    process start; an id is persisted only if the file's facts held still across the hash. The in-process cache
-    still holds for the process's life; `rm <state>/model-ids.json` forces a re-hash. Best-effort: an unreadable
-    cache just hashes.
-  - **Anything comparing a stored row's model must resolve the id the SAME way** — `frontend.embeddingDrift`
-    calls `embedder.ModelIDFor` rather than taking the base name; the two drifting apart is silent and
-    permanent. `EmbeddingDrift.ModelName` is DISPLAY only; `ModelID` is the comparison key.
-  - **Known and NOT fixed:** a fleet whose nodes run genuinely different models, or disagree on
-    `min_salient_chars`, still ping-pongs — `Reconcile` rewrites peers' rows on every pull. The vector is
-    stored per SIGNATURE, not per (signature, model), so the alternative would confine cosine to rows each
-    node embedded itself. A uniform fleet is unaffected either way.
-- **A short PANE-TAIL salient is never embedded — on EITHER side of the comparison.** Below
-  `embedding.min_salient_chars` (default 100, on the masked salient) matching uses BM25. **STRUCTURED salients
-  are exempt at any length, and that exemption is load-bearing**: they are short by construction
-  (`permission:proceed | options:no;yes` is 35 chars), so a floor over them switches cosine off for every
-  approval, choice and error rule — the paraphrase matching the feature exists for. **If every pre-existing
-  semantic test needs a lowered floor to pass, the floor's scope is wrong** — that was the tell the first
-  time. The reason for the floor: sentence embeddings are not discriminative on a few generic tokens, so any
-  two near-empty screens land above `similarity_threshold` and ONE almost-empty rule becomes a magnet silently
-  answering everything. `domain.EmbeddableSalient` is the single definition, enforced three times because
-  closing only the query side still lets a long screen match a short stored rule — the incoming situation
-  skips the embed, a new short rule is persisted with no vector, and an existing one is stripped by
-  `reembed.Reconcile` AND vetoed again in `resolveSignature`'s accept filter (covering the window before a
-  rebuild). Reconcile runs at every start and `[embedding]` reload, healing an existing database with no
-  migration. Such a rule stays reachable by BM25 and exact hash.
-- **Agent-TUI chrome is redacted from pane-tail salients, gated on agent type** — `domain.StripClaudeChrome`,
-  `domain.StripCodexComposer`. Chrome is byte-identical across unrelated panes, so it BOTH inflates similarity
-  between different screens and eats the `pane_salient_chars` window. It runs BEFORE the window is taken and
-  only on the pane-tail branch, and only ever deletes lines it can positively identify — an unrecognized line
-  is kept, so two different screens stay different.
-  - The `❯` filter is anchored on "last non-empty line" because `❯` is also an option-list caret — **never
-    widen it to the bare glyph.**
-  - Every filter is ANCHORED at line start: a bare substring test deletes a whole line when the agent merely
-    QUOTES the phrase, and the footer window is the entire capture on a short pane.
-  - The status bar needs three pieces of evidence together (≥3 pipes, no leading `|`, the terminal-width
-    padding run) — the pipe count alone matches a shell pipeline the agent reported running.
-  - The banner filter is ARMED only by the `Claude Code` marker at the head, and each line needs ≥2 CORNER
-    glyphs (`▐▛▜▌▝▘`, which `█` is not). A capture does not guarantee the logo is on screen, so
-    `████████ 80% done` can legitimately be line 1 and stripping it collapses two screens differing only in
-    bar length.
-  - Accepted trade-offs: a status bar with no trailing token is not recognized (chrome survives — degraded,
-    never dangerous), and a pane left with a word or two after the strip trips the over-masking floor.
-
-### The LLM re-ranking judge
-
-**An LLM judge may only ever NARROW what cosine already admitted, and it may never run on the select loop.**
-`llm.reranking_command` (off by default) turns `similarity_threshold` into a FILTER: every candidate at or
-above it is listed for a one-shot CLI returning `[{"id": n, "score": s}]` by relevance, and hap WALKS it.
-
-- **The judge ranks by RELEVANCE and cannot see a rule's learned STATE, so the head is not always actionable**
-  — its best match is routinely one hap may not act on (shadow mode, below threshold, an option no longer
-  offered), and only `domain.Decide` knows. `walkRankedDecision` takes the first candidate whose decision is
-  not an escalation; when none is, the HEAD escalates, because that is the rule the operator should be asked
-  about. This cannot loosen a safety control by construction: every gate not depending on the SIGNATURE is
-  fixed in the shared `DecideInput` and vetoes every candidate or none. `llm.reranking_top_k` is the DEPTH of
-  that walk, not a prompt cap, which is why `config set` refuses anything below 1.
-- **The kill switch is asked for HERE, not inherited** — `startRerank` spawns BEFORE `Decide`'s read, so an
-  ungated judge leaves a PAUSED herd launching a subprocess per attention event per parked agent for decisions
-  that escalate regardless. Refusing is not a degrade (the caller uses the cosine fallback); a read error
-  refuses too.
-- **The resume re-reads the pane, and its drop is SILENT** — `rerankSituationHeldStill` discards and logs one
-  INFO line. Right direction (the alternative resumes a 30-second-old decision into a live menu) but the branch
-  most able to disable the feature unnoticed, so cover it directly rather than through the pipeline tests. It
-  carries `handleActionReviewOutcome`'s asymmetry: idle matches on situation TYPE alone, because an idle
-  signature hashes a masked head that legitimately differs between the `recent` capture and this `visible`
-  re-read; the transition's status falls back to the situation's own, or an empty one mismatches on type and
-  drops everything while every test still passes.
-- **A vector-search ERROR is not a cosine miss** — `bm25RetryAllowed` refuses a text retry for any STRUCTURED
-  salient cosine REFUSED, so collapsing a transient KNN failure into "cosine missed" mints a new key for every
-  approval, choice and error screen: the very population this targets.
-- **The candidate set is accept-filtered BEFORE the judge sees it** — the same closure the cosine pass uses
-  (`min_salient_chars` veto plus `remapAllowed`/`ApprovalRemapCompatible`) gates `matcher.VectorCandidates`.
-  Those gates exist because similarity alone bridges two approval screens sharing a verb (#155); delegating
-  them to a model puts the wrong answer into a pane.
-- **An EMPTY verdict is TERMINAL and skips BM25** — step 4 runs equally when the vector search was clean but
-  found nothing above threshold, so a fallen-through veto would be re-admitted by text and the feature becomes
-  a no-op that looks like it works. `finishRerank` mints instead (`MatchRerankVeto`).
-- **A judge FAILURE is not a veto** — missing binary, timeout, non-zero exit, prose with no array, duplicate or
-  out-of-range ids all degrade to `fallback` (computed BEFORE the run, so no error path reconstructs it). The
-  veto is an empty array, and equally a verdict scoring entirely below `relevance_score_threshold`;
-  `domain.ErrNoRerankVerdict` keeps the two apart, and `lastJSONArray` only accepts a region that already
-  unmarshals, so prose brackets are never an answer — except an empty bracket pair, which under last-wins turns
-  an earlier answer into a veto, the safe direction.
-- **It CANNOT run inline** — the cosine pass returns a `rerankPlan`, `decideAndAct` suspends, and
-  `handleRerankOutcome` re-enters `decideAndActResolved`. One flight per agent keyed on `sig.Raw` (there is no
-  learning key yet — resolving it is what the run is for), superseded on a different raw and cancelled wherever
-  a pending capture is; a token check drops a stale verdict, and `RerankingConfigured` is re-asked so a verdict
-  in flight when the operator turned the feature off degrades instead of vetoing. `rerankOutcome` carries
-  `fallback` AND `original` because they are not interchangeable: a veto mints from the ORIGINAL, and minting
-  from the fallback persists the raw hash while returning the candidate the judge just refused.
-- **Only an ESCALATION row carries `match_method`** (`daemon.escalate`, the sole writer, predating this
-  feature) — so `MatchRerankVeto` is visible in `hap audit` while `MatchRerank` on a delivered row is not. Do
-  not "fix" this by adding provenance to the auto path without deciding what that does for every existing
-  cosine/bm25 delivery too.
-- **An IN-FLIGHT run is invalidated by the same events the cache is** (`invalidateRerank`). Clearing only the
-  cache leaves the hole in its most confusing form: a run started under the old command or threshold finishes
-  seconds later, passes the per-agent token check — which is about SUPERSESSION, not staleness — applies its
-  answer, and REPOPULATES the cache just emptied; a refresh can also DELETE the very rule the verdict names.
-  Each flight carries its `rerankGen` and an older one degrades to the cosine fallback rather than CANCELLING,
-  because a reload follows every `hap config set`. **Two bounds make the counter work:** `invalidateRerank`
-  bumps UNCONDITIONALLY — a verdict IN TRANSIT is in neither map, so an "is there anything to invalidate" fast
-  path lets a pre-refresh verdict commit; and the generation check and the cache write are ONE critical section
-  (`commitRerankVerdict`), or an invalidation landing between them caches a pre-invalidation verdict anyway.
-  `cancelRerank` keeps its own fast path: it is per-EVENT and keyed on one agent, where a missing entry really
-  does mean nothing to cancel.
-- **The verdict cache keys on the RENDERED listing, never the candidate signatures** — the listing carries each
-  rule's `TopAction`/`Confidence`/`Mode`/`Decisions`, which is what makes the judge say "reuse this", and all
-  of those move under an UNCHANGED signature set every time a decision is recorded. Cleared on ANY reload
-  unconditionally — never gated on a section compare, or turning the judge off and on again resurrects its old
-  answers.
-- **A fleet pull retires verdicts only when the listing's INPUTS moved** (`invalidateRerankForKnowledge`). Under
-  turso nearly every pull reports a change, and bumping on each one retired almost every in-flight judge run — the
-  subprocess ran for nothing. The digest must cover EVERYTHING the listing reads: the candidate rows
-  (`SignatureEmbeddingsFingerprint`) AND the learned state (`RuleStateFingerprint`: mode, decision floor, decision
-  count + max id). This is not the forbidden "nothing to invalidate" fast path — that asks whether a verdict
-  EXISTS, this asks whether the QUESTION changed — and the compare and the bump share one hold of `mu`. Either
-  digest unknown invalidates. A change made on THIS node is caught by the next pull's digest, as before.
-
-`match.VectorCandidates` exists for this and re-expresses `MatchVector` rather than duplicating it:
-`MatchVector`'s "return the first accepted candidate" is sound only because the list is in descending cosine —
-a re-ranker breaks that, so the threshold moves to a caller that sees every candidate. **If any pre-existing
-semantic test needs its expectations edited to accommodate this feature, the gating is wrong.**
+### Semantic matching and the re-ranking judge
+- Matching degrades, never blocks: vector → BM25 → exact hash. `signature_embeddings` is the source of truth;
+  the bleve index is a disk-backed cache.
+- Short pane-tail salients are never embedded on either side (`domain.EmbeddableSalient`); structured
+  salients are exempt. If existing semantic tests need a lowered floor, the scope is wrong.
+- Chrome stripping (`domain.StripClaudeChrome`, `domain.StripCodexComposer`) only deletes positively
+  identified, line-anchored lines; never widen the `❯` filter to the bare glyph.
+- The judge (`llm.reranking_command`) may only NARROW cosine's set and never runs on the select loop
+  (`rerankPlan` → `handleRerankOutcome`). `startRerank` asks the kill switch itself (it runs before
+  `Decide`). Candidates are accept-filtered before the judge sees them (`remapAllowed` /
+  `ApprovalRemapCompatible`). An empty verdict is terminal (`MatchRerankVeto`); a failure is
+  not a veto. Invalidation bumps unconditionally (`invalidateRerank`, `commitRerankVerdict`). If existing
+  semantic tests need edited expectations, the gating is wrong.
 
 ## Testing practices
+- Unit tests mandatory for behavior changes; fakes over mocks (`internal/fakeherdr`, `newHarness`).
+- Socket paths: `testutil.SocketDir(t)`, never `t.TempDir()`. macOS temp paths: `filepath.EvalSymlinks`.
+- Real-subprocess code must tolerate a deleted cwd (`llm.Adapter.WorkDir`, `chdirStable`).
+- Keep both halves of control-test pairs.
+- **fakeherdr traps:** `AddPane` is a plain shell — use `AddAgentPane` to push status; `events_lost` cases
+  need `SetSubscribeReplay(false)`; adding a pane triggers a ~1s resubscribe. The fake implements no
+  claude-typed-input setter (`TestReloadPushesClaudeTypedInputToTheHerdrAdapter` is the only proof).
 
-- Unit tests are mandatory for behavior changes — table-driven where natural, fakes over mocks
-  (`internal/fakeherdr` fakes the herdr socket + CLI; `daemon_test.go` has in-process fakes and `newHarness`).
-- **Unix socket paths are length-capped** (~104 bytes on macOS): use `testutil.SocketDir(t)`, never
-  `t.TempDir()`.
-- macOS temp dirs live under the `/var → /private/var` symlink — compare paths via `filepath.EvalSymlinks`.
-- Anything spawning real subprocesses should tolerate a deleted cwd (`llm.Adapter.WorkDir`, `chdirStable`) —
-  the daemon can outlive the directory herdr launched it from.
-- Where a rule above names a **control** test ("without it the first passes on code that answers one way for
-  everything"), that pairing is the point — don't drop one half.
+## External facts (verified live; the code cannot prove these)
+- `pane read --source recent` is a consuming delta; use `--source visible` to re-read a screen.
+- herdr ≥0.7.5 has no `agent send`. `CLI.submitText` routes single-line → `pane send-text` + Enter,
+  multi-line → `agent prompt`; legacy `agent send` is a fallback ONLY on exit 2 (exit 1 is returned, never
+  retried — a retry is a double send). **Never route a menu digit through paste** — it commits the caret's option.
+- A paste into claude reaches its model as untrusted `<pasted_content>`; `[agents] claude_typed_input`
+  types instead (`internal/herdr/typed.go`). Pacing, not burst size, is what avoids the paste heuristic.
+- A label matching no option commits option 1 — `domain.UnmatchedMenuReply` gates all four send paths
+  (`daemon.act`, `handleLLMOutcome`, `handleActionReviewOutcome`, `deliver.Deliver`).
+  Send digits (`domain.MenuKeystroke`), not labels.
+- AskUserQuestion: preview tabs need digit + Enter, plain tabs commit on the digit — `internal/mcqdeliver`
+  presses and re-reads, never plans a series.
+- Before herdr 0.8.2 `send-keys shift+tab` sends TAB; hap sends CSI Z (`domain.ShiftTab`) until
+  `min_herdr_version` ≥ 0.8.2. Shift+Tab inside a claude modal approves the plan — require
+  `domain.ClaudeComposerReady`.
+- Permission mode is readable only from the pane, only positively (`domain.AgentModeFromPane`); the mode
+  cycle is per SESSION, so `SetAgentMode` detects a closed rotation.
+- Claude's remote-environment picker reports idle (`domain.ClaudeRemoteEnvForm`).
+- One request per herdr socket connection. herdr ≥0.9.0 replays no existing panes on subscribe; `events_lost`
+  means resubscribe + resync. Only agent panes get status subscriptions.
+- Agent names: `[a-z][a-z0-9_-]{0,31}`, unique. `agent prompt` right after `agent start` may land without
+  submitting — don't remove the status-gated retry-Enter loop in `CLI.send`.
+- `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` override the binary and events socket.
 
-## herdr integration gotchas
-
-The **`herdr`** skill covers CLI usage; these are the hap-specific protocol facts. Version stamps are kept
-where the behaviour could revert.
-
-- CLI reads print JSON envelopes (`{"id":…,"result":{…}}`); `pane read --format text` prints plain text.
-  `pane get` exposes `cwd` / `foreground_cwd` (a deleted dir renders as `"/path (deleted)"`).
-- **`pane read --source recent` is a consuming delta**, not the screen: after one read it can return just the
-  cursor line. To recover a standing menu at confirm time, read `--source visible`
-  (`herdr.CLI.ReadPaneVisible` / `ports.VisiblePaneReader`).
-- **herdr 0.7.5 REMOVED `agent send`** — the old call exits 2 with a usage banner and nothing reaches the
-  agent. It quietly did two things and the survivors split them, so `internal/herdr.CLI.submitText` **routes on
-  the content**:
-  - **single-line → `pane send-text` + `pane send-keys enter`.** Literal terminal input, so a menu digit
-    arrives as the KEY it is. Safety-critical: verified live against a real Claude question form,
-    `agent prompt "2"` PASTES the 2 as text and its Enter commits whichever option the caret was on — it
-    answered "Apple" while hap had chosen "Banana", silently, with a success exit code. **Never route a digit
-    through paste.**
-  - **multi-line → `agent prompt`.** Writes the text AND its Enter in one request honoring the pane's live
-    bracketed-paste mode, so a hand-out lands as ONE message. `pane send-text` is NOT paste-aware — each
-    embedded newline is a literal Enter, submitting the first line and typing the rest into the next prompt.
-
-  Both fall back to the legacy `agent send` only on exit status 2 — herdr rejecting the VERB — which keeps
-  `min_herdr_version = 0.7.0` honest. A pane-level failure exits 1 with a JSON error body and is returned
-  as-is, so a real delivery error is never retried as a second send.
-- **A PASTE into claude reaches its model as untrusted quoted text, so `[agents] claude_typed_input` TYPES
-  what would be one** (`internal/herdr/typed.go`, verified against Claude Code 2.1.283). Claude wraps a paste
-  in `<pasted_content>` and its system prompt says instructions inside count only where the user's own typed
-  words direct it — a hand-out pasted whole carries no user words at all. Its tokenizer calls two things a
-  paste: bracketed-paste markers (`agent prompt`), and an UNBRACKETED run over 800 UTF-16 units arriving in ONE
-  read — a long `pane send-text` included. The session transcript (`~/.claude/projects/*/*.jsonl`) records the
-  wrap and is the proof: a four-line `agent prompt` arrived wrapped whole. The typed route is a third arm AHEAD
-  of the two above, claude-only and off by default, pushed into the adapter on every reload
-  (`ports.ClaudeTypedInputSetter`) so every send path gets it through `ports.SendToAgent`:
-  - **The PACING holds the line, not the burst size.** Unpaced, herdr's socket answers in under a millisecond
-    and one Claude read stall right after the first burst piled 3,400 chars into a single read — 16- and
-    64-char bursts both came out pasted. Bursts are 64 UTF-16 units, burst STARTS 20ms apart, the first
-    followed by a 100ms settle; 10ms spacing passed every live run, a saturated CPU included.
-  - Only what is a paste TODAY is rerouted: multi-line, or one line over 512 BYTES (bytes bound UTF-16 units
-    from above, and the margin survives the threshold moving between builds). A short line keeps the burst
-    route every digit and `/rename` rule was verified on.
-  - **Never type what keystrokes would reinterpret** (`claudeTypedBody`) — such text keeps the paste. A
-    leading `!` is SHELL mode (verified for a lone key and a burst alike: the rest runs outside Claude's
-    permission prompts), and every control character but LF is a key (CR submits, Tab is bound, ESC starts a
-    sequence). LF is Claude's `chat:newline` (ctrl+j): in claude it inserts a line break, unlike the
-    submitting newline the multi-line bullet above describes. `?` only opens the shortcuts panel as a LONE
-    key, which a burst of two or more characters never is.
-  - **Only the FIRST burst may change transport** (socket unreachable, or a herdr that does not know
-    `pane.send_text` → `pane send-text` per burst). After a burst lands, a failure returns with NO Enter and
-    no retry — the composer holds half a message, and a retry would type it again behind the first half.
-  - **The Enter is the one keystroke a modal can capture, so it gets its own last look**
-    (`typedSubmitRefusal`). The paste route carried its Enter inside the same request; this one follows the
-    last burst by the whole typing time, and a prompt raised in that window would have its highlighted option
-    committed. It is withheld on a status that moved TO `blocked` since `send()`'s raw snapshot (keyed on the
-    change, so an agent the operator chose to send to while blocked is unaffected) or on a standing form.
-    A burst needs no such look — its digits arrive inside a multi-character run, never as a lone key.
-  - **Accepted cost: the send blocks its caller for the typing time** — ~0.5s for 1,000 characters, ~1.3s for
-    3,500 — and three send sites run on the select loop. That is the price of the pacing; the burst gap is
-    the speed knob (10ms is the tested alternative), never the burst size.
-  - **Test trap:** the daemon's fake herdr implements no setter, so only
-    `TestReloadPushesClaudeTypedInputToTheHerdrAdapter` proves the key reaches the adapter.
-    `TestRealClaudeTypedInputArrivesAsTyping` pairs a pasted CONTROL (it must come back wrapped, or the case
-    skips — a build that wraps nothing proves nothing) with the typed send, both read from the transcript.
-- **Before herdr 0.8.2, `pane send-keys shift+tab` is ACCEPTED and delivers a bare TAB** — herdr validates
-  the key name, exits 0, and writes `0x09`; `backtab`, `btab` and `S-Tab` are rejected outright, so no key
-  NAME works there. 0.8.2 fixed it (herdr #1561; verified with `cat -v` in a pane: 0.8.0 writes a TAB, 0.8.2
-  through 0.9.3 write `^[[Z`). hap still sends the raw encoding, CSI Z (`domain.ShiftTab` = `"\x1b[Z"`),
-  through `pane send-text` because `min_herdr_version` is 0.7.0 — the right transport precisely because it is
-  not paste-aware, so the bytes pass through untouched (`CLI.SendChord`, `ports.ChordSender`). Switching to
-  the key name is a `min_herdr_version` bump first. This is why `frontend.SetAgentMode` is an open loop re-reading the
-  pane after every press: a green exit code is not evidence a chord landed.
-- **An agent's permission mode is READABLE ONLY FROM ITS PANE, and only positively** — neither `agent list` nor
-  `pane get` carries a mode field, so `domain.AgentModeFromPane` parses the composer footer. **Absence is
-  UNKNOWN, never a default**: every Claude mode renders a line (2.1.226, including `⏸ manual mode on`, which
-  uniquely omits the cycle hint), so no line means the footer is not shown. **Matching is on the LABEL, never
-  the glyph**: `accept edits on` and `auto mode on` both render `⏵⏵`. Codex is the mirror image — it appends a
-  right-aligned `Plan mode` segment in Plan and nothing in Default, so "no segment" only means Default once the
-  footer itself is recognized. agy follows Codex (`domain.AgyAgentMode`): an `accept-edits · `/`plan · ` prefix on
-  the status bar's model segment, none for default — and the bar only counts DIRECTLY under the composer's rule,
-  because agy paints the same bar, mode prefix included, under every form and picker.
-- **The mode cycle is per-SESSION, not per-agent-type, so a set must detect a closed rotation** — verified live,
-  a `--model haiku` Claude session offers three modes while a default-model session in the same build offers
-  four, so `domain.AgentModesFor` is a SUPERSET, never a promise. `SetAgentMode` tracks the modes it has
-  observed and stops when the rotation returns to one, because pressing to the ceiling parks the agent in an
-  arbitrary PERMISSION mode nobody asked for; a failed set also ROTATES THE AGENT BACK (`restoreMode`). The two
-  diagnoses are distinct: a mode that did not change means the chord did not land and must keep pressing; only
-  a mode that CHANGED into one already seen means the cycle closed.
-- **Shift+Tab is REBOUND inside Claude's modals, so a mode press needs positive composer evidence** — a
-  standing plan approval renders `shift+tab to approve with this feedback`, so pressing the chord there
-  APPROVES THE PLAN. `domain.ClaudeComposerReady` requires the composer SANDWICH (a `───` rule, the `❯` line, a
-  second rule), not the bare `❯`, which is also an option list's caret. Refusing because a known form was
-  *detected* is not enough; the ordinary composer must be *proven*, and re-proven before EVERY press.
-- **A herdr agent name is 1-32 chars of `[a-z0-9_-]` starting with a lowercase letter**
-  (`invalid_agent_name`), and `agent start` refuses a name already in use — integration cases derive a unique
-  short name from `t.Name()`.
-- **`agent prompt` needs the agent to be interactively READY, and says so** — a prompt in the seconds after
-  `agent start`, or during claude's release-notes screen, lands in the composer WITHOUT submitting, which is
-  what the status-gated retry-Enter loop in `CLI.send` recovers; do not remove it on the grounds that
-  submission is atomic now. A pane whose agent is not the foreground process is refused with
-  `agent_not_ready`, which is why an externally reported agent can never receive `agent prompt`.
-- **Numbered menus want the digit, not the label** — sending the literal label is silently ignored, reading as
-  "nothing happened" on confirm. Map with `domain.MenuKeystroke` before delivering.
-- **A label that maps to NO option must never be delivered — the literal fall-through commits option 1.**
-  Verified live (Claude Code 2.1.220): an unmatched reply at a standing Bash approval runs the command under
-  plain "Yes" and reports success, because the agent ignores the letters and the trailing Enter commits
-  whatever option the caret rests on. So "no digit could be mapped" is not a safe default:
-  `domain.UnmatchedMenuReply` is the gate and **all FOUR send paths** refuse on it — `daemon.act`, the LLM
-  promotion in `handleLLMOutcome`, the rewritten reply in `handleActionReviewOutcome`, and `deliver.Deliver`.
-  - Two things make a correct label fail to map, both load-bearing. **Typography** — the same build renders
-    `don’t` with U+2019 while every rule, LLM answer and fixture here writes ASCII, so comparisons go through
-    `domain.FoldMenuText`. **Drift** — a rule learned on one render names an option no longer offered, which is
-    exactly what must escalate.
-  - Three ordering rules are deliberate and easy to undo: the gate runs AFTER the multi-tab answer-series and
-    remote-environment branches (each answers its own protocol); AFTER `llm.enable_rewrite_action` dispatches
-    in `act`, because adapting a drifted label is what the rewrite is for (and the result is re-checked, so
-    nothing skips the gate that way); and matching is unique-or-refuse on BOTH the exact and prefix passes,
-    since one capture can hold two renders numbering the same label differently.
-  - Two accepted trade-offs: an approval whose real prompt is a bare `y/n` with unrelated numbered lines in the
-    scrollback now escalates instead of typing `y`; and an UNREADABLE pane refuses only when the decision's own
-    capture proves a menu was standing (`req.PaneExcerpt`), so legacy rows with no excerpt behave as before.
-- **A digit does NOT always commit — AskUserQuestion has two protocols, per tab.** On **plain** options the
-  digit selects AND auto-advances; on **preview** options (list left, `┌──┐` box right) the digit only **moves
-  the caret** and **Enter** commits. The footer is identical in both and never mentions digits, and one form
-  mixes them (a preview form's generated Submit tab renders plain), so blind digit-only delivery is a silent
-  no-op. **Never plan a whole keystroke series up front** — `internal/mcqdeliver` presses, re-reads, and only
-  presses Enter if the answer did not commit (refusing if the caret never reached the chosen option).
-- **Claude's "Select remote environment" picker reports IDLE, not blocked** — herdr shows no blocked status
-  while the modal stands, so hap detects it structurally (`domain.ClaudeRemoteEnvForm`) and classifies it as a
-  parked APPROVAL at idle/done, the same exception pattern as Codex's Plan approval. Despite its "Enter to
-  select" footer the digit alone COMMITS, but all paths still answer adaptively via `mcqdeliver.ClaudeRemoteEnv`
-  in case a build ships the caret binding, failing closed when the learned label matches no offered environment.
-- One request per socket connection — herdr answers and CLOSES, so nothing is pipelined or reused (verified
-  live, herdr 0.8.2: a second request on the same connection gets a reset). `events.subscribe` is the one that
-  then keeps streaming; status subscriptions require a concrete `pane_id`. Before herdr 0.9.0 existing panes
-  were replayed as `pane_created`; 0.9.0+ starts a subscription with LIVE events only (verified on 0.9.3), so
-  `pane.list` on every (re)subscribe is the only way to learn of a pane that predates the stream.
-- **`events_lost` is a resubscribe, not an outage** (herdr 0.9.2+, `errEventsLost`). A reader that falls behind
-  the retained history gets an error with its subscription's request id and the stream is CLOSED; the evicted
-  events are never resent. `loop()` resubscribes at once at INFO (a repeat within `eventsLostQuietWindow` takes
-  the ordinary backoff, or an overloaded herdr gets a re-list and a subscribe per round — and the healthy-stretch
-  reset runs FIRST, or a ladder an old outage ratcheted survives into that repeat). A STATUS overrun sets `resync`,
-  so the next `runStatus` replays EVERY watched agent's current status from its fresh listing; it is stored
-  before the `errPaneSetChanged` mapping, which a racing dirty signal would otherwise take. A DISCOVERY overrun
-  only marks the pane set dirty: the re-list alone recovers a lost `pane.agent_detected` (the pane is newly
-  watched, so replayed) or `pane.exited`, and each connection reads at its own position, so replaying every
-  agent there would only cost an overloaded herdr a capture per parked agent. What comes back is current STATE,
-  never the missed history — so every replayed transition is marked `Replayed`, and the daemon never counts a
-  replayed `working` as a human check-in (it would reset `max_consecutive_auto_prompts` herd-wide per overrun).
-  **Test trap:** `fakeherdr` replays `pane.created` on subscribe by default (herdr < 0.9.0), which recovers a
-  missed detection by itself — an `events_lost` case must call `SetSubscribeReplay(false)` or it passes on
-  code that does no resync at all.
-- **The socket carries EVENTS, `notification.show` and TYPED input; everything else is the CLI, the pane
-  LISTING included** (`herdr.PaneLister` → `CLI.ListPanes`). Typed input (`pane.send_text`, one request per
-  burst — see the claude paste bullet) is the exception on cost: a hand-out is dozens of writes and a `herdr`
-  process measured ~42ms each, which is a second of spawns per 1,000 characters on the select loop. The CLI is itself a client of the same `pane.list` method — the
-  envelope it prints is byte-identical to the socket's — so this costs one process (~3.4ms idle, ~9ms median
-  under load, measured) and buys herdr's CLI-first surface. The accepted consequence is that the subscriber
-  needs BOTH transports: a listing can succeed and the stream that follows it fail, which costs one extra exec
-  per retry, bounded by `loop()`'s 30s ceiling. **So an outage must still be reported by the STREAM, never by an
-  empty listing** — `CLI.ListPanes` refuses a zero-exit error envelope rather than decoding its absent `panes`
-  as an empty herd, which would park the status loop with nothing to watch and no reconnect.
-- **A status subscription costs herdr CPU per pane, so only AGENT panes are watched** (`Subscriber.agentPanes`,
-  herdr 0.8.2): with 13 live panes (2 agents) the per-pane subscriptions were ~5.5 points of the server's CPU —
-  more than half its load with the daemon up — against ~2.8 for the agent panes alone, while the discovery stream
-  and hap's CLI calls were negligible. The label comes from `pane.list` (authoritative; an agent that exited
-  clears it) or `pane.agent_detected`, and a label newly attached to an existing pane resubscribes
-  (`upsertPane`) — too late for ONE event by construction: herdr emits the detection and the agent's first status
-  in the same update, so a resubscribe that ADDS an agent pane replays its status from the `pane.list` snapshot
-  (`replayStatus`; not on the first subscribe, which the startup reconcile covers). **A listing that labels NO pane falls back to watching every pane** (and keeps discovery's
-  labels) — `min_herdr_version` is 0.7.0 and a herdr not reporting labels in `pane.list` would otherwise leave
-  every agent running at daemon start unwatched; a herd with no agents takes the same path, harmlessly.
-  **Test trap:** `fakeherdr.AddPane` is a plain SHELL — a test pushing status must use
-  `AddAgentPane` (or `PushAgentDetected` first), exactly as real herdr only reports status for a detected agent.
-  `fakeherdr.Server` answers the listing too (`Server.ListPanes`, the `PaneLister` tests inject) from the SAME
-  state the event stream is driven from, so a pane added, labelled or removed moves both — mirroring it into the
-  `FakeCLI` script instead would need a second registration every test could forget.
-- Adding a pane makes the subscriber reconnect ("pane set changed", 1s backoff) — tests pushing transitions
-  right after `AddPane` must wait past the resubscribe.
-- The herdr binary resolves via `HERDR_BIN_PATH` (fallback: `herdr` on PATH); the events socket via
-  `HERDR_SOCKET_PATH`.
-
-## Where things live
-
-| Path | What |
-|---|---|
-| `cmd/hap` | entrypoint: daemon / TUI / CLI / `mcp` subcommands |
-| `internal/domain` | pure decision core, signatures, safety heuristics |
-| `internal/daemon` | monitor loop: subscribe → classify → decide → act/escalate |
-| `internal/classify` | pane-content classifier + golden fixtures |
-| `internal/mcqdeliver` | answers a live multi-tab MCQ form, verifying each keystroke landed |
-| `internal/domain/agentmode.go` | parses an agent's permission mode out of its composer footer; proves the composer is safe to press into |
-| `internal/domain/backgroundwork.go` | reads "this agent is waiting on its OWN shells/monitors/subagents" off a pane herdr calls idle |
-| `internal/domain/operatortyping.go` | reads "a human has a draft in the composer" off the same pane; UNKNOWN is the common answer |
-| `internal/llm` | operator LLM CLI adapter (argv template, auto-repair) |
-| `internal/mcpserver` | stdio MCP server (`get_context`, `submit_decision`) |
-| `internal/herdr` | herdr CLI + events-socket adapters |
-| `internal/store` | SQLite persistence (WAL; `context_json` is an opaque blob) |
-| `internal/store/libsqlreplica` | the libsql engine's store: local replica, capture triggers + outbox, change-log pull, re-seed, retention |
-| `internal/store/libsql` | the libsql engine's transport: Hrana client (`hrana.go`, its only HTTP), `Batch`/`Tx` pipelines, a direct `database/sql` handle over `sqlbridge.Backend`; `hranafake` is the in-process test server |
-| `internal/taskfile` | advisory file lock behind every checklist read-modify-write |
-| `internal/tasklocator` | the ONE canonicalizer for a task-list locator + provider resolution (pure) |
-| `internal/taskstore` | task-list backends: `local` (default), `gist` (opt-in, the only GitHub SDK importer) and `dbtask` (the `database` provider: lists as `task_lists` rows, `db://<node>/<name>`, synced under turso) |
-| `internal/selfpath` | resolves a live `hap` binary (an upgrade unlinks the running one) |
-| `internal/tuisession` | flock registry of live `hap tui` processes; closes the oldest past `[tui] max_instances` |
-| `internal/streamlog` | machine-local SQLite event log behind `hap stream orchestrator` (its own file, NOT a store table) |
-| `internal/profiling` | opt-in rolling CPU/heap profiles (`HAP_PROFILE_DIR`); files only, no listener |
-| `internal/updatecheck` | GitHub release check — one of the allowlisted `net/http` importers (NFR-007) |
-| `internal/fakeherdr`, `e2e_harness/` | test fakes and the e2e driver |
-| `docs/architect/herd-auto-prompter-architecture.md` | consolidated architecture doc (FR-xxx / NFR-xxx ids used in comments) |
+Full architecture: `docs/architect/herd-auto-prompter-architecture.md` (FR-/NFR- ids used in comments).
