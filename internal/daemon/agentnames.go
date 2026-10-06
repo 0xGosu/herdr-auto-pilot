@@ -223,6 +223,11 @@ func (d *Daemon) declareWaitAction(ctx context.Context, a domain.AgentAction) (s
 	if err := json.Unmarshal([]byte(a.Payload), &p); err != nil {
 		return "", fmt.Errorf("the queued wait request could not be read: %w", err)
 	}
+	// Bounded BEFORE the multiplication: an out-of-range Seconds would
+	// overflow time.Duration and could wrap into the valid window.
+	if p.Seconds < 0 || p.Seconds > int64(domain.MaxDeclaredWait/time.Second) {
+		return "", fmt.Errorf("a wait of %d seconds is outside 0..%s", p.Seconds, domain.MaxDeclaredWait)
+	}
 	wait := time.Duration(p.Seconds) * time.Second
 	if err := domain.ValidateWaitDuration(wait); err != nil {
 		return "", err

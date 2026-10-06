@@ -1139,6 +1139,38 @@ func TestSyncAgentTerminalID(t *testing.T) {
 	}
 }
 
+// TestARecycledPaneDropsThePreviousTenantsDeclaredWait: a declared wait is the
+// agent's own word about its own work, so a new terminal on a reused pane id
+// must not inherit it — while the same terminal re-observed keeps it.
+func TestARecycledPaneDropsThePreviousTenantsDeclaredWait(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	if _, err := s.EnsureAgentName(ctx, "w1:p1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetAgentWait(ctx, "w1:p1", time.Now().Add(time.Hour), "cold build"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Control: the same terminal re-observed keeps its declaration.
+	if _, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_a"); err != nil {
+		t.Fatal(err)
+	}
+	if w, err := s.AgentWaitFor(ctx, "w1:p1"); err != nil || !w.Active(time.Now()) {
+		t.Fatalf("the same terminal lost its wait: %+v (%v)", w, err)
+	}
+
+	if reset, err := s.SyncAgentTerminalID(ctx, "w1:p1", "term_b"); err != nil || !reset {
+		t.Fatalf("differing id must reset, got reset=%v err=%v", reset, err)
+	}
+	if w, err := s.AgentWaitFor(ctx, "w1:p1"); err != nil || !w.Until.IsZero() || w.Reason != "" {
+		t.Fatalf("a new terminal inherited the previous tenant's wait: %+v (%v)", w, err)
+	}
+}
+
 func TestAgentNames(t *testing.T) {
 	s, _ := openTestStore(t)
 	ctx := context.Background()

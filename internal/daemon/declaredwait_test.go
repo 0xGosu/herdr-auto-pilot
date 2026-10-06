@@ -260,6 +260,30 @@ func TestAWorkingAgentsHandoutIsGivenUpOnPastTheTTLWithoutAWait(t *testing.T) {
 	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
 }
 
+// TestAGoneAgentsDeclaredWaitDoesNotHoldItsHandoutPastTheTTL: the TTL branch
+// honours a declaration only for the tenant the task was handed to, like the
+// declared-wait branch below it. An agent that is gone cannot resume the item,
+// so a wait it left behind must not pin the "[-]" for another two hours.
+func TestAGoneAgentsDeclaredWaitDoesNotHoldItsHandoutPastTheTTL(t *testing.T) {
+	h, _ := autoSendFixture(t, "agent-fg4", "- [ ] step two\n", true)
+	agents := parkIdle(h, 2*time.Minute, "agent-fg4")
+	ctx := context.Background()
+
+	h.daemon.autoSendIdleTasks(ctx, agents)
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 1 })
+	backdateHandouts(t, h, 2*staleHandoutTTL)
+	declareWait(t, h, "agent-fg4", time.Hour)
+
+	// The agent's pane is gone; only an unrelated agent is still running.
+	others := []domain.AgentTransition{{
+		AgentID: "agent-other", PaneID: "agent-other", AgentType: "claude", Status: "working",
+	}}
+	h.herdr.setAgents(others)
+	h.daemon.autoSendIdleTasks(ctx, others)
+
+	waitFor(t, 3*time.Second, func() bool { return len(openHandouts(t, h)) == 0 })
+}
+
 // TestADeclaredWaitNeverOutlastsTheAbsoluteHandoutCeiling is what keeps the
 // renewal honest. A declaration can be made again, so honouring it at the TTL
 // without a second bound would restore exactly the unbounded "[-]" that branch
@@ -391,6 +415,9 @@ func TestDeclareWaitActionRefusesAnOutOfBoundsDuration(t *testing.T) {
 		int64((domain.MaxDeclaredWait + time.Hour) / time.Second),
 		int64(domain.MinDeclaredWait/time.Second) - 1,
 		-60,
+		// Overflows time.Duration and wraps to ~1m0.29s, inside the valid
+		// window, unless the bound is asked before the multiplication.
+		18446744134,
 	} {
 		_, err := h.daemon.declareWaitAction(ctx, domain.AgentAction{
 			Kind: domain.AgentActionDeclareWait, Target: "pW6",

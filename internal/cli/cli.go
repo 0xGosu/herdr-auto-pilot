@@ -1005,6 +1005,12 @@ func declareWait(ctx context.Context, app *frontend.App, out io.Writer, args []s
 		}
 	}
 	target := strings.TrimSpace(agent)
+	if target == "" && nodeID != "" {
+		// HERDR_PANE_ID names a pane on THIS machine. Pane ids are compact and
+		// node-local, so sending it to another node would declare a wait on
+		// whichever agent happens to hold the same id over there.
+		return fmt.Errorf("--node needs --agent: this pane's id means nothing on another machine (see: hap agents)")
+	}
 	if target == "" {
 		target = strings.TrimSpace(os.Getenv("HERDR_PANE_ID"))
 	}
