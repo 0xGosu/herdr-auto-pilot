@@ -1,4 +1,0 @@
-- Fixed a recycled pane inheriting the previous agent's `hap wait`, which could hold the new agent's hand-outs and queue notices for hours
-- Fixed a closed agent's declared wait keeping its stale hand-out `[-]` past the hand-out TTL
-- `hap wait --node <node>` now needs `--agent`, instead of applying this pane's id to whatever agent shares it on the other machine
-- The MCP `declare_wait` tool no longer falls back to another agent's pending consult when it is given no agent, and rejects an out-of-range duration that used to wrap into a valid one

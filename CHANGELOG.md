@@ -8,6 +8,15 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.64
+
+- Added `hap nodes`, which lists the other machines sharing a turso/libsql store with when each last reported, and `hap nodes prune`, which removes the agents, names and node row of machines silent for over a week (`--older-than`, `--node`); it only lists candidates until you pass `--yes`, and keeps audit history, learned rules, task lists and disabled agents' names
+- The TUI's Agents tab now hides agents whose machine has been silent for more than 24 hours, and its "other nodes" separator says how many it hid
+- Fixed a recycled pane inheriting the previous agent's `hap wait`, which could hold the new agent's hand-outs and queue notices for hours
+- Fixed a closed agent's declared wait keeping its stale hand-out `[-]` past the hand-out TTL
+- `hap wait --node <node>` now needs `--agent`, instead of applying this pane's id to whatever agent shares it on the other machine
+- The MCP `declare_wait` tool no longer falls back to another agent's pending consult when it is given no agent, and rejects an out-of-range duration that used to wrap into a valid one
+
 ## 0.9.63
 
 - Fixed the devcontainer's post-create step so the FAISS build finds a linkable BLAS (`libopenblas-dev`), and pinned golangci-lint to the Go toolchain it was built with so a newer image Go no longer silently disables the `unused` linter
