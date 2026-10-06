@@ -51,7 +51,8 @@ document is convenience.
   `escalations` (bare), `kill-history`, `signatures list|show|search`,
   `config show|fields|path`, `config env list` (names only, never values),
   `config rules|task-source|classifier|capture-delay list`,
-  `task <agent> list|get`, `state-dir`, `paths`, `version`, `gc --dry-run`.
+  `task <agent> list|get`, `state-dir`, `paths`, `version`, `gc --dry-run`,
+  `nodes`, `nodes prune` (without `--yes`).
 
 ## the CLI documents itself
 

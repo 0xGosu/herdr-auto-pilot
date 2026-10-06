@@ -28,8 +28,11 @@ type RemoteAgent struct {
 	NodeLabel string
 	// Stale: that machine's daemon has stopped reporting, or its roster is
 	// too old to trust. Rendered, never acted on.
-	Stale    bool
-	Disabled bool
+	Stale bool
+	// LastHeard is the newest proof that machine's daemon was running
+	// (domain.NodeLastHeard); zero when it never reported at all.
+	LastHeard time.Time
+	Disabled  bool
 	// Snoozed: that machine's operator silenced notices about this agent's
 	// QUEUE. Distinct from Disabled — its prompts are still answered.
 	Snoozed bool
@@ -240,6 +243,7 @@ func (a *App) fillFleet(st *Status, f fleetReads) {
 			Name:        st.FleetNames[key],
 			NodeLabel:   domain.NodeLabelOrID(node),
 			Stale:       domain.NodeStale(node, now) || !domain.RosterFresh(published[r.NodeID], now),
+			LastHeard:   domain.NodeLastHeard(node, published[r.NodeID]),
 			Disabled:    disabled[key],
 			Snoozed:     snoozed[key],
 			Wait:        waiting[key],

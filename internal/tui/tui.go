@@ -1343,6 +1343,9 @@ func (m Model) agentRows() []agentRow {
 		rows = append(rows, m.localRow(a))
 	}
 	for _, r := range st.RemoteAgents {
+		if offlineTooLong(r, now) {
+			continue
+		}
 		rows = append(rows, agentRow{
 			AgentTransition: r.Transition(),
 			NodeID:          r.NodeID,
@@ -1358,6 +1361,28 @@ func (m Model) agentRows() []agentRow {
 		})
 	}
 	return rows
+}
+
+// offlineTooLong reports whether a remote agent's machine has been unheard for
+// longer than domain.NodeOfflineHideAfter, which keeps it off the Agents tab.
+// Only on EVIDENCE: a row with no last-heard time at all is unknown, not old,
+// and stays listed (marked stale) rather than vanishing.
+func offlineTooLong(r frontend.RemoteAgent, now time.Time) bool {
+	return !r.LastHeard.IsZero() &&
+		domain.NodeOfflineLongerThan(r.LastHeard, now, domain.NodeOfflineHideAfter)
+}
+
+// hiddenOfflineAgents counts the remote agents agentRows left out because their
+// machine has been offline too long, so the separator can say they exist.
+func (m Model) hiddenOfflineAgents() int {
+	now := time.Now()
+	n := 0
+	for _, r := range m.data.status.RemoteAgents {
+		if offlineTooLong(r, now) {
+			n++
+		}
+	}
+	return n
 }
 
 // visibleAgents applies the Agents tab search filter and inserts the separator.
@@ -1393,13 +1418,18 @@ func (m Model) visibleAgents() []agentRow {
 			local = append(local, r)
 		}
 	}
-	if len(remote) == 0 {
+	hidden := m.hiddenOfflineAgents()
+	if len(remote) == 0 && hidden == 0 {
 		return local
 	}
-	out := append(local, agentRow{
-		sep:  true,
-		Name: fmt.Sprintf("── other nodes (%d agents) ──", len(remote)),
-	})
+	label := fmt.Sprintf("── other nodes (%d agents) ──", len(remote))
+	if hidden > 0 {
+		// Said on the separator rather than dropped silently — even when it
+		// is the only remote row — so an operator looking for a machine's
+		// agents learns they are hidden rather than concluding they are gone.
+		label = fmt.Sprintf("── other nodes (%d agents; %d hidden: node offline > 24h) ──", len(remote), hidden)
+	}
+	out := append(local, agentRow{sep: true, Name: label})
 	return append(out, remote...)
 }
 
