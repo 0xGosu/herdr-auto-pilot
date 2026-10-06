@@ -89,12 +89,13 @@ var (
 	// the end of the turn — which is the whole reason it is usable here, since
 	// both of this predicate's callers only look at PARKED agents.
 	//
-	// The "/ps to view" hint is REQUIRED, not decoration. The count phrase
-	// alone is ordinary English an agent will type while reporting what it did
-	// ("I left 1 background terminal running"), and the footer window is the
-	// entire capture on a short pane, so the hint is what makes the line
-	// positively codex's own chrome rather than its prose. Line-anchored for
-	// the same reason every rule in claudechrome.go is.
+	// A slash-command hint ("/ps to view" or "/stop to close") is REQUIRED,
+	// not decoration. The count phrase alone is ordinary English an agent will
+	// type while reporting what it did ("I left 1 background terminal
+	// running"), and the footer window is the entire capture on a short pane,
+	// so the hint is what makes the line positively codex's own chrome rather
+	// than its prose. Line-anchored for the same reason every rule in
+	// claudechrome.go is.
 	codexBackgroundTerminalRE = regexp.MustCompile(
 		`^(\d+)\s+background\s+terminals?\s+running\s*·.*(?:/ps\b|/stop\b)`)
 )

@@ -142,6 +142,58 @@ func TestDeclareWaitBoundsAndClears(t *testing.T) {
 	}
 }
 
+// TestDeclareWaitWithNoAgentNeedsANamedRequest: outside a consult (no request
+// id) the no-agent form must refuse rather than fall back to the newest pending
+// request, which may be about a different agent entirely.
+func TestDeclareWaitWithNoAgentNeedsANamedRequest(t *testing.T) {
+	st := waitTestStore(t)
+	ctx := context.Background()
+	if _, err := st.EnsureAgentName(ctx, "w1:p7"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.StageLLMRequest(ctx, domain.LLMRequest{
+		RequestID: "req-other", Signature: "idle:abc", SituationType: domain.SituationIdle,
+		AgentType: "claude", AgentID: "w1:p7", ContextJSON: `{"situation_type":"idle"}`,
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := startServer(t, st, "")
+	resp := c.call(t, "tools/call", map[string]any{
+		"name": "declare_wait", "arguments": map[string]any{"minutes": 30},
+	})
+	text, _ := json.Marshal(resp)
+	if !strings.Contains(string(text), "needs an agent") {
+		t.Fatalf("declare_wait guessed an agent from an unrelated pending request: %s", text)
+	}
+	if w, err := st.AgentWaitFor(ctx, "w1:p7"); err != nil || !w.Until.IsZero() {
+		t.Fatalf("another agent's request received the wait: %+v (%v)", w, err)
+	}
+}
+
+// TestDeclareWaitRefusesAnOverflowingMinutes: a minutes large enough to
+// overflow time.Duration must be refused on its face, not after it wraps.
+func TestDeclareWaitRefusesAnOverflowingMinutes(t *testing.T) {
+	st := waitTestStore(t)
+	ctx := context.Background()
+	if _, err := st.EnsureAgentName(ctx, "w1:p4"); err != nil {
+		t.Fatal(err)
+	}
+	c := startServer(t, st, "")
+	// 2^53 minutes: exact in JSON's float64, and far past time.Duration's range.
+	resp := c.call(t, "tools/call", map[string]any{
+		"name": "declare_wait", "arguments": map[string]any{"agent": "w1:p4", "minutes": int64(1) << 53},
+	})
+	text, _ := json.Marshal(resp)
+	if !strings.Contains(string(text), "ceiling") {
+		t.Fatalf("an overflowing minutes was not refused as over the ceiling: %s", text)
+	}
+	if w, err := st.AgentWaitFor(ctx, "w1:p4"); err != nil || !w.Until.IsZero() {
+		t.Fatalf("a refused wait still wrote a row: %+v (%v)", w, err)
+	}
+}
+
 func TestDeclareWaitIsListed(t *testing.T) {
 	c := startServer(t, waitTestStore(t), "")
 	resp := c.call(t, "tools/list", nil)

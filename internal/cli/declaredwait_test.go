@@ -3,12 +3,14 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/cli"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
 // #508 item 3: `hap wait` is the AGENT-facing verb of the per-agent switches.
@@ -123,6 +125,31 @@ func TestWaitNeedsATargetWhenThereIsNoPane(t *testing.T) {
 	err := cli.Run(context.Background(), app, &out, "wait", []string{"20m"})
 	if err == nil {
 		t.Fatal("hap wait outside a pane was accepted")
+	}
+	if !strings.Contains(err.Error(), "--agent") {
+		t.Errorf("the refusal must name the remedy, got: %v", err)
+	}
+}
+
+// TestWaitOnAnotherNodeNeedsAnExplicitAgent: HERDR_PANE_ID is this machine's
+// pane id, and pane ids are compact and node-local, so defaulting to it for
+// --node would declare a wait on whichever remote agent shares that id.
+func TestWaitOnAnotherNodeNeedsAnExplicitAgent(t *testing.T) {
+	app, _ := testApp(t)
+	ctx := context.Background()
+	other, err := store.OpenAs(filepath.Join(filepath.Dir(app.ConfigPath), "t.db"), "bbbbbbbbbbbbbbbb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := other.UpsertNode(ctx, domain.NodeInfo{Label: "laptop", LastSeen: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERDR_PANE_ID", "w1:p9")
+	var out bytes.Buffer
+	err = cli.Run(ctx, app, &out, "wait", []string{"--node", "laptop", "20m"})
+	if err == nil {
+		t.Fatal("hap wait --node with no --agent sent this pane's id to another machine")
 	}
 	if !strings.Contains(err.Error(), "--agent") {
 		t.Errorf("the refusal must name the remedy, got: %v", err)

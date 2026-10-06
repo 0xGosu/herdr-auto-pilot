@@ -476,8 +476,15 @@ func (d *Daemon) reclaimStrandedTasks(ctx context.Context, agents []domain.Agent
 			// restore the unbounded "[-]" this TTL exists to prevent. Past
 			// staleHandoutTTL + domain.MaxDeclaredWait the row is given up on
 			// whatever the agent says.
+			//
+			// And only for the tenant the task was handed to, exactly as the
+			// declared-wait branch below: an agent that is gone cannot resume
+			// the item, and a recycled pane id's new tenant must not hold its
+			// predecessor's hand-out on the strength of its own declaration.
 			w := declaredWait(r.AgentID)
-			held := w.Active(now) && now.Sub(r.ReservedAt) <= staleHandoutTTL+domain.MaxDeclaredWait
+			a, present := live[r.AgentID]
+			held := present && sameTenant(a, r) && w.Active(now) &&
+				now.Sub(r.ReservedAt) <= staleHandoutTTL+domain.MaxDeclaredWait
 			if held {
 				slog.Info("auto-send: hand-out is past its TTL but the agent declared a wait; leaving it alone",
 					"agent", r.AgentID, "path", r.SourcePath, "task", r.TaskText,

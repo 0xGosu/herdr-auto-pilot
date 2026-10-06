@@ -2804,7 +2804,8 @@ func (s *Store) EnsureAgentName(ctx context.Context, agentID string) (string, er
 // row. Herdr reuses compact pane ids after panes close, so a differing
 // terminal id means the row now describes a brand-new terminal: created_at
 // is reset so AGE reflects the current session, while the name, disabled
-// flag, and audit history survive (issue #158). Returns reset=true when the
+// flag, and audit history survive (issue #158); the previous tenant's declared
+// wait does not. Returns reset=true when the
 // timestamp was reset. Empty terminalID (older herdr) and unknown agentID
 // (row not created yet — EnsureAgentName owns creation) are no-ops.
 func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID string) (bool, error) {
@@ -2835,8 +2836,14 @@ func (s *Store) SyncAgentTerminalID(ctx context.Context, agentID, terminalID str
 				terminalID, s.self, agentID)
 			return err
 		default:
+			// A declared wait (domain.AgentWait) is the PREVIOUS tenant's own
+			// word about its own work, so unlike the operator's name and
+			// disable it must not carry over to the new terminal: left in
+			// place it would withhold hand-outs and queue notices from a
+			// fresh agent for up to domain.MaxDeclaredWait.
 			_, err = tx.ExecContext(ctx,
-				`UPDATE agent_names SET terminal_id = ?, created_at = ? WHERE node_id = ? AND agent_id = ?`,
+				`UPDATE agent_names SET terminal_id = ?, created_at = ?, wait_until = 0, wait_reason = ''
+				 WHERE node_id = ? AND agent_id = ?`,
 				terminalID, time.Now().UnixMilli(), s.self, agentID)
 			if err == nil {
 				wantReset = true

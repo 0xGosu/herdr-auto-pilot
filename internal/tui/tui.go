@@ -1320,8 +1320,14 @@ func (r agentRow) remote() bool { return !r.sep && r.NodeID != "" }
 // address for a local agent — that is exactly why it takes an
 // AgentTransition (always local: MonitoredAgents) rather than an id.
 func (m Model) localRow(a domain.AgentTransition) agentRow {
+	return m.localRowAt(a, time.Now())
+}
+
+// localRowAt is localRow against a clock reading the caller already took, so
+// one list build resolves every row's declared wait against the same instant.
+func (m Model) localRowAt(a domain.AgentTransition, now time.Time) agentRow {
 	st := m.data.status
-	wait, waiting := st.AgentWaiting(a.AgentID, time.Now())
+	wait, waiting := st.AgentWaiting(a.AgentID, now)
 	return agentRow{
 		AgentTransition: a,
 		Name:            st.AgentName(a.AgentID),
@@ -1340,7 +1346,7 @@ func (m Model) agentRows() []agentRow {
 	now := time.Now()
 	rows := make([]agentRow, 0, len(st.MonitoredAgents)+len(st.RemoteAgents)+1)
 	for _, a := range st.MonitoredAgents {
-		rows = append(rows, m.localRow(a))
+		rows = append(rows, m.localRowAt(a, now))
 	}
 	for _, r := range st.RemoteAgents {
 		if offlineTooLong(r, now) {

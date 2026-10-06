@@ -677,12 +677,28 @@ func (s *Server) declareWait(ctx context.Context, p toolCallParams, requestID st
 	if p.Arguments.Minutes == nil {
 		return nil, fmt.Errorf("declare_wait requires minutes: how long the agent expects to be busy (0 ends a wait that is already standing)")
 	}
+	// Bounded BEFORE the multiplication: an out-of-range minutes would
+	// otherwise overflow time.Duration and could wrap into the valid window.
+	switch minutes := *p.Arguments.Minutes; {
+	case minutes < 0:
+		return nil, fmt.Errorf("a wait cannot be negative")
+	case minutes > int(domain.MaxDeclaredWait/time.Minute):
+		return nil, fmt.Errorf("a wait of %d minutes is longer than the %s ceiling; declare a shorter one and renew it",
+			minutes, domain.MaxDeclaredWait)
+	}
 	d := time.Duration(*p.Arguments.Minutes) * time.Minute
 	if err := domain.ValidateWaitDuration(d); err != nil {
 		return nil, err
 	}
 	target := strings.TrimSpace(p.Arguments.Agent)
 	if target == "" {
+		// Only a NAMED request may stand in for the agent. resolveRequest's
+		// no-id fallback is the newest pending request across EVERY agent,
+		// which is a guess — tolerable for a read like get_context, not for a
+		// write that withholds work from whichever agent it lands on.
+		if requestID == "" {
+			return nil, fmt.Errorf("declare_wait needs an agent: pass agent, or call it from a decision request")
+		}
 		req, err := s.resolveRequest(ctx, requestID)
 		if err != nil {
 			return nil, fmt.Errorf("declare_wait needs an agent: pass one, or call it from a decision request (%w)", err)
