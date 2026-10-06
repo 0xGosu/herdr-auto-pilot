@@ -60,6 +60,32 @@ func NodeStale(n NodeInfo, now time.Time) bool {
 	return n.LastSeen.IsZero() || now.Sub(n.LastSeen) > nodeStaleAfter
 }
 
+// NodeOfflineHideAfter is how long a node may go unheard before the TUI's
+// Agents tab stops listing its agents. Stale (nodeStaleAfter) is "its daemon
+// missed a few beats" — a laptop lid closed over lunch — and those rows stay,
+// marked. A day of silence is a machine that is gone or parked, and its frozen
+// rows only crowd out the live herd. `hap agents` still lists them, and
+// `hap nodes prune` removes them for good.
+const NodeOfflineHideAfter = 24 * time.Hour
+
+// NodeLastHeard is the newest proof that a node's daemon was running: its
+// heartbeat (LastSeen) or its roster stamp, whichever is later. Either alone
+// can lag — an older daemon may stamp only one of them — and both are written
+// only by that node's own daemon, so the later one is the honest answer.
+func NodeLastHeard(n NodeInfo, rosterPublished time.Time) time.Time {
+	if rosterPublished.After(n.LastSeen) {
+		return rosterPublished
+	}
+	return n.LastSeen
+}
+
+// NodeOfflineLongerThan reports whether nothing has been heard from a node
+// (lastHeard, see NodeLastHeard) for longer than d. A node never heard from at
+// all has been offline for as long as anyone can tell, so it reports true.
+func NodeOfflineLongerThan(lastHeard, now time.Time, d time.Duration) bool {
+	return lastHeard.IsZero() || now.Sub(lastHeard) > d
+}
+
 // NodeLabelOrID is the display label, falling back to the id's first eight
 // characters — the same shape a git short hash has, for the same reason.
 func NodeLabelOrID(n NodeInfo) string {

@@ -1,0 +1,2 @@
+- Added `hap nodes`, which lists the other machines sharing a turso/libsql store with when each last reported, and `hap nodes prune`, which removes the agents, names and node row of machines silent for over a week (`--older-than`, `--node`); it only lists candidates until you pass `--yes`, and keeps audit history, learned rules, task lists and disabled agents' names
+- The TUI's Agents tab now hides agents whose machine has been silent for more than 24 hours, and its "other nodes" separator says how many it hid

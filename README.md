@@ -937,6 +937,17 @@ reordering them from the TUI's Tasks tab. Changing a remote agent's permission
 MODE is still refused — that one reads the pane it is about to press into, so it
 belongs to the machine watching it.
 
+**Machines that go away.** A machine switched off or rebuilt leaves its agents
+behind, frozen: `hap agents` keeps listing them as `(stale)`, and the TUI's
+Agents tab hides them once their machine has been silent for 24 hours (the
+separator says how many it hid). `hap nodes` lists every other machine with when
+it last reported; `hap nodes prune` lists the ones silent for over a week and,
+with `--yes`, removes their roster, agent names and node row from the shared
+database and dismisses their pending escalations (`--older-than 30d`,
+`--node <label>`). Audit history, learned rules and task lists are kept, and so
+are the names of agents you disabled. A pruned machine that comes back simply
+re-registers, with fresh agent names.
+
 **How conflicts are avoided.** Every row a machine owns carries its node id
 (herdr pane ids repeat across machines), ids are allocated with node bits, and a
 machine's daemon only ever executes its own agents' actions — including at

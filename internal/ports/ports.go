@@ -141,6 +141,19 @@ type RowRetentionPort interface {
 	PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domain.PruneCounts, error)
 }
 
+// NodePruner is implemented by stores that can retire ANOTHER, long-offline
+// node's agent rows (`hap nodes prune`). Optional for the same reason as
+// RowRetentionPort: the fakes that predate it need not grow it, and a front
+// end whose store lacks it refuses the prune rather than reporting nothing
+// removed.
+//
+// PruneOfflineNode re-checks, inside its own transaction, that nothing was
+// heard from the node after cutoff (domain.ErrNodeHeardSince otherwise), and
+// refuses this node itself (domain.ErrNodePruneSelf).
+type NodePruner interface {
+	PruneOfflineNode(ctx context.Context, nodeID string, cutoff time.Time) (domain.NodePruneCounts, error)
+}
+
 // KnowledgeFingerprinter is implemented by stores that can digest the rows
 // the semantic match index is built from (signature_embeddings), so the daemon
 // can skip a rebuild when a fleet pull moved nothing the index reads. Optional:

@@ -629,6 +629,43 @@ func buildCommands() {
 			Handler: dismiss,
 		},
 		{
+			Name:    "nodes",
+			Group:   groupData,
+			Summary: "list the other machines sharing the store; prune the ones offline too long",
+			Usage: []string{
+				"hap nodes",
+				"hap nodes prune [--older-than 7d] [--node <label|id>] [--yes]",
+			},
+			Flags: []FlagDoc{
+				{Name: "--older-than", Arg: "AGE", Default: "7d", Desc: "prune only nodes unheard for longer than this: whole days (7d) or a duration (36h)"},
+				{Name: "--node", Arg: "<label|id>", Desc: "prune only this node (it must still be offline longer than --older-than)"},
+				{Name: "--yes", Desc: "actually delete; without it `prune` only lists what would go"},
+				{Name: "--dry-run", Desc: "list what would go and change nothing, even with --yes"},
+			},
+			Details: "Under a shared database (`[database] engine = \"turso\"` or `\"libsql\"`) every\n" +
+				"machine's daemon registers itself and publishes its agents. A machine that is\n" +
+				"switched off or rebuilt leaves those rows behind, frozen: `hap agents` keeps\n" +
+				"listing them as stale, and the TUI hides them once their node has been silent\n" +
+				"for 24 hours. `hap nodes` lists every other node with when it last reported.\n\n" +
+				"`prune` removes the agent data of nodes unheard for longer than --older-than\n" +
+				"(default 7 days): their roster, agent names, herdr locations, rate and retry\n" +
+				"state and the node row, and dismisses their pending escalations. It is a\n" +
+				"shared-database write — every machine stops seeing those rows. Kept: the audit\n" +
+				"history, learned rules, task lists, and the names of agents you DISABLED (a node\n" +
+				"that comes back reuses its pane ids, and must not get those agents back with\n" +
+				"automation on). The node's age is checked again at the moment of the delete,\n" +
+				"so a node that reported in the meantime is skipped.\n\n" +
+				"A pruned node that comes back simply re-registers. Its agents get fresh names,\n" +
+				"so task sources that select them by name need `hap rename` again.\n" +
+				"Without --yes nothing is changed: the command lists the candidates.",
+			Examples: []string{
+				"hap nodes", "hap nodes prune", "hap nodes prune --older-than 30d --yes",
+				"hap nodes prune --node old-laptop --older-than 2d --yes",
+			},
+			SelfHints: true,
+			Handler:   nodes,
+		},
+		{
 			Name:    "gc",
 			Group:   groupData,
 			Summary: "reclaim disk from hap's own logs and audit history",
