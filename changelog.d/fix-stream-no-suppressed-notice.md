@@ -1,1 +1,0 @@
-- Stopped `hap stream orchestrator` printing a `# suppressed N self-authored event(s)` line: the orchestrator's own actions now produce no output at all, so they no longer cost it a turn

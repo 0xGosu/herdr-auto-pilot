@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.66
+
+- Stopped `hap stream orchestrator` printing a `# suppressed N self-authored event(s)` line: the orchestrator's own actions now produce no output at all, so they no longer cost it a turn
+
 ## 0.9.65
 
 - Put the full-self-prompting orchestrator to sleep while the mode is off: hap now tells it to stop its event-stream Monitor and hourly health check, so an idle herd costs no tokens, and wakes the same session — re-survey, fresh Monitor, cron re-created — when the mode comes back on
