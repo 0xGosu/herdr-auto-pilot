@@ -416,12 +416,11 @@ func waitForCursor(t *testing.T, rec *cursorRecordingLog, seq int64) {
 	}
 }
 
-// TestStreamSelfWorkAloneWritesNothing: every line wakes the reader, so a run
-// of the orchestrator's own work must produce NO output on its own — not even
-// the "# suppressed" notice, which used to be written 10s after each burst and
-// woke the orchestrator to say it had nothing to act on. The notice rides in
-// front of the next foreign event instead, as one line, naming the last
-// suppressed seq.
+// TestStreamSelfWorkAloneWritesNothing: every line wakes the reader, so the
+// orchestrator's own work must produce NO output — not alone, and not as a
+// "# suppressed" notice riding ahead of the next foreign event either: that
+// notice cost the orchestrator a turn after every action of its own. The next
+// foreign event is the very next thing written.
 func TestStreamSelfWorkAloneWritesNothing(t *testing.T) {
 	app, log := streamApp(t)
 	rec := &cursorRecordingLog{Log: log}
@@ -444,21 +443,18 @@ func TestStreamSelfWorkAloneWritesNothing(t *testing.T) {
 	if err := stop(); err != nil {
 		t.Fatalf("stream returned %v on cancel, want nil", err)
 	}
-	want := banner +
-		fmt.Sprintf("# suppressed 2 self-authored event(s) through seq=%d (--include-self shows them)\n", last) +
-		fmt.Sprintf("%d ", fsp)
-	if got := out.String(); !strings.HasPrefix(got, want) || strings.Count(got, "# suppressed") != 1 {
-		t.Fatalf("want exactly one notice directly ahead of the foreign event, got:\n%s", got)
+	if got := out.String(); !strings.HasPrefix(got, banner+fmt.Sprintf("%d ", fsp)) || strings.Contains(got, "# suppressed") {
+		t.Fatalf("want the foreign event directly after the banner and no notice, got:\n%s", got)
 	}
 }
 
-// TestStreamStopWritesTheOwedNotice: a stream stopped with self-authored
-// events still unannounced ends with the notice, so the seq it reached is not
-// lost to a reader resuming from its last line — and one with nothing owed
-// adds nothing.
-func TestStreamStopWritesTheOwedNotice(t *testing.T) {
-	for _, owed := range []bool{true, false} {
-		t.Run(fmt.Sprintf("owed=%v", owed), func(t *testing.T) {
+// TestStreamStopWritesNothingForSelfWork: a stream stopped with its last
+// events the reader's own ends on the last line it printed — a closing notice
+// would be one more line for the reader to wake to. Control: the same stop
+// with nothing of the reader's own pending ends the same way.
+func TestStreamStopWritesNothingForSelfWork(t *testing.T) {
+	for _, selfLast := range []bool{true, false} {
+		t.Run(fmt.Sprintf("selfLast=%v", selfLast), func(t *testing.T) {
 			app, log := streamApp(t)
 			rec := &cursorRecordingLog{Log: log}
 			app.Stream = rec
@@ -467,30 +463,25 @@ func TestStreamStopWritesTheOwedNotice(t *testing.T) {
 			now := time.Now()
 			last := appendEvent(t, log, domain.StreamPauseOn, now)
 			waitForOutput(t, out, " pause.on by=operator\n")
-			if owed {
+			if selfLast {
 				last = appendSelfEvent(t, log, domain.StreamTaskUpdated, now)
 			}
 			waitForCursor(t, rec, last)
 			if err := stop(); err != nil {
 				t.Fatalf("stream returned %v on cancel, want nil", err)
 			}
-			got := out.String()
-			notice := fmt.Sprintf("# suppressed 1 self-authored event(s) through seq=%d (--include-self shows them)\n", last)
-			if owed && !strings.HasSuffix(got, notice) {
-				t.Fatalf("a stopped stream dropped the notice it owed:\n%s", got)
-			}
-			if !owed && strings.Contains(got, "# suppressed") {
-				t.Fatalf("a stopped stream owing nothing wrote a notice:\n%s", got)
+			if got := out.String(); !strings.HasSuffix(got, " pause.on by=operator\n") {
+				t.Fatalf("a stopped stream wrote past its last foreign event:\n%s", got)
 			}
 		})
 	}
 }
 
 // TestStreamNoticesAVanishedReaderAtTheNextForeignEvent: a write is the only
-// signal that the reader went away, and the orchestrator's own work no longer
-// writes anything — so a stream whose Monitor died while only the orchestrator
-// was acting learns it at the next event somebody else writes, and the owed
-// notice goes out in that same write.
+// signal that the reader went away, and the orchestrator's own work writes
+// nothing — so a stream whose Monitor died while only the orchestrator was
+// acting learns it at the next event somebody else writes, and that event is
+// all the write carries.
 func TestStreamNoticesAVanishedReaderAtTheNextForeignEvent(t *testing.T) {
 	app, log := streamApp(t)
 	rec := &cursorRecordingLog{Log: log}
@@ -523,16 +514,15 @@ func TestStreamNoticesAVanishedReaderAtTheNextForeignEvent(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the stream never noticed its reader was gone at the next foreign event")
 	}
-	want := fmt.Sprintf("# suppressed 3 self-authored event(s) through seq=%d (--include-self shows them)\n%d ", last, fsp)
-	if got := out.attempted.String(); !strings.HasPrefix(got, want) {
-		t.Fatalf("want the notice and the foreign event in one attempted write, got:\n%s", got)
+	if got := out.attempted.String(); !strings.HasPrefix(got, fmt.Sprintf("%d ", fsp)) {
+		t.Fatalf("want the foreign event alone in the attempted write, got:\n%s", got)
 	}
 }
 
-// TestStreamOwedNoticeRidesAheadOfAGap: a "# gap" line is written output too,
-// so a notice owed when one is found goes out in the SAME write, ahead of it —
-// the suppressed seqs are all below the gap, so that is also seq order.
-func TestStreamOwedNoticeRidesAheadOfAGap(t *testing.T) {
+// TestStreamGapCarriesNoSuppressedNotice: a "# gap" found right after the
+// reader's own work is reported on its own, with nothing about that work in
+// front of it.
+func TestStreamGapCarriesNoSuppressedNotice(t *testing.T) {
 	app, log := streamApp(t)
 	pl := newPruneOnDemandLog(log)
 	app.Stream = pl
@@ -540,6 +530,7 @@ func TestStreamOwedNoticeRidesAheadOfAGap(t *testing.T) {
 	t.Cleanup(cli.SetStreamGapRecheck(time.Millisecond))
 	out, stop := startStream(t, app)
 	waitForOutput(t, out, "# hap stream orchestrator head=0 floor=0\n")
+	banner := out.String()
 	old := time.Now().Add(-30 * 24 * time.Hour)
 	// Aged as well: the gap check reads the retained FLOOR, so a surviving
 	// event below the hole would hide it.
@@ -556,10 +547,9 @@ func TestStreamOwedNoticeRidesAheadOfAGap(t *testing.T) {
 	if err := stop(); err != nil {
 		t.Fatalf("stream returned %v on cancel, want nil", err)
 	}
-	want := fmt.Sprintf("# suppressed 1 self-authored event(s) through seq=%d (--include-self shows them)\n"+
-		"# gap missed=%d..%d ", self, self+1, lost)
-	if got := out.String(); !strings.Contains(got, want) || strings.Count(got, "# suppressed") != 1 {
-		t.Fatalf("want the owed notice directly ahead of the gap, exactly once, got:\n%s", got)
+	want := banner + fmt.Sprintf("# gap missed=%d..%d ", self+1, lost)
+	if got := out.String(); !strings.HasPrefix(got, want) || strings.Contains(got, "# suppressed") {
+		t.Fatalf("want the gap directly after the banner, with no notice, got:\n%s", got)
 	}
 }
 

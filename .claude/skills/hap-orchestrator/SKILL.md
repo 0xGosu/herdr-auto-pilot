@@ -118,9 +118,8 @@ Then arm two things and keep them alive:
   you handled. `# gap` or `# reset` means events really were lost: re-survey from
   scratch. Your own actions never come back at you: events `by=orchestrator` are
   suppressed (`--include-self` if you ever need to see them), so anything the
-  Monitor reports is something else moved. A `# suppressed …` line never arrives
-  alone — only just ahead of a real event, or as the last line when the stream
-  stops — and is not something to report: note its seq, say nothing about it;
+  Monitor reports is something else moved — nothing at all is printed for your
+  own work, not even a note that some was left out;
 - an hourly health-check cron: `hap status`, `hap agents`, restart a dead
   daemon with `hap daemon --ensure`, unblock anything stuck, report only if
   something needed action.

@@ -98,39 +98,28 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 	}
 
 	var lastErr string
-	// suppressed counts the self-authored events skipped since the last write,
-	// through seq suppressedThrough. They are owed ONE "# suppressed" notice, and
-	// it is never written on its own: every line of output wakes the reader, and
-	// a notice announcing only the reader's own work is exactly the echo the
-	// filter exists to remove — observed live as an orchestrator waking to say
-	// "that was my own dismissal, nothing to act on" after each of its actions.
-	// So the notice rides IN FRONT of the next line that is written anyway (an
-	// event or a "# gap", in one write so the reader gets one chunk), or is the
-	// stream's last line when it is stopped, where it still hands a resuming
-	// reader the seq it reached.
+	// Self-authored events produce NO output — no event line, and no notice
+	// that any were skipped. Every line of output wakes the reader, and a line
+	// announcing only the reader's own work is exactly the echo the filter
+	// exists to remove: a "# suppressed" notice used to ride ahead of the next
+	// event and end a stopped stream, and the orchestrator spent a turn on it
+	// each time. Nothing is lost without it: the cursor still steps over a
+	// suppressed event (below), a resume filters the same events again, and
+	// every printed line carries its own seq.
 	//
-	// Accepted cost: a write is the only way this loop learns its reader went
-	// away (a closed pipe answers with EPIPE, or SIGPIPE on stdout), so a stream
-	// whose Monitor died while only the orchestrator was acting now follows the
-	// log until the next event someone else writes — the limit a genuinely idle
-	// stream always had, and closing it would mean a heartbeat on every quiet one.
-	var suppressed, suppressedThrough int64
+	// Accepted cost: a reader that resumes from its last PRINTED seq after a
+	// stretch of nothing but its own work longer than streamlog.Retention (7
+	// days) is told "# gap" for events that were all its own. It re-surveys
+	// once; the notice that could have spared it cost a turn on every action.
+	//
+	// And: a write is the only way this loop learns its reader went away (a
+	// closed pipe answers with EPIPE, or SIGPIPE on stdout), so a stream whose
+	// Monitor died while only the orchestrator was acting follows the log until
+	// the next event someone else writes — the limit a genuinely idle stream
+	// always had, and closing it would mean a heartbeat on every quiet one.
 	write := func(text string) bool {
-		if suppressed > 0 {
-			text = suppressedNotice(suppressed, suppressedThrough) + text
-			suppressed = 0
-		}
 		_, err := io.WriteString(out, text)
 		return err == nil
-	}
-	// finish writes the notice still owed when the stream is stopped. Never
-	// called on a failed write: that reader is gone. A failure here needs no
-	// handling — the stream is ending either way.
-	finish := func() error {
-		if suppressed > 0 {
-			_, _ = io.WriteString(out, suppressedNotice(suppressed, suppressedThrough))
-		}
-		return nil
 	}
 	// settled means the previous read came back empty AND its gap check found
 	// nothing, so the cursor had reached the head. From there an empty read
@@ -161,7 +150,7 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		if err != nil {
 			settled = false
 			if ctx.Err() != nil {
-				return finish()
+				return nil
 			}
 			// A transient read failure (a busy database) must not end a stream
 			// an agent is watching; say it once per distinct error and retry.
@@ -186,9 +175,6 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 				if !write(ev.Line() + "\n") {
 					return nil // the reader went away
 				}
-			} else {
-				suppressed++
-				suppressedThrough = ev.Seq
 			}
 			cursor = ev.Seq
 		}
@@ -203,15 +189,10 @@ func streamOrchestrator(ctx context.Context, app *frontend.App, out io.Writer, a
 		}
 		select {
 		case <-ctx.Done():
-			return finish()
+			return nil
 		case <-time.After(wait):
 		}
 	}
-}
-
-// suppressedNotice is the one line owed for a run of self-authored events.
-func suppressedNotice(n, through int64) string {
-	return fmt.Sprintf("# suppressed %d self-authored event(s) through seq=%d (--include-self shows them)\n", n, through)
 }
 
 // prunedUnder reports the last seq of events pruned beneath the cursor that
