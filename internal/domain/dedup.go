@@ -185,7 +185,8 @@ type PendingEscalation struct {
 // DuplicatesPendingEscalation reports whether a fresh capture repeats an
 // escalation already awaiting the operator — so re-raising it would just ask
 // the same question twice. `pending` must be pre-scoped to one agent + agent
-// type (the store does this).
+// type (the store does this); agentType is that type, and gates the one
+// agent-specific rule (a different standing Claude dialog is never a repeat).
 //
 // The key is agent + agent type + the normalized pane content. Neither the
 // agent status nor the situation type participates:
@@ -246,7 +247,8 @@ type PendingEscalation struct {
 // characters — never collapse into one, which would silently strand the second
 // agent. jitterPct <= 0 disables the tolerance, preserving the exact-match
 // behavior.
-func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshotCap, jitterPct int, pending []PendingEscalation) bool {
+func DuplicatesPendingEscalation(sitType SituationType, agentType, excerpt string, snapshotCap, jitterPct int, pending []PendingEscalation) bool {
+	claude := strings.EqualFold(strings.TrimSpace(agentType), "claude")
 	key := NormalizeForDedup(excerpt)
 	freshWindowed := snapshotCap > 0 && utf8.RuneCountInString(excerpt)*2 >= snapshotCap
 	suffixKey := NormalizeForDedup(dropFirstLine(excerpt))
@@ -275,9 +277,16 @@ func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshot
 		}
 		// A different Claude dialog standing at the bottom is a different
 		// question, however little of the screen it moved: the next page of a
-		// paged permission queue differs from the last by its "N of M" counter
-		// and a parameter line, well inside the jitter tolerance below.
-		if ClaudeModalAdvanced(p.PaneExcerpt, excerpt) {
+		// paged permission queue differs from the last by its tool and a
+		// parameter line, well inside the jitter tolerance below.
+		//
+		// Claude ONLY (#565). ClaudeModalRegion also finds a region in agy's
+		// approvals — a rule above a numbered list — but agy's key-hint line sits
+		// inside it and changes with the agent's mode (plan mode appends "· ctrl+r
+		// Review"), so the same standing agy approval re-captured after a mode
+		// switch would skip both fuzzy paths and be escalated twice. agy draws no
+		// paged queue, so nothing is lost by leaving it to the paths below.
+		if claude && ClaudeModalAdvanced(p.PaneExcerpt, excerpt) {
 			continue
 		}
 		// Suffix path (head-shift tolerant): the first line may be a truncation

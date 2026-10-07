@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -299,7 +300,7 @@ func TestDuplicatesPendingEscalation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// jitter 0: every case here pins the exact/suffix behavior, which the
 			// tolerance path must leave untouched.
-			if got := DuplicatesPendingEscalation(tc.sit, tc.excerpt, tc.cap, 0, tc.pending); got != tc.want {
+			if got := DuplicatesPendingEscalation(tc.sit, "claude", tc.excerpt, tc.cap, 0, tc.pending); got != tc.want {
 				t.Errorf("DuplicatesPendingEscalation = %v, want %v", got, tc.want)
 			}
 		})
@@ -390,7 +391,7 @@ func TestDuplicatesPendingEscalationJitter(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := DuplicatesPendingEscalation(SituationIdle, tc.excerpt, cap, tc.jitter, tc.pending); got != tc.want {
+			if got := DuplicatesPendingEscalation(SituationIdle, "claude", tc.excerpt, cap, tc.jitter, tc.pending); got != tc.want {
 				t.Errorf("DuplicatesPendingEscalation = %v, want %v", got, tc.want)
 			}
 		})
@@ -414,14 +415,14 @@ func TestDuplicatesPendingEscalationClaudePagedPrompt(t *testing.T) {
 	first := page("1 of 3", "Get Pr", "61")
 	pending := []PendingEscalation{pend(SituationApproval, first)}
 
-	if DuplicatesPendingEscalation(SituationApproval, page("2 of 3", "Get Files", "62"), cap, 5, pending) {
+	if DuplicatesPendingEscalation(SituationApproval, "claude", page("2 of 3", "Get Files", "62"), cap, 5, pending) {
 		t.Error("the next page of a paged permission queue was collapsed into the answered one")
 	}
-	if !DuplicatesPendingEscalation(SituationApproval, page("1 of 4", "Get Pr", "61"), cap, 5, pending) {
+	if !DuplicatesPendingEscalation(SituationApproval, "claude", page("1 of 4", "Get Pr", "61"), cap, 5, pending) {
 		t.Error("the same dialog with only its queue counter moved no longer dedups")
 	}
 	jittered := strings.Replace(first, "line 20:", "line 20: (retry)", 1)
-	if !DuplicatesPendingEscalation(SituationApproval, jittered, cap, 5, pending) {
+	if !DuplicatesPendingEscalation(SituationApproval, "claude", jittered, cap, 5, pending) {
 		t.Error("jitter around the SAME standing dialog no longer dedups")
 	}
 }
@@ -480,5 +481,32 @@ func TestSuffixDuplicateRatioBoundary(t *testing.T) {
 	}
 	if suffixDuplicate(strings.Repeat("●", 19), glyphLonger) {
 		t.Errorf("a below-2/3-rune-length glyph tail must be refused")
+	}
+}
+
+// #565: agy's key-hint line sits inside the region ClaudeModalRegion extracts
+// and changes with the agent's mode, so the claude-only paged-prompt rule must
+// not apply to agy — the same standing approval with only that line changed is
+// still the same question. The control half keeps the claude rule in force.
+func TestDuplicatesPendingEscalationAgyHintLineIsNotANewDialog(t *testing.T) {
+	const cap = 200
+	b, err := os.ReadFile("../classify/testdata/transcripts/approval_agy_shell.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shell := string(b)
+	hinted := strings.Replace(shell, "ctrl+g edit/expand command\n", "ctrl+g edit/expand command · ctrl+r Review\n", 1)
+	if hinted == shell {
+		t.Fatal("the hint line did not change; the case proves nothing")
+	}
+	if !ClaudeModalAdvanced(shell, hinted) {
+		t.Fatal("premise: the hint line moves the extracted region; without it this case proves nothing")
+	}
+	pending := []PendingEscalation{pend(SituationApproval, shell)}
+	if !DuplicatesPendingEscalation(SituationApproval, AgentTypeAgy, hinted, cap, 5, pending) {
+		t.Error("the same agy approval with only its mode-hint line changed was not collapsed")
+	}
+	if DuplicatesPendingEscalation(SituationApproval, "claude", hinted, cap, 5, pending) {
+		t.Error("control: for claude a different standing dialog must still escalate")
 	}
 }

@@ -2527,7 +2527,7 @@ func (d *Daemon) duplicatePendingEscalation(ctx context.Context, s domain.Situat
 	// tail window" threshold that gates the two fuzzy paths, not a storage budget —
 	// passing the larger aggregate budget would silently switch those paths off for
 	// exactly the captures most likely to need them.
-	return domain.DuplicatesPendingEscalation(s.Type,
+	return domain.DuplicatesPendingEscalation(s.Type, s.AgentType,
 		truncateExcerpt(s.Content), snapshotMaxRunes,
 		escalationDedupJitterPercent, pending)
 }
