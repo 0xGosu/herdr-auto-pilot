@@ -3887,6 +3887,11 @@ func (d *Daemon) followUpPromptStanding(ctx context.Context, p verifyunblock.Par
 	if p.SituationType != domain.SituationApproval && p.SituationType != domain.SituationChoice {
 		return false
 	}
+	// A swept form's aggregate is never compared to a live frame
+	// (ClaudeModalAdvanced refuses it); refuse it before any herdr read.
+	if domain.LooksLikeAggregatedMCQ(p.Excerpt) {
+		return false
+	}
 	if _, ok := domain.ClaudeModalRegion(p.Excerpt); !ok {
 		return false
 	}
@@ -3919,8 +3924,8 @@ func (d *Daemon) followUpPromptStanding(ctx context.Context, p verifyunblock.Par
 	// Not an operator retry and not an idle-poll hand-out: those intents belonged
 	// to the capture that was just answered. shutdownCtx, not ctx: ctx is this
 	// check's own deadline and is cancelled the moment it returns, which would
-	// drop the capture before its delay elapsed.
-	live.Status = "blocked"
+	// drop the capture before its delay elapsed. live.Status is already
+	// "blocked" (checked above).
 	live.RetryAuditID, live.AutoIdleSend = 0, false
 	if live.AgentID == "" {
 		live.AgentID = p.AgentID

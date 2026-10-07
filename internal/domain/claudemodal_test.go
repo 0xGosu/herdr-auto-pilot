@@ -106,3 +106,44 @@ func TestClaudeModalAdvancedIgnoresTheQueueCounter(t *testing.T) {
 		})
 	}
 }
+
+// The selection caret marks where the cursor rests, not which dialog stands:
+// arrowing through the options, or a digit that only moved the caret, is the
+// SAME dialog. Read as an advance, an answer that did not land would be
+// captured and answered again (and the dedup would raise it twice).
+func TestClaudeModalAdvancedIgnoresTheCaret(t *testing.T) {
+	one := readClaudeModalFixture(t, "claude_paged_approval_1of3.txt")
+	moved := strings.Replace(strings.Replace(one, " ❯ 1. Yes\n", "   1. Yes\n", 1),
+		"   2. Yes, and", " ❯ 2. Yes, and", 1)
+	if moved == one {
+		t.Fatal("the caret did not move; the case proves nothing")
+	}
+	if ClaudeModalAdvanced(one, moved) {
+		t.Fatal("a caret-only change read as a new dialog")
+	}
+}
+
+// mcqFrame is one tab of a Claude AskUserQuestion form: a rule, the question,
+// its options, and the inner rule above "Chat about this".
+func mcqFrame(question string) string {
+	rule := strings.Repeat("─", 60)
+	return "● Asking.\n" + rule + "\n←  ☐ First  ☐ Second  ✔ Submit  →\n\n" + question +
+		"\n\n❯ 1. Alpha\n  2. Beta\n  3. Type something.\n" + rule + "\n  4. Chat about this\n\n" +
+		"Enter to select · Tab/Arrow keys to navigate · Esc to cancel\n"
+}
+
+// A swept form's baseline is an AGGREGATE; its region is the last frame's (the
+// Submit tab), never the one frame a live read shows. Compared, a form still
+// standing after a delivery that did not land would read as answered.
+func TestClaudeModalAdvancedRefusesAnAggregate(t *testing.T) {
+	submit := "←  ☐ First  ☐ Second  ✔ Submit  →\n\nReview your answers\n\n" +
+		"Ready to submit your answers?\n\n❯ 1. Submit answers\n  2. Cancel\n"
+	first := mcqFrame("First question?")
+	agg := AggregateMCQFrames([]string{first, mcqFrame("Second question?"), submit})
+	if _, ok := ClaudeModalRegion(agg); !ok {
+		t.Fatal("the aggregate carries no region; the case proves nothing")
+	}
+	if ClaudeModalAdvanced(agg, first) || ClaudeModalAdvanced(first, agg) {
+		t.Fatal("an aggregate compared against one frame of the same standing form read as an advance")
+	}
+}

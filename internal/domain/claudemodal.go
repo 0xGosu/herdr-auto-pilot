@@ -9,9 +9,16 @@ import (
 // dialog's header line ("Tool use · from the general-purpose agent   2 of 3").
 var claudeModalCounterRE = regexp.MustCompile(`\s+\d+ of \d+$`)
 
+// claudeModalCaretRE is the selection caret in front of a numbered option
+// ("❯ 1. Yes"). It marks where the cursor rests, not which dialog stands, so it
+// is dropped: arrowing through the options, or a digit that only moved the
+// caret, must not read as a different dialog.
+var claudeModalCaretRE = regexp.MustCompile(`^[❯›>]\s*(\d+[.)]|\[\d+\])`)
+
 // ClaudeModalRegion returns the dialog Claude Code is standing at — every line
-// below the LAST plain horizontal rule of the capture, with blank lines and the
-// key-hint footer ("Esc to cancel · …") dropped and whitespace collapsed — so
+// below the LAST plain horizontal rule of the capture, with blank lines, the
+// key-hint footer ("Esc to cancel · …", any case) and the selection caret
+// dropped and whitespace collapsed — so
 // two captures of the same dialog compare equal however the rest of the screen
 // moved. ok is false when the capture has no such rule, or when what sits below
 // it offers no numbered option: the region is only a dialog when it can be
@@ -54,13 +61,14 @@ func ClaudeModalRegion(pane string) (string, bool) {
 	kept := make([]string, 0, len(lines)-top)
 	for _, line := range lines[top+1:] {
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.Contains(trimmed, "Esc to cancel") {
+		if trimmed == "" || strings.Contains(strings.ToLower(trimmed), "esc to cancel") {
 			continue
 		}
 		line := strings.Join(strings.Fields(trimmed), " ")
 		if len(kept) == 0 {
 			line = claudeModalCounterRE.ReplaceAllString(line, "")
 		}
+		line = claudeModalCaretRE.ReplaceAllString(line, "$1")
 		kept = append(kept, line)
 	}
 	region := strings.Join(kept, "\n")
@@ -74,7 +82,16 @@ func ClaudeModalRegion(pane string) (string, bool) {
 // (ClaudeModalRegion) and that it is not the same one — the evidence that an
 // answer landed and Claude drew its next queued prompt in place. Either side
 // without a dialog answers false: absence of evidence is not an advance.
+//
+// So does a swept multi-tab AGGREGATE on either side. Its region is the LAST
+// frame's (the Submit tab), which never equals the one frame a live read shows,
+// so comparing the two would report every still-standing form as answered. A
+// swept form's baseline is compared frame-wise (mcqFormHeldStill), never here.
+// The marker test, not the strict parse: a stored excerpt may have been cut.
 func ClaudeModalAdvanced(before, after string) bool {
+	if LooksLikeAggregatedMCQ(before) || LooksLikeAggregatedMCQ(after) {
+		return false
+	}
 	b, ok := ClaudeModalRegion(before)
 	if !ok {
 		return false

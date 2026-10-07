@@ -148,8 +148,17 @@ func TestRealClaudePagedApprovalQueueIsFollowed(t *testing.T) {
 	if !strings.HasPrefix(first, "1 of ") || first == "1 of 1" {
 		t.Skipf("claude did not page its approvals (last counter %q); nothing to assert", first)
 	}
-	// Let the counter settle: the third request can join a moment after the second.
-	time.Sleep(2 * time.Second)
+	// Let the counter settle: the third request can join a moment after the
+	// second. Waited for on screen, not slept: a queue that stays at two is
+	// still a queue, so the deadline only bounds the wait.
+	settle := time.Now().Add(10 * time.Second)
+	for time.Now().Before(settle) && first != "1 of 3" {
+		time.Sleep(300 * time.Millisecond)
+		content, _ := cli.ReadPaneVisible(context.Background(), pane, 60)
+		if pos := pagerPosition(content); pos != "" {
+			first = pos
+		}
+	}
 
 	h := newTestDaemon(t, cli, "")
 	dctx, cancel := context.WithCancel(context.Background())
