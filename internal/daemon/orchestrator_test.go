@@ -1162,7 +1162,8 @@ func TestOrchestratorWakeFailureReachesTheHeartbeatAndClears(t *testing.T) {
 	if hl := h.daemon.orchestratorHealth(); hl == nil || !strings.Contains(hl.LastError, "wake") {
 		t.Fatalf("health = %+v, want the wake failure", hl)
 	}
-	h.herdr.setFailSend(false)
+	// Sends still failing: a delivered dormant message would clear the error
+	// itself, so only the toggle's settle can be what clears it here.
 	setOrchestratorFSP(h, false)
 	orchestratorSweep(t, h)
 	setOrchestratorFSP(h, true)

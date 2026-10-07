@@ -428,6 +428,15 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 	}
 	d.orch.running = true
 	d.orch.mu.Unlock()
+	d.spawnOrchestratorPass(func(ctx context.Context) {
+		d.ensureOrchestrator(ctx, launcher, cfg, agents)
+	})
+}
+
+// spawnOrchestratorPass runs pass as the one pass in flight. The caller has
+// already set d.orch.running under d.orch.mu; it is cleared when pass returns,
+// or at once when the daemon is shutting down and nothing was spawned.
+func (d *Daemon) spawnOrchestratorPass(pass func(ctx context.Context)) {
 	release := func() {
 		d.orch.mu.Lock()
 		d.orch.running = false
@@ -436,7 +445,7 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 	if !d.spawn(func() {
 		defer release()
 		_ = logging.Guard("orchestrator", func() error {
-			d.ensureOrchestrator(d.shutdownCtx, launcher, cfg, agents)
+			pass(d.shutdownCtx)
 			return nil
 		})
 	}) {
@@ -444,17 +453,27 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 	}
 }
 
+// orchestratorListing returns agents, or a fresh listing when the caller had
+// none (startup, a reload); ok is false when herdr could not list.
+func (d *Daemon) orchestratorListing(ctx context.Context, agents []domain.AgentTransition) ([]domain.AgentTransition, bool) {
+	if agents != nil {
+		return agents, true
+	}
+	listed, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		slog.Warn("orchestrator: listing agents failed", "error", err)
+		return nil, false
+	}
+	return listed, true
+}
+
 // ensureOrchestrator is one pass: make sure the session exists, then that it
 // has been briefed.
 func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLauncher, cfg config.Config,
 	agents []domain.AgentTransition) {
-	if agents == nil {
-		listed, err := d.opt.Herdr.ListAgents(ctx)
-		if err != nil {
-			slog.Warn("orchestrator: listing agents failed", "error", err)
-			return
-		}
-		agents = listed
+	agents, ok := d.orchestratorListing(ctx, agents)
+	if !ok {
+		return
 	}
 	// Against the OLD identity, before anything can replace it: a pane recycled
 	// while the daemon was down still carries the previous orchestrator's name
@@ -529,6 +548,12 @@ func (d *Daemon) settleOrchestratorNudges(wantDormant bool) {
 	}
 	d.orch.id.NudgeTarget, d.orch.id.NudgeAttempts = wantDormant, 0
 	d.saveOrchestratorLocked(d.orch.id)
+	d.clearNudgeErrLocked()
+}
+
+// clearNudgeErrLocked drops the heartbeat error a failed wake wrote, leaving
+// any other error alone. Caller holds d.orch.mu.
+func (d *Daemon) clearNudgeErrLocked() {
 	if d.orch.nudgeErr != "" && d.orch.lastErr == d.orch.nudgeErr {
 		d.orch.lastErr = ""
 	}
@@ -547,32 +572,17 @@ func (d *Daemon) startOrchestratorDormancyPass(agents []domain.AgentTransition) 
 	}
 	d.orch.running = true
 	d.orch.mu.Unlock()
-	release := func() {
-		d.orch.mu.Lock()
-		d.orch.running = false
-		d.orch.mu.Unlock()
-	}
-	if !d.spawn(func() {
-		defer release()
-		_ = logging.Guard("orchestrator", func() error {
-			d.ensureOrchestratorDormant(d.shutdownCtx, agents)
-			return nil
-		})
-	}) {
-		release()
-	}
+	d.spawnOrchestratorPass(func(ctx context.Context) {
+		d.ensureOrchestratorDormant(ctx, agents)
+	})
 }
 
 // ensureOrchestratorDormant is the mode-off pass: tell a live session hap
 // briefed to stand its Monitor and cron down.
 func (d *Daemon) ensureOrchestratorDormant(ctx context.Context, agents []domain.AgentTransition) {
-	if agents == nil {
-		listed, err := d.opt.Herdr.ListAgents(ctx)
-		if err != nil {
-			slog.Warn("orchestrator: listing agents failed", "error", err)
-			return
-		}
-		agents = listed
+	agents, ok := d.orchestratorListing(ctx, agents)
+	if !ok {
+		return
 	}
 	d.observeOrchestrator(ctx, agents)
 	id := d.orchestratorIdentity()
@@ -625,7 +635,7 @@ func (d *Daemon) nudgeOrchestrator(ctx context.Context, id domain.OrchestratorId
 	}
 	cfg, _, _ := d.snapshot()
 	err = ports.SendToAgent(ctx, d.opt.Herdr, id.PaneID, domain.OrchestratorAgentKind, d.renderOrchestratorText(cfg, text))
-	attempts := d.recordOrchestratorNudge(id, dormant, what, err)
+	attempts := d.recordOrchestratorNudge(id, dormant, err)
 	if err != nil {
 		slog.Warn("orchestrator: sending the "+what+" message failed", "attempt", attempts, "error", err)
 	} else {
@@ -639,7 +649,7 @@ func (d *Daemon) nudgeOrchestrator(ctx context.Context, id domain.OrchestratorId
 // started a fresh count (settleOrchestratorNudges) while the send was in
 // flight, and a stale snapshot would resurrect the spent one. Returns the
 // failed-send count toward this target.
-func (d *Daemon) recordOrchestratorNudge(sent domain.OrchestratorIdentity, dormant bool, what string, err error) int {
+func (d *Daemon) recordOrchestratorNudge(sent domain.OrchestratorIdentity, dormant bool, err error) int {
 	d.orch.mu.Lock()
 	defer d.orch.mu.Unlock()
 	id := &d.orch.id
@@ -648,10 +658,7 @@ func (d *Daemon) recordOrchestratorNudge(sent domain.OrchestratorIdentity, dorma
 	}
 	if err == nil {
 		id.Dormant, id.NudgeUnconfirmed, id.NudgeTarget, id.NudgeAttempts = dormant, false, dormant, 0
-		if d.orch.nudgeErr != "" && d.orch.lastErr == d.orch.nudgeErr {
-			d.orch.lastErr = ""
-		}
-		d.orch.nudgeErr = ""
+		d.clearNudgeErrLocked()
 		d.saveOrchestratorLocked(*id)
 		return 0
 	}
@@ -664,8 +671,8 @@ func (d *Daemon) recordOrchestratorNudge(sent domain.OrchestratorIdentity, dorma
 	// nothing while the mode is off, so a dormant failure there would only
 	// surface — stale — after the mode came back.
 	if !dormant {
-		d.orch.lastErr = fmt.Sprintf("sending the %s message failed (attempt %d of %d): %v",
-			what, id.NudgeAttempts, orchestratorNudgeAttempts, err)
+		d.orch.lastErr = fmt.Sprintf("sending the wake message failed (attempt %d of %d): %v",
+			id.NudgeAttempts, orchestratorNudgeAttempts, err)
 		d.orch.lastErrAt = d.opt.Clock.Now()
 		d.orch.nudgeErr = d.orch.lastErr
 	}
