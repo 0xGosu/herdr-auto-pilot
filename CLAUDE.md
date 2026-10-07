@@ -208,9 +208,9 @@ real confirm is proven only in `internal/frontend`, and TUI/CLI suites must drai
 - A wedged sync restarts with `--restart`, never `--ensure` (`checkFleetSyncWedged`), only for process-local
   faults (`domain.SyncFailureProcessLocal`).
 - Retention (`PruneAgedRows`): `audit_log` and `decisions` are never swept; roster rows only with a tombstone.
+  **Test trap:** `kill_events` survivors are per SCOPE — seed non-global rows.
 - The ONE cross-node delete is `store.PruneOfflineNode` (`hap nodes prune`): deliberate, operator-run, freshness
   re-checked inside its transaction, disabled agents' names kept (a returning node must not get them back enabled).
-  **Test trap:** `kill_events` survivors are per SCOPE — seed non-global rows.
 - Front ends poll a change token (`Store.Revision`, `frontend.App.ChangeKey`), one poll in flight. Config
   never enters the database; front ends draw ids from the daemon with no local fallback.
 
