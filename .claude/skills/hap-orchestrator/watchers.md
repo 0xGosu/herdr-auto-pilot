@@ -32,14 +32,9 @@ immediately; also restart it after any daemon upgrade so it runs the new binary:
 hap stream orchestrator --resume <last-seq>
 ```
 
-Two lines in that output are bookkeeping, not signal. `# gap` and `# reset` mean
-events really were lost — re-survey the herd from scratch. **`# suppressed N
-self-authored event(s) through seq=N` is neither an event nor something to
-report to the operator**: it only confirms that events you authored were
-filtered out, and advances the sequence. It is never printed on its own — only
-just ahead of a real event, or as the last line when the stream stops. Note the
-seq and move on. Speak up for
-real events only — `escalation`, `task.*`, `task_source.*`, `daemon.started`,
+`# gap` and `# reset` mean events really were lost — re-survey the herd from
+scratch. Events you authored print nothing at all, so every line is something
+you have not done yourself. Speak up for real events only — `escalation`, `task.*`, `task_source.*`, `daemon.started`,
 and gap/reset. `agent.mode … promote=<mode>` is acted on, not reported: run
 `hap mode <agent> <mode> --yes` (see the loop in SKILL.md).
 

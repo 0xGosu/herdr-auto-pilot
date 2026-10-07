@@ -863,10 +863,8 @@ func buildCommands() {
 				"still consume their sequence numbers, so a --resume cursor never replays them\n" +
 				"and a run of them is not a gap. Pass --include-self to see them anyway when\n" +
 				"debugging what an emitter writes. Another node's orchestrator is not affected:\n" +
-				"the log is per machine. A `# suppressed N … through seq=N` line only notes that\n" +
-				"some were left out; it carries no event and is not worth reporting onward. It\n" +
-				"is never written on its own — only just ahead of the next real line, or as the\n" +
-				"last line when the stream is stopped — so your own work alone prints nothing.\n\n" +
+				"the log is per machine. Nothing at all is printed for them — not even a note\n" +
+				"that some were left out — so your own work never wakes you.\n\n" +
 				"There is no heartbeat, deliberately: most of these streams are idle most of\n" +
 				"the time, and a keepalive on every quiet one buys nothing. So a reader whose\n" +
 				"watch has a timeout cannot tell an expiry from a quiet herd — arm it with the\n" +

@@ -676,7 +676,7 @@ func TestOrchestratorBriefShape(t *testing.T) {
 		"`hap daemon --ensure`", "`fsp.off`", "`fsp.on`",
 		// The stream leaves out the orchestrator's own events; a brief that
 		// does not say so disagrees with the binary it drives.
-		"`--include-self`", "`# suppressed`",
+		"`--include-self`",
 		// The pane check alone attributes only commands run in the
 		// orchestrator's own pane; the brief declares the actor explicitly so
 		// every command it runs is audited as the orchestrator's.
@@ -685,6 +685,12 @@ func TestOrchestratorBriefShape(t *testing.T) {
 		if !strings.Contains(orchestratorBrief, want) {
 			t.Errorf("the brief does not mention %s", want)
 		}
+	}
+	// The stream prints nothing for the orchestrator's own events — no notice
+	// either — so a brief that still describes one sends the session looking
+	// for a line that never comes.
+	if strings.Contains(orchestratorBrief, "# suppressed") {
+		t.Error("the brief still describes a `# suppressed` line the stream no longer prints")
 	}
 }
 

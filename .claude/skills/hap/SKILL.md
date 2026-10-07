@@ -1418,12 +1418,9 @@ interrupted — built for an agent to watch (Claude's `Monitor` tool) and react:
 - **Your own actions are not printed** — events `by=orchestrator` are
   suppressed, so the stream carries only what you have not already done
   yourself. They still take their sequence numbers, so `--resume` never replays
-  them and a run of them is not a `# gap`. Such a run is noted by one
-  `# suppressed N self-authored event(s) through seq=S` line, which is never
-  printed on its own: it arrives just ahead of the next real event (or as the
-  last line when the stream stops), so your own work alone prints nothing and
-  never wakes you. Ignore it beyond noting the seq. `--include-self` prints them when you are debugging what
-  an emitter writes.
+  them and a run of them is not a `# gap`. Nothing at all is printed for them —
+  no notice that any were left out — so your own work never wakes you.
+  `--include-self` prints them when you are debugging what an emitter writes.
 - **Per machine:** an action taken on another fleet node appears in that
   machine's stream; a hand edit to `config.toml` or a task file is not an event.
 
