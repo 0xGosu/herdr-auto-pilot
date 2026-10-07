@@ -1,0 +1,2 @@
+- Fixed Claude agents staying blocked after hap answered the first of several queued tool approvals (the "1 of 3" dialog parallel subagents raise): hap now captures and answers each following approval instead of waiting for a status change that never comes
+- Made full self-prompting and timed auto-accept report an answer that did not land ("agent still blocked after action"), like every other automatic answer

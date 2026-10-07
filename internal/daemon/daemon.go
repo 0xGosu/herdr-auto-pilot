@@ -330,6 +330,20 @@ type Daemon struct {
 	// Guarded by mu.
 	episodeHandled map[string]bool
 
+	// followUpRecaptures counts, per pane, the captures the post-action
+	// self-check scheduled for a Claude prompt drawn in place of the one just
+	// answered (followUpPromptStanding). Cleared with episodeHandled — on the
+	// agent's next "working" transition, and when the pane is recycled — so it
+	// bounds one blocked stretch, never the pane's lifetime. Guarded by mu.
+	followUpRecaptures map[string]int
+
+	// captureGen counts, per pane, every cancelCapture. A capture decided OFF
+	// the select loop (followUpPromptStanding) snapshots it before looking and
+	// is installed only if it has not moved (scheduleCaptureIf), so a "working"
+	// transition handled while it looked voids it instead of being outlived by
+	// it. Monotonic; guarded by mu.
+	captureGen map[string]uint64
+
 	// learnInFlight marks agents with a learn-from-correction run outstanding,
 	// so a burst of corrections cannot stack CLI subprocesses on one agent.
 	// Corrections are human-paced, so this only ever guards a burst (a batch
@@ -930,6 +944,8 @@ func New(opt Options) (*Daemon, error) {
 		pendingCapture:            map[string]*captureEntry{},
 		captureStarted:            map[string]bool{},
 		episodeHandled:            map[string]bool{},
+		followUpRecaptures:        map[string]int{},
+		captureGen:                map[string]uint64{},
 		learnInFlight:             map[string]bool{},
 		lastAutoSend:              map[string]time.Time{},
 		lastAutoNoop:              map[string]time.Time{},
@@ -2037,6 +2053,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 		// file, so dropping it strands nothing).
 		d.mu.Lock()
 		delete(d.episodeHandled, tr.PaneID)
+		delete(d.followUpRecaptures, tr.PaneID)
 		delete(d.idleSince, tr.AgentID)
 		delete(d.episodeNoticeRaised, tr.AgentID)
 		delete(d.autoTaskClaim, tr.AgentID)
@@ -2107,6 +2124,7 @@ func (d *Daemon) handleTransition(ctx context.Context, tr domain.AgentTransition
 // firing sees its map entry gone and bails (generation check).
 func (d *Daemon) cancelCapture(paneID string) {
 	d.mu.Lock()
+	d.captureGen[paneID]++
 	if p := d.pendingCapture[paneID]; p != nil {
 		d.stopTimer(p.timer) // release the tracked bg slot, not a bare Stop
 		delete(d.pendingCapture, paneID)
@@ -2125,8 +2143,19 @@ type captureEntry struct {
 // a pending one (latest wins). When the timer fires, the transition
 // re-enters the main loop through delayedTr — nothing sleeps in Run.
 func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition) {
+	d.scheduleCaptureIf(ctx, tr, nil)
+}
+
+// scheduleCaptureIf is scheduleCapture behind a precondition evaluated under
+// d.mu, atomically with installing the capture; it reports whether the capture
+// was scheduled. nil always schedules.
+func (d *Daemon) scheduleCaptureIf(ctx context.Context, tr domain.AgentTransition, still func() bool) bool {
 	cfg, _, _ := d.snapshot()
 	d.mu.Lock()
+	if still != nil && !still() {
+		d.mu.Unlock()
+		return false
+	}
 	if p := d.pendingCapture[tr.PaneID]; p != nil {
 		d.stopTimer(p.timer)
 		// A regular attention event may arrive while an operator-requested
@@ -2163,10 +2192,11 @@ func (d *Daemon) scheduleCapture(ctx context.Context, tr domain.AgentTransition)
 		// Daemon shutting down: drop this capture rather than leak an entry
 		// whose timer will never fire (afterFunc refused to schedule).
 		d.mu.Unlock()
-		return
+		return false
 	}
 	d.pendingCapture[tr.PaneID] = entry
 	d.mu.Unlock()
+	return true
 }
 
 // reconcileAttention surfaces agents already parked in an attention state at
@@ -2293,6 +2323,7 @@ func (d *Daemon) resetRecycledPaneState(ctx context.Context, a domain.AgentTrans
 
 	d.mu.Lock()
 	delete(d.episodeHandled, a.PaneID)
+	delete(d.followUpRecaptures, a.PaneID)
 	delete(d.captureStarted, a.PaneID)
 	delete(d.paneCwds, a.PaneID)
 	delete(d.lastAutoSend, a.AgentID)
@@ -3799,6 +3830,11 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 			// read a store the caller is about to close.
 			ctx, cancel := context.WithTimeout(d.shutdownCtx, 10*time.Second)
 			defer cancel()
+			// Ahead of Check: a new prompt is not a failed delivery, so it
+			// writes no delivery_failed row and raises no notification.
+			if d.followUpPromptStanding(ctx, p) {
+				return nil
+			}
 			blocked, _, err := verifyunblock.Check(ctx, d.opt.Herdr, d.opt.Store, p, d.opt.Clock.Now())
 			if err != nil {
 				slog.Warn("post-action unblock self-check failed", "agent", p.AgentID, "error", err)
@@ -3817,6 +3853,111 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 			return nil
 		})
 	})
+}
+
+// maxFollowUpRecaptures bounds how many in-place Claude prompts the self-check
+// will capture for one pane before the agent next goes working. A queue longer
+// than this falls back to the ordinary "still blocked" notification rather than
+// typing on without end. Far above any batch seen live (parallel subagents
+// queue one approval each).
+const maxFollowUpRecaptures = 32
+
+// followUpPromptStanding is the self-check's first question: did the answer
+// land and Claude draw its NEXT prompt in place? If so it schedules a capture of
+// that prompt and reports true.
+//
+// It exists because nothing else would ever look. Concurrent requesters
+// (parallel subagents) queue their tool approvals behind one paged dialog ("1
+// of 3"); answering one draws the next while herdr keeps reporting the agent
+// blocked, so there is no status event, and reconcileAttention skips a pane
+// whose parked episode it already handled. The queue then stands forever —
+// observed live under full self-prompting, and reproduced against Claude Code
+// 2.1.292 with the agent left blocked for 9+ minutes with nothing captured.
+//
+// Evidence-gated on purpose: the dialog region of the answered capture and of a
+// fresh visible read must DIFFER (domain.ClaudeModalAdvanced). An unchanged
+// dialog means the answer did not land, which stays the self-check's failure
+// to report — capturing it again would answer the same prompt again. Claude
+// only: agy re-captures after every answer itself (recaptureAfterAgyAnswer), and
+// no other agent is known to page prompts in place.
+func (d *Daemon) followUpPromptStanding(ctx context.Context, p verifyunblock.Params) bool {
+	if !strings.EqualFold(strings.TrimSpace(p.AgentType), "claude") {
+		return false
+	}
+	if p.SituationType != domain.SituationApproval && p.SituationType != domain.SituationChoice {
+		return false
+	}
+	// A swept form's aggregate is never compared to a live frame
+	// (ClaudeModalAdvanced refuses it); refuse it before any herdr read.
+	if domain.LooksLikeAggregatedMCQ(p.Excerpt) {
+		return false
+	}
+	if _, ok := domain.ClaudeModalRegion(p.Excerpt); !ok {
+		return false
+	}
+	// Before anything is looked at: a "working" transition handled on the
+	// select loop while this goroutine reads herdr cancels the pane's capture,
+	// and must void this one too rather than be outlived by it (the consuming
+	// recent read would still hold the answered menu).
+	d.mu.Lock()
+	gen := d.captureGen[p.PaneID]
+	d.mu.Unlock()
+	agents, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		return false
+	}
+	var live domain.AgentTransition
+	found := false
+	for _, a := range agents {
+		if a.PaneID == p.PaneID {
+			live, found = a, true
+			break
+		}
+	}
+	if !found || live.Status != "blocked" {
+		return false
+	}
+	pane, err := d.readVisible(ctx, p.PaneID, d.opt.PaneReadLines)
+	if err != nil || !domain.ClaudeModalAdvanced(p.Excerpt, pane) {
+		return false
+	}
+	// Not an operator retry and not an idle-poll hand-out: those intents belonged
+	// to the capture that was just answered. shutdownCtx, not ctx: ctx is this
+	// check's own deadline and is cancelled the moment it returns, which would
+	// drop the capture before its delay elapsed. live.Status is already
+	// "blocked" (checked above).
+	live.RetryAuditID, live.AutoIdleSend = 0, false
+	if live.AgentID == "" {
+		live.AgentID = p.AgentID
+	}
+	if live.AgentType == "" {
+		live.AgentType = p.AgentType
+	}
+	capped := false
+	scheduled := d.scheduleCaptureIf(d.shutdownCtx, live, func() bool {
+		if d.captureGen[p.PaneID] != gen {
+			return false
+		}
+		if d.followUpRecaptures[p.PaneID] >= maxFollowUpRecaptures {
+			capped = true
+			return false
+		}
+		d.followUpRecaptures[p.PaneID]++
+		return true
+	})
+	switch {
+	case capped:
+		slog.Warn("a Claude prompt queue is longer than the self-check will follow; leaving it for the operator",
+			"agent", p.AgentID, "captured", maxFollowUpRecaptures)
+		return false
+	case !scheduled:
+		// The agent moved on while we looked; whatever it parks on next raises
+		// its own event. Nothing failed, so nothing is reported either.
+		return true
+	}
+	slog.Info("a new Claude prompt replaced the answered one with no status change; capturing it",
+		"agent", p.AgentID, "situation", p.SituationType)
+	return true
 }
 
 // deliverNoop applies a graduated "do nothing" rule autonomously: audit-first

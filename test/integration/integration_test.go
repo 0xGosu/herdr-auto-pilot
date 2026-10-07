@@ -471,8 +471,9 @@ func claudeModel() string {
 // startClaudeAgent launches an interactive Claude Code session in a herdr
 // pane, with permission prompting on so a Bash tool call raises an approval
 // menu, and returns its pane id. It also clears the first-run "trust this
-// folder" prompt so the REPL is ready for input.
-func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string) string {
+// folder" prompt so the REPL is ready for input. extra is appended to claude's
+// own argv.
+func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string, extra ...string) string {
 	t.Helper()
 	// herdr 0.7.5: `agent start` names a KIND and an EXISTING pane, and the
 	// agent's own argv follows `--`. `--timeout` is generous because a cold
@@ -484,7 +485,7 @@ func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string) string {
 	name := sanitizeAgentName(t.Name())
 	pane := newScratchPane(t, cwd, name)
 	startAgentInPane(t, pane, name, "claude",
-		"--", "--model", claudeModel(), "--permission-mode", "default")
+		append([]string{"--", "--model", claudeModel(), "--permission-mode", "default"}, extra...)...)
 
 	// Claude asks to trust a new folder on first start; option 1 ("Yes, I
 	// trust") is pre-selected, so Enter clears it. Wait for the REPL prompt.

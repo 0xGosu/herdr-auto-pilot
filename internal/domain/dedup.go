@@ -273,6 +273,13 @@ func DuplicatesPendingEscalation(sitType SituationType, excerpt string, snapshot
 		if !bothLarge {
 			continue
 		}
+		// A different Claude dialog standing at the bottom is a different
+		// question, however little of the screen it moved: the next page of a
+		// paged permission queue differs from the last by its "N of M" counter
+		// and a parameter line, well inside the jitter tolerance below.
+		if ClaudeModalAdvanced(p.PaneExcerpt, excerpt) {
+			continue
+		}
 		// Suffix path (head-shift tolerant): the first line may be a truncation
 		// fragment, so it uses firstLineExplained (fragment-of-the-other) and an
 		// EXACT suffix match, which is order-sensitive and safe.

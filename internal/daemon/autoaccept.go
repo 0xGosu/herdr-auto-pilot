@@ -14,6 +14,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
+	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
 // maxAutoAcceptAttempts bounds how many times one escalation's delivery is
@@ -519,6 +520,19 @@ func (d *Daemon) autoAcceptOne(ctx context.Context, rec *domain.AuditRecord, sug
 	}
 	d.clearAutoAcceptAttempts(rec.ID)
 	d.clearPendingNote(rec.ID)
+	// The same post-action self-check every other unattended send arms. Here
+	// rather than in autoAcceptDeliver, which the operator's --send also goes
+	// through and which arms its own via processCorrections. Without it a
+	// Claude prompt drawn in place of the one just answered is never captured
+	// (followUpPromptStanding) — the unattended path is exactly where nobody
+	// would notice. agy re-captures inside autoAcceptDeliver already.
+	if !domain.IsAgy(rec.AgentType) {
+		d.scheduleUnblockCheck(verifyunblock.Params{
+			PaneID: rec.AgentID, AgentID: rec.AgentID, AgentType: rec.AgentType,
+			Signature: rec.Signature, Input: suggestion, Excerpt: rec.PaneExcerpt,
+			SituationType: rec.SituationType,
+		})
+	}
 	slog.Info("auto-accept: delivered an aged escalation",
 		"audit_id", rec.ID, "agent", rec.AgentID, "situation", rec.SituationType,
 		"waited", now.Sub(rec.CreatedAt).Round(time.Second).String(),
