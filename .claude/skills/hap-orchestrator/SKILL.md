@@ -146,8 +146,9 @@ Monitor re-armed every half hour plus an hourly cron is pure token spend. So hap
 The `fsp.off` / `fsp.on` stream lines then need nothing from you. hap holds both
 messages while the herd is paused and sends them on the resume.
 
-hap sends these only to a session it started and briefed itself. A session hap
-**adopted** (one already named `orchestrator` that it found rather than started)
+hap sends these only to a session it started and briefed itself — and still
+recognises as its own after losing track of it, so a dormant session is always
+woken. A session hap **adopted** (one already named `orchestrator` that it found rather than started)
 gets no messages: there, `fsp.off` means retire the cron but keep the Monitor,
 and `fsp.on` means re-create the cron.
 

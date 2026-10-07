@@ -3,6 +3,7 @@ package domain
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -78,6 +79,11 @@ type OrchestratorIdentity struct {
 	NudgeUnconfirmed bool `json:"nudge_unconfirmed,omitempty"`
 	NudgeTarget      bool `json:"nudge_target,omitempty"`
 	NudgeAttempts    int  `json:"nudge_attempts,omitempty"`
+	// Reclaimed marks a session hap found by name rather than through this
+	// record, but proved to be its own: hap's dormant message, never followed
+	// by a wake, was on its screen (OrchestratorDormantOnScreen). It counts as
+	// briefed by hap, so the wake it is owed is sent.
+	Reclaimed bool `json:"reclaimed,omitempty"`
 }
 
 // Known reports whether the identity names a session at all.
@@ -87,8 +93,11 @@ func (id OrchestratorIdentity) Known() bool { return id.PaneID != "" }
 // only sessions it types anything further into. An ADOPTED session is recorded
 // as Briefed with no attempts (hap never sent it anything), and a delivered
 // brief always counts its attempt first, so the pair tells them apart in
-// identity files written before this existed too.
-func (id OrchestratorIdentity) HapBriefed() bool { return id.Briefed && id.BriefAttempts > 0 }
+// identity files written before this existed too. A Reclaimed session is one
+// hap proved, by its screen, it had briefed.
+func (id OrchestratorIdentity) HapBriefed() bool {
+	return id.Briefed && (id.BriefAttempts > 0 || id.Reclaimed)
+}
 
 // Matches reports whether tr comes from the orchestrator session. The terminal
 // id decides when both sides carry one; otherwise the pane id does, because
@@ -115,4 +124,24 @@ func (id OrchestratorIdentity) Matches(tr AgentTransition) bool {
 func (id OrchestratorIdentity) RecycledBy(tr AgentTransition) bool {
 	return id.Known() && tr.PaneID == id.PaneID &&
 		tr.TerminalID != "" && id.TerminalID != "" && tr.TerminalID != id.TerminalID
+}
+
+// The opening words of hap's two dormancy messages. They open the messages so
+// a screen read can find them, and they are what proves, on screen, that a
+// session hap finds by name is one it was driving (OrchestratorDormantOnScreen).
+const (
+	OrchestratorDormantMarker = "hap here: full self-prompting is now OFF"
+	OrchestratorWakeMarker    = "hap here: full self-prompting is back ON"
+)
+
+// OrchestratorDormantOnScreen reports whether pane shows hap's dormant message
+// with no wake message after it — a session hap put to sleep and has not woken
+// since. A dormant session runs nothing, so that exchange stays the last thing
+// on its screen. Whitespace is collapsed first: claude wraps a long message at
+// the pane's width and indents the continuation lines, which can split the
+// marker across lines.
+func OrchestratorDormantOnScreen(pane string) bool {
+	flat := strings.Join(strings.Fields(pane), " ")
+	at := strings.LastIndex(flat, OrchestratorDormantMarker)
+	return at >= 0 && at > strings.LastIndex(flat, OrchestratorWakeMarker)
 }

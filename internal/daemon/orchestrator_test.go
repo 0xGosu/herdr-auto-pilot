@@ -927,8 +927,8 @@ func setKillSwitch(t *testing.T, h *harness, state string) {
 }
 
 const (
-	dormantMarker = "full self-prompting is now OFF"
-	wakeMarker    = "full self-prompting is back ON"
+	dormantMarker = domain.OrchestratorDormantMarker
+	wakeMarker    = domain.OrchestratorWakeMarker
 )
 
 // The whole cycle: an awake session is left alone, the mode going off sends
@@ -1233,6 +1233,117 @@ func TestOrchestratorDormancyMessageShape(t *testing.T) {
 		"`HAP_ACTOR=orchestrator`", "{self}", "{skills}", "`hap escalations`", wakeMarker} {
 		if !strings.Contains(orchestratorWakeNudge, want) {
 			t.Errorf("the wake message does not mention %s", want)
+		}
+	}
+}
+
+// reclaimHarness is a herd with the mode off and a live claude session named
+// "orchestrator" at wO:p8 / term_8 whose screen is visible — and nothing else:
+// the test sets the identity hap remembers (if any), then turns the mode on.
+func reclaimHarness(t *testing.T, visible string) (*harness, *orchLauncher) {
+	t.Helper()
+	h, l, _ := newOrchHarness(t, "", nil)
+	live := domain.AgentTransition{AgentID: "wO:p8", PaneID: "wO:p8", AgentType: "claude",
+		Status: "idle", TerminalID: "term_8"}
+	l.lmu.Lock()
+	l.named[domain.OrchestratorAgentName] = live
+	l.lmu.Unlock()
+	l.mu.Lock()
+	l.agents = append(l.agents, live)
+	l.mu.Unlock()
+	l.setVisible(visible)
+	return h, l
+}
+
+// turnOrchestratorOnAndPass turns the mode on and runs the startup pass (a nil
+// listing), the way a daemon restarted with the mode on does.
+func turnOrchestratorOnAndPass(t *testing.T, h *harness) {
+	t.Helper()
+	h.daemon.mu.Lock()
+	h.daemon.cfg.FullSelfPrompting.Enabled = true
+	h.daemon.cfg.FullSelfPrompting.OrchestratorAgentCommand = []string{"claude"}
+	h.daemon.mu.Unlock()
+	h.daemon.startOrchestratorPass(nil)
+	waitOrchestratorIdle(t, h)
+}
+
+// dormantScreen is the orchestrator's screen after hap put it to sleep: the
+// dormant message (wrapped, as claude shows it), its one-line reply, and the
+// empty composer it has sat at since.
+func dormantScreen(t *testing.T) string {
+	t.Helper()
+	return "> " + domain.OrchestratorDormantMarker[:30] + "\n  " + domain.OrchestratorDormantMarker[30:] +
+		" on this machine, so the herd needs\n  nothing from you until hap needs you again.\n⏺ Dormant.\n\n" +
+		emptyComposer(t)
+}
+
+// hap lost its record of the session it put to sleep (the identity file gone
+// or unreadable), so it finds that session again by name. Its screen proves hap
+// was driving it — its own dormant message, never followed by a wake — so it
+// is reclaimed and woken, not adopted and left asleep for as long as the mode
+// stays on. Controls: a session whose screen shows no dormant message, or one
+// already woken since, is adopted as before and never typed into.
+func TestOrchestratorReclaimsItsDormantSessionByItsScreen(t *testing.T) {
+	h, l := reclaimHarness(t, dormantScreen(t))
+	turnOrchestratorOnAndPass(t, h)
+	sent := h.herdr.sentInputs()
+	if len(sent) != 1 || !strings.Contains(sent[0], wakeMarker) {
+		t.Fatalf("sends = %q, want exactly the wake", sent)
+	}
+	if _, started, _ := l.snapshot(); len(started) != 0 {
+		t.Fatalf("a second orchestrator was started beside the sleeping one: %q", started)
+	}
+	if id := h.daemon.orchestratorIdentity(); !id.HapBriefed() || id.Dormant {
+		t.Fatalf("identity = %+v, want hap's own session, awake", id)
+	}
+
+	for name, screen := range map[string]string{
+		"no dormant message": emptyComposer(t),
+		"already woken": dormantScreen(t) + "\n> " + domain.OrchestratorWakeMarker + ". Wake up\n" +
+			emptyComposer(t),
+	} {
+		h, _ := reclaimHarness(t, screen)
+		turnOrchestratorOnAndPass(t, h)
+		if got := h.herdr.sentInputs(); len(got) != 0 {
+			t.Errorf("%s: an adopted session was typed into: %q", name, got)
+		}
+		if id := h.daemon.orchestratorIdentity(); id.HapBriefed() {
+			t.Errorf("%s: identity = %+v, want an ordinary adoption", name, id)
+		}
+	}
+}
+
+// hap still holds its record, but the session's pane id changed (the pane was
+// moved, or the listing renumbered it), so the record no longer finds it and
+// hap finds it by name. The terminal id is the same session's, so the record —
+// briefed by hap, asleep — carries over and the wake goes out, whatever the
+// screen shows. Control: a different terminal under the name is somebody
+// else's session and is adopted as before.
+func TestOrchestratorReclaimsItsMovedSessionByItsTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		terminal string
+		wantWake bool
+	}{
+		{"same terminal", "term_8", true},
+		{"another terminal", "term_other", false},
+	} {
+		h, _ := reclaimHarness(t, emptyComposer(t))
+		h.daemon.setOrchestratorIdentity(domain.OrchestratorIdentity{PaneID: "wO:p1", TerminalID: tc.terminal,
+			Briefed: true, BriefAttempts: 1, Dormant: true, NudgeTarget: true})
+		turnOrchestratorOnAndPass(t, h)
+		sent := h.herdr.sentInputs()
+		if tc.wantWake {
+			if len(sent) != 1 || !strings.Contains(sent[0], wakeMarker) {
+				t.Errorf("%s: sends = %q, want exactly the wake", tc.name, sent)
+			}
+			if id := h.daemon.orchestratorIdentity(); id.PaneID != "wO:p8" || !id.HapBriefed() || id.Dormant {
+				t.Errorf("%s: identity = %+v, want hap's own session at its new pane, awake", tc.name, id)
+			}
+			continue
+		}
+		if len(sent) != 0 {
+			t.Errorf("%s: somebody else's session was typed into: %q", tc.name, sent)
 		}
 	}
 }

@@ -130,12 +130,12 @@ const (
 // --resume on purpose: its survey covers the dormant stretch, and replaying
 // hours of events into the session is the cost dormancy exists to avoid.
 const (
-	orchestratorDormantNudge = `hap here: full self-prompting is now OFF on this machine (switched off, stood down at a limit, or the orchestrator unconfigured), so the herd needs nothing from you until hap needs you again. Go dormant to save tokens:
+	orchestratorDormantNudge = domain.OrchestratorDormantMarker + ` on this machine (switched off, stood down at a limit, or the orchestrator unconfigured), so the herd needs nothing from you until hap needs you again. Go dormant to save tokens:
 1. Stop the Monitor on ` + "`hap stream orchestrator`" + ` with the TaskStop tool, and do not re-arm it.
 2. Delete the hourly health check with the CronDelete tool, then check CronList shows none left.
 Then do nothing at all — no surveys, no polling, no herdr reads, no hap commands — until hap sends you a message here saying full self-prompting is back on. The operator may still talk to you here; answer them as usual. Reply with one line saying you are dormant.`
 
-	orchestratorWakeNudge = `hap here: full self-prompting is back ON. Wake up and resume orchestrating:
+	orchestratorWakeNudge = domain.OrchestratorWakeMarker + `. Wake up and resume orchestrating:
 1. If this conversation no longer holds your brief or the ` + "`hap-orchestrator`" + ` skill, recover them first. {skills}
 2. Re-survey the herd: ` + "`hap status`" + `, ` + "`hap agents`" + `, ` + "`hap escalations`" + `.
 3. Stop any Monitor still running on ` + "`hap stream orchestrator`" + ` with the TaskStop tool, then arm a FRESH one — without ` + "`--resume`" + `: your survey already covers what happened while you were dormant, and replaying it only costs tokens. When it expires, re-arm with ` + "`--resume <last seq>`" + ` as usual.
@@ -506,7 +506,8 @@ func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLau
 	id := d.orchestratorIdentity()
 	if !orchestratorAlive(id, agents) {
 		var ok bool
-		if id, ok = d.launchOrchestrator(ctx, launcher, kind, args, cfg.FullSelfPrompting.OrchestratorAgentCwd, agents); !ok {
+		if id, ok = d.launchOrchestrator(ctx, launcher, kind, args, cfg.FullSelfPrompting.OrchestratorAgentCwd, agents,
+			id); !ok {
 			return
 		}
 	}
@@ -684,8 +685,11 @@ func (d *Daemon) recordOrchestratorNudge(sent domain.OrchestratorIdentity, dorma
 // creates one. An ADOPTED session is never briefed: hap did not start it, and
 // typing into a session somebody else started is exactly what the rest of this
 // daemon refuses to do without evidence.
+//
+// prev is the record hap held before this pass, which no longer finds the
+// session: it is what lets reclaimOrchestrator recognise the session it names.
 func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLauncher, kind string, args []string,
-	cwd string, agents []domain.AgentTransition) (domain.OrchestratorIdentity, bool) {
+	cwd string, agents []domain.AgentTransition, prev domain.OrchestratorIdentity) (domain.OrchestratorIdentity, bool) {
 	now := d.opt.Clock.Now()
 	tr, found, err := launcher.AgentByName(ctx, domain.OrchestratorAgentName)
 	if errors.Is(err, ports.ErrLaunchUnsupported) {
@@ -764,15 +768,66 @@ func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLau
 		PaneID: tr.PaneID, TerminalID: tr.TerminalID, WorkspaceID: tr.WorkspaceID,
 		StartedAt: now, Briefed: adopted,
 	}
+	reclaimed := false
+	if adopted {
+		id, reclaimed = d.reclaimOrchestrator(ctx, id, prev)
+	}
 	d.setOrchestratorIdentity(id)
 	d.claimOrchestratorName(ctx, tr.PaneID, agents)
 	d.orchestratorSucceeded()
-	if adopted {
+	switch {
+	case reclaimed:
+		slog.Info("orchestrator: found its own session under that name; hap keeps driving it",
+			"pane", tr.PaneID, "dormant", id.Dormant)
+	case adopted:
 		slog.Info("orchestrator: adopted the existing agent of that name; hap will not brief it", "pane", tr.PaneID)
-	} else {
+	default:
 		slog.Info("orchestrator: started", "pane", tr.PaneID, "workspace", domain.OrchestratorWorkspaceLabel)
 	}
 	return id, true
+}
+
+// reclaimOrchestrator tells hap's OWN session apart from one somebody else
+// started, among the sessions launchOrchestrator finds by name — and returns
+// adopted unchanged when it cannot prove it, so the rule that hap never types
+// into a session it did not start stands.
+//
+// Without this, losing track of a session hap had put to sleep would strand it:
+// found by name, it would be recorded as adopted — never briefed by hap, never
+// dormant — and so never woken, asleep for as long as the mode stayed on. Two
+// proofs, positive only:
+//
+//   - The TERMINAL is the one hap recorded. The record lost the session because
+//     its pane id changed (a moved pane, a renumbered listing), not because it is
+//     another session, so the whole record — brief, dormancy, attempts — carries
+//     over.
+//   - The record is gone (the identity file deleted or unreadable), but the
+//     SCREEN shows hap's own dormant message with no wake after it. A dormant
+//     session runs nothing, so that exchange is still the last thing it shows.
+//     Only the dormant case is provable this way, and only it needs to be: an
+//     awake session found like this keeps its Monitor and cron, and stays
+//     adopted.
+func (d *Daemon) reclaimOrchestrator(ctx context.Context, adopted, prev domain.OrchestratorIdentity) (
+	domain.OrchestratorIdentity, bool) {
+	if prev.HapBriefed() && prev.TerminalID != "" && prev.TerminalID == adopted.TerminalID {
+		id := prev
+		id.PaneID, id.WorkspaceID = adopted.PaneID, adopted.WorkspaceID
+		return id, true
+	}
+	reader, ok := d.opt.Herdr.(ports.VisiblePaneReader)
+	if !ok {
+		return adopted, false
+	}
+	pane, err := reader.ReadPaneVisible(ctx, adopted.PaneID, orchestratorBriefReadLines)
+	if err != nil {
+		slog.Warn("orchestrator: reading an adopted session's pane failed", "pane", adopted.PaneID, "error", err)
+		return adopted, false
+	}
+	if !domain.OrchestratorDormantOnScreen(pane) {
+		return adopted, false
+	}
+	adopted.Reclaimed, adopted.Dormant, adopted.NudgeTarget = true, true, true
+	return adopted, true
 }
 
 // claimOrchestratorName gives the pane the hap name "orchestrator" and

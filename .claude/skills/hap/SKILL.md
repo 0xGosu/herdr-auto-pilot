@@ -1476,7 +1476,10 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
   tokens; when the mode comes back on, hap tells the same session to wake —
   re-survey, arm a fresh Monitor and re-create the cron. Both messages wait while
   the herd is paused, go out only once the composer is ready, and go only to a
-  session hap briefed itself (never an adopted one). The built-in text is fixed;
+  session hap briefed itself (never an adopted one). hap still knows its own
+  session after losing track of it — a moved pane (same terminal), or a lost
+  state file with hap's dormant message still the last thing on screen — so a
+  sleeping orchestrator is always woken. The built-in text is fixed;
   `orchestrator_agent_prompt` replaces the brief only.
 - **A start that keeps failing is shown, not just logged**: the TUI banner reads
   `⚠ orchestrator could not start — <reason>` (or `… waiting on a claude prompt`
