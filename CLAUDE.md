@@ -274,6 +274,9 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
 - Permission mode is readable only from the pane, only positively (`domain.AgentModeFromPane`); the mode
   cycle is per SESSION, so `SetAgentMode` detects a closed rotation.
 - Claude's remote-environment picker reports idle (`domain.ClaudeRemoteEnvForm`).
+- Concurrent tool approvals (parallel subagents) are PAGED in one dialog ("1 of 3"); answering a page draws
+  the next in place with herdr still `blocked` — no event. Only the post-action self-check sees it
+  (`followUpPromptStanding`, gated on `domain.ClaudeModalAdvanced`); every unattended send must arm it.
 - One request per herdr socket connection. herdr ≥0.9.0 replays no existing panes on subscribe; `events_lost`
   means resubscribe + resync. Only agent panes get status subscriptions.
 - Agent names: `[a-z][a-z0-9_-]{0,31}`, unique. `agent prompt` right after `agent start` may land without

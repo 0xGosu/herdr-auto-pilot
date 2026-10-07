@@ -1,0 +1,28 @@
+❯ Launch THREE general-purpose subagents in parallel in one message (Agent tool).
+
+● 3 general-purpose agents launched (ctrl+o to expand)
+
+✻ Waiting for 3 background agents to finish
+
+● Agent "Call get_files 62" finished · 30s
+
+● Subagent B finished: get_files with x='62' returned ok from get_files. A (get_pr 61) and C
+  (get_profile 63) are still running.
+
+✻ Waiting for 2 background agents to finish
+
+────────────────────────────────────────────────────────────────────────────────────────────
+ Tool use · from the general-purpose agent                                           2 of 3
+ fakegh — Get Pr Tool: (MCP)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ x: "61"
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ About the fakegh — Get Pr Tool:
+ │ Get details for a single pull request
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for fakegh — Get Pr commands in /tmp/repro
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents

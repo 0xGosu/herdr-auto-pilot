@@ -397,6 +397,35 @@ func TestDuplicatesPendingEscalationJitter(t *testing.T) {
 	}
 }
 
+// Claude's paged permission queue draws the next prompt in place: the next page
+// of a batch differs from the last only by its tool and a parameter line — well
+// inside the jitter tolerance — yet it is a new question. The control half: the
+// SAME dialog whose queue counter moved (another requester joined) still
+// collapses, as does jitter around it.
+func TestDuplicatesPendingEscalationClaudePagedPrompt(t *testing.T) {
+	const cap = 200
+	body := bigVariedBody(40)
+	page := func(counter, tool, x string) string {
+		return "● Working on it\n" + body + strings.Repeat("─", 40) + "\n" +
+			" Tool use · from the general-purpose agent   " + counter + "\n" +
+			" fakegh — " + tool + " Tool: (MCP)\n x: \"" + x + "\"\n Do you want to proceed?\n" +
+			" ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n"
+	}
+	first := page("1 of 3", "Get Pr", "61")
+	pending := []PendingEscalation{pend(SituationApproval, first)}
+
+	if DuplicatesPendingEscalation(SituationApproval, page("2 of 3", "Get Files", "62"), cap, 5, pending) {
+		t.Error("the next page of a paged permission queue was collapsed into the answered one")
+	}
+	if !DuplicatesPendingEscalation(SituationApproval, page("1 of 4", "Get Pr", "61"), cap, 5, pending) {
+		t.Error("the same dialog with only its queue counter moved no longer dedups")
+	}
+	jittered := strings.Replace(first, "line 20:", "line 20: (retry)", 1)
+	if !DuplicatesPendingEscalation(SituationApproval, jittered, cap, 5, pending) {
+		t.Error("jitter around the SAME standing dialog no longer dedups")
+	}
+}
+
 func TestSimilarWithin(t *testing.T) {
 	body := bigVariedBody(40) // large, varied → a small edit is a small fraction
 	tests := []struct {
