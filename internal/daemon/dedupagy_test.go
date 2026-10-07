@@ -88,8 +88,16 @@ func TestClaudeNextPagedPromptIsNotADuplicate(t *testing.T) {
 
 	s := domain.Situation{
 		AgentID: "cl-1", PaneID: "cl-1", AgentType: "claude",
-		Type: domain.SituationApproval, Status: "blocked", Content: largeCapture(t, two),
+		Type: domain.SituationApproval, Status: "blocked",
 	}
+	// Premise: false is also what a store error or an invisible seed returns, so
+	// first prove the seeded row IS a candidate — the same dialog with only its
+	// queue counter moved collapses into it.
+	s.Content = largeCapture(t, strings.Replace(one, "1 of 3", "1 of 4", 1))
+	if !h.daemon.duplicatePendingEscalation(context.Background(), s) {
+		t.Fatal("premise: the seeded claude row is not a dedup candidate")
+	}
+	s.Content = largeCapture(t, two)
 	if h.daemon.duplicatePendingEscalation(context.Background(), s) {
 		t.Fatal("the next page of claude's paged queue was collapsed into the pending one")
 	}
