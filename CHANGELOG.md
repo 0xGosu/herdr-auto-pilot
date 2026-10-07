@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.68
+
+- Fixed duplicate escalations for one standing agy approval when the agent's mode changed (e.g. into plan mode) while it waited
+
 ## 0.9.67
 
 - Fixed Claude agents staying blocked after hap answered the first of several queued tool approvals (the "1 of 3" dialog parallel subagents raise): hap now captures and answers each following approval instead of waiting for a status change that never comes
