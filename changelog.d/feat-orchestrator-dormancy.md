@@ -1,1 +1,0 @@
-- Put the full-self-prompting orchestrator to sleep while the mode is off: hap now tells it to stop its event-stream Monitor and hourly health check, so an idle herd costs no tokens, and wakes the same session — re-survey, fresh Monitor, cron re-created — when the mode comes back on
