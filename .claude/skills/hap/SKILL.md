@@ -1455,10 +1455,9 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
   — armed with the longest timeout the host allows, re-armed with `--resume` when it
   expires — schedule an hourly
   `CronCreate` health check of `hap status` / `hap agents` that restarts a stopped
-  daemon with `hap daemon --ensure` — deleted on `fsp.off`, re-created on
-  `fsp.on` — and how to act: **carry ordinary work to completion**, escalate only
-  the irreversible, and treat a repo's `AUTO.md` as decisions the operator has
-  already made. Replace it with
+  daemon with `hap daemon --ensure` — and how to act: **carry ordinary work to
+  completion**, escalate only the irreversible, and treat a repo's `AUTO.md` as
+  decisions the operator has already made. Replace it with
   `full_self_prompting.orchestrator_agent_prompt`.
   **Type your goals into that session.** If claude shows a first-run prompt
   (trusting the new directory), answer it once — hap never types into a modal.
@@ -1471,6 +1470,17 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
 - Re-created when it disappears, at most 3 times an hour; never while paused,
   with the mode off, or after the mode stood down at a `[limits]` ceiling. hap
   never closes it — turning the mode off leaves it running.
+- **It sleeps while the mode is off.** When full self-prompting turns off (or
+  stands down at a ceiling), hap types a message into the session telling it to
+  stop its stream Monitor and delete its hourly cron, so an idle herd costs no
+  tokens; when the mode comes back on, hap tells the same session to wake —
+  re-survey, arm a fresh Monitor and re-create the cron. Both messages wait while
+  the herd is paused, go out only once the composer is ready, and go only to a
+  session hap briefed itself (never an adopted one). hap still knows its own
+  session after losing track of it — a moved pane (same terminal), or a lost
+  state file with hap's dormant message still the last thing on screen — so a
+  sleeping orchestrator is always woken. The built-in text is fixed;
+  `orchestrator_agent_prompt` replaces the brief only.
 - **A start that keeps failing is shown, not just logged**: the TUI banner reads
   `⚠ orchestrator could not start — <reason>` (or `… waiting on a claude prompt`
   while its brief is held), `hap status` prints an `orchestrator:` line with the

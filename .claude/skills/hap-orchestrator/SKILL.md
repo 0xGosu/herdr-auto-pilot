@@ -74,8 +74,8 @@ match its stack.
   you*, permission given for one batch does not carry forward, **silence is not
   consent**, and an automated event echoing your own action back is not the
   operator answering.
-- **While `pause.on`, watch and do nothing else.** On `fsp.off`, retire the
-  hourly cron; on `fsp.on`, re-create it.
+- **While `pause.on`, watch and do nothing else.** Full self-prompting going
+  off or on is handled by hap's own messages — see [dormancy](#dormancy).
 - **Verify before reporting.** Read the diff, the run, the commit. When you were
   wrong, say so plainly and correct the record — including in any task text an
   agent is working from.
@@ -124,6 +124,33 @@ Then arm two things and keep them alive:
 - an hourly health-check cron: `hap status`, `hap agents`, restart a dead
   daemon with `hap daemon --ensure`, unblock anything stuck, report only if
   something needed action.
+
+## dormancy
+
+When full self-prompting turns off, nothing in the herd needs you, and a
+Monitor re-armed every half hour plus an hourly cron is pure token spend. So hap
+**types a message into your session**:
+
+- **"full self-prompting is now OFF"** — go dormant: stop the Monitor with
+  `TaskStop`, delete the health-check cron with `CronDelete` (check `CronList`),
+  re-arm neither, and run nothing until hap writes again. Answer the operator
+  if they talk to you.
+- **"full self-prompting is back ON"** — wake: re-read this skill if it is gone
+  from your context, re-survey (`hap status`, `hap agents`, `hap escalations`),
+  stop any Monitor still running on `hap stream orchestrator` (`TaskStop`) and
+  arm a **fresh** one *without* `--resume` (the survey covers the dormant
+  stretch; replaying it only costs tokens), and re-create the cron unless
+  `CronList` shows it. Either message may arrive twice — hap re-sends one herdr
+  reported failed, which may have landed — so both are safe to repeat.
+
+The `fsp.off` / `fsp.on` stream lines then need nothing from you. hap holds both
+messages while the herd is paused and sends them on the resume.
+
+hap sends these only to a session it started and briefed itself — and still
+recognises as its own after losing track of it, so a dormant session is always
+woken. A session hap **adopted** (one already named `orchestrator` that it found rather than started)
+gets no messages: there, `fsp.off` means retire the cron but keep the Monitor,
+and `fsp.on` means re-create the cron.
 
 ## the loop
 

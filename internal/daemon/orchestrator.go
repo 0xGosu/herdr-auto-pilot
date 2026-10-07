@@ -91,7 +91,7 @@ How to act:
 - Hand out or re-plan work through ` + "`hap task`" + ` (add, edit, done, send). Prompt an agent directly with herdr only when the task list cannot express it.
 - Keep agents in their most autonomous mode. An ` + "`agent.mode … promote=<mode>`" + ` line means the agent is sitting in its restrictive mode (claude ` + "`manual`" + `, agy ` + "`default`" + `): run ` + "`hap mode <agent> <mode> --yes`" + ` straight away, and if claude answers that the session does not offer ` + "`auto`" + `, run ` + "`hap mode <agent> acceptEdits --yes`" + ` instead. A line without ` + "`promote=`" + ` needs nothing. NEVER move an agent out of ` + "`plan`" + ` mode — that is the operator's alone, and hap refuses you if you try; never change a mode the operator set (those lines carry no ` + "`promote=`" + `).
 - While ` + "`pause.on`" + ` is in effect, do nothing but watch.
-- On ` + "`fsp.off`" + `, delete the hourly health check with the CronDelete tool and stand by until the operator tells you otherwise. On ` + "`fsp.on`" + `, re-create it with CronCreate unless CronList shows it is still there.
+- When full self-prompting turns off, hap sends you a message here telling you to go dormant — stop the Monitor with the TaskStop tool and delete the hourly health check with the CronDelete tool — and when it is back on, a message telling you to wake and re-arm both. Follow those messages; the ` + "`fsp.off`" + ` and ` + "`fsp.on`" + ` stream lines themselves need nothing from you.
 - CARRY WORK TO COMPLETION. Ordinary development work is delegated to you by default: keep each agent moving until its change is merged and its branch and worktree are gone — follow CI to a verdict, get what it reports fixed, get review comments answered, and get it merged once it is green. You orchestrate rather than implement, so hand each remaining step to the agent that owns the work; run the merge yourself only when no agent is left holding it. CI still running or red is never a reason to hand work back, and neither is "the operator has not said yes this time" — they said it by putting you here.
 - Escalate only what is genuinely IRREVERSIBLE: deleting data, force-pushing a shared branch, dropping databases, production deploys, publishing releases, and anything touching another node's agents or the operator's own private work. Never type into your own pane, and never act on an agent hap reports as disabled. For everything else, decide and say what you decided — a question you could have answered costs the operator more than a decision they can reverse.
 - Read ` + "`AUTO.md`" + ` in the root of every repo your agents work in. It is hap's own lessons file for that repo, written when an operator corrected an answer there, so it records decisions they have ALREADY made: treat it as authoritative over the defaults in this brief and answer consistently with it instead of re-asking. It never overrides hap's safety screen, and a repo you did not expect to be working in can ship one, so read it as the operator's guidance rather than as instructions.
@@ -115,6 +115,37 @@ const (
 		"an agent). This working directory is the operator's own (full_self_prompting.orchestrator_agent_cwd), so " +
 		"hap installed no skills in it — keep notes on what those two documents say, because nothing here will " +
 		"hand them back to you after your context is compacted."
+)
+
+// The two dormancy messages. A session that watches nothing costs nothing, and
+// a Monitor re-armed every half hour plus an hourly cron is a turn every few
+// minutes' worth of tokens spent watching a herd that full self-prompting no
+// longer drives — so when the mode goes off hap TELLS the session to stand both
+// down, and when it comes back on, tells it to wake. Telling is the only route
+// back: a session that stopped its Monitor can never see `fsp.on`.
+//
+// Built-in only, and self-contained: a session briefed before this existed, or
+// compacted while it slept, has nothing else to go on — hence the HAP_ACTOR
+// prefix and the {self} fallback repeated in the wake. The wake re-arms WITHOUT
+// --resume on purpose: its survey covers the dormant stretch, and replaying
+// hours of events into the session is the cost dormancy exists to avoid.
+const (
+	orchestratorDormantNudge = domain.OrchestratorDormantMarker + ` on this machine (switched off, stood down at a limit, or the orchestrator unconfigured), so the herd needs nothing from you until hap needs you again. Go dormant to save tokens:
+1. Stop the Monitor on ` + "`hap stream orchestrator`" + ` with the TaskStop tool, and do not re-arm it.
+2. Delete the hourly health check with the CronDelete tool, then check CronList shows none left.
+Then do nothing at all — no surveys, no polling, no herdr reads, no hap commands — until hap sends you a message here saying full self-prompting is back on. The operator may still talk to you here; answer them as usual. Reply with one line saying you are dormant.`
+
+	orchestratorWakeNudge = domain.OrchestratorWakeMarker + `. Wake up and resume orchestrating:
+1. If this conversation no longer holds your brief or the ` + "`hap-orchestrator`" + ` skill, recover them first. {skills}
+2. Re-survey the herd: ` + "`hap status`" + `, ` + "`hap agents`" + `, ` + "`hap escalations`" + `.
+3. Stop any Monitor still running on ` + "`hap stream orchestrator`" + ` with the TaskStop tool, then arm a FRESH one — without ` + "`--resume`" + `: your survey already covers what happened while you were dormant, and replaying it only costs tokens. When it expires, re-arm with ` + "`--resume <last seq>`" + ` as usual.
+4. Re-create the hourly health check with the CronCreate tool, unless CronList shows it is still there.
+Run every ` + "`hap`" + ` command with ` + "`HAP_ACTOR=orchestrator`" + ` prefixed on its command line, the Monitor and the cron's included; if ` + "`hap`" + ` is not on your PATH, use {self} in its place. Then report the herd's state in a few lines.`
+
+	// orchestratorNudgeAttempts bounds failed SENDS toward one dormancy state,
+	// for the reason orchestratorBriefAttempts bounds the brief's: a send herdr
+	// reported failed may still have landed.
+	orchestratorNudgeAttempts = 3
 )
 
 // orchestratorState is the daemon's in-memory view of the orchestrator,
@@ -145,6 +176,9 @@ type orchestratorState struct {
 	// conditions hold until an operator changes something.
 	skillsCwdNoted bool
 	skillsErrNoted string
+	// nudgeErr is the lastErr a failed wake wrote, so a later success or a
+	// change of target clears that one and never somebody else's.
+	nudgeErr string
 }
 
 func (d *Daemon) orchestratorStatePath() string {
@@ -358,7 +392,10 @@ func (d *Daemon) orchestratorPermitted(ctx context.Context) bool {
 // non-blocking: every shell-out happens in the spawned pass.
 func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 	cfg, _, _ := d.snapshot()
-	if !d.orchestratorModeOn(cfg) {
+	on := d.orchestratorModeOn(cfg)
+	d.settleOrchestratorNudges(!on)
+	if !on {
+		d.startOrchestratorDormancyPass(agents)
 		return
 	}
 	launcher, ok := d.opt.Herdr.(ports.AgentLauncher)
@@ -380,7 +417,8 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 		return
 	}
 	id := d.orch.id
-	if agents != nil && orchestratorAlive(id, agents) && (id.Briefed || id.BriefAttempts >= orchestratorBriefAttempts) {
+	if agents != nil && orchestratorAlive(id, agents) && (id.Briefed || id.BriefAttempts >= orchestratorBriefAttempts) &&
+		!orchestratorNudgeOwed(id, false) {
 		d.orch.mu.Unlock()
 		return // healthy: nothing to do
 	}
@@ -390,6 +428,15 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 	}
 	d.orch.running = true
 	d.orch.mu.Unlock()
+	d.spawnOrchestratorPass(func(ctx context.Context) {
+		d.ensureOrchestrator(ctx, launcher, cfg, agents)
+	})
+}
+
+// spawnOrchestratorPass runs pass as the one pass in flight. The caller has
+// already set d.orch.running under d.orch.mu; it is cleared when pass returns,
+// or at once when the daemon is shutting down and nothing was spawned.
+func (d *Daemon) spawnOrchestratorPass(pass func(ctx context.Context)) {
 	release := func() {
 		d.orch.mu.Lock()
 		d.orch.running = false
@@ -398,7 +445,7 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 	if !d.spawn(func() {
 		defer release()
 		_ = logging.Guard("orchestrator", func() error {
-			d.ensureOrchestrator(d.shutdownCtx, launcher, cfg, agents)
+			pass(d.shutdownCtx)
 			return nil
 		})
 	}) {
@@ -406,17 +453,27 @@ func (d *Daemon) startOrchestratorPass(agents []domain.AgentTransition) {
 	}
 }
 
+// orchestratorListing returns agents, or a fresh listing when the caller had
+// none (startup, a reload); ok is false when herdr could not list.
+func (d *Daemon) orchestratorListing(ctx context.Context, agents []domain.AgentTransition) ([]domain.AgentTransition, bool) {
+	if agents != nil {
+		return agents, true
+	}
+	listed, err := d.opt.Herdr.ListAgents(ctx)
+	if err != nil {
+		slog.Warn("orchestrator: listing agents failed", "error", err)
+		return nil, false
+	}
+	return listed, true
+}
+
 // ensureOrchestrator is one pass: make sure the session exists, then that it
 // has been briefed.
 func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLauncher, cfg config.Config,
 	agents []domain.AgentTransition) {
-	if agents == nil {
-		listed, err := d.opt.Herdr.ListAgents(ctx)
-		if err != nil {
-			slog.Warn("orchestrator: listing agents failed", "error", err)
-			return
-		}
-		agents = listed
+	agents, ok := d.orchestratorListing(ctx, agents)
+	if !ok {
+		return
 	}
 	// Against the OLD identity, before anything can replace it: a pane recycled
 	// while the daemon was down still carries the previous orchestrator's name
@@ -449,21 +506,190 @@ func (d *Daemon) ensureOrchestrator(ctx context.Context, launcher ports.AgentLau
 	id := d.orchestratorIdentity()
 	if !orchestratorAlive(id, agents) {
 		var ok bool
-		if id, ok = d.launchOrchestrator(ctx, launcher, kind, args, cfg.FullSelfPrompting.OrchestratorAgentCwd, agents); !ok {
+		if id, ok = d.launchOrchestrator(ctx, launcher, kind, args, cfg.FullSelfPrompting.OrchestratorAgentCwd, agents,
+			id); !ok {
 			return
 		}
 	}
 	if !id.Briefed && id.BriefAttempts < orchestratorBriefAttempts {
 		d.briefOrchestrator(ctx, id, cfg)
 	}
+	// A session that slept through the mode being off is owed its wake. A
+	// freshly launched one never is: its identity starts awake.
+	if orchestratorNudgeOwed(id, false) {
+		d.nudgeOrchestrator(ctx, id, false)
+	}
+}
+
+// orchestratorNudgeOwed reports whether id is owed the message that moves it
+// to wantDormant: a session hap briefed itself (never an adopted one — hap
+// does not type into a session somebody else started), not known to be in that
+// state already, with sends left. Level-triggered on purpose: nothing is owed
+// while the delivered state is CONFIRMED to match, so a toggle undone before
+// its message went out sends nothing at all — but after a send reported failed
+// (which may have landed) the state is unknown, and the wanted message is owed
+// even if Dormant matches. Both messages are written to be safe to repeat.
+func orchestratorNudgeOwed(id domain.OrchestratorIdentity, wantDormant bool) bool {
+	if !id.HapBriefed() || (id.Dormant == wantDormant && !id.NudgeUnconfirmed) {
+		return false
+	}
+	return id.NudgeTarget != wantDormant || id.NudgeAttempts < orchestratorNudgeAttempts
+}
+
+// settleOrchestratorNudges starts a fresh failed-send count when the wanted
+// state is no longer the one the count was spent on, so attempts spent on one
+// toggle never count against the next — and drops the heartbeat error a wake
+// left behind, which would otherwise outlive the toggle it described. A write
+// only when there is a count to clear — once per toggle, never per sweep.
+func (d *Daemon) settleOrchestratorNudges(wantDormant bool) {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	if d.orch.id.NudgeTarget == wantDormant || d.orch.id.NudgeAttempts == 0 {
+		return
+	}
+	d.orch.id.NudgeTarget, d.orch.id.NudgeAttempts = wantDormant, 0
+	d.saveOrchestratorLocked(d.orch.id)
+	d.clearNudgeErrLocked()
+}
+
+// clearNudgeErrLocked drops the heartbeat error a failed wake wrote, leaving
+// any other error alone. Caller holds d.orch.mu.
+func (d *Daemon) clearNudgeErrLocked() {
+	if d.orch.nudgeErr != "" && d.orch.lastErr == d.orch.nudgeErr {
+		d.orch.lastErr = ""
+	}
+	d.orch.nudgeErr = ""
+}
+
+// startOrchestratorDormancyPass is startOrchestratorPass with the mode OFF:
+// at most a dormancy message to a live session hap briefed, and NOTHING that
+// creates — no launcher, no skills, no start. Same one-pass latch.
+func (d *Daemon) startOrchestratorDormancyPass(agents []domain.AgentTransition) {
+	d.orch.mu.Lock()
+	id := d.orch.id
+	if d.orch.running || !orchestratorNudgeOwed(id, true) || (agents != nil && !orchestratorAlive(id, agents)) {
+		d.orch.mu.Unlock()
+		return
+	}
+	d.orch.running = true
+	d.orch.mu.Unlock()
+	d.spawnOrchestratorPass(func(ctx context.Context) {
+		d.ensureOrchestratorDormant(ctx, agents)
+	})
+}
+
+// ensureOrchestratorDormant is the mode-off pass: tell a live session hap
+// briefed to stand its Monitor and cron down.
+func (d *Daemon) ensureOrchestratorDormant(ctx context.Context, agents []domain.AgentTransition) {
+	agents, ok := d.orchestratorListing(ctx, agents)
+	if !ok {
+		return
+	}
+	d.observeOrchestrator(ctx, agents)
+	id := d.orchestratorIdentity()
+	if !orchestratorAlive(id, agents) || !orchestratorNudgeOwed(id, true) {
+		return
+	}
+	d.nudgeOrchestrator(ctx, id, true)
+}
+
+// orchestratorDormancyPermitted is orchestratorPermitted's mirror for the
+// dormant message, against the LIVE config: the mode must still be off (a
+// re-enable while the pane was read owes a wake instead), and the kill switch
+// clear — a paused herd gets nothing typed into any pane, this one included,
+// and the message waits for the resume.
+func (d *Daemon) orchestratorDormancyPermitted(ctx context.Context) bool {
+	cfg, _, _ := d.snapshot()
+	return !d.orchestratorModeOn(cfg) && !d.orchestratorPaused(ctx)
+}
+
+// nudgeOrchestrator delivers the dormant (dormant=true) or wake message on the
+// brief's terms: a proven-ready, empty composer, the gate re-asked immediately
+// before the send, and no WithAgentAutomation — the pane is disabled on
+// purpose. A composer that is not ready defers silently to the next pass:
+// unlike the brief, nothing here waits on the operator.
+func (d *Daemon) nudgeOrchestrator(ctx context.Context, id domain.OrchestratorIdentity, dormant bool) {
+	reader, ok := d.opt.Herdr.(ports.VisiblePaneReader)
+	if !ok {
+		return
+	}
+	text, what, permitted := orchestratorWakeNudge, "wake", d.orchestratorPermitted
+	if dormant {
+		text, what, permitted = orchestratorDormantNudge, "dormant", d.orchestratorDormancyPermitted
+	}
+	// Asked before the pane read as well as before the send: a paused herd
+	// owes its message on every sweep, and a store read is cheaper than a
+	// shell-out that would only be refused.
+	if !permitted(ctx) {
+		return
+	}
+	pane, err := reader.ReadPaneVisible(ctx, id.PaneID, orchestratorBriefReadLines)
+	if err != nil {
+		slog.Warn("orchestrator: reading its pane failed", "error", err)
+		return
+	}
+	if sess, ok := domain.ClaudeSessionFromPane(pane); !ok || !sess.ComposerEmpty {
+		return
+	}
+	if !permitted(ctx) {
+		return
+	}
+	cfg, _, _ := d.snapshot()
+	err = ports.SendToAgent(ctx, d.opt.Herdr, id.PaneID, domain.OrchestratorAgentKind, d.renderOrchestratorText(cfg, text))
+	attempts := d.recordOrchestratorNudge(id, dormant, err)
+	if err != nil {
+		slog.Warn("orchestrator: sending the "+what+" message failed", "attempt", attempts, "error", err)
+	} else {
+		slog.Info("orchestrator: sent the "+what+" message", "pane", id.PaneID)
+	}
+}
+
+// recordOrchestratorNudge applies one send's outcome to the LIVE identity —
+// only the dormancy fields, and only while it is still the session the send
+// went to. Not a write-back of the caller's snapshot: the select loop may have
+// started a fresh count (settleOrchestratorNudges) while the send was in
+// flight, and a stale snapshot would resurrect the spent one. Returns the
+// failed-send count toward this target.
+func (d *Daemon) recordOrchestratorNudge(sent domain.OrchestratorIdentity, dormant bool, err error) int {
+	d.orch.mu.Lock()
+	defer d.orch.mu.Unlock()
+	id := &d.orch.id
+	if id.PaneID != sent.PaneID || id.TerminalID != sent.TerminalID {
+		return 0
+	}
+	if err == nil {
+		id.Dormant, id.NudgeUnconfirmed, id.NudgeTarget, id.NudgeAttempts = dormant, false, dormant, 0
+		d.clearNudgeErrLocked()
+		d.saveOrchestratorLocked(*id)
+		return 0
+	}
+	if id.NudgeTarget != dormant {
+		id.NudgeTarget, id.NudgeAttempts = dormant, 0
+	}
+	id.NudgeUnconfirmed = true
+	id.NudgeAttempts++
+	// Only the wake's failure reaches the heartbeat: orchestratorHealth shows
+	// nothing while the mode is off, so a dormant failure there would only
+	// surface — stale — after the mode came back.
+	if !dormant {
+		d.orch.lastErr = fmt.Sprintf("sending the wake message failed (attempt %d of %d): %v",
+			id.NudgeAttempts, orchestratorNudgeAttempts, err)
+		d.orch.lastErrAt = d.opt.Clock.Now()
+		d.orch.nudgeErr = d.orch.lastErr
+	}
+	d.saveOrchestratorLocked(*id)
+	return id.NudgeAttempts
 }
 
 // launchOrchestrator adopts the agent herdr already calls "orchestrator", or
 // creates one. An ADOPTED session is never briefed: hap did not start it, and
 // typing into a session somebody else started is exactly what the rest of this
 // daemon refuses to do without evidence.
+//
+// prev is the record hap held before this pass, which no longer finds the
+// session: it is what lets reclaimOrchestrator recognise the session it names.
 func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLauncher, kind string, args []string,
-	cwd string, agents []domain.AgentTransition) (domain.OrchestratorIdentity, bool) {
+	cwd string, agents []domain.AgentTransition, prev domain.OrchestratorIdentity) (domain.OrchestratorIdentity, bool) {
 	now := d.opt.Clock.Now()
 	tr, found, err := launcher.AgentByName(ctx, domain.OrchestratorAgentName)
 	if errors.Is(err, ports.ErrLaunchUnsupported) {
@@ -542,15 +768,66 @@ func (d *Daemon) launchOrchestrator(ctx context.Context, launcher ports.AgentLau
 		PaneID: tr.PaneID, TerminalID: tr.TerminalID, WorkspaceID: tr.WorkspaceID,
 		StartedAt: now, Briefed: adopted,
 	}
+	reclaimed := false
+	if adopted {
+		id, reclaimed = d.reclaimOrchestrator(ctx, id, prev)
+	}
 	d.setOrchestratorIdentity(id)
 	d.claimOrchestratorName(ctx, tr.PaneID, agents)
 	d.orchestratorSucceeded()
-	if adopted {
+	switch {
+	case reclaimed:
+		slog.Info("orchestrator: found its own session under that name; hap keeps driving it",
+			"pane", tr.PaneID, "dormant", id.Dormant)
+	case adopted:
 		slog.Info("orchestrator: adopted the existing agent of that name; hap will not brief it", "pane", tr.PaneID)
-	} else {
+	default:
 		slog.Info("orchestrator: started", "pane", tr.PaneID, "workspace", domain.OrchestratorWorkspaceLabel)
 	}
 	return id, true
+}
+
+// reclaimOrchestrator tells hap's OWN session apart from one somebody else
+// started, among the sessions launchOrchestrator finds by name — and returns
+// adopted unchanged when it cannot prove it, so the rule that hap never types
+// into a session it did not start stands.
+//
+// Without this, losing track of a session hap had put to sleep would strand it:
+// found by name, it would be recorded as adopted — never briefed by hap, never
+// dormant — and so never woken, asleep for as long as the mode stayed on. Two
+// proofs, positive only:
+//
+//   - The TERMINAL is the one hap recorded. The record lost the session because
+//     its pane id changed (a moved pane, a renumbered listing), not because it is
+//     another session, so the whole record — brief, dormancy, attempts — carries
+//     over.
+//   - The record is gone (the identity file deleted or unreadable), but the
+//     SCREEN shows hap's own dormant message with no wake after it. A dormant
+//     session runs nothing, so that exchange is still the last thing it shows.
+//     Only the dormant case is provable this way, and only it needs to be: an
+//     awake session found like this keeps its Monitor and cron, and stays
+//     adopted.
+func (d *Daemon) reclaimOrchestrator(ctx context.Context, adopted, prev domain.OrchestratorIdentity) (
+	domain.OrchestratorIdentity, bool) {
+	if prev.HapBriefed() && prev.TerminalID != "" && prev.TerminalID == adopted.TerminalID {
+		id := prev
+		id.PaneID, id.WorkspaceID = adopted.PaneID, adopted.WorkspaceID
+		return id, true
+	}
+	reader, ok := d.opt.Herdr.(ports.VisiblePaneReader)
+	if !ok {
+		return adopted, false
+	}
+	pane, err := reader.ReadPaneVisible(ctx, adopted.PaneID, orchestratorBriefReadLines)
+	if err != nil {
+		slog.Warn("orchestrator: reading an adopted session's pane failed", "pane", adopted.PaneID, "error", err)
+		return adopted, false
+	}
+	if !domain.OrchestratorDormantOnScreen(pane) {
+		return adopted, false
+	}
+	adopted.Reclaimed, adopted.Dormant, adopted.NudgeTarget = true, true, true
+	return adopted, true
 }
 
 // claimOrchestratorName gives the pane the hap name "orchestrator" and
@@ -659,6 +936,12 @@ func (d *Daemon) orchestratorPrompt(cfg config.Config) string {
 	if text == "" {
 		text = orchestratorBrief
 	}
+	return d.renderOrchestratorText(cfg, text)
+}
+
+// renderOrchestratorText expands {self} and {skills} in anything hap types into
+// the orchestrator — the brief and both dormancy messages.
+func (d *Daemon) renderOrchestratorText(cfg config.Config, text string) string {
 	self := "hap"
 	if d.opt.ResolveSelf != nil {
 		if p, err := d.opt.ResolveSelf(); err == nil && p != "" {

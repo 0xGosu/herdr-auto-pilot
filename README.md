@@ -1715,9 +1715,17 @@ publishing a release, another node's or your own private work). It is also told
 to read each repo's `AUTO.md` as decisions you have already made there. It is re-created if
 it disappears — at most 3 times an hour — and never closed by hap. Its brief also
 has it schedule an hourly health check (Claude's `CronCreate`) that restarts a
-stopped hap daemon and looks in on hung agents, removed while the mode is off. It
+stopped hap daemon and looks in on hung agents. It
 runs in `<state>/orchestrator` unless `full_self_prompting.orchestrator_agent_cwd`
 names another existing directory.
+
+While the mode is off, the session sleeps rather than spending tokens watching a
+herd nothing drives: when full self-prompting turns off (or stands down at a
+`[limits]` ceiling), hap types a message into it to stop its stream Monitor and
+delete its hourly cron, and when the mode comes back on, tells the same session
+to wake — re-survey, arm a fresh Monitor and re-create the cron. Both messages
+wait while the herd is paused, and go only to a session hap started and briefed
+itself.
 
 hap also puts the `hap` and `hap-orchestrator` skills on disk in that working
 directory (`<state>/orchestrator/.claude/skills/`, refreshed whenever an upgrade
