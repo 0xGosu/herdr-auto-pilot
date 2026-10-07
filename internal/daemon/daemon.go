@@ -1294,10 +1294,11 @@ func (d *Daemon) reloadWith(forceEmbedder bool) error {
 		d.startClaudeSessionNameSync()
 	}
 	// Turning the orchestrator on (the key, or the mode it rides on) starts it
-	// now rather than at the next sweep. `!first` for the reason above: Run
-	// drives its own startup pass. Called after the unlock — the pass takes
-	// d.mu itself.
-	if !first && !d.orchestratorModeOn(prev) {
+	// — or wakes a session left dormant — now rather than at the next sweep,
+	// and turning it off sends the dormant message now. `!first` for the reason
+	// above: Run drives its own startup pass. Called after the unlock — the
+	// pass takes d.mu itself.
+	if !first && d.orchestratorModeOn(prev) != d.orchestratorModeOn(cfg) {
 		d.startOrchestratorPass(nil)
 	}
 

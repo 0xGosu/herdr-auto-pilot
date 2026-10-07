@@ -45,8 +45,11 @@ and gap/reset. `agent.mode … promote=<mode>` is acted on, not reported: run
 
 **An hourly health check**, as a cron: `hap status` and `hap agents`; if paused,
 only watch; start a dead daemon with `hap daemon --ensure`; read the screen of
-anything stuck and unblock it; report only if something needed action. Retire it
-on `fsp.off`; re-create it on `fsp.on`.
+anything stuck and unblock it; report only if something needed action.
+
+Both go away while full self-prompting is off: hap messages you to stop the
+Monitor and delete the cron, then messages you again to re-arm both when the mode
+returns. See [dormancy](SKILL.md#dormancy).
 
 That is the standing set. Adding a third is the exception, not the routine.
 

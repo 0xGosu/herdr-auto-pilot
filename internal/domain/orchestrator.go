@@ -63,10 +63,32 @@ type OrchestratorIdentity struct {
 	// retries of a delivery that keeps failing.
 	Briefed       bool `json:"briefed"`
 	BriefAttempts int  `json:"brief_attempts,omitempty"`
+	// Dormant is which dormancy message was last DELIVERED: true once the
+	// session was told to stand its Monitor and cron down because full
+	// self-prompting went off, false again once it was told to wake. Persisted,
+	// so a daemon restarted between the two still knows a wake is owed.
+	//
+	// NudgeUnconfirmed is set by a send herdr reported FAILED, which may still
+	// have landed: until a send is confirmed, Dormant is not known to describe
+	// the session, so whichever message the mode wants is owed even when Dormant
+	// already matches it. NudgeAttempts bounds those failed sends, counted
+	// toward NudgeTarget (the state they were trying to reach) — a change of
+	// target starts a fresh count.
+	Dormant          bool `json:"dormant,omitempty"`
+	NudgeUnconfirmed bool `json:"nudge_unconfirmed,omitempty"`
+	NudgeTarget      bool `json:"nudge_target,omitempty"`
+	NudgeAttempts    int  `json:"nudge_attempts,omitempty"`
 }
 
 // Known reports whether the identity names a session at all.
 func (id OrchestratorIdentity) Known() bool { return id.PaneID != "" }
+
+// HapBriefed reports whether hap itself delivered this session's brief — the
+// only sessions it types anything further into. An ADOPTED session is recorded
+// as Briefed with no attempts (hap never sent it anything), and a delivered
+// brief always counts its attempt first, so the pair tells them apart in
+// identity files written before this existed too.
+func (id OrchestratorIdentity) HapBriefed() bool { return id.Briefed && id.BriefAttempts > 0 }
 
 // Matches reports whether tr comes from the orchestrator session. The terminal
 // id decides when both sides carry one; otherwise the pane id does, because

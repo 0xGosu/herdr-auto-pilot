@@ -42,3 +42,24 @@ func TestOrchestratorIdentityMatching(t *testing.T) {
 		t.Error("an unknown identity matched an agent")
 	}
 }
+
+// Only a session hap briefed itself gets the dormancy messages. An adopted one
+// is recorded Briefed with no attempts; one whose brief never landed is not
+// Briefed at all.
+func TestOrchestratorIdentityHapBriefed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   OrchestratorIdentity
+		want bool
+	}{
+		{"briefed by hap", OrchestratorIdentity{PaneID: "p", Briefed: true, BriefAttempts: 1}, true},
+		{"briefed after a retry", OrchestratorIdentity{PaneID: "p", Briefed: true, BriefAttempts: 2}, true},
+		{"adopted", OrchestratorIdentity{PaneID: "p", Briefed: true}, false},
+		{"brief never landed", OrchestratorIdentity{PaneID: "p", BriefAttempts: 3}, false},
+		{"fresh", OrchestratorIdentity{PaneID: "p"}, false},
+	} {
+		if got := tc.id.HapBriefed(); got != tc.want {
+			t.Errorf("%s: HapBriefed() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
