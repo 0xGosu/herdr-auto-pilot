@@ -1,1 +1,0 @@
-- Fixed an answer decided for one Claude permission prompt being pressed into the next queued prompt when the first was answered by hand in the meantime; hap now checks it is still the same prompt, and otherwise raises the new one on its own
