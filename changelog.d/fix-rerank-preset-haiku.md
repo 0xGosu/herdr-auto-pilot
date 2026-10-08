@@ -1,3 +1,0 @@
-- Changed the claude preset for `llm.reranking_command` to run on haiku instead of sonnet, so the re-ranking judge answers faster while the agent waits
-- Changed the claude preset for `llm.command` to run on sonnet instead of opus
-- Moved the codex presets to GPT-6: `llm.task_generate_command` and `llm.learn_from_user_command` now run on gpt-6.1-sol, and `llm.reranking_command` on gpt-6-luna

@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.69
+
+- Changed the claude preset for `llm.reranking_command` to run on haiku instead of sonnet, so the re-ranking judge answers faster while the agent waits
+- Changed the claude preset for `llm.command` to run on sonnet instead of opus
+- Moved the codex presets to GPT-6: `llm.task_generate_command` and `llm.learn_from_user_command` now run on gpt-6.1-sol, and `llm.reranking_command` on gpt-6-luna
+
 ## 0.9.68
 
 - Fixed duplicate escalations for one standing agy approval when the agent's mode changed (e.g. into plan mode) while it waited
