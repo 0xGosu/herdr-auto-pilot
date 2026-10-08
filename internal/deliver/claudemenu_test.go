@@ -2,6 +2,7 @@ package deliver_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/deliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 )
 
 // pagedApprovalPane renders Claude's paged permission dialog ("1 of N") for
@@ -136,5 +138,19 @@ func TestDeliverClaudeMenuDigitHandsTheSettleOff(t *testing.T) {
 	settle(context.Background())
 	if !reflect.DeepEqual(h.keys, []string{"2", "enter"}) {
 		t.Fatalf("keys after the settle = %v, want the digit then Enter", h.keys)
+	}
+}
+
+// An answer decided on page 1 is not pressed into page 2 (#571): an operator's
+// reply, or an auto-accept, whose dialog was replaced in place is refused with
+// nothing typed.
+func TestDeliverClaudeMenuDigitRefusesADialogItWasNotDecidedFor(t *testing.T) {
+	h := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: pagedApprovalPane("Get Files", 2, 1)}}
+	err := deliver.Deliver(context.Background(), fastCfg(h), pagedRequest("Yes"))
+	if !errors.Is(err, mcqdeliver.ErrClaudeMenuMoved) {
+		t.Fatalf("err = %v, want ErrClaudeMenuMoved", err)
+	}
+	if len(h.keys) != 0 || len(h.inputs) != 0 {
+		t.Fatalf("keys = %v inputs = %v; nothing may be typed", h.keys, h.inputs)
 	}
 }

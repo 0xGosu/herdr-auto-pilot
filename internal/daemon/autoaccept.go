@@ -748,6 +748,20 @@ func (d *Daemon) autoAcceptDeliveryFailed(ctx context.Context, rec *domain.Audit
 		return autoAcceptSkipped
 	}
 
+	// The Claude dialog this row was raised for was replaced in place before
+	// the digit went out (#571): nothing was pressed, and every retry would be
+	// refused the same way. Returned to the queue without spending an attempt —
+	// Guard 3's held-still check then leaves it for the operator — and the pane
+	// is captured again so the dialog now standing is decided on its own.
+	if isClaudeMenuMoved(cause) {
+		slog.Info("auto-accept: the Claude dialog changed before the answer went out; nothing was pressed",
+			"audit_id", rec.ID, "agent", rec.AgentID)
+		d.revertClaim(ctx, rec.ID)
+		d.notePending(rec, "the Claude dialog on screen is no longer the one this escalation was raised for")
+		d.recaptureAfterMovedDialog(ctx, rec)
+		return autoAcceptSkipped
+	}
+
 	// A disabled agent is suppression, not failure: it must not burn an
 	// attempt, or an agent left off for a few minutes would exhaust the budget
 	// and lose its escalation.

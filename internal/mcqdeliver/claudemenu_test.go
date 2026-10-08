@@ -149,7 +149,7 @@ func TestClaudeMenuDigitThatCommitsGetsNoEnter(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			f := c.f
-			if err := ClaudeMenu(context.Background(), f.config(), c.digit); err != nil {
+			if err := ClaudeMenu(context.Background(), f.config(), "", c.digit); err != nil {
 				t.Fatalf("delivery failed: %v", err)
 			}
 			noEnter(t, f.keys)
@@ -169,7 +169,7 @@ func TestClaudeMenuDigitThatMovesTheCaretIsCommittedWithEnter(t *testing.T) {
 	for _, digit := range []string{"2", "3"} {
 		t.Run("option "+digit, func(t *testing.T) {
 			f := newFakeClaudeQueue(digitMovesCaret, "Get Pr", "Get Files")
-			before, err := ClaudeMenuPress(context.Background(), f.config(), digit)
+			before, err := ClaudeMenuPress(context.Background(), f.config(), "", digit)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -193,7 +193,7 @@ func TestClaudeMenuDigitThatMovesTheCaretIsCommittedWithEnter(t *testing.T) {
 // self-check to report, never risked on the next request.
 func TestClaudeMenuDigitAlreadyUnderTheCaretGetsNoEnter(t *testing.T) {
 	f := newFakeClaudeQueue(digitMovesCaret, "Get Pr", "Get Files")
-	if err := ClaudeMenu(context.Background(), f.config(), "1"); err != nil {
+	if err := ClaudeMenu(context.Background(), f.config(), "", "1"); err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(f.keys, []string{"1"}) || len(f.answered) != 0 {
@@ -209,7 +209,7 @@ func TestClaudeMenuWithholdsEnterOnAnyDoubt(t *testing.T) {
 	t.Run("caret not on the chosen option", func(t *testing.T) {
 		f := newFakeClaudeQueue(digitMovesCaret, "Get Pr")
 		f.deaf = true
-		if err := ClaudeMenu(context.Background(), f.config(), "2"); err != nil {
+		if err := ClaudeMenu(context.Background(), f.config(), "", "2"); err != nil {
 			t.Fatalf("err = %v", err)
 		}
 		noEnter(t, f.keys)
@@ -217,7 +217,7 @@ func TestClaudeMenuWithholdsEnterOnAnyDoubt(t *testing.T) {
 	t.Run("pane unreadable after the digit", func(t *testing.T) {
 		f := newFakeClaudeQueue(digitMovesCaret, "Get Pr")
 		cfg := f.config()
-		before, err := ClaudeMenuPress(context.Background(), cfg, "2")
+		before, err := ClaudeMenuPress(context.Background(), cfg, "", "2")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -232,7 +232,7 @@ func TestClaudeMenuWithholdsEnterOnAnyDoubt(t *testing.T) {
 func TestClaudeMenuRefusesBeforePressing(t *testing.T) {
 	t.Run("option not offered", func(t *testing.T) {
 		f := newFakeClaudeQueue(digitCommits, "Get Pr")
-		err := ClaudeMenu(context.Background(), f.config(), "7")
+		err := ClaudeMenu(context.Background(), f.config(), "", "7")
 		if err == nil || errors.Is(err, ErrNoClaudeMenu) {
 			t.Fatalf("err = %v, want a refusal", err)
 		}
@@ -243,7 +243,7 @@ func TestClaudeMenuRefusesBeforePressing(t *testing.T) {
 	t.Run("read failure", func(t *testing.T) {
 		f := newFakeClaudeQueue(digitCommits, "Get Pr")
 		f.readErr = errors.New("herdr unreachable")
-		if err := ClaudeMenu(context.Background(), f.config(), "1"); err == nil || errors.Is(err, ErrNoClaudeMenu) {
+		if err := ClaudeMenu(context.Background(), f.config(), "", "1"); err == nil || errors.Is(err, ErrNoClaudeMenu) {
 			t.Fatalf("err = %v, want a read failure", err)
 		}
 		if len(f.keys) != 0 {
@@ -256,10 +256,46 @@ func TestClaudeMenuRefusesBeforePressing(t *testing.T) {
 // nothing and hands the caller back its ordinary route.
 func TestClaudeMenuWithoutADialogPressesNothing(t *testing.T) {
 	f := newFakeClaudeQueue(digitCommits)
-	if err := ClaudeMenu(context.Background(), f.config(), "1"); !errors.Is(err, ErrNoClaudeMenu) {
+	if err := ClaudeMenu(context.Background(), f.config(), "", "1"); !errors.Is(err, ErrNoClaudeMenu) {
 		t.Fatalf("err = %v, want ErrNoClaudeMenu", err)
 	}
 	if len(f.keys) != 0 {
 		t.Errorf("keys pressed: %v", f.keys)
+	}
+}
+
+// The dialog the answer was decided for was replaced in place before the digit
+// went out — every Claude permission page offers the same options, so only the
+// dialog itself can tell page 2 from page 1 (#571). Nothing may be pressed.
+func TestClaudeMenuRefusesADialogItWasNotDecidedFor(t *testing.T) {
+	f := newFakeClaudeQueue(digitCommits, "Get Files", "Get Profile")
+	decided := newFakeClaudeQueue(digitCommits, "Get Pr", "Get Files", "Get Profile").render()
+	if err := ClaudeMenu(context.Background(), f.config(), decided, "1"); !errors.Is(err, ErrClaudeMenuMoved) {
+		t.Fatalf("err = %v, want ErrClaudeMenuMoved", err)
+	}
+	if len(f.keys) != 0 || len(f.answered) != 0 {
+		t.Fatalf("keys = %v answered = %v; nothing may reach a dialog nobody decided about", f.keys, f.answered)
+	}
+}
+
+// Only positive evidence of a DIFFERENT dialog refuses: the queue counter moving
+// (another requester joined, or a page settled elsewhere) is the same dialog, and
+// a decision screen with no dialog in it (the consuming capture often lacks the
+// border) cannot be compared at all.
+func TestClaudeMenuPressesWhenTheDialogIsTheSameOrUnknown(t *testing.T) {
+	for name, decided := range map[string]string{
+		"counter moved":        newFakeClaudeQueue(digitCommits, "Get Pr", "Get Files", "Get Profile", "Get Repo").render(),
+		"no dialog in capture": "● 3 general-purpose agents launched\n\n✻ Waiting for background agents\n",
+		"nothing kept":         "",
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newFakeClaudeQueue(digitCommits, "Get Pr", "Get Files", "Get Profile")
+			if err := ClaudeMenu(context.Background(), f.config(), decided, "1"); err != nil {
+				t.Fatalf("err = %v", err)
+			}
+			if !reflect.DeepEqual(f.answered, []string{"Get Pr=1"}) {
+				t.Fatalf("answered %v, want page 1 answered", f.answered)
+			}
+		})
 	}
 }

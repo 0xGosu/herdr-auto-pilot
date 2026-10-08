@@ -65,6 +65,14 @@ func (d *Daemon) agyForm(ks ports.KeystrokeSender, s domain.Situation, tr domain
 // cancels the capture (handleTransition); when the form closed, the capture
 // classifies whatever agy parked on, exactly as a status event would have.
 func (d *Daemon) recaptureAfterAgyAnswer(ctx context.Context, tr domain.AgentTransition) {
+	d.recaptureRedrawn(ctx, tr)
+}
+
+// recaptureRedrawn schedules a fresh capture of a pane whose agent redrew its
+// screen IN PLACE — no status change, so no herdr event to announce it. A
+// working transition cancels it (handleTransition); otherwise the capture
+// classifies whatever is standing, exactly as a status event would have.
+func (d *Daemon) recaptureRedrawn(ctx context.Context, tr domain.AgentTransition) {
 	switch tr.Status {
 	case "idle", "done", "blocked":
 	default:

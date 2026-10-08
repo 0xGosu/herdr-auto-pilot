@@ -44,7 +44,12 @@ func (d *Daemon) claudeMenuConfig(ks ports.KeystrokeSender, paneID string) mcqde
 // other settle can press keys between the digit and a possible Enter; a pane
 // already claimed refuses, as every keyed delivery does. A returned press OWNS
 // the claim and settleClaudeMenu releases it.
-func (d *Daemon) pressClaudeMenu(ctx context.Context, s domain.Situation, mapped bool, digit string) (*claudeMenuPress, error) {
+//
+// decided is the screen the answer was decided from; a live dialog that is
+// provably a different one refuses with mcqdeliver.ErrClaudeMenuMoved, which the
+// caller handles as "the screen moved on", not a delivery failure
+// (claudeMenuMoved).
+func (d *Daemon) pressClaudeMenu(ctx context.Context, s domain.Situation, mapped bool, decided, digit string) (*claudeMenuPress, error) {
 	if !domain.ClaudeMenuDigit(s.Type, s.AgentType, mapped) {
 		return nil, nil
 	}
@@ -56,7 +61,7 @@ func (d *Daemon) pressClaudeMenu(ctx context.Context, s domain.Situation, mapped
 	if !d.acquirePane(s.AgentID) {
 		return nil, errClaudeMenuPaneBusy
 	}
-	before, err := mcqdeliver.ClaudeMenuPress(ctx, d.claudeMenuConfig(ks, s.PaneID), digit)
+	before, err := mcqdeliver.ClaudeMenuPress(ctx, d.claudeMenuConfig(ks, s.PaneID), decided, digit)
 	if err != nil {
 		d.releasePane(s.AgentID)
 		if errors.Is(err, mcqdeliver.ErrNoClaudeMenu) {
@@ -128,8 +133,8 @@ var errClaudeMenuPaneBusy = errors.New("another pane interaction is in flight fo
 // sendReply delivers a decided reply: a Claude menu digit as a key
 // (pressClaudeMenu), anything else through the ordinary send. press is non-nil
 // when the key route was taken; hand it to armAfterSend.
-func (d *Daemon) sendReply(ctx context.Context, s domain.Situation, mapped bool, text string) (*claudeMenuPress, error) {
-	press, err := d.pressClaudeMenu(ctx, s, mapped, text)
+func (d *Daemon) sendReply(ctx context.Context, s domain.Situation, mapped bool, decided, text string) (*claudeMenuPress, error) {
+	press, err := d.pressClaudeMenu(ctx, s, mapped, decided, text)
 	if err != nil || press != nil {
 		return press, err
 	}
@@ -168,4 +173,36 @@ func (d *Daemon) settleClaudeMenu(press *claudeMenuPress, s domain.Situation, au
 		d.scheduleUnblockCheck(p)
 	})
 	d.releasePane(s.AgentID)
+}
+
+// isClaudeMenuMoved reports that a Claude menu digit was refused because the
+// dialog it was decided for is no longer the one on screen.
+func isClaudeMenuMoved(err error) bool {
+	return errors.Is(err, mcqdeliver.ErrClaudeMenuMoved)
+}
+
+// claudeMenuMoved handles mcqdeliver.ErrClaudeMenuMoved: the dialog the answer
+// was decided for was replaced in place before the digit went out — typically
+// answered by hand, with Claude's next queued request drawn where it stood. That
+// is a verdict about the screen, not a delivery fault: nothing was pressed, so
+// the audit row is retired as ignored (no failure notice), and the pane is
+// captured again, because an in-place redraw raises no herdr event and the new
+// dialog would otherwise stand unseen (recaptureRedrawn).
+func (d *Daemon) claudeMenuMoved(ctx context.Context, s domain.Situation, tr domain.AgentTransition, auditID int64) {
+	slog.Info("the Claude dialog changed between the decision and the send; nothing was pressed",
+		"agent", s.AgentID, "audit_id", auditID)
+	d.opt.Store.UpdateAuditStatus(ctx, auditID, domain.AuditStatusIgnored)
+	d.recaptureRedrawn(ctx, tr)
+}
+
+// recaptureAfterMovedDialog is claudeMenuMoved's re-capture for a delivery
+// driven from an audit row (auto-accept, an operator's reply). The live listing
+// supplies the agent's real status — a Claude permission dialog parks it
+// blocked — and an unlisted agent keeps the row's bare transition.
+func (d *Daemon) recaptureAfterMovedDialog(ctx context.Context, rec *domain.AuditRecord) {
+	if live, ok := d.liveAgentFor(ctx, rec.AgentID); ok {
+		d.recaptureRedrawn(ctx, live)
+		return
+	}
+	d.recaptureRedrawn(ctx, d.recaptureTransitionFor(ctx, rec))
 }

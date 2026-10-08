@@ -3473,6 +3473,10 @@ type delivery struct {
 	// (DeliverOutbound's bool) — for Claude, pressed as a key with a
 	// conditional Enter (domain.ClaudeMenuDigit, #564).
 	menuDigit bool
+	// decided is the screen the reply was decided from, when it is not
+	// s.Content — the action review maps its answer on a fresh visible read.
+	// A Claude menu digit refuses to press into a different dialog (#571).
+	decided   string
 	input     string // audit Input and the "auto:" action label
 	rationale string
 	llmOutput string // LLM review diagnostics, when applicable
@@ -3718,7 +3722,16 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		return false
 	}
 
-	press, err := d.sendReply(ctx, s, del.menuDigit, del.sendText)
+	decided := del.decided
+	if decided == "" {
+		decided = s.Content
+	}
+	press, err := d.sendReply(ctx, s, del.menuDigit, decided, del.sendText)
+	if isClaudeMenuMoved(err) {
+		rollback()
+		d.claudeMenuMoved(ctx, s, tr, auditID)
+		return false
+	}
 	if err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
 		// A failed send leaves NO reservation behind — the ledger row below is
@@ -5674,6 +5687,7 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	delivered := d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
 		sendText:      sendText,
 		menuDigit:     menuDigit,
+		decided:       pane,
 		input:         final,
 		rationale:     fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
 		llmOutput:     llmOutput,
@@ -6239,7 +6253,13 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 					"An LLM-derived action was blocked because its audit record could not be written.")
 				return
 			}
-			press, err := d.sendReply(ctx, s, menuDigit, sendText)
+			press, err := d.sendReply(ctx, s, menuDigit, s.Content, sendText)
+			if isClaudeMenuMoved(err) {
+				d.dropAutoTaskClaim(s.AgentID)
+				d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "expired")
+				d.claudeMenuMoved(ctx, s, tr, auditID)
+				return
+			}
 			if err != nil {
 				// Release any pairing this agent holds so no other agent is
 				// denied the item until the claim's TTL (the rule path does
