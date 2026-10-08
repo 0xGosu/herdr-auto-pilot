@@ -1,1 +1,0 @@
-- Fixed answering a Claude single-question form sometimes answering the next queued question too: hap now presses the option's number on its own and waits for the next question to be raised separately
