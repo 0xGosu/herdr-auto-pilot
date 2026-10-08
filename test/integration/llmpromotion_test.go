@@ -5,7 +5,6 @@ package integration
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -14,24 +13,23 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
-// scriptedLLM answers every approval consult with a confident "Yes", staging
-// the decision row in the daemon's store the way the real CLI's submit_decision
-// does. Anything else is refused, so a consult the case did not expect cannot
-// quietly turn into a send.
+// scriptedLLM answers every approval consult for its own scratch pane with a
+// confident "Yes", staging the decision row in the daemon's store the way the
+// real CLI's submit_decision does. Anything else is refused, so a consult the
+// case did not expect cannot quietly turn into a send. The pane scope is
+// load-bearing: the test daemon's reconcile reaches EVERY real pane on the
+// shared herdr (see capturingLLM), and an unscoped "Yes" would approve whatever
+// the operator's own agents are blocked on.
 type scriptedLLM struct {
-	st       *store.Store
-	mu       sync.Mutex
-	consults int
+	st   *store.Store
+	pane string
 }
 
 func (l *scriptedLLM) Configured() bool { return true }
 
 func (l *scriptedLLM) Consult(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
-	l.mu.Lock()
-	l.consults++
-	l.mu.Unlock()
-	if req.SituationType != domain.SituationApproval || req.ActionReview {
-		return nil, errors.New("integration test: only approval consults are scripted")
+	if req.AgentID != l.pane || req.SituationType != domain.SituationApproval || req.ActionReview {
+		return nil, errors.New("integration test: only the scratch pane's approval consults are scripted")
 	}
 	dec := domain.LLMDecision{
 		RequestID: req.RequestID, Signature: req.Signature,
@@ -63,7 +61,9 @@ func TestRealClaudeLLMPromotedPagedApprovalApprovesOneRequestPerAnswer(t *testin
 
 	const cfg = "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n" +
 		"[limits]\nmax_auto_prompts_per_minute = 100\nmax_consecutive_auto_prompts = 100\n"
-	h := newTestDaemonWithLLM(t, cli, cfg, func(st *store.Store) ports.LLMPort { return &scriptedLLM{st: st} })
+	h := newTestDaemonWithLLM(t, cli, cfg, func(st *store.Store) ports.LLMPort {
+		return &scriptedLLM{st: st, pane: pane}
+	})
 	dctx, cancel := context.WithCancel(context.Background())
 	runDaemon(t, dctx, cancel, h.Daemon)
 
@@ -97,13 +97,18 @@ func TestRealClaudeLLMPromotedPagedApprovalApprovesOneRequestPerAnswer(t *testin
 		return len(got), auto, llm
 	}
 
-	// Done when the queue is gone (every page answered) after at least two
+	// Done when no dialog stands at all (every page answered) after at least two
 	// promoted answers — page 1, and a page the self-check captured in place.
+	// "No pager counter" is not enough: a last request drawn without one, or a
+	// failed read, would end the wait with a dialog the daemon then answers
+	// under the final count.
+	drained := false
 	deadline := time.Now().Add(120 * time.Second)
 	for time.Now().Before(deadline) {
 		_, _, llm := check()
-		content, _ := cli.ReadPaneVisible(ctx, pane, 60)
-		if llm >= 2 && pagerPosition(content) == "" {
+		content, err := cli.ReadPaneVisible(ctx, pane, 60)
+		if _, modal := domain.ClaudeModalRegion(content); err == nil && llm >= 2 && !modal {
+			drained = true
 			break
 		}
 		time.Sleep(300 * time.Millisecond)
@@ -116,6 +121,14 @@ func TestRealClaudeLLMPromotedPagedApprovalApprovesOneRequestPerAnswer(t *testin
 		content, _ := cli.ReadPaneVisible(ctx, pane, 40)
 		t.Fatalf("want every page answered by a promoted LLM decision, got %d LLM answers (%d automatic, %d calls).\npane:\n%s",
 			llm, auto, calls, content)
+	}
+	if !drained {
+		content, _ := cli.ReadPaneVisible(ctx, pane, 40)
+		t.Fatalf("the queue still stands after %d LLM answers (%d automatic, %d calls).\npane:\n%s",
+			llm, auto, calls, content)
+	}
+	if llm != auto {
+		t.Fatalf("%d of %d automatic answers came from a promoted LLM decision; want every page answered by one", llm, auto)
 	}
 	if calls != auto {
 		t.Fatalf("Claude ran %d tool calls for %d automatic answers; every answer approves exactly one request", calls, auto)
