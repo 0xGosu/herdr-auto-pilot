@@ -149,6 +149,13 @@ func (d *Daemon) deliverToPane(ctx context.Context, audit *domain.AuditRecord, a
 		// against a screen that keeps moving, and the staleness bound would
 		// refuse it anyway with a far less useful reason.
 		return fmt.Errorf("agent %s is disabled for automation; re-enable it and answer again", audit.AgentID)
+	case isClaudeMenuMoved(err):
+		// The operator answered a dialog that has since been replaced in
+		// place (#571). Nothing was pressed; the escalation stays open, and
+		// the dialog now standing is captured and raised on its own.
+		d.recaptureAfterMovedDialog(ctx, audit)
+		return fmt.Errorf("the Claude dialog on screen is no longer the one this answer was for, so nothing was " +
+			"pressed; the prompt now standing will be raised on its own")
 	default:
 		return err
 	}

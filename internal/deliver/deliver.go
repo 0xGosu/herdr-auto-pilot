@@ -228,7 +228,7 @@ func Deliver(ctx context.Context, c Config, req Request) error {
 		// A Claude menu digit is pressed as a KEY: Claude commits on the digit,
 		// and an Enter after it would answer the next queued request (#564).
 		if domain.ClaudeMenuDigit(req.SituationType, req.AgentType, mapped) {
-			if handled, err := c.deliverClaudeMenu(ctx, req.PaneID, outbound); handled {
+			if handled, err := c.deliverClaudeMenu(ctx, req.PaneID, req.PaneExcerpt, outbound); handled {
 				return err
 			}
 		}
@@ -274,20 +274,23 @@ func (c Config) deliverAgy(ctx context.Context, req Request) error {
 // false — and nothing was pressed — when the adapter cannot send keystrokes or
 // the pane shows no dialog that deliverer models; the caller then keeps the
 // ordinary send.
-func (c Config) deliverClaudeMenu(ctx context.Context, paneID, digit string) (bool, error) {
+//
+// decided is the capture the answer was decided from; a live dialog that is
+// provably a different one refuses with mcqdeliver.ErrClaudeMenuMoved.
+func (c Config) deliverClaudeMenu(ctx context.Context, paneID, decided, digit string) (bool, error) {
 	ks, ok := c.Herdr.(ports.KeystrokeSender)
 	if !ok {
 		return false, nil
 	}
 	cfg := c.mcq(ks, paneID)
 	if c.SettleAsync == nil {
-		err := mcqdeliver.ClaudeMenu(ctx, cfg, digit)
+		err := mcqdeliver.ClaudeMenu(ctx, cfg, decided, digit)
 		if errors.Is(err, mcqdeliver.ErrNoClaudeMenu) {
 			return false, nil
 		}
 		return true, err
 	}
-	before, err := mcqdeliver.ClaudeMenuPress(ctx, cfg, digit)
+	before, err := mcqdeliver.ClaudeMenuPress(ctx, cfg, decided, digit)
 	if errors.Is(err, mcqdeliver.ErrNoClaudeMenu) {
 		return false, nil
 	}

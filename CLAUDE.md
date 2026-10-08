@@ -285,7 +285,10 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   (`delivery.menuDigit`), the LLM promotion. The digit is pressed inline; the settle runs OFF the loop
   (`runClaudeSettle`, via `deliver.Config.SettleAsync` for auto-accept and operator replies), and a settling
   pane is busy to `acquirePane`/`paneBusy` and to the self-check (`armUnblockCheck` defers). Past the
-  digit nothing is a delivery failure (auto-accept would retry).
+  digit nothing is a delivery failure (auto-accept would retry). The press refuses a dialog other than the
+  one DECIDED on (`mcqdeliver.ErrClaudeMenuMoved`: masked `Region` differs; an unparseable decided screen
+  still presses) — every page offers the same options. Refused = ignored row + `recaptureRedrawn` (no
+  herdr event for an in-place redraw); auto-accept returns the claim without spending an attempt (#571).
   **Test trap:** the daemon fake answers digits through `onKey`; `menuDigits` fails on a text send. Live
   proof: `TestRealClaudePagedApprovalQueueIsFollowed` (operator) and `…LLMPromotedPagedApproval…` (LLM);
   their fake MCP server must log each call on RECEIPT and answer it on a thread, or a stray approval hides.

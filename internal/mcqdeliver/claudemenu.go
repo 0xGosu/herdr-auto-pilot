@@ -26,12 +26,22 @@ const claudeMenuVerifyReads = 4
 // built and verified for.
 var ErrNoClaudeMenu = errors.New("no Claude dialog that can be answered by key is standing in the pane")
 
+// ErrClaudeMenuMoved reports that the Claude dialog on screen is provably not
+// the one the answer was decided for — nothing was pressed. Every Claude
+// permission page offers the same Yes / Yes-and / No options, so the option set
+// alone cannot tell page 2 from page 1 (#571): answered by hand in the seconds
+// between a decision and its send, page 1 is replaced in place, and the digit
+// would approve page 2 unclassified. A verdict about the screen, not a delivery
+// fault — the caller re-captures the pane rather than retrying.
+var ErrClaudeMenuMoved = errors.New("the Claude dialog on screen is not the one this answer was decided for; nothing was pressed")
+
 // ClaudeMenu answers the Claude dialog standing in the pane with digit — a menu
-// digit the caller has already mapped (domain.ClaudeMenuDigit). It is
-// ClaudeMenuPress followed by ClaudeMenuSettle, for callers that may block for
-// the settle window; the daemon's select loop presses inline and settles off it.
-func ClaudeMenu(ctx context.Context, c Config, digit string) error {
-	before, err := ClaudeMenuPress(ctx, c, digit)
+// digit the caller has already mapped (domain.ClaudeMenuDigit) from the screen
+// decided. It is ClaudeMenuPress followed by ClaudeMenuSettle, for callers that
+// may block for the settle window; the daemon's select loop presses inline and
+// settles off it.
+func ClaudeMenu(ctx context.Context, c Config, decided, digit string) error {
+	before, err := ClaudeMenuPress(ctx, c, decided, digit)
 	if err != nil {
 		return err
 	}
@@ -43,12 +53,21 @@ func ClaudeMenu(ctx context.Context, c Config, digit string) error {
 // Enter, returning the dialog as it stood before the press — the baseline
 // ClaudeMenuSettle compares against.
 //
+// decided is the screen the answer was decided from ("" when none was kept).
+// When it shows a Claude dialog, the live dialog must be that same one —
+// domain.ClaudeMenu.Region equal, which masks the caret and the queue counter, so
+// a requester joining the queue does not refuse — or ErrClaudeMenuMoved is
+// returned and nothing is pressed. When it shows none (the consuming "recent"
+// capture often lacks the dialog's border), nothing can be compared and the
+// press goes ahead: only positive evidence of a different dialog refuses, the
+// bargain mcqdeliver.Agy strikes with its own excerpt.
+//
 // A pane showing no Claude dialog returns ErrNoClaudeMenu, and so does one whose
 // dialog region does not carry the digit while the screen as a whole does (an
 // AskUserQuestion form, whose last rule sits above "Chat about this"): both are
 // shapes this deliverer does not model. A dialog that offers the digit nowhere is
 // refused outright — typed with an Enter, it would commit the caret's option.
-func ClaudeMenuPress(ctx context.Context, c Config, digit string) (domain.ClaudeMenu, error) {
+func ClaudeMenuPress(ctx context.Context, c Config, decided, digit string) (domain.ClaudeMenu, error) {
 	pane, err := c.Read(ctx, c.PaneID, c.ReadLines)
 	if err != nil {
 		return domain.ClaudeMenu{}, fmt.Errorf("claude menu pre-answer read: %w", err)
@@ -56,6 +75,9 @@ func ClaudeMenuPress(ctx context.Context, c Config, digit string) (domain.Claude
 	menu, ok := domain.ParseClaudeMenu(pane)
 	if !ok {
 		return domain.ClaudeMenu{}, ErrNoClaudeMenu
+	}
+	if was, ok := domain.ParseClaudeMenu(decided); ok && was.Region != menu.Region {
+		return domain.ClaudeMenu{}, ErrClaudeMenuMoved
 	}
 	if !menu.Offers(digit) {
 		if _, offered := domain.MenuKeystroke(pane, digit); offered {

@@ -11,6 +11,8 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/mcqdeliver"
 	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
@@ -254,4 +257,177 @@ func TestUnblockCheckWaitsOutAClaudeMenuSettle(t *testing.T) {
 
 	h.setClaudeSettling("agent-ws", 0)
 	waitFor(t, 3*time.Second, func() bool { return h.countDeliveryFailed() == 1 })
+}
+
+// replacedDialogPages returns paged-approval page 1 (decided on) and page 2 (the
+// request Claude drew in its place).
+func replacedDialogPages(t *testing.T) (one, two string) {
+	t.Helper()
+	return pagedFixture(t, "claude_paged_approval_1of3.txt"), pagedFixture(t, "claude_paged_approval_2of3.txt")
+}
+
+// assertMovedDialogHandled checks the #571 outcome at a daemon call site: nothing
+// reached the pane, the decided row was retired as ignored (not a delivery
+// failure), and page 2 was captured on its own and escalated.
+func assertMovedDialogHandled(t *testing.T, h *harness, agentID string) {
+	t.Helper()
+	waitFor(t, 10*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(context.Background())
+		for _, r := range pend {
+			if r.AgentID == agentID && strings.Contains(r.PaneExcerpt, "2 of 3") {
+				return true
+			}
+		}
+		return false
+	})
+	if keys, sent := h.herdr.keysSent(), h.herdr.sentInputs(); len(keys) != 0 || len(sent) != 0 {
+		t.Fatalf("pressed into a dialog nobody decided about: keys=%v inputs=%v", keys, sent)
+	}
+	rows, _ := h.raw.AuditLog(context.Background(), 50)
+	ignored := false
+	for _, r := range rows {
+		if r.AgentID == agentID && r.Status == domain.AuditStatusIgnored && strings.Contains(r.PaneExcerpt, "1 of 3") {
+			ignored = true
+		}
+	}
+	if !ignored {
+		t.Errorf("the page-1 answer's row was not retired as ignored: %+v", rows)
+	}
+	for _, n := range h.herdr.notified() {
+		if strings.Contains(n, "delivery failed") {
+			t.Errorf("a refused press is not a delivery failure; got %q", n)
+		}
+	}
+}
+
+func TestRuleAnswerIsNotPressedIntoAReplacedClaudeDialog(t *testing.T) {
+	h := newVerifyUnblockHarness(t, "")
+	one, two := replacedDialogPages(t)
+	h.seedAutonomous(one, domain.SituationApproval, "1")
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-mv", PaneID: "agent-mv", AgentType: "claude", Status: "blocked"}})
+	// The capture decides on page 1; by the time the digit would go out, page 1
+	// was answered by hand and page 2 stands in its place.
+	h.herdr.setPaneScript(one, two)
+
+	h.push("agent-mv", "blocked")
+
+	assertMovedDialogHandled(t, h, "agent-mv")
+}
+
+func TestLLMAnswerIsNotPressedIntoAReplacedClaudeDialog(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarness(t, cfg)
+	h.daemon.verifyUnblockDelay = 20 * time.Millisecond
+	one, two := replacedDialogPages(t)
+	h.herdr.setPane(one)
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-mvl", PaneID: "agent-mvl", AgentType: "claude", Status: "blocked"}})
+	h.llm.configured = true
+	var answered atomic.Bool
+	h.llm.consult = func(ctx context.Context, req domain.LLMRequest) (*domain.LLMDecision, error) {
+		// Page 1 only: page 2, captured after the refusal, escalates.
+		if answered.Swap(true) {
+			return nil, errors.New("only page 1 is answered")
+		}
+		// The staleness re-read still sees page 1; the press read sees page 2.
+		h.herdr.setPaneScript(one, two)
+		id, _ := h.raw.InsertLLMDecision(ctx, domain.LLMDecision{
+			RequestID: req.RequestID, Signature: req.Signature,
+			SituationType: req.SituationType, AgentType: req.AgentType,
+			Action: "Yes", Rationale: "read-only", ConfidentScore: 95,
+			Status: "pending", CreatedAt: time.Now(),
+		})
+		return &domain.LLMDecision{ID: id, RequestID: req.RequestID, Action: "Yes",
+			Rationale: "read-only", ConfidentScore: 95, Status: "pending"}, nil
+	}
+
+	h.push("agent-mvl", "blocked")
+
+	assertMovedDialogHandled(t, h, "agent-mvl")
+}
+
+func TestActionReviewedAnswerIsNotPressedIntoAReplacedClaudeDialog(t *testing.T) {
+	h := newHarness(t, reviewCfg(""))
+	h.daemon.verifyUnblockDelay = 20 * time.Millisecond
+	one, two := replacedDialogPages(t)
+	h.seedAutonomous(one, domain.SituationApproval, "y")
+	h.herdr.setPane(one)
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-mvr", PaneID: "agent-mvr", AgentType: "claude", Status: "blocked"}})
+	h.llm.configured = true
+	var calls atomic.Int32
+	respondReview(h, &calls, 90, func(domain.LLMRequest) (string, error) {
+		// The outcome's staleness re-read and the two operator-draft looks
+		// still see page 1; the press read sees page 2.
+		h.herdr.setPaneScript(one, one, one, two)
+		return "Yes", nil
+	})
+
+	h.push("agent-mvr", "blocked")
+
+	assertMovedDialogHandled(t, h, "agent-mvr")
+	if calls.Load() == 0 {
+		t.Fatal("the reply never went through the action review")
+	}
+}
+
+// An operator's reply decided on page 1 is not pressed into page 2 (#571): the
+// action fails with a reason the operator can act on, nothing is typed, and the
+// page now standing is raised on its own.
+func TestQueuedReplyIsNotPressedIntoAReplacedClaudeDialog(t *testing.T) {
+	h := newHarness(t, "")
+	h.daemon.verifyUnblockDelay = 20 * time.Millisecond
+	one, two := replacedDialogPages(t)
+	h.herdr.setPane(two)
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "a1", PaneID: "a1", AgentType: "claude", Status: "blocked"}})
+	auditID := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Suggestion: "respond: Yes", PaneExcerpt: one,
+	})
+
+	got := h.deliverReplyNow(auditID, "Yes", "a1")
+	if got.Status != domain.AgentActionFailed || !strings.Contains(got.Error, "no longer the one") {
+		t.Fatalf("status = %q (%s), want a failure naming the replaced dialog", got.Status, got.Error)
+	}
+	if keys, sent := h.herdr.keysSent(), h.herdr.sentInputs(); len(keys) != 0 || len(sent) != 0 {
+		t.Fatalf("typed into a dialog the operator never saw: keys=%v inputs=%v", keys, sent)
+	}
+	waitFor(t, 10*time.Second, func() bool {
+		pend, _ := h.raw.PendingEscalations(context.Background())
+		for _, r := range pend {
+			if r.AgentID == "a1" && strings.Contains(r.PaneExcerpt, "2 of 3") {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// For auto-accept a replaced dialog is a verdict, not a delivery fault: every
+// retry would be refused the same way, so the claim is returned without spending
+// an attempt — the budget would otherwise dismiss the row at its ceiling.
+func TestAutoAcceptReplacedClaudeDialogSpendsNoAttempt(t *testing.T) {
+	h := newHarness(t, autoAcceptOn)
+	ctx := context.Background()
+	h.herdr.setPane(approvalPane)
+	id := seedAgedEscalation(t, h, "pA", approvalPane, domain.SituationApproval, "respond: Yes", 20*time.Minute)
+	if ok, err := h.raw.ClaimForAutoAccept(ctx, id); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	rec, err := h.raw.GetAudit(ctx, id)
+	if err != nil || rec == nil {
+		t.Fatalf("audit: %v", err)
+	}
+
+	cause := fmt.Errorf("delivering: %w", mcqdeliver.ErrClaudeMenuMoved)
+	if got := h.daemon.autoAcceptDeliveryFailed(ctx, rec, cause, time.Now()); got != autoAcceptSkipped {
+		t.Fatalf("outcome = %v, want skipped", got)
+	}
+	if got := auditStatus(t, h, id); got != "escalated" {
+		t.Fatalf("status = %q, want the claim returned", got)
+	}
+	h.daemon.mu.Lock()
+	attempts := h.daemon.autoAcceptAttempts[id]
+	h.daemon.mu.Unlock()
+	if attempts != 0 {
+		t.Fatalf("attempts = %d; a replaced dialog must not spend the retry budget", attempts)
+	}
 }
