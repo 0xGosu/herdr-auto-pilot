@@ -133,7 +133,7 @@ func TestRealClaudeModeCycle(t *testing.T) {
 	t.Logf("claude started in %s mode", start)
 
 	// The cycle is DISCOVERED, not assumed. domain.AgentModesFor is a superset:
-	// verified live, a `--model haiku` session rotates through only three modes
+	// verified live, a session on an older model rotated through only three modes
 	// with no "auto" at all, so asserting every listed mode is reachable makes
 	// this test fail on a perfectly healthy agent.
 	offered := discoverCycle(t, cli, pane, "claude", start)

@@ -16,8 +16,8 @@ package domain
 //     promote;
 //   - unknown is never a mode (see AgentMode).
 //
-// claude's auto is not offered by every session (a --model haiku session
-// cycles manual/acceptEdits/plan), so a caller whose rotation to auto is
+// claude's auto is not offered by every session (some models' sessions
+// cycle manual/acceptEdits/plan), so a caller whose rotation to auto is
 // refused falls back to acceptEdits; SetAgentMode detects the closed cycle and
 // rotates the agent back before refusing.
 //
