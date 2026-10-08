@@ -1,1 +1,0 @@
-- Fixed answering a Claude permission prompt sometimes approving the next queued request too: hap now presses the option's number on its own and adds Enter only when the same prompt is provably still waiting
