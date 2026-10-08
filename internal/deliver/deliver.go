@@ -19,6 +19,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -92,6 +93,13 @@ type Config struct {
 	// before the read that verifies it), so a zero value defaults rather than
 	// disabling it; tests wanting speed pass time.Nanosecond.
 	KeyDelay time.Duration
+	// SettleAsync, when set, takes a Claude menu digit's settle step
+	// (mcqdeliver.ClaudeMenuSettle: up to about a second of pane reads before
+	// a possible Enter) off the caller: Deliver presses the digit and returns,
+	// and SettleAsync must run settle — typically on its own goroutine, with
+	// the pane marked busy until it is done. Nil runs it inline, for callers
+	// that may block (#564).
+	SettleAsync func(settle func(ctx context.Context))
 }
 
 // withDefaults resolves the optional pacing fields.
@@ -271,11 +279,30 @@ func (c Config) deliverClaudeMenu(ctx context.Context, paneID, digit string) (bo
 	if !ok {
 		return false, nil
 	}
-	err := mcqdeliver.ClaudeMenu(ctx, c.mcq(ks, paneID), digit)
+	cfg := c.mcq(ks, paneID)
+	if c.SettleAsync == nil {
+		err := mcqdeliver.ClaudeMenu(ctx, cfg, digit)
+		if errors.Is(err, mcqdeliver.ErrNoClaudeMenu) {
+			return false, nil
+		}
+		return true, err
+	}
+	before, err := mcqdeliver.ClaudeMenuPress(ctx, cfg, digit)
 	if errors.Is(err, mcqdeliver.ErrNoClaudeMenu) {
 		return false, nil
 	}
-	return true, err
+	if err != nil {
+		return true, err
+	}
+	c.SettleAsync(func(ctx context.Context) {
+		// Only a failed Enter send is an error; whether the answer landed is
+		// the post-action self-check's call.
+		if _, err := mcqdeliver.ClaudeMenuSettle(ctx, cfg, before, digit); err != nil {
+			slog.Error("claude menu: the Enter after the digit could not be sent",
+				"pane", paneID, "option", digit, "error", err)
+		}
+	})
+	return true, nil
 }
 
 // deliverSeries answers a multi-tab question form. Every path returns, so

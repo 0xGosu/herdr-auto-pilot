@@ -282,8 +282,10 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   shows `domain.ClaudeMenu.SameStanding` (counter KEPT — never `ClaudeModalAdvanced`) AND the digit MOVED the
   caret onto itself (a digit already under the caret gets no Enter: a late redraw looks identical).
   Every send path asks `domain.ClaudeMenuDigit` — `deliver.Deliver`, `deliverAutonomousClaimed`
-  (`delivery.menuDigit`), the LLM promotion; the daemon claims the pane BEFORE the digit, settles off the
-  loop, then arms the self-check. Past the digit nothing is a delivery failure (auto-accept would retry).
+  (`delivery.menuDigit`), the LLM promotion. The digit is pressed inline; the settle runs OFF the loop
+  (`runClaudeSettle`, via `deliver.Config.SettleAsync` for auto-accept and operator replies), and a settling
+  pane is busy to `acquirePane`/`paneBusy` and to the self-check (`armUnblockCheck` defers). Past the
+  digit nothing is a delivery failure (auto-accept would retry).
   **Test trap:** the daemon fake answers digits through `onKey`; `menuDigits` fails on a text send.
 - One request per herdr socket connection. herdr ≥0.9.0 replays no existing panes on subscribe; `events_lost`
   means resubscribe + resync. Only agent panes get status subscriptions.

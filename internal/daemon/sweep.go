@@ -78,7 +78,7 @@ func (d *Daemon) sweepAllowed(ctx context.Context, s domain.Situation) bool {
 func (d *Daemon) acquirePane(agentID string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.sweepInFlight[agentID] {
+	if d.sweepInFlight[agentID] || d.claudeSettling[agentID] > 0 {
 		return false
 	}
 	d.sweepInFlight[agentID] = true
@@ -96,7 +96,7 @@ func (d *Daemon) releasePane(agentID string) {
 func (d *Daemon) paneBusy(agentID string) bool {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.sweepInFlight[agentID]
+	return d.sweepInFlight[agentID] || d.claudeSettling[agentID] > 0
 }
 
 // startSweep launches (or dedupes) the one pane interaction per agent. The

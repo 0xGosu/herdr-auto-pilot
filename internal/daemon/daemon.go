@@ -521,6 +521,10 @@ type Daemon struct {
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
 	sweepInFlight map[string]bool
+	// claudeSettling counts the off-loop Claude menu settles running per agent
+	// (guarded by mu; runClaudeSettle). A settling pane is busy to acquirePane
+	// and paneBusy, and the unblock self-check waits it out.
+	claudeSettling map[string]int
 
 	// sessionRenamePushes counts the `/rename` keystrokes spent per
 	// (agent, terminal, name) by the Claude session-name sync, so a pane that
@@ -958,6 +962,7 @@ func New(opt Options) (*Daemon, error) {
 		rerankInFlight:            map[string]rerankFlight{},
 		rerankCache:               map[string][]domain.RerankResult{},
 		sweepInFlight:             map[string]bool{},
+		claudeSettling:            map[string]int{},
 		sessionRenamePushes:       map[string]int{},
 		sessionSyncNoted:          map[string]string{},
 		sessionSyncDeferred:       map[string]sessionSyncDefer{},
@@ -3407,6 +3412,16 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 		del.declared, del.taskText = declared, declared.Task
 	}
 
+	// A Claude menu digit is pressed under the pane claim (pressClaudeMenu);
+	// refuse a busy pane here, before an audit row claims an answer.
+	if d.claudeMenuPaneBusy(s.Type, s.AgentType, s.AgentID, menuMapped) {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPaneBusy, Rationale: "pane busy",
+			Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
+		}, tr, now)
+		return
+	}
+
 	// learned stays empty: deliverAutonomous computes it after the send,
 	// exactly as the pre-review code did.
 	//
@@ -3414,15 +3429,6 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// the one that routes through deliverDeclared — the pre-delivery task-list
 	// review's only entry point. Every other deliverAutonomous caller builds a
 	// delivery with no declared task by construction (see deliverDeclared).
-	// A Claude menu digit is pressed under the pane claim (pressClaudeMenu);
-	// refuse a busy pane here, before an audit row claims an answer.
-	if domain.ClaudeMenuDigit(s.Type, s.AgentType, menuMapped) && d.paneBusy(s.AgentID) {
-		d.escalate(ctx, s, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonPaneBusy, Rationale: "pane busy",
-			Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
-		}, tr, now)
-		return
-	}
 	d.deliverDeclared(ctx, s, sig, dec, tr, del, now)
 }
 
@@ -3833,11 +3839,31 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 	}
 	// Keep the diagnostic row's excerpt the same size as the normal audit rows.
 	p.Excerpt = truncateExcerpt(p.Excerpt)
+	d.armUnblockCheck(p, 0)
+}
+
+// maxUnblockCheckDeferrals bounds how often the self-check waits out a Claude
+// menu settle (runClaudeSettle) before it reads anyway. A settle is a few
+// hundred milliseconds of pane reads, so this is never reached in practice; it
+// only keeps a stuck settle from deferring the check forever.
+const maxUnblockCheckDeferrals = 10
+
+// armUnblockCheck schedules one self-check attempt. While a Claude menu digit is
+// still settling on this agent — its Enter not yet decided — the attempt is
+// pushed back instead: read mid-settle, a caret-only dialog about to be
+// committed would be reported as a delivery that did not land. This covers every
+// arm site at once (auto-accept's finalize, processCorrections for an operator's
+// reply) without reordering any of them.
+func (d *Daemon) armUnblockCheck(p verifyunblock.Params, deferrals int) {
 	delay := d.verifyUnblockDelay
 	if delay <= 0 {
 		delay = unblockCheckDelay
 	}
 	d.afterFunc(delay, func() {
+		if deferrals < maxUnblockCheckDeferrals && d.claudeSettlingNow(p.AgentID) {
+			d.armUnblockCheck(p, deferrals+1)
+			return
+		}
 		_ = logging.Guard("verify-unblock", func() error {
 			// Root the check at shutdownCtx (not context.Background) so daemon
 			// teardown cancels an in-flight self-check instead of letting it
@@ -5638,7 +5664,7 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	// act path makes, so the audit row and what is learned still read as the
 	// answer a human recognizes rather than a bare keystroke.
 	sendText, menuDigit := domain.DeliverOutbound(current.Type, s.AgentType, pane, final)
-	if domain.ClaudeMenuDigit(current.Type, s.AgentType, menuDigit) && d.paneBusy(s.AgentID) {
+	if d.claudeMenuPaneBusy(current.Type, s.AgentType, s.AgentID, menuDigit) {
 		escalateWith(domain.ReasonPaneBusy,
 			"another pane interaction is in flight for this agent; not delivering concurrently")
 		return
@@ -6190,8 +6216,8 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			"LLM answer matches none of the offered options: "+llmDec.Action)
 		return
 	}
-	if _, mapped := domain.DeliverOutbound(s.Type, s.AgentType, pane, llmDec.Action); domain.ClaudeMenuDigit(s.Type, s.AgentType, mapped) &&
-		d.paneBusy(s.AgentID) {
+	sendText, menuDigit := domain.DeliverOutbound(s.Type, s.AgentType, pane, llmDec.Action)
+	if d.claudeMenuPaneBusy(s.Type, s.AgentType, s.AgentID, menuDigit) {
 		reject(domain.ReasonPaneBusy,
 			"another pane interaction is in flight for this agent; not delivering concurrently")
 		return
@@ -6213,7 +6239,6 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 					"An LLM-derived action was blocked because its audit record could not be written.")
 				return
 			}
-			sendText, menuDigit := domain.DeliverOutbound(s.Type, s.AgentType, pane, llmDec.Action)
 			press, err := d.sendReply(ctx, s, menuDigit, sendText)
 			if err != nil {
 				// Release any pairing this agent holds so no other agent is

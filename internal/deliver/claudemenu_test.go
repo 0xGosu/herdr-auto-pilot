@@ -114,3 +114,27 @@ func TestDeliverClaudeMenuDigitFallsBackToTheTextSend(t *testing.T) {
 		}
 	})
 }
+
+// With SettleAsync, Deliver returns once the digit is pressed — its callers run
+// on the daemon's select loop — and the settle that may add Enter runs through
+// the hook instead.
+func TestDeliverClaudeMenuDigitHandsTheSettleOff(t *testing.T) {
+	h := &fakeKeyHerdr{
+		fakeHerdr:       fakeHerdr{pane: pagedApprovalPane("Get Pr", 3, 1)},
+		keyScript:       []string{"2", "enter"},
+		keyScriptFrames: []string{pagedApprovalPane("Get Pr", 3, 2), pagedApprovalPane("Get Files", 2, 1)},
+	}
+	var settle func(context.Context)
+	cfg := fastCfg(h)
+	cfg.SettleAsync = func(s func(context.Context)) { settle = s }
+	if err := deliver.Deliver(context.Background(), cfg, pagedRequest("Yes, and don't ask again")); err != nil {
+		t.Fatal(err)
+	}
+	if settle == nil || !reflect.DeepEqual(h.keys, []string{"2"}) {
+		t.Fatalf("settle handed off = %v, keys = %v; want the digit pressed and the settle deferred", settle != nil, h.keys)
+	}
+	settle(context.Background())
+	if !reflect.DeepEqual(h.keys, []string{"2", "enter"}) {
+		t.Fatalf("keys after the settle = %v, want the digit then Enter", h.keys)
+	}
+}

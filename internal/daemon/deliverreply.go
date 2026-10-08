@@ -79,6 +79,15 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 		return "", err
 	}
 
+	// A Claude menu digit is pressed as a key with a conditional Enter
+	// (domain.ClaudeMenuDigit, #564); while another interaction owns the pane —
+	// a sweep, a keyed delivery, or a digit still settling — the operator's
+	// answer waits a pass rather than interleaving keys with it. Before the
+	// side-effect mark, so nothing has been typed and the retry is clean.
+	if _, mapped := domain.DeliverOutbound(audit.SituationType, audit.AgentType, audit.PaneExcerpt, outbound); d.claudeMenuPaneBusy(audit.SituationType, audit.AgentType, audit.AgentID, mapped) {
+		return "", fmt.Errorf("%w: another interaction with agent %s's pane is in flight", errActionTransient, audit.AgentID)
+	}
+
 	// The point of no return: mark BEFORE the keystrokes, so a daemon that
 	// dies in the next instant leaves evidence instead of a row that looks
 	// untouched and gets replayed at startup. A failure here happens before

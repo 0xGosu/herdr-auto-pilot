@@ -74,12 +74,14 @@ func parseClaudeModal(pane string) (ClaudeMenu, bool) {
 			continue
 		}
 		line := strings.Join(strings.Fields(trimmed), " ")
+		sub := claudeModalCaretRE.FindStringSubmatch(line)
+		line = claudeModalCaretRE.ReplaceAllString(line, "$1")
 		if len(kept) == 0 {
+			// Caret masked, counter kept: when no title line is drawn the first
+			// kept line is an option, and a caret move must not change Header.
 			m.Header = line
 			line = claudeModalCounterRE.ReplaceAllString(line, "")
 		}
-		sub := claudeModalCaretRE.FindStringSubmatch(line)
-		line = claudeModalCaretRE.ReplaceAllString(line, "$1")
 		// Only an OPTION line carries the selection caret; a quoted "> 1." in
 		// a tool's description is text.
 		if sub != nil && m.Caret == "" && numberedOptionRE.MatchString(line) {
@@ -100,8 +102,8 @@ func parseClaudeModal(pane string) (ClaudeMenu, bool) {
 type ClaudeMenu struct {
 	// Region is ClaudeModalRegion's dialog: counter and caret masked.
 	Region string
-	// Header is the dialog's first line as drawn, whitespace collapsed, with
-	// the "N of M" queue counter KEPT.
+	// Header is the dialog's first line as drawn, whitespace collapsed and
+	// caret masked, with the "N of M" queue counter KEPT.
 	Header string
 	// Caret is the number of the option under the selection caret, "" when
 	// none is drawn.

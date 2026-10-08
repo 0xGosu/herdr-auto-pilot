@@ -239,3 +239,24 @@ func TestClaudeMenuDigit(t *testing.T) {
 		}
 	}
 }
+
+// A dialog drawn with no title line has an OPTION as its first line, so the
+// header must mask the caret too: a digit that only moved it is still the same
+// dialog, or no caret-only build could ever be given its Enter.
+func TestClaudeMenuSameStandingIgnoresTheCaretOnAHeaderlessDialog(t *testing.T) {
+	rule := strings.Repeat("─", 40)
+	base, ok := ParseClaudeMenu(rule + "\n ❯ 1. Yes\n   2. No\n")
+	if !ok {
+		t.Fatal("a headerless dialog was not parsed")
+	}
+	moved, ok := ParseClaudeMenu(rule + "\n   1. Yes\n ❯ 2. No\n")
+	if !ok {
+		t.Fatal("the moved-caret capture was not parsed")
+	}
+	if !base.SameStanding(moved) {
+		t.Fatalf("a caret move read as a different dialog: header %q vs %q", base.Header, moved.Header)
+	}
+	if moved.Caret != "2" {
+		t.Errorf("caret = %q, want 2", moved.Caret)
+	}
+}

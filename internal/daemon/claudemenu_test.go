@@ -10,6 +10,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"reflect"
 	"strings"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
+	"github.com/0xGosu/herdr-auto-pilot/internal/verifyunblock"
 )
 
 // waitForFirstMenuKeys waits until the first menu answer's settle window has
@@ -168,4 +170,88 @@ func TestClaudeMenuDigitWaitsForTheClaimBeforePressing(t *testing.T) {
 		}
 	}
 	h.daemon.releasePane("agent-busy")
+}
+
+func (h *harness) setClaudeSettling(agentID string, n int) {
+	h.daemon.mu.Lock()
+	defer h.daemon.mu.Unlock()
+	if n == 0 {
+		delete(h.daemon.claudeSettling, agentID)
+		return
+	}
+	h.daemon.claudeSettling[agentID] = n
+}
+
+// An operator's reply that is a Claude menu digit waits a pass while another
+// interaction owns the pane — here a digit still settling — rather than
+// interleaving keys with it; then it delivers as the key alone.
+func TestQueuedReplyClaudeMenuDigitWaitsForASettlingPane(t *testing.T) {
+	h := newHarness(t, "")
+	one := pagedFixture(t, "claude_paged_approval_1of3.txt")
+	two := pagedFixture(t, "claude_paged_approval_2of3.txt")
+	h.herdr.setPane(one)
+	h.herdr.mu.Lock()
+	h.herdr.onKey = pagedQueueOnKey("a1", two)
+	h.herdr.mu.Unlock()
+	auditID := h.seedEscalation(domain.AuditRecord{
+		AgentID: "a1", AgentType: "claude", SituationType: domain.SituationApproval,
+		Suggestion: "respond: Yes", PaneExcerpt: one,
+	})
+	h.setClaudeSettling("a1", 1)
+
+	payload, _ := json.Marshal(domain.DeliverReplyPayload{AuditID: auditID, Action: "Yes"})
+	id := h.queueAction(domain.AgentAction{
+		Kind: domain.AgentActionDeliverReply, Target: "a1", Payload: string(payload),
+	})
+	waitFor(t, 3*time.Second, func() bool {
+		a, err := h.raw.AgentActionByID(context.Background(), id)
+		return err == nil && a != nil && a.Attempts >= 1 && a.Status == domain.AgentActionPending
+	})
+	if keys, sent := h.herdr.keysSent(), h.herdr.sentInputs(); len(keys) != 0 || len(sent) != 0 {
+		t.Fatalf("typed beside a settling digit: keys=%v inputs=%v", keys, sent)
+	}
+
+	h.setClaudeSettling("a1", 0)
+	if got := h.awaitActionAfterNudge(id); got.Status != domain.AgentActionDone {
+		t.Fatalf("status = %q (%s), want done once the pane is free", got.Status, got.Error)
+	}
+	if keys := h.waitKeysSettled(); !reflect.DeepEqual(keys, []string{"1"}) {
+		t.Fatalf("keys = %v, want the digit alone", keys)
+	}
+	if sent := h.herdr.sentInputs(); len(sent) != 0 {
+		t.Fatalf("a Claude menu answer went through the text send: %v", sent)
+	}
+}
+
+// waitKeysSettled returns the keys pressed once no Claude menu settle is running
+// any more — the point at which a stray Enter would have been pressed.
+func (h *harness) waitKeysSettled() []string {
+	h.t.Helper()
+	waitFor(h.t, 5*time.Second, func() bool {
+		h.daemon.mu.RLock()
+		defer h.daemon.mu.RUnlock()
+		return len(h.daemon.claudeSettling) == 0
+	})
+	return h.herdr.keysSent()
+}
+
+// The self-check waits out a running settle: read mid-settle, a caret-only
+// dialog about to get its Enter would be reported as an answer that did not land.
+func TestUnblockCheckWaitsOutAClaudeMenuSettle(t *testing.T) {
+	h := newVerifyUnblockHarness(t, "")
+	h.herdr.setPane(approvalPane)
+	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-ws", PaneID: "agent-ws", Status: "blocked"}})
+	h.setClaudeSettling("agent-ws", 1)
+
+	h.daemon.scheduleUnblockCheck(verifyunblock.Params{
+		PaneID: "agent-ws", AgentID: "agent-ws", AgentType: "claude",
+		Input: "1", Excerpt: approvalPane, SituationType: domain.SituationApproval,
+	})
+	time.Sleep(5 * h.daemon.verifyUnblockDelay)
+	if n := h.countDeliveryFailed(); n != 0 {
+		t.Fatalf("the self-check read the pane mid-settle: %d delivery_failed rows", n)
+	}
+
+	h.setClaudeSettling("agent-ws", 0)
+	waitFor(t, 3*time.Second, func() bool { return h.countDeliveryFailed() == 1 })
 }
