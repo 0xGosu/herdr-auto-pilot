@@ -1,0 +1,1 @@
+- Added a real-Claude integration test proving that an answer the LLM decides approves exactly one request in Claude's paged permission queue
