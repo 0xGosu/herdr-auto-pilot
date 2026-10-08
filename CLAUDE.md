@@ -277,6 +277,14 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
 - Concurrent tool approvals (parallel subagents) are PAGED in one dialog ("1 of 3"); answering a page draws
   the next in place with herdr still `blocked` — no event. Only the post-action self-check sees it
   (`followUpPromptStanding`, gated on `domain.ClaudeModalAdvanced`); every unattended send must arm it.
+- Claude commits a permission dialog on the DIGIT alone, so an Enter after it approves the next queued page
+  unseen (#564). A mapped Claude menu digit is a KEY (`mcqdeliver.ClaudeMenu`): Enter only when every re-read
+  shows `domain.ClaudeMenu.SameStanding` (counter KEPT — never `ClaudeModalAdvanced`) AND the digit MOVED the
+  caret onto itself (a digit already under the caret gets no Enter: a late redraw looks identical).
+  Every send path asks `domain.ClaudeMenuDigit` — `deliver.Deliver`, `deliverAutonomousClaimed`
+  (`delivery.menuDigit`), the LLM promotion; the daemon claims the pane BEFORE the digit, settles off the
+  loop, then arms the self-check. Past the digit nothing is a delivery failure (auto-accept would retry).
+  **Test trap:** the daemon fake answers digits through `onKey`; `menuDigits` fails on a text send.
 - One request per herdr socket connection. herdr ≥0.9.0 replays no existing panes on subscribe; `events_lost`
   means resubscribe + resync. Only agent panes get status subscriptions.
 - Agent names: `[a-z][a-z0-9_-]{0,31}`, unique. `agent prompt` right after `agent start` may land without

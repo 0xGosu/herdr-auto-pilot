@@ -104,6 +104,10 @@ type fakeHerdr struct {
 	// session-rename push verifies its own keystroke by re-reading the pane,
 	// so a fake that never repaints could only ever prove the failure path.
 	onSend func(f *fakeHerdr, input string)
+	// onKey is onSend for SendKey, run after keyScript: a Claude menu digit
+	// arrives as a KEY (domain.ClaudeMenuDigit), so a pane that changes in
+	// response to an answer has to react here.
+	onKey func(f *fakeHerdr, key string)
 	// paneScript serves a DIFFERENT pane to each successive read, the last entry
 	// sticking. A gate that is re-proven immediately before a send is invisible
 	// to a fake that answers every read identically — such a test passes whether
@@ -220,6 +224,9 @@ func (f *fakeHerdr) SendKey(ctx context.Context, paneID, key string) error {
 		f.keyScriptFrames = f.keyScriptFrames[1:]
 		f.frames = nil
 		f.frameIdx = 0
+	}
+	if f.onKey != nil {
+		f.onKey(f, key)
 	}
 	switch key {
 	case "right":

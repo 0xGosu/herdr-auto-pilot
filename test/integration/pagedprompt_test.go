@@ -21,8 +21,11 @@ import (
 // slowMCPServer is a stdio MCP server with three harmless tools, each taking
 // seconds to answer. The delay is what makes Claude PAGE its approvals: while
 // one subagent's call runs, the others' requests queue behind one dialog ("1
-// of 3") instead of being asked one at a time.
+// of 3") instead of being asked one at a time. Every tools/call is appended to
+// the log file named by argv[1] on RECEIPT, before the sleep, so a test can count
+// exactly which requests were approved.
 const slowMCPServer = `import json, sys, time
+LOG = sys.argv[1]
 TOOLS = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}}
          for n, d in [("get_pr", "Get details for a single pull request"),
                       ("get_profile", "Get my user profile"),
@@ -39,6 +42,8 @@ for line in sys.stdin:
     elif meth == "tools/list":
         r = {"tools": TOOLS}
     elif meth == "tools/call":
+        with open(LOG, "a") as f:
+            f.write(m["params"]["name"] + "\n")
         time.sleep(8)
         r = {"content": [{"type": "text", "text": "ok from " + m["params"]["name"]}]}
     else:
@@ -113,11 +118,12 @@ func TestRealClaudePagedApprovalQueueIsFollowed(t *testing.T) {
 	cli := herdr.NewCLI()
 	work := t.TempDir()
 	server := filepath.Join(work, "fakegh.py")
+	callLog := filepath.Join(work, "calls.log")
 	if err := os.WriteFile(server, []byte(slowMCPServer), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	mcpCfg, err := json.Marshal(map[string]any{"mcpServers": map[string]any{
-		"fakegh": map[string]any{"command": "python3", "args": []string{"-I", server}},
+		"fakegh": map[string]any{"command": "python3", "args": []string{"-I", server, callLog}},
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -189,14 +195,32 @@ func TestRealClaudePagedApprovalQueueIsFollowed(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, p := range pending {
-			// Any OTHER page counts: hap's trailing Enter can race the redraw and
-			// land on page 2 itself, leaving page 3 as the next one standing.
 			if pos := pagerPosition(p.PaneExcerpt); p.AgentID == pane && pos != "" && pos != page1 {
-				return // captured with no status event to announce it
+				// Captured with no status event to announce it — and page 1's
+				// answer approved page 1 ALONE. Claude commits on the digit and
+				// draws page 2 in place, so an Enter after the digit would
+				// approve page 2 unseen (#564): two calls in the log. The log is
+				// read after a bounded wait, so a stray approval's call has had time
+				// to reach the server (well under its 8s answer delay).
+				time.Sleep(3 * time.Second)
+				if calls := approvedCalls(t, callLog); len(calls) != 1 {
+					t.Fatalf("answering page %q approved %d requests %v, want exactly one", page1, len(calls), calls)
+				}
+				return
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 	content, _ := cli.ReadPaneVisible(context.Background(), pane, 40)
 	t.Fatalf("the next page of the queue was never captured after page %q was answered.\npane:\n%s", page1, content)
+}
+
+// approvedCalls reads the tool calls the fake MCP server has received.
+func approvedCalls(t *testing.T, path string) []string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	return strings.Fields(string(b))
 }

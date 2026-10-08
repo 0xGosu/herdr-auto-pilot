@@ -215,7 +215,15 @@ func Deliver(ctx context.Context, c Config, req Request) error {
 			return fmt.Errorf("%q matches none of the options the pane is offering; "+
 				"nothing was delivered (answering it literally would commit the first option)", outbound)
 		}
-		outbound = domain.DeliverKeystroke(req.SituationType, req.AgentType, pane, outbound)
+		var mapped bool
+		outbound, mapped = domain.DeliverOutbound(req.SituationType, req.AgentType, pane, outbound)
+		// A Claude menu digit is pressed as a KEY: Claude commits on the digit,
+		// and an Enter after it would answer the next queued request (#564).
+		if domain.ClaudeMenuDigit(req.SituationType, req.AgentType, mapped) {
+			if handled, err := c.deliverClaudeMenu(ctx, req.PaneID, outbound); handled {
+				return err
+			}
+		}
 	case domain.MenuSituation(req.SituationType, req.AgentType, req.PaneExcerpt) &&
 		len(domain.ParseNumberedOptions(req.PaneExcerpt)) > 0:
 		// The live read failed, but the decision's own capture proves a menu was
@@ -251,6 +259,23 @@ func (c Config) deliverAgy(ctx context.Context, req Request) error {
 		return fmt.Errorf("%w: %v", ErrReplyWithheld, err)
 	}
 	return err
+}
+
+// deliverClaudeMenu presses a Claude menu digit as a key and adds Enter only
+// when the dialog provably did not take it (mcqdeliver.ClaudeMenu). handled is
+// false — and nothing was pressed — when the adapter cannot send keystrokes or
+// the pane shows no dialog that deliverer models; the caller then keeps the
+// ordinary send.
+func (c Config) deliverClaudeMenu(ctx context.Context, paneID, digit string) (bool, error) {
+	ks, ok := c.Herdr.(ports.KeystrokeSender)
+	if !ok {
+		return false, nil
+	}
+	err := mcqdeliver.ClaudeMenu(ctx, c.mcq(ks, paneID), digit)
+	if errors.Is(err, mcqdeliver.ErrNoClaudeMenu) {
+		return false, nil
+	}
+	return true, err
 }
 
 // deliverSeries answers a multi-tab question form. Every path returns, so
