@@ -97,6 +97,11 @@ func ClaudeMenuPress(ctx context.Context, c Config, digit string) (domain.Claude
 // call, as it was for "digit, Enter" — a failure here would invite a retry that
 // presses a digit into whatever Claude drew next.
 func ClaudeMenuSettle(ctx context.Context, c Config, before domain.ClaudeMenu, digit string) (bool, error) {
+	// Already under the caret: no read could license an Enter, so none is taken
+	// — the common "1. Yes" answer costs no more than the old send did.
+	if before.Caret == digit {
+		return false, nil
+	}
 	var last domain.ClaudeMenu
 	for i := 0; i < claudeMenuVerifyReads; i++ {
 		menu, ok, err := c.claudeMenuAfter(ctx)
@@ -110,7 +115,7 @@ func ClaudeMenuSettle(ctx context.Context, c Config, before domain.ClaudeMenu, d
 		}
 		last = menu
 	}
-	if before.Caret == digit || last.Caret != digit {
+	if last.Caret != digit {
 		slog.Warn("claude menu: the dialog still stands and the digit did not visibly move the caret onto it; "+
 			"not pressing Enter", "pane", c.PaneID, "option", digit, "caret_before", before.Caret, "caret", last.Caret)
 		return false, nil

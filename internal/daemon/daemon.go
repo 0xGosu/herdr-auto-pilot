@@ -3414,6 +3414,15 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// the one that routes through deliverDeclared — the pre-delivery task-list
 	// review's only entry point. Every other deliverAutonomous caller builds a
 	// delivery with no declared task by construction (see deliverDeclared).
+	// A Claude menu digit is pressed under the pane claim (pressClaudeMenu);
+	// refuse a busy pane here, before an audit row claims an answer.
+	if domain.ClaudeMenuDigit(s.Type, s.AgentType, menuMapped) && d.paneBusy(s.AgentID) {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPaneBusy, Rationale: "pane busy",
+			Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
+		}, tr, now)
+		return
+	}
 	d.deliverDeclared(ctx, s, sig, dec, tr, del, now)
 }
 
@@ -5629,6 +5638,11 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	// act path makes, so the audit row and what is learned still read as the
 	// answer a human recognizes rather than a bare keystroke.
 	sendText, menuDigit := domain.DeliverOutbound(current.Type, s.AgentType, pane, final)
+	if domain.ClaudeMenuDigit(current.Type, s.AgentType, menuDigit) && d.paneBusy(s.AgentID) {
+		escalateWith(domain.ReasonPaneBusy,
+			"another pane interaction is in flight for this agent; not delivering concurrently")
+		return
+	}
 
 	original := truncateRunes(res.dec.Input, 200)
 	delivered := d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
@@ -6174,6 +6188,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 	if domain.UnmatchedMenuReply(s.Type, s.AgentType, pane, llmDec.Action) {
 		reject(domain.ReasonUnfamiliarOptions,
 			"LLM answer matches none of the offered options: "+llmDec.Action)
+		return
+	}
+	if _, mapped := domain.DeliverOutbound(s.Type, s.AgentType, pane, llmDec.Action); domain.ClaudeMenuDigit(s.Type, s.AgentType, mapped) &&
+		d.paneBusy(s.AgentID) {
+		reject(domain.ReasonPaneBusy,
+			"another pane interaction is in flight for this agent; not delivering concurrently")
 		return
 	}
 

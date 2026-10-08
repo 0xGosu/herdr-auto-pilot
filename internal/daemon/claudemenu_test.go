@@ -143,17 +143,29 @@ func TestClaudeMenuDigitWaitsForTheClaimBeforePressing(t *testing.T) {
 
 	h.push("agent-busy", "blocked")
 
+	// Refused BEFORE an audit row claims an answer: a confirmable pane-busy
+	// escalation, not an "auto" row flipped to a delivery failure.
+	var esc domain.AuditRecord
 	waitFor(t, 5*time.Second, func() bool {
-		rows, _ := h.raw.AuditLog(context.Background(), 10)
-		for _, r := range rows {
-			if r.AgentID == "agent-busy" && r.Status == "escalated" {
+		pend, _ := h.raw.PendingEscalations(context.Background())
+		for _, r := range pend {
+			if r.AgentID == "agent-busy" {
+				esc = r
 				return true
 			}
 		}
 		return false
 	})
+	if !strings.Contains(esc.Rationale, string(domain.ReasonPaneBusy)) || esc.Suggestion == "" {
+		t.Errorf("escalation = %q / suggestion %q, want a confirmable pane-busy escalation", esc.Rationale, esc.Suggestion)
+	}
 	if keys, sent := h.herdr.keysSent(), h.herdr.sentInputs(); len(keys) != 0 || len(sent) != 0 {
 		t.Fatalf("pressed beside an in-flight interaction: keys=%v inputs=%v", keys, sent)
+	}
+	for _, n := range h.herdr.notified() {
+		if strings.Contains(n, "delivery failed") || strings.Contains(n, "could not deliver") {
+			t.Errorf("nothing was sent, so nothing failed; got %q", n)
+		}
 	}
 	h.daemon.releasePane("agent-busy")
 }
