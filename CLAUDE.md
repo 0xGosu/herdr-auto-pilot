@@ -268,6 +268,11 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   Send digits (`domain.MenuKeystroke`), not labels.
 - AskUserQuestion: preview tabs need digit + Enter, plain tabs commit on the digit — `internal/mcqdeliver`
   presses and re-reads, never plans a series.
+  A SINGLE-question form (no ← → tab header, verified 2.1.294): plain commits on the digit and draws a
+  numbered "N. Chat about this" below an inner rule — `domain.ParseClaudeMenu` widens to the outer rule
+  (`claudeSingleQuestionFrom`) so it is answered by key; parallel AskUserQuestion calls QUEUE and the next
+  form is drawn within ~100ms (herdr may still report `working` there). Preview has an unnumbered Chat row
+  and needs Enter — it stays on the text route.
 - Before herdr 0.8.2 `send-keys shift+tab` sends TAB; hap sends CSI Z (`domain.ShiftTab`) until
   `min_herdr_version` ≥ 0.8.2. Shift+Tab inside a claude modal approves the plan — require
   `domain.ClaudeComposerReady`.

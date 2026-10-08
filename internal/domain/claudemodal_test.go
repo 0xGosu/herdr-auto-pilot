@@ -260,3 +260,72 @@ func TestClaudeMenuSameStandingIgnoresTheCaretOnAHeaderlessDialog(t *testing.T) 
 		t.Errorf("caret = %q, want 2", moved.Caret)
 	}
 }
+
+// Claude's plain single-select, single-question AskUserQuestion form draws an
+// inner rule above its numbered "Chat about this" row; the dialog is the whole
+// form, not that row (#571, verified live on Claude Code 2.1.294).
+func TestParseClaudeMenuWidensToASingleQuestionForm(t *testing.T) {
+	m, ok := ParseClaudeMenu(readClaudeModalFixture(t, "claude_question_single.txt"))
+	if !ok {
+		t.Fatal("the single-question form was not parsed")
+	}
+	for _, want := range []string{"Which fruit?", "1. Apple", "2. Banana", "5. Chat about this"} {
+		if !strings.Contains(m.Region, want) {
+			t.Errorf("region lacks %q:\n%s", want, m.Region)
+		}
+	}
+	if !m.Offers("2") || m.Caret != "1" || m.Header != "☐ Fruit" {
+		t.Errorf("offers 2 = %v, caret = %q, header = %q", m.Offers("2"), m.Caret, m.Header)
+	}
+	if strings.Contains(m.Region, "Enter to select") {
+		t.Errorf("the key-hint footer is churn, not the dialog:\n%s", m.Region)
+	}
+}
+
+// A caret move is the same form; a different question is a different one — so
+// after an answer, the next single-question form reads as an advance.
+func TestSingleQuestionFormIdentity(t *testing.T) {
+	q1 := readClaudeModalFixture(t, "claude_question_single.txt")
+	moved := strings.Replace(strings.Replace(q1, "❯ 1. Apple", "  1. Apple", 1), "  2. Banana", "❯ 2. Banana", 1)
+	a, _ := ParseClaudeMenu(q1)
+	b, _ := ParseClaudeMenu(moved)
+	if !a.SameStanding(b) || b.Caret != "2" {
+		t.Fatalf("a caret move read as another form (caret %q)", b.Caret)
+	}
+	q2 := strings.NewReplacer("Which fruit?", "Which color?", "Fruit", "Color").Replace(q1)
+	if !ClaudeModalAdvanced(q1, q2) {
+		t.Fatal("the next single-question form was not seen as a new dialog")
+	}
+}
+
+// Every other AskUserQuestion shape keeps the last-rule cut: a multi-tab form
+// has its own series route, a multi-select digit only toggles a box, and a
+// preview form's digit only moves the caret (its box redraws with it), so it
+// stays on the text route that sends the Enter it needs.
+func TestParseClaudeMenuKeepsTheCutForOtherQuestionForms(t *testing.T) {
+	single := readClaudeModalFixture(t, "claude_question_single.txt")
+	preview := readClaudeModalFixture(t, "claude_question_single_preview.txt")
+	cases := map[string]string{
+		"multi-tab":                  mcqFrame("Which shape?"),
+		"multi-select":               strings.NewReplacer("1. Apple", "1. [ ] Apple", "2. Banana", "2. [ ] Banana", "3. Cherry", "3. [ ] Cherry").Replace(single),
+		"preview, numbered chat row": strings.Replace(preview, "  Chat about this", "  4. Chat about this", 1),
+	}
+	for name, pane := range cases {
+		t.Run(name, func(t *testing.T) {
+			m, ok := ParseClaudeMenu(pane)
+			if !ok {
+				t.Fatal("the last-rule cut no longer parses")
+			}
+			if strings.Contains(m.Region, "\n") || !strings.HasSuffix(m.Region, "Chat about this") {
+				t.Fatalf("widened a form it must not:\n%s", m.Region)
+			}
+		})
+	}
+	// Live preview frames, before and after a caret move (its box redraws):
+	// neither parses, so both stay on the text route.
+	for _, frame := range []string{preview, readClaudeModalFixture(t, "claude_question_single_preview_caret2.txt")} {
+		if _, ok := ParseClaudeMenu(frame); ok {
+			t.Fatal("a live preview frame (unnumbered Chat row) now parses as a dialog")
+		}
+	}
+}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -152,5 +154,51 @@ func TestDeliverClaudeMenuDigitRefusesADialogItWasNotDecidedFor(t *testing.T) {
 	}
 	if len(h.keys) != 0 || len(h.inputs) != 0 {
 		t.Fatalf("keys = %v inputs = %v; nothing may be typed", h.keys, h.inputs)
+	}
+}
+
+func readDomainFixture(t *testing.T, name string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("..", "domain", "testdata", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func singleQuestionRequest(pane, outbound string) deliver.Request {
+	return deliver.Request{
+		PaneID: "w1:p1", AgentType: "claude", SituationType: domain.SituationChoice,
+		PaneExcerpt: pane, Outbound: outbound,
+	}
+}
+
+// Claude's plain single-question AskUserQuestion form commits on the digit
+// (verified live, 2.1.294), so the answer is the digit KEY alone — the text
+// route's trailing Enter would land on whatever Claude draws next (#571).
+func TestDeliverSingleQuestionFormAnswerIsAKeyWithNoEnter(t *testing.T) {
+	form := readDomainFixture(t, "claude_question_single.txt")
+	h := &fakeKeyHerdr{
+		fakeHerdr: fakeHerdr{pane: form},
+		keyScript: []string{"2"}, keyScriptFrames: []string{readDomainFixture(t, "claude_question_single_answered.txt")},
+	}
+	if err := deliver.Deliver(context.Background(), fastCfg(h), singleQuestionRequest(form, "Banana")); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(h.keys, []string{"2"}) || len(h.inputs) != 0 {
+		t.Fatalf("keys = %v inputs = %v, want the digit key alone", h.keys, h.inputs)
+	}
+}
+
+// The preview form's digit only moves the caret, and Enter commits — exactly
+// what the text route sends, so it stays there (verified live, 2.1.294).
+func TestDeliverSingleQuestionPreviewFormKeepsTheTextRoute(t *testing.T) {
+	form := readDomainFixture(t, "claude_question_single_preview.txt")
+	h := &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: form}}
+	if err := deliver.Deliver(context.Background(), fastCfg(h), singleQuestionRequest(form, "Beta")); err != nil {
+		t.Fatal(err)
+	}
+	if len(h.keys) != 0 || !reflect.DeepEqual(h.inputs, []string{"2"}) {
+		t.Fatalf("keys = %v inputs = %v, want the digit through the text send (digit + Enter)", h.keys, h.inputs)
 	}
 }
