@@ -56,19 +56,39 @@ func ClaudeModalRegion(pane string) (string, bool) {
 // delivery compares can never be cut differently.
 func parseClaudeModal(pane string) (ClaudeMenu, bool) {
 	lines := strings.Split(strings.TrimRight(pane, "\n"), "\n")
-	top := -1
-	for i := len(lines) - 1; i >= 0; i-- {
-		if claudeRuleLineRE.MatchString(strings.TrimSpace(lines[i])) {
-			top = i
-			break
-		}
-	}
+	top := lastClaudeRule(lines, len(lines))
 	if top < 0 {
 		return ClaudeMenu{}, false
 	}
+	m := claudeModalFrom(lines[top+1:])
+	if question, ok := claudeSingleQuestionFrom(lines, top, m); ok {
+		m = question
+	}
+	if m.Options = ParseNumberedOptions(m.Region); len(m.Options) == 0 {
+		return ClaudeMenu{}, false
+	}
+	return m, true
+}
+
+// lastClaudeRule returns the index of the last plain horizontal rule above
+// line end, or -1.
+func lastClaudeRule(lines []string, end int) int {
+	for i := end - 1; i >= 0; i-- {
+		if claudeRuleLineRE.MatchString(strings.TrimSpace(lines[i])) {
+			return i
+		}
+	}
+	return -1
+}
+
+// claudeModalFrom reduces the lines below a dialog's top border to a
+// ClaudeMenu, Options unset: blank lines and the key-hint footer dropped,
+// whitespace collapsed, the caret masked (and read), the header's queue counter
+// masked in Region but kept in Header.
+func claudeModalFrom(body []string) ClaudeMenu {
 	var m ClaudeMenu
-	kept := make([]string, 0, len(lines)-top)
-	for _, line := range lines[top+1:] {
+	kept := make([]string, 0, len(body))
+	for _, line := range body {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.Contains(strings.ToLower(trimmed), "esc to cancel") {
 			continue
@@ -90,10 +110,50 @@ func parseClaudeModal(pane string) (ClaudeMenu, bool) {
 		kept = append(kept, line)
 	}
 	m.Region = strings.Join(kept, "\n")
-	if m.Options = ParseNumberedOptions(m.Region); len(m.Options) == 0 {
+	return m
+}
+
+// claudeChatRowRE matches a numbered "Chat about this" row — the only thing an
+// AskUserQuestion form draws below its INNER rule.
+var claudeChatRowRE = regexp.MustCompile(`(?i)^\d+[.)] chat about this$`)
+
+// claudeSingleQuestionFrom widens a dialog cut at the last rule to Claude's
+// plain single-select, single-question AskUserQuestion form (#571).
+//
+// That form draws an inner rule above its numbered "N. Chat about this" row, so
+// the last-rule cut leaves the dialog as that one row: the question and its
+// options are invisible, the chosen digit is not offered, and the answer used to
+// fall back to "digit, Enter" — where the digit commits (verified live
+// 2026-10-08, Claude Code 2.1.294) and the Enter lands on whatever Claude draws
+// next. Widened to the form's outer border, the region carries the question,
+// the options and the caret, and the form is answered by key like a permission
+// dialog.
+//
+// Deliberately narrow: only when everything below the last rule is that numbered
+// row, and only for a form with no tab header (a multi-tab form has its own
+// series route), no checkbox options (a multi-select digit only toggles a box)
+// and no preview column. A preview form's digit only moves the caret and its box
+// redraws with it, so it stays on the text route, which already sends the Enter
+// it needs (verified live: its Chat row is unnumbered, so this never matches it
+// anyway). Anything else keeps the last-rule cut unchanged.
+func claudeSingleQuestionFrom(lines []string, top int, cut ClaudeMenu) (ClaudeMenu, bool) {
+	if !claudeChatRowRE.MatchString(cut.Region) {
 		return ClaudeMenu{}, false
 	}
-	return m, true
+	outer := lastClaudeRule(lines, top)
+	if outer < 0 {
+		return ClaudeMenu{}, false
+	}
+	raw := strings.Join(lines[outer+1:], "\n")
+	if mcqTabHeaderRE.MatchString(raw) || MultiSelectTab(raw) {
+		return ClaudeMenu{}, false
+	}
+	for _, line := range lines[outer+1 : top] {
+		if previewColumnRE.MatchString(line) {
+			return ClaudeMenu{}, false
+		}
+	}
+	return claudeModalFrom(lines[outer+1:]), true
 }
 
 // ClaudeMenu is a standing Claude dialog reduced to what answering it by KEY
