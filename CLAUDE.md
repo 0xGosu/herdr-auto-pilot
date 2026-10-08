@@ -286,7 +286,9 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   (`runClaudeSettle`, via `deliver.Config.SettleAsync` for auto-accept and operator replies), and a settling
   pane is busy to `acquirePane`/`paneBusy` and to the self-check (`armUnblockCheck` defers). Past the
   digit nothing is a delivery failure (auto-accept would retry).
-  **Test trap:** the daemon fake answers digits through `onKey`; `menuDigits` fails on a text send.
+  **Test trap:** the daemon fake answers digits through `onKey`; `menuDigits` fails on a text send. Live
+  proof: `TestRealClaudePagedApprovalQueueIsFollowed` (operator) and `…LLMPromotedPagedApproval…` (LLM);
+  their fake MCP server must log each call on RECEIPT and answer it on a thread, or a stray approval hides.
 - One request per herdr socket connection. herdr ≥0.9.0 replays no existing panes on subscribe; `events_lost`
   means resubscribe + resync. Only agent panes get status subscriptions.
 - Agent names: `[a-z][a-z0-9_-]{0,31}`, unique. `agent prompt` right after `agent start` may land without

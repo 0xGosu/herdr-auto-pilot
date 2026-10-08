@@ -18,6 +18,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/herdr"
+	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 	"github.com/0xGosu/herdr-auto-pilot/internal/testutil"
 )
@@ -124,6 +125,18 @@ type testDaemon struct {
 // source + LLM stub (so the pipeline never touches any other real pane).
 func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) *testDaemon {
 	t.Helper()
+	llm := &capturingLLM{}
+	h := newTestDaemonWithLLM(t, cli, cfgTOML, func(*store.Store) ports.LLMPort { return llm })
+	h.LLM = llm
+	return h
+}
+
+// newTestDaemonWithLLM is newTestDaemon with the LLM port built by newLLM, which
+// is handed the daemon's store (a consult must stage its decision there, as the
+// real CLI's submit_decision does). testDaemon.LLM is left nil.
+func newTestDaemonWithLLM(t *testing.T, cli *herdr.CLI, cfgTOML string,
+	newLLM func(*store.Store) ports.LLMPort) *testDaemon {
+	t.Helper()
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
 	if err := os.WriteFile(cfgPath, []byte(cfgTOML+tinyCaptureDelayTOML), 0o600); err != nil {
@@ -136,7 +149,7 @@ func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) *testDaemon {
 	t.Cleanup(func() { st.Close() })
 
 	events := newManualEvents()
-	llm := &capturingLLM{}
+	llm := newLLM(st)
 	ctlPath := filepath.Join(testutil.SocketDir(t), "ctl.sock")
 	// The operator's task hand-out seam, wired the way cmd/hap wires it: the
 	// daemon executes a queued send_task through the FRONT END's checklist and
@@ -157,7 +170,7 @@ func newTestDaemon(t *testing.T, cli *herdr.CLI, cfgTOML string) *testDaemon {
 		t.Fatal(err)
 	}
 	return &testDaemon{
-		Daemon: d, Events: events, LLM: llm, Store: st,
+		Daemon: d, Events: events, Store: st,
 		ConfigPath: cfgPath, ControlPath: ctlPath,
 	}
 }

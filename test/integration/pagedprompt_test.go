@@ -22,14 +22,24 @@ import (
 // seconds to answer. The delay is what makes Claude PAGE its approvals: while
 // one subagent's call runs, the others' requests queue behind one dialog ("1
 // of 3") instead of being asked one at a time. Every tools/call is appended to
-// the log file named by argv[1] on RECEIPT, before the sleep, so a test can count
-// exactly which requests were approved.
-const slowMCPServer = `import json, sys, time
+// the log file named by argv[1] on RECEIPT and answered from its own thread, so
+// a test can count exactly which requests were approved the moment Claude runs
+// them — answered inline, a second call would sit unread behind the first one's
+// sleep, and a stray approval would not show in the log for seconds.
+const slowMCPServer = `import json, sys, threading, time
 LOG = sys.argv[1]
+OUT = threading.Lock()
 TOOLS = [{"name": n, "description": d, "inputSchema": {"type": "object", "properties": {"x": {"type": "string"}}}}
          for n, d in [("get_pr", "Get details for a single pull request"),
                       ("get_profile", "Get my user profile"),
                       ("get_files", "List files of a pull request")]]
+def reply(mid, r):
+    with OUT:
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": r}) + "\n")
+        sys.stdout.flush()
+def call(mid, name):
+    time.sleep(8)
+    reply(mid, {"content": [{"type": "text", "text": "ok from " + name}]})
 for line in sys.stdin:
     m = json.loads(line)
     mid = m.get("id")
@@ -37,19 +47,16 @@ for line in sys.stdin:
         continue
     meth = m.get("method")
     if meth == "initialize":
-        r = {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
-             "serverInfo": {"name": "fakegh", "version": "1"}}
+        reply(mid, {"protocolVersion": m["params"].get("protocolVersion", "2025-06-18"), "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "fakegh", "version": "1"}})
     elif meth == "tools/list":
-        r = {"tools": TOOLS}
+        reply(mid, {"tools": TOOLS})
     elif meth == "tools/call":
         with open(LOG, "a") as f:
             f.write(m["params"]["name"] + "\n")
-        time.sleep(8)
-        r = {"content": [{"type": "text", "text": "ok from " + m["params"]["name"]}]}
+        threading.Thread(target=call, args=(mid, m["params"]["name"]), daemon=True).start()
     else:
-        r = {}
-    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": r}) + "\n")
-    sys.stdout.flush()
+        reply(mid, {})
 `
 
 // pagerRE matches the counter in the header of Claude's paged permission dialog.
@@ -95,19 +102,16 @@ func escalationShowing(t *testing.T, st *store.Store, pane, pos string) int64 {
 	return 0
 }
 
-// TestRealClaudePagedApprovalQueueIsFollowed drives a REAL Claude Code into its
-// paged permission queue and answers page 1 through the daemon. Page 2 is drawn
-// in place while herdr keeps reporting the agent blocked — no status event — so
-// the only thing that can capture it is the post-action self-check
-// (followUpPromptStanding). Before that, the queue stood forever.
-//
-// The test daemon gets no herdr events at all (manualEvents), and its startup
-// reconcile has already handled this pane's parked episode by the time page 2
-// appears, which makes "an escalation for page 2 exists" a direct proof of the
-// self-check's capture.
-func TestRealClaudePagedApprovalQueueIsFollowed(t *testing.T) {
+// raisePagedApprovalQueue drives a REAL Claude Code into its paged permission
+// queue: three parallel subagents each call a tool of a fake MCP server
+// (slowMCPServer), whose tools are never auto-approved, so the requests queue
+// behind one dialog ("1 of 3"). It returns the herdr adapter, the pane, and the
+// server's call log — every request Claude was allowed to run. Skips when a
+// dependency is absent or Claude does not page.
+func raisePagedApprovalQueue(t *testing.T) (*herdr.CLI, string, string) {
+	t.Helper()
 	if os.Getenv("HAP_ITEST_CLAUDE") != "1" {
-		t.Skip("set HAP_ITEST_CLAUDE=1 to run the real Claude paged-approval test")
+		t.Skip("set HAP_ITEST_CLAUDE=1 to run the real Claude paged-approval tests")
 	}
 	requireHerdr(t)
 	for _, bin := range []string{"claude", "python3"} {
@@ -135,7 +139,7 @@ func TestRealClaudePagedApprovalQueueIsFollowed(t *testing.T) {
 
 	pane := startClaudeAgent(t, cli, work, "--mcp-config", mcpPath)
 	// The operator's own daemon watches scratch panes too and would answer the
-	// queue out from under this case.
+	// queue out from under these cases.
 	quietOperatorDaemon(t, pane)
 
 	prompt := "Launch THREE general-purpose subagents in parallel in one message (Agent tool). " +
@@ -165,13 +169,28 @@ func TestRealClaudePagedApprovalQueueIsFollowed(t *testing.T) {
 			first = pos
 		}
 	}
+	return cli, pane, callLog
+}
+
+// TestRealClaudePagedApprovalQueueIsFollowed drives a REAL Claude Code into its
+// paged permission queue and answers page 1 through the daemon. Page 2 is drawn
+// in place while herdr keeps reporting the agent blocked — no status event — so
+// the only thing that can capture it is the post-action self-check
+// (followUpPromptStanding). Before that, the queue stood forever.
+//
+// The test daemon gets no herdr events at all (manualEvents), and its startup
+// reconcile has already handled this pane's parked episode by the time page 2
+// appears, which makes "an escalation for page 2 exists" a direct proof of the
+// self-check's capture.
+func TestRealClaudePagedApprovalQueueIsFollowed(t *testing.T) {
+	cli, pane, callLog := raisePagedApprovalQueue(t)
 
 	h := newTestDaemon(t, cli, "")
 	dctx, cancel := context.WithCancel(context.Background())
 	runDaemon(t, dctx, cancel, h.Daemon)
 
 	page1 := ""
-	deadline = time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	var page1ID int64
 	for time.Now().Before(deadline) && page1ID == 0 {
 		content, _ := cli.ReadPaneVisible(context.Background(), pane, 60)
