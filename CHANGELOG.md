@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.71
+
+- Added a real-Claude integration test proving that an answer the LLM decides approves exactly one request in Claude's paged permission queue
+
 ## 0.9.70
 
 - Fixed answering a Claude permission prompt sometimes approving the next queued request too: hap now presses the option's number on its own and adds Enter only when the same prompt is provably still waiting
