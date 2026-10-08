@@ -368,7 +368,7 @@ func (a *App) SetAgentMode(ctx context.Context, target, modeName string, opts Mo
 	// means the rotation has closed WITHOUT passing through the target, which is
 	// how an unavailable mode is detected — and it is not hypothetical: a claude
 	// session's cycle is per-SESSION, not per-agent-type. Verified live
-	// (2026-08-09) a `--model haiku` session rotates through only three modes,
+	// (2026-08-09) a session on an older model rotated through only three modes,
 	// manual -> acceptEdits -> plan, with no "auto" at all.
 	//
 	// Without this the loop spends its entire ceiling pressing, and — far worse

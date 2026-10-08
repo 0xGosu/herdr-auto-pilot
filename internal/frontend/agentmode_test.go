@@ -435,8 +435,8 @@ func TestSetAgentModeStopsWhenThePaneGoesUnreadableMidRotation(t *testing.T) {
 
 // TestSetAgentModeDetectsAModeThisSessionDoesNotOffer is the live-caught case
 // that motivated cycle detection: a claude session's rotation is per-SESSION,
-// not per-agent-type. A `--model haiku` session cycles through only manual,
-// acceptEdits and plan — "auto" is simply not in it.
+// not per-agent-type. A session whose model leaves "auto" out cycles through
+// only manual, acceptEdits and plan — "auto" is simply not in it.
 //
 // Two things must hold. The loop must NOT spend its whole ceiling pressing (the
 // original behavior: 8 presses, ~24s, then a generic "still in acceptEdits"),

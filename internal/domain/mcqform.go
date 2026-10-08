@@ -182,7 +182,7 @@ func MultiTabForm(pane string) (tabs int, ok bool) {
 //
 // It exists because Claude renders the SAME form with two different key
 // protocols, decided per tab by whether its options carry a preview
-// (verified live 2026-07-16, Claude Code / Haiku 4.5):
+// (verified live 2026-07-16, Claude Code):
 //
 //   - plain options ("1. Apple" / "2. Banana"): the DIGIT selects and commits,
 //     auto-advancing to the next tab.

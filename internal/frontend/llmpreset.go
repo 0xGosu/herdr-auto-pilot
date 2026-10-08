@@ -32,9 +32,9 @@ import (
 // survive any edit here: the learn recipes run with WRITE access (claude
 // --permission-mode acceptEdits; codex --dangerously-bypass-approvals-and-sandbox;
 // agy --dangerously-skip-permissions) because they are the only ones that edit
-// a file, where the read-only consult and generate recipes do not; and codex's
-// consult names a different model (gpt-5.6-terra) from its generate/learn
-// recipes (gpt-5.6-sol).
+// a file, where the read-only consult and generate recipes do not; and the
+// consult names a different model from the generate/learn recipes — claude's
+// sonnet against opus, codex's gpt-5.6-terra against gpt-6.1-sol.
 //
 // agy adds a THIRD asymmetry and does NOT follow the codex pattern — read
 // LLMPresetAgy's own doc comment before assuming it does. It serves three of
@@ -232,7 +232,7 @@ var llmCommandPresets = map[string]map[string][]string{
 			"claude",
 			"--no-session-persistence",
 			"--model",
-			"opus",
+			"sonnet",
 			"--permission-mode",
 			"auto",
 			"-p",
@@ -279,7 +279,7 @@ var llmCommandPresets = map[string]map[string][]string{
 		LLMPresetCodex: {
 			"codex",
 			"--model",
-			"gpt-5.6-sol",
+			"gpt-6.1-sol",
 			"exec",
 			"--ephemeral",
 			"--skip-git-repo-check",
@@ -325,7 +325,7 @@ var llmCommandPresets = map[string]map[string][]string{
 		LLMPresetCodex: {
 			"codex",
 			"--model",
-			"gpt-5.6-sol",
+			"gpt-6.1-sol",
 			"exec",
 			"--ephemeral",
 			"--skip-git-repo-check",
@@ -374,7 +374,7 @@ var llmCommandPresets = map[string]map[string][]string{
 			"claude",
 			"--no-session-persistence",
 			"--model",
-			"sonnet",
+			"haiku",
 			"--permission-mode",
 			"auto",
 			"-p",
@@ -388,7 +388,7 @@ var llmCommandPresets = map[string]map[string][]string{
 		LLMPresetCodex: {
 			"codex",
 			"--model",
-			"gpt-5.6-luna",
+			"gpt-6-luna",
 			"exec",
 			"--ephemeral",
 			"--skip-git-repo-check",

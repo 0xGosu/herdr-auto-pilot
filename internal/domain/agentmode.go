@@ -103,7 +103,7 @@ func modeAgentKind(agentType string) string {
 //
 // It is the SUPERSET, not a promise: the modes a given session actually rotates
 // through depend on that session, not just on the agent type. Verified live
-// (2026-08-09) a `--model haiku` Claude session cycles through only three modes
+// (2026-08-09) a Claude session on an older model cycled through only three modes
 // — manual, acceptEdits, plan — with no "auto" at all, while a default-model
 // session in the same build offers all four. So a target from this list can
 // still be unreachable, which is why the caller detects a closed rotation rather
