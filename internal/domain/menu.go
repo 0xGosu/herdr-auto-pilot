@@ -356,12 +356,6 @@ func DeliverOutbound(sitType SituationType, agentType, paneContent, chosen strin
 	return MenuKeystroke(paneContent, chosen)
 }
 
-// DeliverKeystroke is DeliverOutbound for callers that only need the text.
-func DeliverKeystroke(sitType SituationType, agentType, paneContent, chosen string) string {
-	out, _ := DeliverOutbound(sitType, agentType, paneContent, chosen)
-	return out
-}
-
 // uniquePrefixMatch returns an option's number when exactly one option label
 // starts with want; ambiguous or absent prefixes return ("", false). want is
 // already folded by the caller, so labels are folded here to match.

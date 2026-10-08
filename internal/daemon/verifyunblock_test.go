@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -213,18 +214,49 @@ func pagedFixture(t *testing.T, name string) string {
 	return padded
 }
 
-// pagedQueueOnSend models Claude's paged permission queue: each send answers
+// pagedQueueOnKey models Claude's paged permission queue: a menu DIGIT answers
 // the standing page and draws the next one IN PLACE, the agent staying blocked
 // throughout — herdr raises no event for it. After the last page the agent goes
-// back to work.
-func pagedQueueOnSend(agentID string, pages ...string) func(f *fakeHerdr, input string) {
-	return func(f *fakeHerdr, _ string) {
+// back to work. An Enter does nothing here, so a stray one cannot hide: it shows
+// up in the recorded keys (#564).
+func pagedQueueOnKey(agentID string, pages ...string) func(f *fakeHerdr, key string) {
+	return func(f *fakeHerdr, key string) {
+		if _, err := strconv.Atoi(key); err != nil {
+			return
+		}
 		if len(pages) == 0 {
 			f.pane = "● Done.\n\n❯ \n"
 			f.agents = []domain.AgentTransition{{AgentID: agentID, PaneID: agentID, AgentType: "claude", Status: "working"}}
 			return
 		}
 		f.pane, pages = pages[0], pages[1:]
+	}
+}
+
+// menuDigits returns the digit keys pressed — the menu answers given — and
+// fails the test on any text send: a Claude menu digit must arrive as a key.
+func (h *harness) menuDigits() []string {
+	h.t.Helper()
+	if sent := h.herdr.sentInputs(); len(sent) != 0 {
+		h.t.Fatalf("a Claude menu answer went through the text send (and its Enter): %v", sent)
+	}
+	var digits []string
+	for _, k := range h.herdr.keysSent() {
+		if _, err := strconv.Atoi(k); err == nil {
+			digits = append(digits, k)
+		}
+	}
+	return digits
+}
+
+// noEnterKey fails the test if an Enter was pressed: every page in these
+// queues commits on its digit, so an Enter would have answered the next page.
+func (h *harness) noEnterKey() {
+	h.t.Helper()
+	for _, k := range h.herdr.keysSent() {
+		if k == "enter" {
+			h.t.Fatalf("an Enter followed a digit that committed the page: keys %v", h.herdr.keysSent())
+		}
 	}
 }
 
@@ -256,12 +288,13 @@ func TestSelfCheckCapturesTheNextPagedClaudePrompt(t *testing.T) {
 	h.herdr.setPane(one)
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-pg", PaneID: "agent-pg", AgentType: "claude", Status: "blocked"}})
 	h.herdr.mu.Lock()
-	h.herdr.onSend = pagedQueueOnSend("agent-pg", two)
+	h.herdr.onKey = pagedQueueOnKey("agent-pg", two)
 	h.herdr.mu.Unlock()
 
 	h.push("agent-pg", "blocked")
 
-	waitFor(t, 5*time.Second, func() bool { return len(h.herdr.sentInputs()) == 2 })
+	waitFor(t, 5*time.Second, func() bool { return len(h.menuDigits()) == 2 })
+	h.noEnterKey()
 	if n := h.auditExcerptsContaining("2 of 3"); n == 0 {
 		t.Error("no decision was recorded against page 2")
 	}
@@ -286,14 +319,14 @@ func TestSelfCheckDoesNotRecaptureAnUnchangedClaudePrompt(t *testing.T) {
 	h.herdr.setPane(one)
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-st", PaneID: "agent-st", AgentType: "claude", Status: "blocked"}})
 	h.herdr.mu.Lock()
-	h.herdr.onSend = pagedQueueOnSend("agent-st", churned, churned, churned)
+	h.herdr.onKey = pagedQueueOnKey("agent-st", churned, churned, churned)
 	h.herdr.mu.Unlock()
 
 	h.push("agent-st", "blocked")
 
 	waitFor(t, 3*time.Second, func() bool { return h.countDeliveryFailed() == 1 })
 	time.Sleep(300 * time.Millisecond)
-	if got := h.herdr.sentInputs(); len(got) != 1 {
+	if got := h.menuDigits(); len(got) != 1 {
 		t.Fatalf("the unchanged prompt was answered again: sent %v", got)
 	}
 }
@@ -323,24 +356,31 @@ func TestFSPCapturesTheNextPagedClaudePrompt(t *testing.T) {
 	h.herdr.setPane(one)
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-fp", PaneID: "agent-fp", AgentType: "claude", Status: "blocked"}})
 	h.herdr.mu.Lock()
-	h.herdr.onSend = pagedQueueOnSend("agent-fp", two)
+	h.herdr.onKey = pagedQueueOnKey("agent-fp", two)
 	h.herdr.mu.Unlock()
 
 	h.push("agent-fp", "blocked")
 
-	waitFor(t, 10*time.Second, func() bool { return len(h.herdr.sentInputs()) == 2 })
-	rows, err := h.raw.AuditLog(context.Background(), 50)
-	if err != nil {
-		t.Fatal(err)
-	}
-	accepted := 0
-	for _, r := range rows {
-		if r.Status == domain.AuditStatusAutoAccepted {
-			accepted++
+	waitFor(t, 10*time.Second, func() bool { return len(h.menuDigits()) == 2 })
+	h.noEnterKey()
+	// A row is finalized once its delivery returns, and a Claude menu digit's
+	// delivery includes its settle window — so the count is waited for.
+	accepted := func() int {
+		rows, err := h.raw.AuditLog(context.Background(), 50)
+		if err != nil {
+			t.Fatal(err)
 		}
+		n := 0
+		for _, r := range rows {
+			if r.Status == domain.AuditStatusAutoAccepted {
+				n++
+			}
+		}
+		return n
 	}
-	if accepted != 2 {
-		t.Errorf("want both pages answered by full self-prompting, got %d auto-accepted rows", accepted)
+	waitFor(t, 5*time.Second, func() bool { return accepted() == 2 })
+	if n := len(h.menuDigits()); n != 2 {
+		t.Errorf("want both pages answered by full self-prompting, got %d answers", n)
 	}
 	if n := h.countDeliveryFailed(); n != 0 {
 		t.Errorf("a new prompt is not a failed delivery, got %d delivery_failed rows", n)
@@ -360,7 +400,7 @@ func TestFSPUnchangedClaudePromptIsAFailedDelivery(t *testing.T) {
 
 	waitFor(t, 10*time.Second, func() bool { return h.countDeliveryFailed() == 1 })
 	time.Sleep(300 * time.Millisecond)
-	if got := h.herdr.sentInputs(); len(got) != 1 {
+	if got := h.menuDigits(); len(got) != 1 {
 		t.Fatalf("the unchanged prompt was answered again: sent %v", got)
 	}
 }
@@ -377,14 +417,14 @@ func TestSelfCheckDoesNotRecaptureACounterOnlyChange(t *testing.T) {
 	h.herdr.setPane(one)
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-ct", PaneID: "agent-ct", AgentType: "claude", Status: "blocked"}})
 	h.herdr.mu.Lock()
-	h.herdr.onSend = pagedQueueOnSend("agent-ct", grown, grown)
+	h.herdr.onKey = pagedQueueOnKey("agent-ct", grown, grown)
 	h.herdr.mu.Unlock()
 
 	h.push("agent-ct", "blocked")
 
 	waitFor(t, 3*time.Second, func() bool { return h.countDeliveryFailed() == 1 })
 	time.Sleep(300 * time.Millisecond)
-	if got := h.herdr.sentInputs(); len(got) != 1 {
+	if got := h.menuDigits(); len(got) != 1 {
 		t.Fatalf("the same prompt was answered again after a counter-only change: sent %v", got)
 	}
 }
@@ -403,15 +443,16 @@ func TestSelfCheckFollowsAQueueOnlyUpToItsCap(t *testing.T) {
 	h.herdr.setPane(one)
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-cap", PaneID: "agent-cap", AgentType: "claude", Status: "blocked"}})
 	h.herdr.mu.Lock()
-	h.herdr.onSend = pagedQueueOnSend("agent-cap", pages...)
+	h.herdr.onKey = pagedQueueOnKey("agent-cap", pages...)
 	h.herdr.mu.Unlock()
 
 	h.push("agent-cap", "blocked")
 
 	waitFor(t, 30*time.Second, func() bool { return h.countDeliveryFailed() == 1 })
 	time.Sleep(300 * time.Millisecond)
+	h.noEnterKey()
 	// The first answer plus one per followed page.
-	if got, want := len(h.herdr.sentInputs()), maxFollowUpRecaptures+1; got != want {
+	if got, want := len(h.menuDigits()), maxFollowUpRecaptures+1; got != want {
 		t.Fatalf("sent %d answers, want %d", got, want)
 	}
 }

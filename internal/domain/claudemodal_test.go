@@ -147,3 +147,116 @@ func TestClaudeModalAdvancedRefusesAnAggregate(t *testing.T) {
 		t.Fatal("an aggregate compared against one frame of the same standing form read as an advance")
 	}
 }
+
+func TestParseClaudeMenuKeepsTheCounterAndReadsTheCaret(t *testing.T) {
+	m, ok := ParseClaudeMenu(readClaudeModalFixture(t, "claude_paged_approval_1of3.txt"))
+	if !ok {
+		t.Fatal("a standing paged dialog was not parsed")
+	}
+	if !strings.HasSuffix(m.Header, "1 of 3") {
+		t.Errorf("header lost the queue counter: %q", m.Header)
+	}
+	if strings.Contains(m.Region, "1 of 3") {
+		t.Errorf("region kept the counter, so it no longer matches ClaudeModalRegion: %q", m.Region)
+	}
+	if m.Caret != "1" {
+		t.Errorf("caret = %q, want 1", m.Caret)
+	}
+	if !m.Offers("3") || m.Offers("4") {
+		t.Errorf("offered options wrong: %+v", m.Options)
+	}
+	if region, _ := ClaudeModalRegion(readClaudeModalFixture(t, "claude_paged_approval_1of3.txt")); region != m.Region {
+		t.Error("ParseClaudeMenu and ClaudeModalRegion cut the dialog differently")
+	}
+}
+
+// SameStanding is what licenses an Enter after a digit, so — unlike
+// ClaudeModalAdvanced — any queue-counter change is a DIFFERENT dialog: three
+// subagents asking for the same command draw identical bodies, and the counter is
+// all that tells page 2 from page 1 (#564).
+func TestClaudeMenuSameStandingTreatsACounterChangeAsADifferentDialog(t *testing.T) {
+	one := readClaudeModalFixture(t, "claude_paged_approval_1of3.txt")
+	base, _ := ParseClaudeMenu(one)
+	for name, after := range map[string]string{
+		"identical body, next page": strings.Replace(one, "1 of 3", "1 of 2", 1),
+		"index moved":               strings.Replace(one, "1 of 3", "2 of 3", 1),
+		"counter dropped":           strings.Replace(one, "1 of 3", "", 1),
+		"next request":              readClaudeModalFixture(t, "claude_paged_approval_2of3.txt"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, ok := ParseClaudeMenu(after)
+			if !ok {
+				t.Fatal("the later capture was not parsed")
+			}
+			if base.SameStanding(m) {
+				t.Fatal("a different page read as the same standing dialog")
+			}
+		})
+	}
+}
+
+// The control half: what a caret-only build draws after a digit — the same
+// dialog, caret moved — and churn around it are the SAME dialog.
+func TestClaudeMenuSameStandingIgnoresTheCaretAndChurn(t *testing.T) {
+	one := readClaudeModalFixture(t, "claude_paged_approval_1of3.txt")
+	base, _ := ParseClaudeMenu(one)
+	moved := strings.Replace(strings.Replace(one, " ❯ 1. Yes\n", "   1. Yes\n", 1),
+		"   2. Yes, and", " ❯ 2. Yes, and", 1)
+	for name, after := range map[string]string{
+		"caret moved": moved,
+		"churned":     readClaudeModalFixture(t, "claude_paged_approval_1of3_churned.txt"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			m, ok := ParseClaudeMenu(after)
+			if !ok || !base.SameStanding(m) {
+				t.Fatal("the same standing dialog was not recognized")
+			}
+		})
+	}
+	if m, _ := ParseClaudeMenu(moved); m.Caret != "2" {
+		t.Errorf("caret = %q after it moved, want 2", m.Caret)
+	}
+}
+
+func TestClaudeMenuDigit(t *testing.T) {
+	cases := []struct {
+		sit    SituationType
+		agent  string
+		mapped bool
+		want   bool
+	}{
+		{SituationApproval, "claude", true, true},
+		{SituationChoice, " Claude ", true, true},
+		{SituationApproval, "claude", false, false}, // free text keeps its route
+		{SituationIdle, "claude", true, false},
+		{SituationError, "claude", true, false},
+		{SituationApproval, "codex", true, false}, // codex's binding is unverified
+		{SituationApproval, "agy", true, false},   // agy has its own deliverer
+	}
+	for _, c := range cases {
+		if got := ClaudeMenuDigit(c.sit, c.agent, c.mapped); got != c.want {
+			t.Errorf("ClaudeMenuDigit(%s, %q, %v) = %v, want %v", c.sit, c.agent, c.mapped, got, c.want)
+		}
+	}
+}
+
+// A dialog drawn with no title line has an OPTION as its first line, so the
+// header must mask the caret too: a digit that only moved it is still the same
+// dialog, or no caret-only build could ever be given its Enter.
+func TestClaudeMenuSameStandingIgnoresTheCaretOnAHeaderlessDialog(t *testing.T) {
+	rule := strings.Repeat("─", 40)
+	base, ok := ParseClaudeMenu(rule + "\n ❯ 1. Yes\n   2. No\n")
+	if !ok {
+		t.Fatal("a headerless dialog was not parsed")
+	}
+	moved, ok := ParseClaudeMenu(rule + "\n   1. Yes\n ❯ 2. No\n")
+	if !ok {
+		t.Fatal("the moved-caret capture was not parsed")
+	}
+	if !base.SameStanding(moved) {
+		t.Fatalf("a caret move read as a different dialog: header %q vs %q", base.Header, moved.Header)
+	}
+	if moved.Caret != "2" {
+		t.Errorf("caret = %q, want 2", moved.Caret)
+	}
+}

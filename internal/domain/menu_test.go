@@ -292,10 +292,6 @@ func TestDeliverOutbound(t *testing.T) {
 				t.Errorf("DeliverOutbound(%v, %q) = (%q, %v), want (%q, %v)",
 					tc.sitType, tc.chosen, got, mapped, tc.want, tc.mapped)
 			}
-			// DeliverKeystroke must stay in lockstep with DeliverOutbound.
-			if ks := DeliverKeystroke(tc.sitType, tc.agentType, tc.content, tc.chosen); ks != got {
-				t.Errorf("DeliverKeystroke = %q, DeliverOutbound text = %q", ks, got)
-			}
 		})
 	}
 }

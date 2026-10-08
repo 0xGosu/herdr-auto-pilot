@@ -676,6 +676,9 @@ func (d *Daemon) autoAcceptDeliver(ctx context.Context, rec *domain.AuditRecord,
 			Herdr:     d.opt.Herdr,
 			Read:      d.readVisible,
 			ReadLines: d.opt.PaneReadLines,
+			// A Claude menu digit's settle polls for up to a second; this
+			// runs on the select loop, so it goes off it (#564).
+			SettleAsync: func(settle func(context.Context)) { d.runClaudeSettle(rec.AgentID, settle) },
 		}, deliver.Request{
 			PaneID:        rec.AgentID,
 			AgentType:     rec.AgentType,

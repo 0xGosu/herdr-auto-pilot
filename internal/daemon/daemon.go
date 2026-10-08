@@ -521,6 +521,10 @@ type Daemon struct {
 	// sweepInFlight dedupes the one live multi-tab form sweep per agent
 	// (guarded by mu); outcomes return through sweepResults.
 	sweepInFlight map[string]bool
+	// claudeSettling counts the off-loop Claude menu settles running per agent
+	// (guarded by mu; runClaudeSettle). A settling pane is busy to acquirePane
+	// and paneBusy, and the unblock self-check waits it out.
+	claudeSettling map[string]int
 
 	// sessionRenamePushes counts the `/rename` keystrokes spent per
 	// (agent, terminal, name) by the Claude session-name sync, so a pane that
@@ -958,6 +962,7 @@ func New(opt Options) (*Daemon, error) {
 		rerankInFlight:            map[string]rerankFlight{},
 		rerankCache:               map[string][]domain.RerankResult{},
 		sweepInFlight:             map[string]bool{},
+		claudeSettling:            map[string]int{},
 		sessionRenamePushes:       map[string]int{},
 		sessionSyncNoted:          map[string]string{},
 		sessionSyncDeferred:       map[string]sessionSyncDefer{},
@@ -3402,9 +3407,19 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// the review without opting into unattended hand-out. reserveDeclaredTask
 	// still no-ops for a non-reserving source, so nothing is marked "[-]" that
 	// was not before.
-	del := delivery{sendText: outbound, input: dec.Input, rationale: dec.Rationale}
+	del := delivery{sendText: outbound, menuDigit: menuMapped, input: dec.Input, rationale: dec.Rationale}
 	if isDeclaredTaskPrompt(declared, dec.Input) {
 		del.declared, del.taskText = declared, declared.Task
+	}
+
+	// A Claude menu digit is pressed under the pane claim (pressClaudeMenu);
+	// refuse a busy pane here, before an audit row claims an answer.
+	if d.claudeMenuPaneBusy(s.Type, s.AgentType, s.AgentID, menuMapped) {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonPaneBusy, Rationale: "pane busy",
+			Confidence: dec.Confidence, Suggestion: "respond: " + dec.Input,
+		}, tr, now)
+		return
 	}
 
 	// learned stays empty: deliverAutonomous computes it after the send,
@@ -3453,7 +3468,11 @@ func (d *Daemon) llmLearnedAction(llmDec *domain.LLMDecision) string {
 // delivery describes one autonomous send: what to write to the pane, what
 // to audit, and what to learn.
 type delivery struct {
-	sendText  string // exactly what is written to the pane
+	sendText string // exactly what is written to the pane
+	// menuDigit marks sendText as a menu digit mapped from the reply
+	// (DeliverOutbound's bool) — for Claude, pressed as a key with a
+	// conditional Enter (domain.ClaudeMenuDigit, #564).
+	menuDigit bool
 	input     string // audit Input and the "auto:" action label
 	rationale string
 	llmOutput string // LLM review diagnostics, when applicable
@@ -3699,7 +3718,8 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		return false
 	}
 
-	if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType, del.sendText); err != nil {
+	press, err := d.sendReply(ctx, s, del.menuDigit, del.sendText)
+	if err != nil {
 		slog.Error("agent send failed; escalating", "pane", s.PaneID, "error", err)
 		// A failed send leaves NO reservation behind — the ledger row below is
 		// written only once herdr accepts the keystrokes — so the reclaim
@@ -3800,7 +3820,7 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 		"agent", s.AgentID, "situation", s.Type, "confidence", dec.Confidence,
 		"rationale", del.rationale, "audit_id", auditID)
 
-	d.scheduleUnblockCheck(verifyunblock.Params{
+	d.armAfterSend(press, s, auditID, verifyunblock.Params{
 		PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 		Signature: sig.Signature, Input: del.input, Excerpt: s.Content, SituationType: s.Type,
 	})
@@ -3819,11 +3839,31 @@ func (d *Daemon) scheduleUnblockCheck(p verifyunblock.Params) {
 	}
 	// Keep the diagnostic row's excerpt the same size as the normal audit rows.
 	p.Excerpt = truncateExcerpt(p.Excerpt)
+	d.armUnblockCheck(p, 0)
+}
+
+// maxUnblockCheckDeferrals bounds how often the self-check waits out a Claude
+// menu settle (runClaudeSettle) before it reads anyway. A settle is a few
+// hundred milliseconds of pane reads, so this is never reached in practice; it
+// only keeps a stuck settle from deferring the check forever.
+const maxUnblockCheckDeferrals = 10
+
+// armUnblockCheck schedules one self-check attempt. While a Claude menu digit is
+// still settling on this agent — its Enter not yet decided — the attempt is
+// pushed back instead: read mid-settle, a caret-only dialog about to be
+// committed would be reported as a delivery that did not land. This covers every
+// arm site at once (auto-accept's finalize, processCorrections for an operator's
+// reply) without reordering any of them.
+func (d *Daemon) armUnblockCheck(p verifyunblock.Params, deferrals int) {
 	delay := d.verifyUnblockDelay
 	if delay <= 0 {
 		delay = unblockCheckDelay
 	}
 	d.afterFunc(delay, func() {
+		if deferrals < maxUnblockCheckDeferrals && d.claudeSettlingNow(p.AgentID) {
+			d.armUnblockCheck(p, deferrals+1)
+			return
+		}
 		_ = logging.Guard("verify-unblock", func() error {
 			// Root the check at shutdownCtx (not context.Background) so daemon
 			// teardown cancels an in-flight self-check instead of letting it
@@ -5623,11 +5663,17 @@ func (d *Daemon) handleActionReviewOutcome(ctx context.Context, res actionReview
 	// sendText carries the digit, input keeps the label — the same split the
 	// act path makes, so the audit row and what is learned still read as the
 	// answer a human recognizes rather than a bare keystroke.
-	sendText := domain.DeliverKeystroke(current.Type, s.AgentType, pane, final)
+	sendText, menuDigit := domain.DeliverOutbound(current.Type, s.AgentType, pane, final)
+	if d.claudeMenuPaneBusy(current.Type, s.AgentType, s.AgentID, menuDigit) {
+		escalateWith(domain.ReasonPaneBusy,
+			"another pane interaction is in flight for this agent; not delivering concurrently")
+		return
+	}
 
 	original := truncateRunes(res.dec.Input, 200)
 	delivered := d.deliverAutonomous(ctx, s, res.sig, res.dec, res.tr, delivery{
 		sendText:      sendText,
+		menuDigit:     menuDigit,
 		input:         final,
 		rationale:     fmt.Sprintf("%s; %s (original: %q)", res.dec.Rationale, note, original),
 		llmOutput:     llmOutput,
@@ -6170,6 +6216,12 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			"LLM answer matches none of the offered options: "+llmDec.Action)
 		return
 	}
+	sendText, menuDigit := domain.DeliverOutbound(s.Type, s.AgentType, pane, llmDec.Action)
+	if d.claudeMenuPaneBusy(s.Type, s.AgentType, s.AgentID, menuDigit) {
+		reject(domain.ReasonPaneBusy,
+			"another pane interaction is in flight for this agent; not delivering concurrently")
+		return
+	}
 
 	executed := d.withAgentAutomation(ctx, s, res.sig, tr, llmDec.Action,
 		computedConf, &llmConf, llmDec.CapturedOutput, llmDec.SessionID, now, func() {
@@ -6187,8 +6239,8 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 					"An LLM-derived action was blocked because its audit record could not be written.")
 				return
 			}
-			if err := ports.SendToAgent(ctx, d.opt.Herdr, s.PaneID, s.AgentType,
-				domain.DeliverKeystroke(s.Type, s.AgentType, pane, llmDec.Action)); err != nil {
+			press, err := d.sendReply(ctx, s, menuDigit, sendText)
+			if err != nil {
 				// Release any pairing this agent holds so no other agent is
 				// denied the item until the claim's TTL (the rule path does
 				// this centrally in deliverAutonomous).
@@ -6213,7 +6265,7 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			d.lastAutoSend[s.AgentID] = now
 			d.mu.Unlock()
 			slog.Info("LLM decision promoted and delivered", "agent", s.AgentID, "action", llmDec.Action)
-			d.scheduleUnblockCheck(verifyunblock.Params{
+			d.armAfterSend(press, s, auditID, verifyunblock.Params{
 				PaneID: s.PaneID, AgentID: s.AgentID, AgentType: s.AgentType,
 				Signature: res.sig.Signature, Input: llmDec.Action, Excerpt: s.Content, SituationType: s.Type,
 			})
