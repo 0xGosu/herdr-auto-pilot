@@ -16,7 +16,7 @@ import (
 const MCQResetKeysForTest = domain.MCQResetKeys
 
 // digitBinding is the per-tab key protocol a rendering uses. Both are real
-// Claude Code behaviours, verified live 2026-07-16 against Haiku 4.5.
+// Claude Code behaviours, verified live 2026-07-16.
 type digitBinding int
 
 const (

@@ -837,7 +837,7 @@ safety control: inside Claude's approval modals `shift+tab` is rebound to
 "approve with this feedback".
 
 Two more things it will not do silently. The cycle is **per session**, not per
-agent type — a `--model haiku` claude offers only three modes — so hap detects a
+agent type — a session's model can leave a mode such as `auto` out of it — so hap detects a
 closed rotation, rotates the agent **back to where it started**, and names the
 cycle it observed. And an agent launched with `--dangerously-skip-permissions`
 reports `bypassPermissions`, which the cycle cannot leave, so hap refuses
