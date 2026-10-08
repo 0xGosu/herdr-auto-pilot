@@ -8,6 +8,10 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.73
+
+- Fixed answering a Claude single-question form sometimes answering the next queued question too: hap now presses the option's number on its own and waits for the next question to be raised separately
+
 ## 0.9.72
 
 - Fixed an answer decided for one Claude permission prompt being pressed into the next queued prompt when the first was answered by hand in the meantime; hap now checks it is still the same prompt, and otherwise raises the new one on its own
