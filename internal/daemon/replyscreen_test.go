@@ -18,10 +18,13 @@ import (
 // agent. Nothing was sent, the refusal is final for that item, and the pull
 // request it answered stalled about three hours until a human stepped in.
 //
-// This is the exact text shape, kept as one string so both arms below screen
-// byte-identical prose — the difference under test is the AUTHOR, nothing else.
+// The live text put a sentence break between "deleting the PK row" and
+// "table", which the heuristic no longer bridges; this keeps its shape with the
+// target in the same clause so it still trips. It is one string so both arms
+// below screen byte-identical prose — the difference under test is the AUTHOR,
+// nothing else.
 const reviewFixProse = "Fix the review comment on the migration: rewrite it to drop only the " +
-	"unique index, without deleting the PK row.\n" +
+	"unique index, without deleting the PK row of the table.\n" +
 	"The table must keep its existing constraint."
 
 // deliverReplyAs queues a reply authored by author and waits for the verdict.
