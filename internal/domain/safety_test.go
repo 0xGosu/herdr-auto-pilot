@@ -89,6 +89,13 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 		"Run systemctl stop postgresql on the primary?",
 		"Execute killall -9 node to clear stuck processes?",
 		"Merge the pull request into main and delete the branch?",
+		// Operator-reported false alarms (2026-10): a noun ("rotation") and a
+		// credential in the next sentence is narration, not a pending act.
+		"The plan covers key rotation. It adds a new plaintext API key to the vault.",
+	}
+	// The one noun the strict credential rule still counts.
+	if _, ok := a.Match("claude", "Confirm deletion of the API key?"); !ok {
+		t.Error(`strict credential rule must match "Confirm deletion of the API key?"`)
 	}
 	for _, p := range benign {
 		if hit, ok := a.Match("claude", p); ok {
@@ -309,6 +316,38 @@ func TestSuspectedIrreversibleHeuristic(t *testing.T) {
 		"Delete the user accounts flagged as spam?",
 		"This change is permanent and cannot be reversed.",
 		"Delete the following?\n  - production database backups",
+		"The following will be deleted:\n\n  - customer data tables",
+		"Truncate the audit tables before the import?",
+		"Regenerate the signing keys for the release pipeline?",
+		"Invalidate the SSH keys on the build hosts?",
+		"Everything will be revoked, including the deploy tokens.",
+		"Deploy the hotfix to prod?",
+		// Dotted names and short code spans stay inside one clause.
+		"Drop the `users` table?",
+		"Truncate the analytics.events table?",
+		"Delete the `staging` database and all its snapshots?",
+		"Release v2.1.0 to production?",
+		"Publish 1.4.2 to the public registry?",
+		"Release the build to our production cluster?",
+		"Purge all customer records?",
+		"Wipe the git history and force a fresh start?",
+		"Revoke the GitHub token?",
+		"Rotate the KMS key?",
+		"Revoke all tokens?",
+		// The target may itself be a code span, and a confirmation may sit
+		// in a dialog box or carry an answer hint before its line break.
+		"Delete the `backups` folder?",
+		"Delete `production`?",
+		"│ Delete the following?          │\n│   - production backups         │",
+		"Delete the following? [y/N]\n  - production backups",
+		"Delete the following?\r\n  - production backups",
+		// A destination with a pronoun, a qualifier, or a flag is still prod.
+		"Release the build to my production server?",
+		"Publish the release to these production hosts?",
+		"Release v3 to us-east-1 production?",
+		"Publish --env production now?",
+		// A period may end the first line when the next opens a list item.
+		"This will delete the following resources.\n  - prod-database",
 	}
 	for _, p := range suspicious {
 		if _, ok := a.SuspectedIrreversible("claude", p); !ok {
@@ -341,6 +380,22 @@ func TestSuspectedIrreversibleHeuristic(t *testing.T) {
 		"Overwrite the existing changes and discard local work?",
 		"Discard the local changes and pull the latest?",
 		"Removing the backups frees 2GB. Continue?",
+		// Operator-reported false alarms (2026-10): past-tense narration, a
+		// verb and target in different sentences or split by a code span, an
+		// application's own "token", and a line that mentions a release and
+		// production without shipping TO production.
+		"I dropped a picked card back down to the table",
+		"Clients drop participants under load. A stuck database restarts cleanly.",
+		"The deleted passage's comment can jump to an identical surviving passage. I record it.",
+		"Then drop the backfill entirely and treat `activated_at` as unset.\nThe users table keeps its column.",
+		"Then delete the branch (local + origin). Link the issues so the repository stays tidy.",
+		"Revoke the stream token when the viewer disconnects?",
+		"Revoke the event-feed token after the replay?",
+		"The workflow deploys on a platform/v* tag and production stays pinned.",
+		"Cut the release. Should I do the live smoke test next?",
+		"Already deployed; MTF vs prod numbers attached.",
+		"Already deleted the staging database and its backups.",
+		"Revoked the stream token after the replay.",
 	}
 	for _, p := range benign {
 		if hit, ok := a.SuspectedIrreversible("claude", p); ok {

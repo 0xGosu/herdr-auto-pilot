@@ -8,6 +8,22 @@ import (
 	"time"
 )
 
+// clauseBridge joins a seed rule's verb to its target within ONE clause: at
+// most 40 steps, where a step is one character, a dotted-name pair (v2.1,
+// analytics.events) or a whole closed code span (`users`). A sentence break
+// (". " or ; ! ?) ends the clause. The trailing optional backtick lets the
+// target itself open a code span ("Delete `production`?"), which the span
+// step would otherwise swallow whole.
+const clauseBridge = `([^\n.;!?\x60]|\.[^\s.]|\x60[^\x60\n]+\x60){0,40}?\x60?`
+
+// lineBreakBridge carries a confirmation over one line break or one blank
+// line ("Delete the following?\n\n - production backups"). The first line may
+// end in "?" or ":", a short "(y/N)" answer hint, a CR, and a dialog's box
+// border ("│"), none of which is a sentence of its own. It may also end in a
+// period, but only when the next line opens a list item ("resources.\n -
+// prod-database"): a period followed by more prose is a finished sentence.
+const lineBreakBridge = `([?:]?[ \t]*(\(y/n\)|\[y/n\])?[ \t│|]*\r?\n([ \t│|]*\r?\n)?|\.[ \t│|]*\r?\n([ \t│|]*\r?\n)?[ \t│|]*([-*•]|\d+[.)])[ \t])`
+
 // SeedNeverAutoPatterns are the shipped never-auto patterns (FR-015/016):
 // regex patterns matched against prompt/pane content. Any match escalates,
 // always, regardless of confidence or mode. The patterns are validated in CI
@@ -57,7 +73,11 @@ var SeedNeverAutoPatterns = []string{
 	`(?i)\bgcloud\s+[^\n]*\bdelete\b`,
 	`(?i)\baz\s+[^\n]*\bdelete\b`,
 	// Credentials / secrets / auth
-	`(?i)(rotat|revok|delet|regenerat)(e|ing|ion)[^\n]*\b(credential|secret|api[- ]?key|password)s?\b`,
+	// Verb first: an imperative or ongoing act ("rotate", "deleting"), not a
+	// past tense ("rotated"), with the target in the same clause — a sentence
+	// break between them is narration. Of the nouns only "deletion" counts
+	// ("Confirm deletion of the API key?"): "rotation" was the false alarm.
+	`(?i)\b((rotat|revok|delet|regenerat)(e|es|ing)|deletion)\b` + clauseBridge + `\b(credential|secret|api[- ]?key|password)s?\b`,
 	`(?i)\b(credential|secret|api[- ]?key|password)s?\b[^\n]*\b(rotat|revok|delet|regenerat)(e|ing|ion)`,
 	`(?i)\b(rotat|revok|delet|regenerat|invalidat)(e[sd]?|ing|ion)\b[^\n]{0,40}?\b(api|deploy|pat|service)[- ]?tokens?\b`,
 	`(?i)\b(api|deploy|pat|service)[- ]?tokens?\b[^\n]{0,40}?\b(rotat|revok|delet|regenerat|invalidat)(e[sd]?|ing|ion)\b`,
@@ -110,27 +130,42 @@ var SeedHeuristicNeverAutoRules = []NeverAutoRule{
 	// you absolutely sure" is not: agent TUIs ask it for routine confirms, so
 	// only the corroborated are-you-sure rule below remains.)
 	seedHeuristic(`(?i)\birreversibl[ey]\b|\bunrecoverabl[ey]\b|\bcannot\s+be\s+(undone|recovered|restored|reversed|reverted)\b|\bcan't\s+be\s+undone\b|\bno\s+undo\b|\blost\s+forever\b|\b(is|are)\s+permanent\b`),
-	// Destructive verb aimed at a data/infrastructure target. The bridge
-	// allows at most one line break or one blank line: confirmations often
-	// put the verb and its target on adjacent lines ("Delete the
-	// following?\n\n - production backups"), but a verb and target separated
-	// by other lines of text is narration, not a pending operation.
+	// Destructive verb aimed at a data/infrastructure target. The verb is a
+	// pending act — imperative, present or gerund, or a passive "be deleted"
+	// — never a bare past tense: "dropped the card on the table" and "the
+	// deleted passage" are an agent narrating what already happened. Each
+	// side of the bridge is one clause (clauseBridge), and the bridge allows
+	// at most one line break or one blank line (lineBreakBridge), so
+	// confirmations that put the verb and its target on adjacent lines
+	// ("Delete the following?\n\n - production backups") still trip while
+	// prose that merely mentions both does not.
 	// "remove" is deliberately absent from the verbs: even with a target it
 	// reads as everyday refactoring ("remove the record from the list",
 	// "remove the repository from the config") far more often than as a
-	// pending destructive operation.
-	seedHeuristic(`(?i)\b(delet(e[sd]?|ing)|destroy(s|ed|ing)?|eras(e[sd]?|ing)|wip(e[sd]?|ing)|purg(e[sd]?|ing)|drop(s|ped|ping)?|truncat(e[sd]?|ing))\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+data|records?|history|repositor(y|ies)|accounts?)\b`),
+	// pending destructive operation. A bare "record" or "history" is not a
+	// target for the same reason ("I record…", "drop it from history"); only a
+	// qualified one is ("all customer records", "git history").
+	seedHeuristic(`(?i)(\b(delet(e|es|ing)|destroy(s|ing)?|eras(e|es|ing)|wip(e|es|ing)|purg(e|es|ing)|drop(s|ping)?|truncat(e|es|ing))|\b(be|being|get|gets|getting)\s+(deleted|destroyed|erased|wiped|purged|dropped|truncated))\b` + clauseBridge + `(` + lineBreakBridge + clauseBridge + `)?\b(databases?|tables?|schemas?|backups?|snapshots?|buckets?|volumes?|partitions?|disks?|prod(uction)?|(user|customer|all)\s+(data|records)|git\s+history|repositor(y|ies)|accounts?)\b`),
 	seedHeuristic(`(?i)\bpermanently\s+(delet|destroy|remov|eras|wip|purg|discard)`),
 	// Forced overwrites/removals (force-push itself is a seed pattern).
 	seedHeuristic(`(?i)\bforc(e|ed|ibly)\b[^\n]*\b(overwrit|delet|remov|push)`),
-	// Credential / access invalidation.
-	seedHeuristic(`(?i)\b(revok|rotat|invalidat|regenerat)(e[sd]?|ing|ion)\b[^\n]*\b(access|keys?|tokens?|cert(ificate)?s?|credentials?|secrets?|sessions?|passwords?)\b`),
-	// Shipping to shared/production surfaces. The public target is a phrase
-	// ("public registry/repository"), not the bare word, so ordinary branch
-	// and identifier names (feat/public, publicapi) stay benign.
-	seedHeuristic(`(?i)\b(deploy(s|ed|ing)?|publish(es|ed|ing)?|releas(e[sd]?|ing))\b[^\n]*(\b(prod|production|live)\b|\bpublic\s+(registr(y|ies)|repositor(y|ies))\b)`),
-	// A confirmation that itself names a destructive act (same bounded
-	// bridge as the verb/target rule above).
+	// Credential / access invalidation. A bare "token", "key", "session" or
+	// "access" is an application's own vocabulary far more often than a
+	// credential ("revoke the stream token"), so a key or token must be
+	// qualified as one; the verb is a pending act in the same clause.
+	seedHeuristic(`(?i)(\b(revok|rotat|invalidat|regenerat)(e|es|ing)|\b(be|being|get|gets|getting)\s+(revoked|rotated|invalidated|regenerated))\b` + clauseBridge + `\b(credentials?|secrets?|passwords?|cert(ificate)?s?|(api|access|auth|ssh|signing|private|root|master|deploy|service|pat|github|gh|oauth|npm|pypi|refresh|bearer|jwt|kms|encryption|gpg|pgp|tls|ssl|aws)[- ]?(keys?|tokens?)|all\s+(user\s+)?(keys|tokens|sessions))\b`),
+	// Shipping to shared/production surfaces: a pending deploy/publish/release
+	// whose DESTINATION is production — "to/on/in/into prod" in the same
+	// clause — not a line that merely mentions both ("deploys on a v* tag and
+	// production", "release. Should I do the live…"). The destination may
+	// carry a determiner and one qualifier ("to your us-east-1 production"),
+	// or be a flag ("--prod", "--env production"). The public target is a
+	// phrase ("public registry/repository"), not the bare word, so ordinary
+	// branch and identifier names (feat/public, publicapi) stay benign.
+	seedHeuristic(`(?i)\b(deploy(s|ing)?|publish(es|ing)?|releas(e|es|ing))\b` + clauseBridge + `(\b(to|on|in|into|onto)\s+((the|our|your|my|their|its|this|these|those|all|every|each|both|a|an)\s+)?([\w-]+\s+)?|--(env|environment|stage|target)[= ]|--)(prod|production|live|public\s+(registr(y|ies)|repositor(y|ies)))\b`),
+	// A confirmation that itself names a destructive act. Its bridge is the
+	// verb/target rule's OLD one (up to 100 characters a side, any
+	// punctuation): an explicit "are you sure" is corroboration enough.
 	seedHeuristic(`(?i)\bare\s+you\s+sure\b[^\n]{0,100}?\n{0,2}[^\n]{0,100}?\b(delet|remov|eras|wip|purg|discard|overwrit|destroy|drop|reset)`),
 }
 

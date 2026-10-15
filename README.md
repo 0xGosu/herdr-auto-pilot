@@ -357,8 +357,8 @@ graduation_n = 1           # consecutive confirmations to graduate (1-10)
 confirmation_weight = 2.0  # confidence weight of an operator confirmation (>=1)
 
 [limits]
-max_consecutive_auto_prompts = 30  # per agent, without human interaction
-max_auto_prompts_per_minute = 5    # per agent, rolling window
+max_consecutive_auto_prompts = 50  # per agent, without human interaction
+max_auto_prompts_per_minute = 10   # per agent, rolling window
 max_error_retries = 2              # per error signature
 # All three are INERT while full self-prompting runs with honour_limits = false
 # (the default) — see "Unattended modes".

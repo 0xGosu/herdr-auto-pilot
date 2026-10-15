@@ -62,10 +62,12 @@ func TestOrchestratorActionsAreScreenedAndPaused(t *testing.T) {
 // handoutProse are task texts an operator or the orchestrator really wrote,
 // every one of which the PANE heuristics refuse. The first two are the live
 // refusals this behaviour was changed for: a task explaining how to fix a
-// failing CI run, and a task that named a seed rule while describing it.
+// failing CI run, and a task that named a seed rule while describing it. (The
+// first now names a database rather than the live text's "records", which the
+// heuristic stopped treating as a data target.)
 var handoutProse = []string{
-	"Fix the failing CI run: the job deletes the cached records before the assertion " +
-		"reads them, so do not weaken the assertion to make it pass.",
+	"Fix the failing CI run: the job deletes the fixture database before the assertion " +
+		"reads it, so do not weaken the assertion to make it pass.",
 	"hap refuses a hand-out whose prose names an irreversible operation, which is the " +
 		"false positive to remove.",
 	"Teach the runner to allow all branches to publish their own coverage report.",
