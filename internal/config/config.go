@@ -1850,8 +1850,8 @@ func Default() Config {
 		// literal here so config stays decoupled from the domain package).
 		Learning: Learning{GraduationN: 1, ConfirmationWeight: 2.0},
 		Limits: Limits{
-			MaxConsecutiveAutoPrompts: 30,
-			MaxAutoPromptsPerMinute:   5,
+			MaxConsecutiveAutoPrompts: 50,
+			MaxAutoPromptsPerMinute:   10,
 			MaxErrorRetries:           2,
 		},
 		LLM: LLM{TimeoutSeconds: 60, PaneExcerptChars: 5000, AutoActConfidenceThreshold: 85, RunInAgentCwd: boolPtr(true)},
