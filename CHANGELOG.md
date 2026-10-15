@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.74
+
+- Raised the default runaway-loop limits to 50 consecutive auto-prompts and 10 auto-prompts per minute per agent (was 30 and 5); a config that sets these keys explicitly keeps its own values
+- **Breaking.** Tightened four built-in safety rules (credential rotation, revoking or rotating keys and tokens, deploying or publishing to production, and destructive verbs aimed at data) so they stop escalating on narration: past tense ("dropped the card on the table"), a verb and a target in different sentences, an app's own "stream token", and lines that mention a release and production without shipping to production. The rule ids change, so an old `disabled_seed_patterns` entry for one of them no longer applies and that rule is active again until you disable its new id.
+
 ## 0.9.73
 
 - Fixed answering a Claude single-question form sometimes answering the next queued question too: hap now presses the option's number on its own and waits for the next question to be raised separately
