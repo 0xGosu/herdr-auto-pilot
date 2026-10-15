@@ -93,6 +93,10 @@ func TestNeverAutoDoesNotMatchBenignPrompts(t *testing.T) {
 		// credential in the next sentence is narration, not a pending act.
 		"The plan covers key rotation. It adds a new plaintext API key to the vault.",
 	}
+	// The one noun the strict credential rule still counts.
+	if _, ok := a.Match("claude", "Confirm deletion of the API key?"); !ok {
+		t.Error(`strict credential rule must match "Confirm deletion of the API key?"`)
+	}
 	for _, p := range benign {
 		if hit, ok := a.Match("claude", p); ok {
 			t.Errorf("benign prompt matched allowlist pattern %q: %q", hit.Pattern, p)
@@ -330,6 +334,20 @@ func TestSuspectedIrreversibleHeuristic(t *testing.T) {
 		"Revoke the GitHub token?",
 		"Rotate the KMS key?",
 		"Revoke all tokens?",
+		// The target may itself be a code span, and a confirmation may sit
+		// in a dialog box or carry an answer hint before its line break.
+		"Delete the `backups` folder?",
+		"Delete `production`?",
+		"│ Delete the following?          │\n│   - production backups         │",
+		"Delete the following? [y/N]\n  - production backups",
+		"Delete the following?\r\n  - production backups",
+		// A destination with a pronoun, a qualifier, or a flag is still prod.
+		"Release the build to my production server?",
+		"Publish the release to these production hosts?",
+		"Release v3 to us-east-1 production?",
+		"Publish --env production now?",
+		// A period may end the first line when the next opens a list item.
+		"This will delete the following resources.\n  - prod-database",
 	}
 	for _, p := range suspicious {
 		if _, ok := a.SuspectedIrreversible("claude", p); !ok {
