@@ -143,10 +143,12 @@ func startAgentInPane(t *testing.T, pane, name, kind string, agentArgs ...string
 		if err == nil {
 			return
 		}
-		// The agent is running but stopped at a startup prompt herdr reports
-		// blocked — Claude's folder-trust dialog (verified, herdr 0.9.1). The
-		// caller's own readiness loop deals with the prompt.
-		if strings.Contains(string(out), "agent_not_ready") && strings.Contains(string(out), "blocked during startup") {
+		// Claude is running but stopped at its folder-trust dialog, which herdr
+		// reports blocked (verified, herdr 0.9.1); the caller's readiness loop
+		// answers it. Claude only: agy now gets the same refusal at its own
+		// startup prompt, and its cases keep skipping on it as before.
+		if kind == "claude" && strings.Contains(string(out), "agent_not_ready") &&
+			strings.Contains(string(out), "blocked during startup") {
 			return
 		}
 		if !strings.Contains(string(out), "agent_pane_busy") || !time.Now().Before(deadline) {

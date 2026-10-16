@@ -1,3 +1,3 @@
 - Recognised Claude Code's folder-trust dialog as an approval instead of an unclassifiable screen: it now escalates as `folder_trust` naming the folder and the tool permissions and directories its `.claude/settings.json` would apply without asking
-- hap never trusts a folder on its own: no learned rule, LLM, auto-accept or orchestrator answers the folder-trust dialog; resolve it by label with `hap resolve <id> --action "Yes, I trust this folder" --send` (or `"No, exit"`), which walks the caret to that row
-- Task hand-outs and other typed text are refused while the folder-trust dialog stands, so a stray Enter can no longer quit or trust a fresh claude session
+- Kept Claude Code's folder-trust dialog operator-only: no learned rule, LLM, auto-accept or orchestrator answers it; resolve it by label with `hap resolve <id> --action "Yes, I trust this folder" --send` (or `"No, exit"`), which walks the caret to that row
+- Refused task hand-outs and other typed text while the folder-trust dialog stands, so a stray Enter can no longer quit or trust a fresh claude session
