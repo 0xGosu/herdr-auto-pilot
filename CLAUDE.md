@@ -227,6 +227,15 @@ herdr never reports an agy modal as blocked; forms are parsed structurally (`int
   **Test trap:** `fakeHerdr` has no `SendToAgent`, so the proof lives at call sites.
 - Never set `MCQKind`/`AnswerCount` on an agy situation.
 
+### Claude folder-trust dialog (`domain.ClaudeFolderTrust`)
+hap never answers it: `domain.Decide` vetoes it as `ReasonFolderTrust` (no suggestion, rationale =
+`Summary`), and `daemon.act`, the LLM promotion and `refuseOrchestratorFolderTrust` refuse it again. It
+has no digits — every reply goes through `mcqdeliver.ClaudeFolderTrust` (`deliver.Deliver`'s
+`deliverFolderTrust`, identified from the excerpt OR the live read). Every path that TYPES into a pane
+asks `composerRefusal` (dialog + operator draft on one read); `herdr.CLI.paneShowsStandingForm` keeps the
+retry Enter off it. The classifier accepts it at blocked AND idle/done — idle must never be its verdict.
+A config-gated auto-trust was declined: Claude already inherits trust from a trusted ancestor folder.
+
 ### Claude session-name sync (`[agents] sync_claude_session_name`)
 Read only from a proven composer; absence is UNKNOWN. Quiescence is asked in `applyClaudeSession` and again
 live in `pushSessionRename` — not a third time. `NormalizeAgentName` and `SuffixedAgentName` must stay fixed
@@ -279,6 +288,11 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
 - Permission mode is readable only from the pane, only positively (`domain.AgentModeFromPane`); the mode
   cycle is per SESSION, so `SetAgentMode` detects a closed rotation.
 - Claude's remote-environment picker reports idle (`domain.ClaudeRemoteEnvForm`).
+- Claude's folder-trust dialog (2.1.301, herdr 0.9.1): herdr reports it `blocked` and `agent start`
+  refuses with `agent_not_ready`. Unnumbered rows; the caret starts on "No, exit" (it started on the
+  trust row in 2.1.206) and Enter commits the caret's row. Claude lists settings.json permissions and
+  directories (truncated "…, and N more") but not hooks, env or `.mcp.json` servers. No dialog appears
+  under a trusted ancestor folder (`/tmp` and `/workspaces` here — use `/var/tmp` to reproduce).
 - Concurrent tool approvals (parallel subagents) are PAGED in one dialog ("1 of 3"); answering a page draws
   the next in place with herdr still `blocked` — no event. Only the post-action self-check sees it
   (`followUpPromptStanding`, gated on `domain.ClaudeModalAdvanced`); every unattended send must arm it.

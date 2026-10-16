@@ -117,6 +117,11 @@ type DecideInput struct {
 	NeverAutoMatched      bool
 	SuspectedIrreversible bool
 	IrreversibleHit       IndicatorHit
+	// PaneCwd is the agent's working directory, read by the caller only when a
+	// Claude folder-trust dialog is standing without its "Accessing workspace:"
+	// header in the capture; it names the folder in that escalation. "" when
+	// unknown.
+	PaneCwd string
 }
 
 // Decide is the pure decision core (Solution §Decision Core): it resolves a
@@ -154,7 +159,7 @@ func Decide(in DecideInput) Decision {
 	// escalation line's budget belongs to the suggestion, not to prose
 	// repeating the tag or the operator's own config.
 	//
-	// These four deliberately return BEFORE the situation is resolved, so they
+	// These deliberately return BEFORE the situation is resolved, so they
 	// carry no suggestion and `hap confirm` refuses them: a vetoed action is
 	// answered by naming it explicitly (`hap resolve <id> --action TEXT`), never
 	// by one key. See TestNeverAutoVetoOutranksVarianceGuardAndStaysUnconfirmable.
@@ -163,6 +168,13 @@ func Decide(in DecideInput) Decision {
 	}
 	if in.Situation.Type == SituationUnclassifiable {
 		return esc(ReasonUnclassifiable, "", conf.Score, "")
+	}
+	// Claude's folder-trust dialog is never answered by hap: trusting applies
+	// the folder's pre-approved permissions and directories without asking, and
+	// "No, exit" ends the session. Ahead of over_masked so the escalation always
+	// carries the folder and its settings — what the operator decides on.
+	if form, ok := ClaudeFolderTrustSituation(in.Situation); ok {
+		return esc(ReasonFolderTrust, form.Summary(in.PaneCwd), conf.Score, "")
 	}
 	if in.Signature.Verdict == GuardOverMasked {
 		return esc(ReasonOverMasked, "", conf.Score, "")

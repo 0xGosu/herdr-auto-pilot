@@ -592,7 +592,10 @@ func (d *Daemon) claimBlockedBy(ctx context.Context, rec *domain.AuditRecord,
 	// answered must not be refused for the draft they are holding. The reward
 	// for refusing here is also the right one — the row stays PENDING and
 	// notePending names the reason, rather than burning a delivery attempt.
-	if err := d.operatorTypingRefusal(ctx, rec.AgentID, rec.AgentType); err != nil {
+	if err := d.composerRefusal(ctx, rec.AgentID, rec.AgentType); err != nil {
+		if errors.Is(err, errClaudeFolderTrust) {
+			return "Claude's folder-trust dialog is standing in this agent's pane"
+		}
 		return "an operator has a draft in this agent's composer"
 	}
 	return ""

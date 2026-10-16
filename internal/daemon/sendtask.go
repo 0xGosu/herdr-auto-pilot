@@ -141,7 +141,7 @@ func (d *Daemon) requireIdleForHandout(ctx context.Context, agentID, name string
 		// "Idle" does not mean unattended: an operator with a half-written
 		// message in the composer is present, and a hand-out typed there would
 		// be appended to their draft and submitted with it (#526).
-		if err := d.operatorTypingRefusal(ctx, agentID, ag.AgentType); err != nil {
+		if err := d.composerRefusal(ctx, agentID, ag.AgentType); err != nil {
 			return fmt.Errorf("agent %s: %v", name, err)
 		}
 		return nil

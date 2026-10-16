@@ -143,6 +143,12 @@ func startAgentInPane(t *testing.T, pane, name, kind string, agentArgs ...string
 		if err == nil {
 			return
 		}
+		// The agent is running but stopped at a startup prompt herdr reports
+		// blocked — Claude's folder-trust dialog (verified, herdr 0.9.1). The
+		// caller's own readiness loop deals with the prompt.
+		if strings.Contains(string(out), "agent_not_ready") && strings.Contains(string(out), "blocked during startup") {
+			return
+		}
 		if !strings.Contains(string(out), "agent_pane_busy") || !time.Now().Before(deadline) {
 			t.Skipf("could not start %s in pane %s: %v (%s)", kind, pane, err, out)
 		}
@@ -470,9 +476,9 @@ func claudeModel() string {
 
 // startClaudeAgent launches an interactive Claude Code session in a herdr
 // pane, with permission prompting on so a Bash tool call raises an approval
-// menu, and returns its pane id. It also clears the first-run "trust this
-// folder" prompt so the REPL is ready for input. extra is appended to claude's
-// own argv.
+// menu, and returns its pane id. It also answers the first-run folder-trust
+// dialog "Yes, I trust this folder" so the REPL is ready for input. extra is
+// appended to claude's own argv.
 func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string, extra ...string) string {
 	t.Helper()
 	// herdr 0.7.5: `agent start` names a KIND and an EXISTING pane, and the
@@ -487,13 +493,18 @@ func startClaudeAgent(t *testing.T, cli *herdr.CLI, cwd string, extra ...string)
 	startAgentInPane(t, pane, name, "claude",
 		append([]string{"--", "--model", claudeModel(), "--permission-mode", "default"}, extra...)...)
 
-	// Claude asks to trust a new folder on first start; option 1 ("Yes, I
-	// trust") is pre-selected, so Enter clears it. Wait for the REPL prompt.
+	// Claude asks to trust a new folder on first start. It is answered BY LABEL:
+	// the caret starts on "No, exit" in 2.1.301 (it was on the trust row in
+	// 2.1.206), so the bare Enter this used to press would quit claude. Wait for
+	// the REPL prompt.
 	deadline := time.Now().Add(40 * time.Second)
 	for time.Now().Before(deadline) {
 		content, _ := cli.ReadPaneVisible(context.Background(), pane, 30)
-		if strings.Contains(content, "trust this folder") || strings.Contains(content, "I trust") {
-			tryHerdr("pane", "send-keys", pane, "enter")
+		if _, ok := domain.ClaudeFolderTrust(content); ok {
+			if err := mcqdeliver.ClaudeFolderTrust(context.Background(), folderTrustKeys(cli, pane),
+				content, "Yes, I trust this folder"); err != nil {
+				t.Logf("answering the folder-trust dialog: %v", err)
+			}
 			time.Sleep(3 * time.Second)
 			continue
 		}

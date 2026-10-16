@@ -136,8 +136,17 @@ func (d *Daemon) agyComposerRefusal(ctx context.Context, paneID string) error {
 	return nil
 }
 
-// operatorTypingRefusal refuses when a human has a half-written message in the
-// agent's composer.
+// errClaudeFolderTrust is the refusal every unattended send path shares while
+// Claude's folder-trust dialog stands: the typed text is ignored there and the
+// Enter after it commits the row under the caret.
+var errClaudeFolderTrust = errors.New("the Claude folder-trust dialog is standing, so typed text " +
+	"would be ignored and its Enter would commit the row under the caret")
+
+// composerRefusal refuses when the agent's composer is not free for typed
+// text: Claude's folder-trust dialog is standing over it
+// (errClaudeFolderTrust), or a human has a half-written message in it
+// (errOperatorTyping). Both checks share ONE visible read, so asking costs the
+// select loop no extra herdr shell-out.
 //
 // It reads `--source visible` for the reason agyComposerRefusal does: the
 // classification capture is a CONSUMING delta that routinely shows no footer,
@@ -146,10 +155,12 @@ func (d *Daemon) agyComposerRefusal(ctx context.Context, paneID string) error {
 // Unreadable is NOT a refusal, and that is the opposite of agyComposerRefusal's
 // bargain on purpose. That one proves a POSITIVE precondition — agy is waiting
 // at an empty composer — where absence of evidence is absence of the thing. This
-// one looks for a human, and every non-claude, non-agy agent plus every capture
-// with no footer answers UNKNOWN, so refusing on unknown would withhold nearly
-// every hand-out from every agent. It withholds only on proof.
-func (d *Daemon) operatorTypingRefusal(ctx context.Context, paneID, agentType string) error {
+// one looks for a human or a dialog, and every non-claude, non-agy agent plus
+// every capture with no footer answers UNKNOWN for the human, so refusing on
+// unknown would withhold nearly every hand-out from every agent. It withholds
+// only on proof. (The dialog is also refused upstream: the classifier reads it
+// as an approval, never idle, so no hand-out is decided for it.)
+func (d *Daemon) composerRefusal(ctx context.Context, paneID, agentType string) error {
 	// agy is SUBSUMED, not exempt: every agy send path already calls
 	// agyComposerRefusal, and AgyComposerReady proves the caret line is a bare
 	// ">" or a mode placeholder — which is strictly stronger than "no draft".
@@ -160,9 +171,12 @@ func (d *Daemon) operatorTypingRefusal(ctx context.Context, paneID, agentType st
 	}
 	pane, err := d.readVisible(ctx, paneID, d.opt.PaneReadLines)
 	if err != nil {
-		slog.Debug("could not read the pane to check for an operator draft",
+		slog.Debug("could not read the pane to check that its composer is free",
 			"pane", paneID, "error", err)
 		return nil
+	}
+	if domain.ClaudeFolderTrustStanding(agentType, pane) {
+		return errClaudeFolderTrust
 	}
 	if typing, known := domain.OperatorTyping(agentType, pane); known && typing {
 		return errOperatorTyping

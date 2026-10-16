@@ -2356,15 +2356,16 @@ func (a *App) Confirm(ctx context.Context, auditID int64, send bool) error {
 
 // errNoSuggestion explains a confirm that cannot proceed.
 //
-// Some escalations carry no suggestion on purpose: the four safety vetoes
-// (kill switch, unclassifiable, over-masked signature, never-auto match) return
-// before the situation is resolved, precisely so a vetoed action cannot be
-// answered with one key. A refusal that only says "carries no suggestion" reads
+// Some escalations carry no suggestion on purpose: the safety vetoes (kill
+// switch, unclassifiable, Claude folder trust, over-masked signature,
+// never-auto match) return before the situation is resolved, precisely so a
+// vetoed action cannot be answered with one key. A refusal that only says
+// "carries no suggestion" reads
 // as a broken plugin instead — it names neither which control fired nor what to
 // type instead, so the operator is stuck with an escalation they can see is
 // answerable. Name both.
 func errNoSuggestion(audit *domain.AuditRecord) error {
-	// Only the four vetoes withhold a resolvable action DELIBERATELY. Every
+	// Only the vetoes withhold a resolvable action DELIBERATELY. Every
 	// other empty suggestion means nothing resolved at all (a variance guard
 	// over an unfamiliar option set, a failed consult), and telling the
 	// operator a control withheld an answer that never existed sends them
@@ -2375,6 +2376,13 @@ func errNoSuggestion(audit *domain.AuditRecord) error {
 		domain.ReasonOverMasked, domain.ReasonNeverAutoMatch:
 		why = "it was escalated by the " + domain.EscalationReasonTag(audit.Rationale) +
 			" control, which withholds a one-key answer on purpose"
+	case domain.ReasonFolderTrust:
+		// The one veto whose answers are known: the dialog's two rows.
+		return fmt.Errorf("audit record %d is Claude's folder-trust dialog, which hap never answers with one key: "+
+			"trusting applies the folder's settings without asking. Decide from its rationale, then "+
+			"`hap resolve %d --action \"Yes, I trust this folder\" --send` or "+
+			"`hap resolve %d --action \"No, exit\" --send` (which ends that claude session)",
+			audit.ID, audit.ID, audit.ID)
 	}
 	return fmt.Errorf("audit record %d has no suggestion to confirm: %s. "+
 		"Answer it explicitly with `hap resolve %d --action TEXT --send`, "+

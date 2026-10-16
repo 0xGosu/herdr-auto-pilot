@@ -176,6 +176,16 @@ func Deliver(ctx context.Context, c Config, req Request) error {
 		}
 	}
 
+	// Claude's folder-trust dialog has no digits: its rows are walked with the
+	// arrows and committed with Enter. Identified from the decision's capture as
+	// well as the live read, so a failed or stale read REFUSES rather than
+	// falling through to the literal send below, whose Enter would commit the
+	// row under the caret — "No, exit" (ending the session) on current builds,
+	// the trust row on older ones.
+	if handled, err := c.deliverFolderTrust(ctx, req, pane, rerr); handled {
+		return err
+	}
+
 	// A per-tab answer series ("1 2 1", or "1 1,3 2" when a tab is multi-
 	// select) answers a multi-tab question form: one keystroke group per tab,
 	// Submit included — sent as literal text it would land in the first
@@ -328,6 +338,33 @@ func (c Config) deliverSeries(ctx context.Context, req Request, pane string, rer
 		return fmt.Errorf("this herdr adapter cannot send keystrokes for the answer series")
 	}
 	return c.tabSeries(ctx, ks, req, groups)
+}
+
+// deliverFolderTrust answers Claude's folder-trust dialog with verified
+// keystrokes (mcqdeliver.ClaudeFolderTrust). handled is false only when
+// neither the decision's capture nor the live screen shows the dialog; every
+// other outcome is handled, so the caller can never send a second time. There
+// is no keystroke-less fallback: no text a send could type answers this dialog.
+func (c Config) deliverFolderTrust(ctx context.Context, req Request, pane string, rerr error) (bool, error) {
+	if !strings.EqualFold(strings.TrimSpace(req.AgentType), "claude") {
+		return false, nil
+	}
+	_, was := domain.ClaudeFolderTrust(req.PaneExcerpt)
+	live := rerr == nil && domain.ClaudeFolderTrustStanding(req.AgentType, pane)
+	if !was && !live {
+		return false, nil
+	}
+	if rerr != nil {
+		return true, fmt.Errorf("the pane could not be read to answer Claude's folder-trust dialog: %w", rerr)
+	}
+	if !live {
+		return true, mcqdeliver.ErrNoFolderTrust
+	}
+	ks, ok := c.Herdr.(ports.KeystrokeSender)
+	if !ok {
+		return true, fmt.Errorf("this herdr adapter cannot send keystrokes, which Claude's folder-trust dialog needs; nothing was delivered")
+	}
+	return true, mcqdeliver.ClaudeFolderTrust(ctx, c.mcq(ks, req.PaneID), req.PaneExcerpt, req.Outbound)
 }
 
 // deliverRemoteEnv answers Claude's remote-environment picker.

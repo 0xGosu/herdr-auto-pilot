@@ -12,6 +12,7 @@ said when it was raised; by the time you read it the agent may have moved on.
 | `llm_timeout` | consult exceeded `llm.timeout_seconds` | answer it; if it recurs, raise the budget (`hap config set llm.timeout_seconds 120`) |
 | `llm CLI failed without submit_decision` | the LLM backend itself is broken | [incidents.md](incidents.md) — do not treat as a one-off |
 | `never_auto_match` | a safety rule forced a human | operator-only. Do not bypass, do not rephrase into the agent |
+| `folder_trust` | Claude asks to trust a folder; the rationale lists what trusting applies without asking | operator-only — hap refuses your `resolve` here, "No, exit" included. Report the folder and its settings to the operator |
 | `suspected_irreversible` | heuristic matched the pane | read the screen: it often matched the agent's own prose |
 | `no_task_source` | the agent has no list | register a source, or dismiss if it is not your node. Latched per parked spell and held for 30 minutes after, so repeats mean something changed |
 | `task_source_unusable` | a source owns the agent but its list could not be read, so no task was generated | fix the source the rationale names (`hap config task-source list`), then dismiss |
