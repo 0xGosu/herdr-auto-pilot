@@ -118,9 +118,8 @@ type DecideInput struct {
 	SuspectedIrreversible bool
 	IrreversibleHit       IndicatorHit
 	// PaneCwd is the agent's working directory, read by the caller only when a
-	// Claude folder-trust dialog is standing without its "Accessing workspace:"
-	// header in the capture; it names the folder in that escalation. "" when
-	// unknown.
+	// folder-trust prompt is standing without its "Accessing workspace:" header
+	// in the capture; it names the folder in that escalation. "" when unknown.
 	PaneCwd string
 }
 
@@ -169,12 +168,13 @@ func Decide(in DecideInput) Decision {
 	if in.Situation.Type == SituationUnclassifiable {
 		return esc(ReasonUnclassifiable, "", conf.Score, "")
 	}
-	// Claude's folder-trust dialog is never answered by hap: trusting applies
-	// the folder's pre-approved permissions and directories without asking, and
-	// "No, exit" ends the session. Ahead of over_masked so the escalation always
-	// carries the folder and its settings — what the operator decides on.
-	if form, ok := ClaudeFolderTrustSituation(in.Situation); ok {
-		return esc(ReasonFolderTrust, form.Summary(in.PaneCwd), conf.Score, "")
+	// A folder-trust prompt (Claude's dialog, agy's prompt) is never answered by
+	// hap: trusting lets the agent read, edit and execute there — for Claude,
+	// applying the folder's pre-approved permissions and directories without
+	// asking — and "No, exit" ends the session. Ahead of over_masked so the
+	// escalation always carries the folder and what trusting applies.
+	if p, ok := FolderTrustSituation(in.Situation); ok {
+		return esc(ReasonFolderTrust, p.Summary(in.PaneCwd), conf.Score, "")
 	}
 	if in.Signature.Verdict == GuardOverMasked {
 		return esc(ReasonOverMasked, "", conf.Score, "")

@@ -163,15 +163,6 @@ func ClaudeFolderTrust(pane string) (ClaudeFolderTrustForm, bool) {
 	return form, true
 }
 
-// ClaudeFolderTrustSituation reports whether s is Claude's folder-trust
-// dialog: a claude approval whose capture shows it standing.
-func ClaudeFolderTrustSituation(s Situation) (ClaudeFolderTrustForm, bool) {
-	if s.Type != SituationApproval || !strings.EqualFold(strings.TrimSpace(s.AgentType), "claude") {
-		return ClaudeFolderTrustForm{}, false
-	}
-	return ClaudeFolderTrust(s.Content)
-}
-
 // ClaudeFolderTrustStanding reports whether pane shows Claude's folder-trust
 // dialog on a claude agent — the check every path that TYPES into a pane asks:
 // typed text is ignored there and the Enter that follows commits the row under
@@ -248,9 +239,11 @@ func trustWarnings(lines []string) []ClaudeFolderTrustWarning {
 
 // SameAs reports whether g is the same standing dialog as f — the same folder,
 // warnings and rows. The caret is not part of it: walking the caret does not
-// change which dialog stands.
+// change which dialog stands. The folder is compared only when both captures
+// show it: the classification read is a consuming delta that can start below
+// the "Accessing workspace:" header, and its absence is not a different folder.
 func (f ClaudeFolderTrustForm) SameAs(g ClaudeFolderTrustForm) bool {
-	if f.Folder != g.Folder || len(f.Warnings) != len(g.Warnings) || len(f.Options) != len(g.Options) {
+	if !sameFolder(f.Folder, g.Folder) || len(f.Warnings) != len(g.Warnings) || len(f.Options) != len(g.Options) {
 		return false
 	}
 	for i := range f.Warnings {

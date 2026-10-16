@@ -256,13 +256,15 @@ const (
 	// submit text. Rows from hap 0.9.18, which withheld every agy form reply,
 	// carry it too. The operator answers in the pane.
 	ReasonReplyWithheld EscalateReason = "reply_withheld"
-	// ReasonFolderTrust: Claude Code's folder-trust dialog is standing.
-	// Trusting a folder applies its .claude/settings.json — pre-approved tool
-	// permissions, extra directories — without asking, so it is the operator's
-	// call alone: no learned rule, LLM, auto-accept or orchestrator answers it.
-	// The rationale carries the folder and what trusting it applies; the row
-	// carries no suggestion, so it is answered by naming a row
-	// (`hap resolve <id> --action "No, exit" --send`).
+	// ReasonFolderTrust: a folder-trust prompt is standing — Claude Code's
+	// folder-trust dialog or agy's "Do you trust the contents of this project?"
+	// (FolderTrustPrompt). Trusting lets the agent read, edit and execute files
+	// there, and for Claude applies the folder's .claude/settings.json —
+	// pre-approved tool permissions, extra directories — without asking, so it
+	// is the operator's call alone: no learned rule, LLM, auto-accept or
+	// orchestrator answers it. The rationale carries the folder and what
+	// trusting applies; the row carries no suggestion, so it is answered by
+	// naming a row (`hap resolve <id> --action "No, exit" --send`).
 	ReasonFolderTrust EscalateReason = "folder_trust"
 )
 

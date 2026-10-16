@@ -278,3 +278,18 @@ func TestAgyHeldScreensIgnoreOperatorRules(t *testing.T) {
 		}
 	}
 }
+
+// herdr 0.9.1 reports agy's trust prompt BLOCKED (every other agy modal arrives
+// idle/done); it is the same approval at every parked status.
+func TestAgyTrustPromptIsAnApprovalAtEveryParkedStatus(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "transcripts", "approval_agy_trust_folder.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, status := range []string{"blocked", "idle", "done"} {
+		s := New(nil).Classify(domain.AgentTypeAgy, status, string(data))
+		if s.Type != domain.SituationApproval || s.PermissionVerb != domain.PermissionVerbAgyTrust {
+			t.Errorf("at %s: %s / %q, want the trust approval", status, s.Type, s.PermissionVerb)
+		}
+	}
+}

@@ -5,6 +5,7 @@ package integration
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -208,4 +209,90 @@ func TestRealClaudeFolderTrustNoExitEndsTheSession(t *testing.T) {
 	}
 	now, _ := cli.ReadPaneVisible(ctx, pane, 40)
 	t.Fatalf("claude did not exit after No, exit.\npane:\n%s", now)
+}
+
+// startAgyAtTrustPrompt launches agy in dir and waits for its trust prompt.
+// `agent start` refuses with agent_not_ready there (herdr 0.9.1 reports the
+// prompt blocked), which is expected; detection is by text, not by the parser
+// under test.
+func startAgyAtTrustPrompt(t *testing.T, cli *herdr.CLI, dir string) (string, string) {
+	t.Helper()
+	name := sanitizeAgentName(t.Name())
+	pane := newScratchPane(t, dir, name)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	out, err := exec.CommandContext(ctx, herdrBin(), "agent", "start", name, "--kind", "agy", "--pane", pane,
+		"--timeout", "60000", "--", "--model", agyModel()).CombinedOutput()
+	cancel()
+	if err != nil && !strings.Contains(string(out), "agent_not_ready") {
+		t.Skipf("could not start agy in pane %s: %v (%s)", pane, err, out)
+	}
+	quietOperatorDaemon(t, pane)
+	deadline := time.Now().Add(40 * time.Second)
+	var content string
+	for time.Now().Before(deadline) {
+		content, _ = cli.ReadPaneVisible(context.Background(), pane, 60)
+		if strings.Contains(content, "Do you trust the contents of this project?") &&
+			strings.Contains(content, "enter Confirm") {
+			time.Sleep(time.Second)
+			content, _ = cli.ReadPaneVisible(context.Background(), pane, 60)
+			return pane, content
+		}
+		time.Sleep(time.Second)
+	}
+	t.Skipf("agy drew no trust prompt within 40s.\npane:\n%s", lastLines(content, 20))
+	return "", ""
+}
+
+// TestRealAgyTrustPromptIsOperatorOnly drives a REAL agy to its trust prompt in
+// a fresh folder and proves it is operator-only end to end: a real daemon
+// escalates it as [folder_trust] naming the folder, a one-key confirm is
+// refused, and the operator's resolve by label ("No, exit", so no trust entry
+// is left behind) is delivered through agy's keyed deliverer and quits agy.
+func TestRealAgyTrustPromptIsOperatorOnly(t *testing.T) {
+	requireAgy(t)
+	cli := herdr.NewCLI()
+	dir := untrustedDir(t, "")
+	pane, content := startAgyAtTrustPrompt(t, cli, dir)
+	ctx := context.Background()
+
+	status := herdrStatus(t, cli, pane)
+	t.Logf("herdr reports agy's trust prompt %q", status)
+	s := classify.New(nil).Classify(domain.AgentTypeAgy, status, content)
+	if s.Type != domain.SituationApproval || s.PermissionVerb != domain.PermissionVerbAgyTrust {
+		t.Fatalf("classified %s / %q at status %q, want the trust approval.\npane:\n%s",
+			s.Type, s.PermissionVerb, status, content)
+	}
+
+	h := newTestDaemon(t, cli, "")
+	dctx, cancel := context.WithCancel(context.Background())
+	runDaemon(t, dctx, cancel, h.Daemon)
+	h.Events.transitions <- domain.AgentTransition{
+		AgentID: pane, PaneID: pane, AgentType: domain.AgentTypeAgy, Status: status, At: time.Now(),
+	}
+	rec := folderTrustEscalation(t, h, pane)
+	if reason, _ := domain.EscalationReason(rec.Rationale); reason != domain.ReasonFolderTrust {
+		t.Fatalf("escalated as %q, want folder_trust: %s", reason, rec.Rationale)
+	}
+	if !strings.Contains(rec.Rationale, dir) {
+		t.Errorf("rationale does not name %s: %s\nexcerpt:\n%s", dir, rec.Rationale, rec.PaneExcerpt)
+	}
+	if err := h.App().Confirm(ctx, rec.ID, true); err == nil {
+		t.Fatal("a one-key confirm was accepted for agy's trust prompt")
+	}
+	if now, _ := cli.ReadPaneVisible(ctx, pane, 60); !domain.FolderTrustStanding(domain.AgentTypeAgy, now) {
+		t.Fatalf("the prompt moved before the operator answered.\npane:\n%s", now)
+	}
+
+	if err := h.App().Resolve(ctx, rec.ID, "No, exit", true); err != nil {
+		t.Fatalf("resolving by label: %v", err)
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(deadline) {
+		if now, _ := cli.ReadPaneVisible(ctx, pane, 60); !domain.FolderTrustStanding(domain.AgentTypeAgy, now) {
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	now, _ := cli.ReadPaneVisible(ctx, pane, 40)
+	t.Fatalf("agy's trust prompt still stands after No, exit.\npane:\n%s", now)
 }

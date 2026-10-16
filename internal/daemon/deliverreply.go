@@ -165,29 +165,31 @@ func (d *Daemon) deliverToPane(ctx context.Context, audit *domain.AuditRecord, a
 	}
 }
 
-// refuseOrchestratorFolderTrust refuses an orchestrator-authored reply while
-// Claude's folder-trust dialog is — or was, when the escalation was raised — on
-// the agent's screen. Trusting applies the folder's pre-approved permissions
-// and directories without asking (domain.ReasonFolderTrust), and the
-// orchestrator is hap's own LLM: its answer would be hap trusting a folder on
-// its own. "No, exit" is refused too — it ends the agent's session, which is
+// refuseOrchestratorFolderTrust refuses an orchestrator-authored reply while a
+// folder-trust prompt (Claude's dialog, agy's prompt) is — or was, when the
+// escalation was raised — on the agent's screen. Trusting lets the agent read,
+// edit and execute there, and for Claude applies the folder's pre-approved
+// permissions and directories without asking (domain.ReasonFolderTrust); the
+// orchestrator is hap's own LLM, so its answer would be hap trusting a folder
+// on its own. "No, exit" is refused too — it ends the agent's session, which is
 // equally the operator's call.
 //
 // The live screen is asked as well as the escalation's capture, so a reply to
 // some OTHER escalation cannot reach a dialog that appeared since. An
 // unreadable pane is not refused here; deliver.Deliver refuses it itself.
 func (d *Daemon) refuseOrchestratorFolderTrust(ctx context.Context, a domain.AgentAction, audit *domain.AuditRecord) error {
-	if a.Author != domain.OrchestratorAuthor || !strings.EqualFold(audit.AgentType, "claude") {
+	if a.Author != domain.OrchestratorAuthor ||
+		(!strings.EqualFold(audit.AgentType, "claude") && !domain.IsAgy(audit.AgentType)) {
 		return nil
 	}
-	standing := domain.ClaudeFolderTrustStanding(audit.AgentType, audit.PaneExcerpt)
+	standing := domain.FolderTrustStanding(audit.AgentType, audit.PaneExcerpt)
 	if !standing {
 		if pane, err := d.readVisible(ctx, audit.AgentID, d.opt.PaneReadLines); err == nil {
-			standing = domain.ClaudeFolderTrustStanding(audit.AgentType, pane)
+			standing = domain.FolderTrustStanding(audit.AgentType, pane)
 		}
 	}
 	if standing {
-		return fmt.Errorf("%w: Claude's folder-trust dialog is the operator's decision alone; "+
+		return fmt.Errorf("%w: a folder-trust prompt is the operator's decision alone; "+
 			"the orchestrator may not answer it", errOutboundRefused)
 	}
 	return nil

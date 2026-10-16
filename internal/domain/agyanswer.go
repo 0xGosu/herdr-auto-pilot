@@ -72,13 +72,28 @@ type AgyForm struct {
 	// item. The trust prompt's caret is deliberately not part of it — moving the
 	// caret does not change which prompt stands.
 	identity string
+	// folder is the trust prompt's folder, "" when the capture does not reach
+	// it. Compared only when both sides show one (SameAs).
+	folder string
 }
 
 // SameAs reports whether g is the same standing form as f (the trust caret
 // aside) — the check that a keystroke has NOT yet landed, and that the form on
 // screen is still the one a decision was made about.
+//
+// A trust prompt naming a DIFFERENT folder is a different prompt — an operator
+// who trusted one folder has not trusted another. A capture that does not reach
+// the folder line (the classification read is a consuming delta that often
+// starts below it) is not evidence either way, so the folder is compared only
+// when both sides show one.
 func (f AgyForm) SameAs(g AgyForm) bool {
-	return f.Kind == g.Kind && f.identity == g.identity
+	return f.Kind == g.Kind && f.identity == g.identity && sameFolder(f.folder, g.folder)
+}
+
+// sameFolder compares two prompts' folders, treating an unseen one ("") as
+// matching: absence of the line is not a different folder.
+func sameFolder(a, b string) bool {
+	return a == "" || b == "" || a == b
 }
 
 // ParseAgyForm parses the agy form hap may answer standing at the bottom of
@@ -103,7 +118,7 @@ func ParseAgyForm(pane string) (AgyForm, bool) {
 			opts[i] = NumberedOption{Number: strconv.Itoa(i + 1), Label: label}
 		}
 		return AgyForm{Kind: AgyFormTrust, Options: opts, Caret: f.Selected,
-			identity: optionIdentity(opts)}, true
+			identity: optionIdentity(opts), folder: f.Folder}, true
 	}
 	if f, ok := ParseAgyReview(pane); ok {
 		return AgyForm{Kind: AgyFormReview, Caret: -1,
