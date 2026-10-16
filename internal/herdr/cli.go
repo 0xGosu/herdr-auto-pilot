@@ -432,6 +432,11 @@ func (c *CLI) paneShowsStandingForm(ctx context.Context, paneID string) bool {
 	if _, ok := domain.ClaudeRemoteEnvForm(content); ok {
 		return true
 	}
+	// Claude's folder-trust dialog: a retried Enter commits the row under the
+	// caret — "No, exit" on current builds, the trust row on older ones.
+	if _, ok := domain.ClaudeFolderTrust(content); ok {
+		return true
+	}
 	if domain.CodexPlanApprovalForm(content) {
 		return true
 	}

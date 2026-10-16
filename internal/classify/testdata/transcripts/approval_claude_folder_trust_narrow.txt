@@ -1,0 +1,31 @@
+root ➜ /var/tmp/hap-trust-rich-NYmG $ claude --model haiku
+
+───────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /var/tmp/hap-trust-rich-NYmG
+
+ Quick safety check: Is this a project you created or one you
+ trust? (Like your own code, a well-known open source project,
+ or work from your team). If not, take a moment to review
+ what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ ⚠ This folder pre-approves 12 tool permissions in
+ .claude/settings.json:
+   mcp__gosu, mcp__claude-in-chrome, mcp__ide__getDiagnostics,
+ mcp__github, Bash(npm run test:*), Bash(git push:*),
+ WebFetch(domain:example.com), Edit(**), and 4 more
+ ⚠ This folder adds 4 directories to the workspace in
+ .claude/settings.json:
+   /tmp/, ~/.claude/, /etc, and /var/log
+ These will apply without asking. Only proceed if you trust
+ this configuration.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel

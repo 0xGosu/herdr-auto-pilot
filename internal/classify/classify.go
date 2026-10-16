@@ -140,9 +140,10 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 	s := domain.Situation{AgentType: agentType, Content: pane, Type: domain.SituationUnclassifiable}
 	codexPlanApproval := strings.EqualFold(agentType, "codex") && domain.CodexPlanApprovalForm(pane)
 	codexRateLimit := strings.EqualFold(agentType, "codex") && domain.CodexRateLimitForm(pane)
-	claudeRemoteEnv := false
+	claudeRemoteEnv, claudeFolderTrust := false, false
 	if strings.EqualFold(agentType, "claude") {
 		_, claudeRemoteEnv = domain.ClaudeRemoteEnvForm(pane)
+		_, claudeFolderTrust = domain.ClaudeFolderTrust(pane)
 	}
 	// herdr reports EVERY agy modal idle/done (docs/designer/agy-support.md),
 	// so agy's forms are recognized structurally, like the two above.
@@ -192,6 +193,11 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		if !matched && r.situation == domain.SituationApproval && claudeRemoteEnv {
 			matched = true
 		}
+		// Claude's folder-trust dialog has no numbered options and no
+		// "do you want to" sentence, so no content rule reads it.
+		if !matched && r.situation == domain.SituationApproval && claudeFolderTrust {
+			matched = true
+		}
 		if !matched && r.situation == domain.SituationApproval && agyApproval {
 			matched = true
 		}
@@ -239,13 +245,19 @@ func (c *Classifier) Classify(agentType, agentStatus, pane string) domain.Situat
 		// working stays excluded.
 		claudeRemoteEnvParked := r.situation == domain.SituationApproval && claudeRemoteEnv &&
 			(agentStatus == "idle" || agentStatus == "done")
+		// herdr reports the folder-trust dialog blocked (verified live, herdr
+		// 0.9.1), but it is accepted parked too: were herdr ever to call it idle,
+		// falling through to the idle verdict below is what would type a task
+		// hand-out into it — and Enter commits the row under the caret.
+		claudeFolderTrustParked := r.situation == domain.SituationApproval && claudeFolderTrust &&
+			(agentStatus == "idle" || agentStatus == "done")
 		// Every agy form is parked at idle/done (verified live, agy 1.2.1 on
 		// herdr 0.8.2). Same statuses as above; working stays excluded.
 		agyParked := ((r.situation == domain.SituationApproval && agyApproval) ||
 			(r.situation == domain.SituationChoice && agyChoice)) &&
 			(agentStatus == "idle" || agentStatus == "done")
 		if (r.situation == domain.SituationApproval || r.situation == domain.SituationChoice) && !blocked &&
-			!codexPlanParked && !claudeRemoteEnvParked && !agyParked {
+			!codexPlanParked && !claudeRemoteEnvParked && !claudeFolderTrustParked && !agyParked {
 			continue
 		}
 		s.Type = r.situation
@@ -326,6 +338,13 @@ func enrich(s *domain.Situation) {
 				// ACTION, not the key. Delivery re-maps the learned label onto
 				// the live option set and fails closed when it is absent.
 				s.PermissionVerb = domain.PermissionVerbSelectRemoteEnv
+				s.Options = append(s.Options, form.OptionLabels()...)
+				return
+			}
+			if form, ok := domain.ClaudeFolderTrust(s.Content); ok {
+				// Only the dialog's own rows: a numbered list in the scrollback
+				// above it is not an answer to it.
+				s.PermissionVerb = domain.PermissionVerbClaudeFolderTrust
 				s.Options = append(s.Options, form.OptionLabels()...)
 				return
 			}

@@ -8,6 +8,9 @@ approval_agy_shell_recent.txt status=done type=approval verb=run options=4
 approval_agy_shell_wide.txt status=done type=approval verb=run options=4
 approval_agy_shell_wrapped.txt status=done type=approval verb=run options=4
 approval_agy_trust_folder.txt status=idle type=approval verb=trust options=2
+approval_claude_folder_trust.txt status=blocked type=approval verb=trust options=2
+approval_claude_folder_trust_narrow.txt status=blocked type=approval verb=trust options=2
+approval_claude_folder_trust_settings.txt status=blocked type=approval verb=trust options=2
 approval_claude_plan.txt status=blocked type=approval verb=proceed options=4
 approval_claude_remote_env.txt status=idle type=approval verb=select options=4
 approval_codex_plan.txt status=idle type=approval verb=implement options=3

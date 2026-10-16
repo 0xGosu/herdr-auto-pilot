@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 )
@@ -76,6 +77,9 @@ func (d *Daemon) deliverReply(ctx context.Context, a domain.AgentAction) (string
 	// been and gives the orchestrator's prose the same treatment a task
 	// hand-out gets. See its comment.
 	if err := d.deliverReplyScreen(a, audit.AgentType)(outbound); err != nil {
+		return "", err
+	}
+	if err := d.refuseOrchestratorFolderTrust(ctx, a, audit); err != nil {
 		return "", err
 	}
 
@@ -159,6 +163,34 @@ func (d *Daemon) deliverToPane(ctx context.Context, audit *domain.AuditRecord, a
 	default:
 		return err
 	}
+}
+
+// refuseOrchestratorFolderTrust refuses an orchestrator-authored reply while
+// Claude's folder-trust dialog is — or was, when the escalation was raised — on
+// the agent's screen. Trusting applies the folder's pre-approved permissions
+// and directories without asking (domain.ReasonFolderTrust), and the
+// orchestrator is hap's own LLM: its answer would be hap trusting a folder on
+// its own. "No, exit" is refused too — it ends the agent's session, which is
+// equally the operator's call.
+//
+// The live screen is asked as well as the escalation's capture, so a reply to
+// some OTHER escalation cannot reach a dialog that appeared since. An
+// unreadable pane is not refused here; deliver.Deliver refuses it itself.
+func (d *Daemon) refuseOrchestratorFolderTrust(ctx context.Context, a domain.AgentAction, audit *domain.AuditRecord) error {
+	if a.Author != domain.OrchestratorAuthor || !strings.EqualFold(audit.AgentType, "claude") {
+		return nil
+	}
+	standing := domain.ClaudeFolderTrustStanding(audit.AgentType, audit.PaneExcerpt)
+	if !standing {
+		if pane, err := d.readVisible(ctx, audit.AgentID, d.opt.PaneReadLines); err == nil {
+			standing = domain.ClaudeFolderTrustStanding(audit.AgentType, pane)
+		}
+	}
+	if standing {
+		return fmt.Errorf("%w: Claude's folder-trust dialog is the operator's decision alone; "+
+			"the orchestrator may not answer it", errOutboundRefused)
+	}
+	return nil
 }
 
 // terminalStillMatches refuses when the terminal behind the target pane is not

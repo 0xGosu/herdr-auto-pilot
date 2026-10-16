@@ -73,6 +73,13 @@ func TestAutoAcceptIneligible(t *testing.T) {
 	}{
 		{name: "nil", rec: nil, suggestion: "Yes", wantWhy: "no record"},
 		{
+			// Trusting a folder applies its settings without asking: the
+			// operator's call, never a timeout's.
+			name:       "folder_trust is excluded in code",
+			rec:        escalation("[folder_trust] Claude asks to trust /work/x"),
+			suggestion: "Yes, I trust this folder", wantWhy: "excluded reason: folder_trust",
+		},
+		{
 			// FR-015: a never-auto match ALWAYS reaches a human. A timeout is
 			// not a human.
 			name:       "never_auto_match is excluded in code",

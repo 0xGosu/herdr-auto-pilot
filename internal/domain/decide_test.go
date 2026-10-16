@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -807,5 +808,46 @@ func TestInertLimitsIgnoreTheErrorRetryCeiling(t *testing.T) {
 	}
 	if d := Decide(mk(true)); d.Action != ActionSend || d.Input != "retry" {
 		t.Fatalf("with [limits] inert the retry ceiling must not gate the send, got %+v", d)
+	}
+}
+
+// Claude's folder-trust dialog is the operator's alone: a fully confident rule
+// that learned "Yes, I trust this folder" still escalates, with no suggestion
+// to confirm and with the folder and its settings in the rationale — and the
+// LLM is not consulted for it either.
+func TestFolderTrustIsAlwaysTheOperatorsCall(t *testing.T) {
+	b, err := os.ReadFile("../classify/testdata/transcripts/approval_claude_folder_trust_settings.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trust := "Yes, I trust this folder"
+	in := autonomous(baseInput(SituationApproval), trust, trust, trust, trust, trust, trust, trust, trust)
+	in.Situation.Content = string(b)
+	in.Situation.Options = []string{"No, exit", trust}
+	in.LLMConfigured = true
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonFolderTrust {
+		t.Fatalf("got %+v, want a folder_trust escalation", d)
+	}
+	if d.Suggestion != "" {
+		t.Errorf("suggestion = %q; the operator answers this by naming a row", d.Suggestion)
+	}
+	for _, want := range []string{"/var/tmp/hap-trust-long-0zze", "and Skill", "/tmp/ and ~/.claude/"} {
+		if !strings.Contains(d.Rationale, want) {
+			t.Errorf("rationale lacks %q: %s", want, d.Rationale)
+		}
+	}
+
+	// The cwd names the folder when the capture starts below the header.
+	in.Situation.Content = strings.Replace(string(b), " Accessing workspace:", " (scrolled)", 1)
+	in.PaneCwd = "/work/from-cwd"
+	if d := Decide(in); !strings.Contains(d.Rationale, "trust /work/from-cwd") {
+		t.Errorf("rationale = %q, want the pane cwd named", d.Rationale)
+	}
+
+	// Control: another agent type's identical text is not this dialog.
+	in.Situation.AgentType = "codex"
+	if d := Decide(in); d.Reason == ReasonFolderTrust {
+		t.Errorf("codex situation vetoed as Claude folder trust: %+v", d)
 	}
 }

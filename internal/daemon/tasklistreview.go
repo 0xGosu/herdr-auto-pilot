@@ -391,8 +391,12 @@ func (d *Daemon) handleTaskListReviewOutcome(ctx context.Context, res taskListRe
 	// Same reasoning for an operator's draft, which herdr's status cannot see
 	// on any agent type: a transient refusal of a delivery attempt, not a
 	// reason to commit the reviewer's edits.
-	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
-		d.standDown(ctx, res, "operator_typing", err.Error(), llmConf, proposal, now)
+	if err := d.composerRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		code := "operator_typing"
+		if errors.Is(err, errClaudeFolderTrust) {
+			code = "claude_folder_trust"
+		}
+		d.standDown(ctx, res, code, err.Error(), llmConf, proposal, now)
 		return
 	}
 

@@ -3,6 +3,7 @@ package deliver_test
 import (
 	"context"
 	"errors"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -426,4 +427,89 @@ func multiTabPane(n int) string {
 	return "←  " + strings.Join(marks, "  ") + "  ✔ Submit  →\n\nQuestion 1?\n" +
 		"❯ 1. sqlite\n  2. postgres\n\n" +
 		"Enter to select · ↑/↓ to navigate · Tab to switch questions · Esc to cancel\n"
+}
+
+func folderTrustFixture(t *testing.T) (caretNo, caretYes string) {
+	t.Helper()
+	b, err := os.ReadFile("../classify/testdata/transcripts/approval_claude_folder_trust_settings.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	caretNo = string(b)
+	caretYes = strings.NewReplacer(" ❯ No, exit", "   No, exit",
+		"   Yes, I trust this folder", " ❯ Yes, I trust this folder").Replace(caretNo)
+	return caretNo, caretYes
+}
+
+// An operator's resolve by label walks the caret to the named row and commits
+// it with Enter. A text send would type the label and its Enter would commit
+// the row under the caret — "No, exit" on Claude 2.1.301.
+func TestDeliverFolderTrustWalksTheCaretByLabel(t *testing.T) {
+	caretNo, caretYes := folderTrustFixture(t)
+	h := &fakeKeyHerdr{
+		fakeHerdr:       fakeHerdr{pane: caretNo},
+		keyScript:       []string{"down", "enter"},
+		keyScriptFrames: []string{caretYes, "❯ \n  ? for shortcuts\n"},
+	}
+	err := deliver.Deliver(context.Background(), deliver.Config{Herdr: h, KeyDelay: time.Nanosecond},
+		deliver.Request{
+			PaneID: "w1:p1", AgentType: "claude", SituationType: domain.SituationApproval,
+			PaneExcerpt: caretNo, Outbound: "Yes, I trust this folder",
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(h.keys, ","); got != "down,enter" {
+		t.Errorf("keys = %q, want \"down,enter\"", got)
+	}
+	if len(h.inputs) != 0 {
+		t.Errorf("the dialog must be answered with keystrokes, not a text send: %v", h.inputs)
+	}
+}
+
+// Every way the dialog can be unanswerable refuses with nothing pressed or
+// typed — including a free-text reply (a task hand-out an operator confirmed
+// while the dialog stood) and an adapter without keystrokes.
+func TestDeliverFolderTrustFailsClosed(t *testing.T) {
+	caretNo, _ := folderTrustFixture(t)
+	tests := []struct {
+		name     string
+		herdr    ports.HerdrPort
+		excerpt  string
+		outbound string
+		sitType  domain.SituationType
+	}{
+		{name: "unreadable", herdr: &fakeKeyHerdr{fakeHerdr: fakeHerdr{readErr: errRead}},
+			excerpt: caretNo, outbound: "No, exit", sitType: domain.SituationApproval},
+		{name: "dialog gone", herdr: &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: "● Working…\n"}},
+			excerpt: caretNo, outbound: "No, exit", sitType: domain.SituationApproval},
+		{name: "no keystrokes", herdr: &fakeHerdr{pane: caretNo},
+			excerpt: caretNo, outbound: "No, exit", sitType: domain.SituationApproval},
+		{name: "unmatched label", herdr: &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: caretNo}},
+			excerpt: caretNo, outbound: "Yes, proceed", sitType: domain.SituationApproval},
+		{name: "hand-out into a live dialog", herdr: &fakeKeyHerdr{fakeHerdr: fakeHerdr{pane: caretNo}},
+			excerpt: "❯ \n", outbound: "Next task: run the test suite", sitType: domain.SituationIdle},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := deliver.Deliver(context.Background(), deliver.Config{Herdr: tt.herdr, KeyDelay: time.Nanosecond},
+				deliver.Request{
+					PaneID: "w1:p1", AgentType: "claude", SituationType: tt.sitType,
+					PaneExcerpt: tt.excerpt, Outbound: tt.outbound,
+				})
+			if err == nil {
+				t.Fatal("delivered")
+			}
+			var inputs, keys []string
+			switch h := tt.herdr.(type) {
+			case *fakeKeyHerdr:
+				inputs, keys = h.inputs, h.keys
+			case *fakeHerdr:
+				inputs = h.inputs
+			}
+			if len(inputs) != 0 || len(keys) != 0 {
+				t.Errorf("nothing may be delivered: keys=%v inputs=%v", keys, inputs)
+			}
+		})
+	}
 }

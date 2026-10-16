@@ -77,7 +77,12 @@ tab-separated; `hap state-dir` and `hap config path` always print a bare value.
 `approval` (asking permission), `choice` (multiple-choice question), `error`
 (hit an error, waiting for guidance). Structural forms herdr reports as idle —
 Codex's Plan approval, Claude's "Select remote environment" picker — are
-detected and classified as parked approvals.
+detected and classified as parked approvals. Claude's folder-trust dialog
+("Quick safety check: … trust?") is an approval hap **never** answers itself:
+it escalates as `folder_trust` with the folder and the permissions and
+directories its `.claude/settings.json` would apply, and you answer by label —
+`hap resolve <id> --action "Yes, I trust this folder" --send` (or `"No, exit"`,
+which ends that session).
 
 **signature** — a fingerprint of a classified situation, with volatile data
 (paths, hashes, numbers) masked. One learned rule per signature. Addressed by
@@ -1298,8 +1303,9 @@ raw screen text, which cannot be compared confidently enough to deliver or
 dismiss on.
 
 What it never does: learn from itself; touch an escalation raised by
-`never_auto_match`, `suspected_irreversible`, `retry_exhausted` or
-`rate_limited` (all four are in code and cannot be configured away); type the
+`never_auto_match`, `suspected_irreversible`, `retry_exhausted`,
+`rate_limited`, `reply_withheld` or `folder_trust` (all in code and cannot be
+configured away); type the
 `@noop` sentinel at an agent; or answer more than **one escalation per agent per
 sweep**. Escalations raised before you upgraded can never auto-accept — the
 comparison needs a signature baseline older audit rows do not carry.
@@ -1457,7 +1463,8 @@ hap config set full_self_prompting.orchestrator_agent_command --preset claude
   decisions the operator has already made. Replace it with
   `full_self_prompting.orchestrator_agent_prompt`.
   **Type your goals into that session.** If claude shows a first-run prompt
-  (trusting the new directory), answer it once — hap never types into a modal.
+  (trusting the new directory), answer it once — hap never types into a modal,
+  and never answers that dialog for you (`folder_trust`).
 - **hap ignores it completely**: no capture, classification, escalation, audit
   row, task hand-out or rename. It is also marked disabled, and highlighted on
   the TUI Agents tab.

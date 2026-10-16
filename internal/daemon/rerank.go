@@ -582,6 +582,11 @@ func (d *Daemon) startRerank(ctx context.Context, s domain.Situation,
 	if rp == nil {
 		return false
 	}
+	// Decide vetoes Claude's folder-trust dialog whatever the judge says
+	// (ReasonFolderTrust), so judging it would only spend a subprocess.
+	if _, ok := domain.ClaudeFolderTrustSituation(s); ok {
+		return false
+	}
 	// The kill switch is read HERE, and it is the one gate this feature has to
 	// ask for itself. Every other LLM subprocess in the daemon is reached only
 	// because Decide asked for it, and Decide already has killActive from

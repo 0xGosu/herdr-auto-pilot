@@ -3,6 +3,7 @@ package herdr
 import (
 	"context"
 	"net"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -410,5 +411,26 @@ func TestClaudeTypedBodyBytesBoundThePasteThreshold(t *testing.T) {
 	}
 	if _, ok := claudeTypedBody(strings.Repeat("é", claudeTypedBurstBytes/2+1)); !ok {
 		t.Error("a single line past the byte margin must be typed")
+	}
+}
+
+func TestClaudeTypedInputWithholdsItsEnterFromTheFolderTrustDialog(t *testing.T) {
+	// herdr reports the folder-trust dialog blocked, but the Enter guard reads
+	// the screen, not the status: an Enter there commits the row under the
+	// caret ("No, exit" ends the session; older builds put the caret on trust).
+	cli, fake, _ := newTypedCLI(t)
+	b, err := os.ReadFile("../classify/testdata/transcripts/approval_claude_folder_trust.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.SetPaneContent(string(b)); err != nil {
+		t.Fatal(err)
+	}
+	err = cli.SendToAgent(context.Background(), "w1:p1", "claude", handOut)
+	if err == nil || !strings.Contains(err.Error(), "Enter was not pressed") {
+		t.Fatalf("want the Enter withheld from the folder-trust dialog, got %v", err)
+	}
+	if n := countCalls(fake.Calls(), "pane send-keys w1:p1 enter"); n != 0 {
+		t.Fatalf("an Enter reached the folder-trust dialog: %v", fake.Calls())
 	}
 }

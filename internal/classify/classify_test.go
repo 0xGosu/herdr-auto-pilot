@@ -654,6 +654,38 @@ func TestClaudeRemoteEnvClassifiesApprovalAtParkedStatuses(t *testing.T) {
 	}
 }
 
+// Claude's folder-trust dialog is an approval wherever herdr says the pane is
+// parked: blocked (verified live) and idle/done (never fall through to the idle
+// verdict that would hand it a task). Its options are only the dialog's rows.
+func TestClaudeFolderTrustClassifiesApproval(t *testing.T) {
+	c := New(nil)
+	for _, name := range []string{"approval_claude_folder_trust.txt",
+		"approval_claude_folder_trust_settings.txt", "approval_claude_folder_trust_narrow.txt"} {
+		data, err := os.ReadFile(filepath.Join("testdata", "transcripts", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, status := range []string{"blocked", "idle", "done"} {
+			s := c.Classify("claude", status, string(data))
+			if s.Type != domain.SituationApproval {
+				t.Fatalf("%s at %s = %v, want approval", name, status, s.Type)
+			}
+			if s.PermissionVerb != domain.PermissionVerbClaudeFolderTrust {
+				t.Errorf("%s verb = %q", name, s.PermissionVerb)
+			}
+			if got := strings.Join(s.Options, "|"); got != "No, exit|Yes, I trust this folder" {
+				t.Errorf("%s options = %q", name, got)
+			}
+		}
+		if s := c.Classify("claude", "working", string(data)); s.Type == domain.SituationApproval {
+			t.Errorf("%s: a working pane must not classify the dialog", name)
+		}
+		if s := c.Classify("codex", "idle", string(data)); s.Type == domain.SituationApproval {
+			t.Errorf("%s: the dialog's structure must stay scoped to claude", name)
+		}
+	}
+}
+
 func TestApprovalFixturesStillApproval(t *testing.T) {
 	// Regression: permission menus also render numbered options; approval
 	// must keep winning (rule order encodes priority).

@@ -35,6 +35,10 @@ var autoAcceptExcludedReasons = []EscalateReason{
 	// answer can be delivered, however long it waits. deliver.Deliver refuses
 	// it anyway; excluding it keeps the row from being claimed at all.
 	ReasonReplyWithheld,
+	// folder_trust: trusting a folder applies its settings without asking.
+	// Decide gives the row no suggestion, so there is nothing to accept; the
+	// exclusion keeps it that way should a suggestion ever be attached.
+	ReasonFolderTrust,
 }
 
 // EscalationReason extracts the machine-readable reason from an escalation's

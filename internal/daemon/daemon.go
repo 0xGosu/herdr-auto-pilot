@@ -2949,6 +2949,14 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType, scan)
 	}
 
+	// The folder-trust dialog names its folder on screen, but a capture can
+	// start below that header; the pane's cwd then names it instead (cached and
+	// refreshed off the loop, so a cold pane may still answer "").
+	paneCwd := ""
+	if form, ok := domain.ClaudeFolderTrustSituation(situation); ok && form.Folder == "" {
+		paneCwd = d.paneCwd(ctx, situation.PaneID)
+	}
+
 	// NOTE: the LLM review of a declared task deliberately does NOT fork here.
 	// It used to, and that placement is what forced it to be mutually exclusive
 	// with enable_auto_send_task_when_idle (issue #255): preempting Decide meant
@@ -2986,6 +2994,7 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 		NeverAutoMatched:       allowMatched,
 		SuspectedIrreversible:  suspected,
 		IrreversibleHit:        irrevHit,
+		PaneCwd:                paneCwd,
 	}
 
 	decision := domain.Decide(in)
@@ -3243,6 +3252,16 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// line from a task file (or any learned action) naming an irreversible
 	// operation must never be delivered automatically (FR-015).
 	cfg, allow, _ := d.snapshot()
+	// Claude's folder-trust dialog is the operator's alone (ReasonFolderTrust).
+	// domain.Decide already refuses it; this is the last word for any path that
+	// reaches act with it standing, ahead of every keystroke route below.
+	if form, ok := domain.ClaudeFolderTrustSituation(s); ok {
+		d.escalate(ctx, s, sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonFolderTrust,
+			Rationale: form.Summary(""), Confidence: dec.Confidence,
+		}, tr, now)
+		return
+	}
 	if hit, matched := allow.Match(s.AgentType, dec.Input); matched {
 		d.escalate(ctx, s, sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonNeverAutoMatch,
@@ -3640,12 +3659,13 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 			return abandon()
 		}
 	}
-	// And for every agent type, a human with a draft in the composer. This is
-	// the unattended path by definition, so "the pane is idle" is the only
-	// evidence it has that nobody is there — and it is wrong exactly when
-	// somebody has started typing and not yet submitted (#526).
-	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
-		slog.Info("not sending: an operator has a draft in the composer",
+	// And for every agent type, a human with a draft in the composer, or
+	// Claude's folder-trust dialog over it. This is the unattended path by
+	// definition, so "the pane is idle" is the only evidence it has that nobody
+	// is there — and it is wrong exactly when somebody has started typing and
+	// not yet submitted (#526).
+	if err := d.composerRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		slog.Info("not sending: the composer is not free for typed text",
 			"agent", s.AgentID, "reason", err)
 		return abandon()
 	}
@@ -3714,8 +3734,8 @@ func (d *Daemon) deliverAutonomousClaimed(ctx context.Context, s domain.Situatio
 	// The same last look for a human, and it needs one for the same reason: the
 	// earlier proof is seconds old, and starting to type is exactly the thing an
 	// operator does in those seconds.
-	if err := d.operatorTypingRefusal(ctx, s.PaneID, s.AgentType); err != nil {
-		slog.Info("an operator started typing between the proof and the send; nothing was typed",
+	if err := d.composerRefusal(ctx, s.PaneID, s.AgentType); err != nil {
+		slog.Info("the composer stopped being free between the proof and the send; nothing was typed",
 			"agent", s.AgentID, "reason", err)
 		rollback()
 		d.opt.Store.UpdateAuditStatus(ctx, auditID, domain.AuditStatusIgnored)
@@ -6131,6 +6151,19 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 		groups, _ := domain.ParseTabSelections(llmDec.Action)
 		d.deliverSeriesLLM(ctx, ks, s, res.sig, tr, llmDec, groups,
 			computedConf, &llmConf, now)
+		return
+	}
+	// Claude's folder-trust dialog is never answered by an LLM: trusting applies
+	// the folder's settings without asking. `pane` is the visible re-read, so
+	// this also catches a dialog that appeared after the consult was asked.
+	// Escalated WITHOUT the LLM's answer as a suggestion — reject() would attach
+	// it, and the operator decides this row by naming a row, not by one key.
+	if form, ok := domain.ClaudeFolderTrust(pane); ok && strings.EqualFold(s.AgentType, "claude") {
+		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
+		d.escalate(ctx, s, res.sig, domain.Decision{
+			Action: domain.ActionEscalate, Reason: domain.ReasonFolderTrust,
+			Rationale: form.Summary(""),
+		}.WithLLMSession(res.request.SessionID), tr, now)
 		return
 	}
 	// Claude's remote-environment picker takes the adaptive keystroke
