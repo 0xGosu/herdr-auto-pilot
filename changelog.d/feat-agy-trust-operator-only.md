@@ -1,3 +1,0 @@
-- Kept agy's "Do you trust the contents of this project?" prompt operator-only, like Claude's folder-trust dialog: it now escalates as `folder_trust` naming the folder, and no learned rule, LLM, auto-accept or orchestrator answers it — including a rule that had already learned to trust
-- Refused an answer decided for one folder's trust prompt when a different folder's prompt is on screen, for agy as for Claude
-- Named the folder in a folder-trust escalation from the agent's known working directory when the capture starts below the prompt's "Accessing workspace:" line, and stopped such a capture from blocking the operator's answer
