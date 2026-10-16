@@ -193,3 +193,106 @@ func TestComposerRefusalRefusesTheFolderTrustDialog(t *testing.T) {
 		t.Errorf("composerRefusal on an empty composer = %v, want nil", err)
 	}
 }
+
+// agy's trust prompt is operator-only too: a rule that learned to trust (the
+// caret already rests on "Yes", so delivery would be a lone Enter) never
+// answers it; the escalation names the folder and carries no suggestion.
+func TestAgyTrustIsNeverAnsweredByALearnedRule(t *testing.T) {
+	pane := agyScreen(t, "approval_agy_trust_folder")
+	h := newHarness(t, "")
+	h.herdr.setPane(pane)
+	h.seedAutonomousAgy(pane, domain.SituationApproval, "Yes, I trust this folder")
+
+	h.pushAgy("agy-trust-rule", "done")
+
+	rec := h.awaitFolderTrustEscalation(t)
+	if !strings.Contains(rec.Rationale, "agy asks to trust /tmp/agyscratch.H2CE") {
+		t.Errorf("rationale = %q", rec.Rationale)
+	}
+}
+
+func TestAgyTrustNeverConsultsTheLLM(t *testing.T) {
+	cfg := "[llm]\ncommand = [\"fake\"]\nauto_act_confidence_threshold = 50\ntimeout_seconds = 5\n"
+	h := newHarnessConsult(t, cfg, func(context.Context, domain.LLMRequest) (*domain.LLMDecision, error) {
+		return nil, errors.New("the LLM was consulted about agy's trust prompt")
+	})
+	h.herdr.setPane(agyScreen(t, "approval_agy_trust_folder"))
+
+	h.pushAgy("agy-trust-llm", "done")
+
+	h.awaitFolderTrustEscalation(t)
+}
+
+// The operator still answers it by label, through agy's keyed deliverer; the
+// orchestrator may not.
+func TestQueuedReplyAnswersTheAgyTrustPromptButNotForTheOrchestrator(t *testing.T) {
+	pane := agyScreen(t, "approval_agy_trust_folder")
+	seed := func(h *harness) int64 {
+		return h.seedEscalation(domain.AuditRecord{
+			AgentID: "w1:p1", AgentType: domain.AgentTypeAgy, SituationType: domain.SituationApproval,
+			PaneExcerpt: pane,
+		})
+	}
+
+	t.Run("orchestrator", func(t *testing.T) {
+		h := newHarness(t, "")
+		h.herdr.setPane(pane)
+		got := h.deliverReplyAs(domain.OrchestratorAuthor, seed(h), "Yes, I trust this folder", "w1:p1")
+		if got.Status == domain.AgentActionDone || !strings.Contains(got.Error, "folder-trust") {
+			t.Fatalf("status %q error %q, want a folder-trust refusal", got.Status, got.Error)
+		}
+		if len(h.herdr.keysSent()) != 0 || len(h.herdr.sentInputs()) != 0 {
+			t.Errorf("nothing may reach the pane: keys=%v inputs=%v", h.herdr.keysSent(), h.herdr.sentInputs())
+		}
+	})
+	t.Run("operator", func(t *testing.T) {
+		h := newHarness(t, "")
+		h.herdr.setPane(pane)
+		h.herdr.mu.Lock()
+		h.herdr.keyScript = []string{"enter"}
+		h.herdr.keyScriptFrames = []string{agyReadyPane}
+		h.herdr.mu.Unlock()
+		got := h.deliverReplyNow(seed(h), "Yes, I trust this folder", "w1:p1")
+		if got.Status != domain.AgentActionDone {
+			t.Fatalf("status = %q (%s), want done", got.Status, got.Error)
+		}
+		if keys := strings.Join(h.herdr.keysSent(), ","); keys != "enter" {
+			t.Errorf("keys = %q, want \"enter\" (the caret already rests on the trust row)", keys)
+		}
+	})
+}
+
+// The classification capture is a consuming delta that can start below the
+// prompt's "Accessing workspace:" header; the escalation then names the folder
+// from the cwd the daemon already holds — the roster's published cwd for the
+// same terminal — with no herdr call on the loop.
+func TestKnownCwdFallsBackToTheRoster(t *testing.T) {
+	h := newHarness(t, "")
+	ctx := context.Background()
+	h.herdr.mu.Lock()
+	h.herdr.failPaneInfo = true // the pane-cwd cache stays empty
+	h.herdr.mu.Unlock()
+	s := domain.Situation{AgentID: "w9:p1", PaneID: "w9:p1", TerminalID: "term-1"}
+	if got := h.daemon.knownCwd(ctx, s); got != "" {
+		t.Fatalf("knownCwd with nothing known = %q, want empty", got)
+	}
+	now := time.Now()
+	if err := h.raw.PublishRoster(ctx, []domain.RosterAgent{{
+		AgentID: "w9:p1", PaneID: "w9:p1", AgentType: domain.AgentTypeAgy, Status: "blocked",
+		TerminalID: "term-1", SeenAt: now,
+	}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.raw.SetRosterCwds(ctx, map[string]domain.RosterCwd{
+		"w9:p1": {Cwd: "/work/agy-project", TerminalID: "term-1"}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.daemon.knownCwd(ctx, s); got != "/work/agy-project" {
+		t.Errorf("knownCwd = %q, want the roster's cwd", got)
+	}
+	// A recycled pane (another terminal on the same id) does not inherit it.
+	s.TerminalID = "term-2"
+	if got := h.daemon.knownCwd(ctx, s); got != "" {
+		t.Errorf("knownCwd for a recycled pane = %q, want empty", got)
+	}
+}

@@ -2377,11 +2377,13 @@ func errNoSuggestion(audit *domain.AuditRecord) error {
 		why = "it was escalated by the " + domain.EscalationReasonTag(audit.Rationale) +
 			" control, which withholds a one-key answer on purpose"
 	case domain.ReasonFolderTrust:
-		// The one veto whose answers are known: the dialog's two rows.
-		return fmt.Errorf("audit record %d is Claude's folder-trust dialog, which hap never answers with one key: "+
-			"trusting applies the folder's settings without asking. Decide from its rationale, then "+
+		// The one veto whose answers are known: the prompt's two rows, which
+		// Claude and agy label identically.
+		return fmt.Errorf("audit record %d is a folder-trust prompt, which hap never answers with one key: "+
+			"trusting lets the agent read, edit and execute files there (for Claude, applying the folder's "+
+			"settings without asking). Decide from its rationale, then "+
 			"`hap resolve %d --action \"Yes, I trust this folder\" --send` or "+
-			"`hap resolve %d --action \"No, exit\" --send` (which ends that claude session)",
+			"`hap resolve %d --action \"No, exit\" --send` (which ends that agent's session)",
 			audit.ID, audit.ID, audit.ID)
 	}
 	return fmt.Errorf("audit record %d has no suggestion to confirm: %s. "+

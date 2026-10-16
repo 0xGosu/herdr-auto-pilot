@@ -442,10 +442,17 @@ const (
 type AgyTrustForm struct {
 	Options  []string
 	Selected int // index of the caret row, -1 when not drawn
+	// Folder is the path under "Accessing workspace:", "" when the capture does
+	// not reach it.
+	Folder string
+	// Note is the prompt's explanation ("Antigravity CLI requires permission to
+	// read, edit, and execute files here."), rejoined across wrapped lines.
+	Note string
 }
 
 var (
 	agyTrustQuestionRE = regexp.MustCompile(`^\s*Do you trust the contents of this project\?\s*$`)
+	agyWorkspaceRE     = regexp.MustCompile(`^\s*Accessing workspace:\s*$`)
 	agyConfirmHintRE   = regexp.MustCompile(`^\s*↑/↓ Navigate · enter Confirm\s*$`)
 	// agyUnnumberedRowRE matches an unnumbered menu row: the caret ("> ") or its
 	// two-space placeholder, then the label. The explanation sentence between
@@ -466,9 +473,21 @@ func ParseAgyTrust(pane string) (AgyTrustForm, bool) {
 		return AgyTrustForm{}, false
 	}
 	form := AgyTrustForm{Selected: -1}
+	// "Accessing workspace:" and the path sit just above the question.
+	for k := q - 1; k >= 0 && k >= q-6; k-- {
+		if agyWorkspaceRE.MatchString(lines[k]) {
+			form.Folder = trustFolderPath(lines[k+1 : q])
+			break
+		}
+	}
+	var note []string
 	for _, l := range lines[q+1 : n-1] {
 		m := agyUnnumberedRowRE.FindStringSubmatch(l)
 		if m == nil {
+			// The explanation is not indented, so it never reads as a row.
+			if t := strings.TrimSpace(l); t != "" && len(form.Options) == 0 {
+				note = append(note, t)
+			}
 			continue
 		}
 		if strings.HasPrefix(l, ">") {
@@ -479,6 +498,7 @@ func ParseAgyTrust(pane string) (AgyTrustForm, bool) {
 	if len(form.Options) < 2 {
 		return AgyTrustForm{}, false
 	}
+	form.Note = strings.Join(note, " ")
 	return form, true
 }
 

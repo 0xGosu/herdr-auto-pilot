@@ -215,8 +215,8 @@ real confirm is proven only in `internal/frontend`, and TUI/CLI suites must drai
   never enters the database; front ends draw ids from the daemon with no local fallback.
 
 ### agy
-herdr never reports an agy modal as blocked; forms are parsed structurally (`internal/domain/agy.go`,
-`docs/designer/agy-support.md`).
+herdr reports agy's modals idle/done (the trust prompt is the one exception seen: `blocked` on herdr 0.9.1);
+forms are parsed structurally (`internal/domain/agy.go`, `docs/designer/agy-support.md`).
 - A reply to an agy form is KEYS (agy commits on the digit alone; a trailing Enter answers the next screen).
   Every send path must ask `domain.AgyFormSituation` and route to `mcqdeliver.Agy` — today `daemon.act`
   (ahead of the action-review rewrite), the LLM promotion in `handleLLMOutcome`, and `deliver.Deliver`.
@@ -227,14 +227,18 @@ herdr never reports an agy modal as blocked; forms are parsed structurally (`int
   **Test trap:** `fakeHerdr` has no `SendToAgent`, so the proof lives at call sites.
 - Never set `MCQKind`/`AnswerCount` on an agy situation.
 
-### Claude folder-trust dialog (`domain.ClaudeFolderTrust`)
-hap never answers it: `domain.Decide` vetoes it as `ReasonFolderTrust` (no suggestion, rationale =
-`Summary`), and `daemon.act`, the LLM promotion and `refuseOrchestratorFolderTrust` refuse it again. It
-has no digits — every reply goes through `mcqdeliver.ClaudeFolderTrust` (`deliver.Deliver`'s
-`deliverFolderTrust`, identified from the excerpt OR the live read). Every path that TYPES into a pane
-asks `composerRefusal` (dialog + operator draft on one read); `herdr.CLI.paneShowsStandingForm` keeps the
-retry Enter off it. The classifier accepts it at blocked AND idle/done — idle must never be its verdict.
-A config-gated auto-trust was declined: Claude already inherits trust from a trusted ancestor folder.
+### Folder-trust prompts (`domain.FolderTrustPrompt`: Claude's dialog, agy's prompt)
+hap never answers one: `domain.Decide` vetoes it as `ReasonFolderTrust` (no suggestion, rationale =
+`Summary`, folder from the screen else `daemon.knownCwd` — no herdr call), and `daemon.act`, the LLM
+promotion, `startRerank` and `refuseOrchestratorFolderTrust` refuse it again; all ask
+`FolderTrustSituation`/`FolderTrustStanding`, so a new agent's prompt is added THERE. Neither has digits:
+Claude's goes through `mcqdeliver.ClaudeFolderTrust` (`deliver.Deliver`'s `deliverFolderTrust`), agy's
+through `mcqdeliver.Agy`'s caret walk. Identity compares the folder only when BOTH captures show it (the
+consuming read often starts below the header). Every path that TYPES into a pane asks `composerRefusal`
+(Claude dialog + operator draft on one read; agy is covered by `agyComposerRefusal`);
+`herdr.CLI.paneShowsStandingForm` keeps the retry Enter off Claude's. The classifier accepts both at
+blocked AND idle/done — idle must never be the verdict. A config-gated auto-trust was declined: Claude
+already inherits trust from a trusted ancestor folder.
 
 ### Claude session-name sync (`[agents] sync_claude_session_name`)
 Read only from a proven composer; absence is UNKNOWN. Quiescence is asked in `applyClaudeSession` and again
@@ -293,6 +297,8 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   trust row in 2.1.206) and Enter commits the caret's row. Claude lists settings.json permissions and
   directories (truncated "…, and N more") but not hooks, env or `.mcp.json` servers. No dialog appears
   under a trusted ancestor folder (`/tmp` and `/workspaces` here — use `/var/tmp` to reproduce).
+- agy's trust prompt (agy 1.4.0, herdr 0.9.1) is reported `blocked`, so `agent start --kind agy`
+  refuses with `agent_not_ready` in an untrusted folder (and the shared itest helper skips agy there).
 - Concurrent tool approvals (parallel subagents) are PAGED in one dialog ("1 of 3"); answering a page draws
   the next in place with herdr still `blocked` — no event. Only the post-action self-check sees it
   (`followUpPromptStanding`, gated on `domain.ClaudeModalAdvanced`); every unattended send must arm it.

@@ -1580,7 +1580,7 @@ What it deliberately does **not** do:
   `never_auto_match` and `suspected_irreversible` always reach a human, and so
   do `retry_exhausted` and `rate_limited` — each means automation has already
   done this as often as it is allowed to, and a timeout is not a human checking
-  in. So does `folder_trust`, Claude's folder-trust dialog. These exclusions are
+  in. So does `folder_trust`, a Claude or agy folder-trust prompt. These exclusions are
   in code and cannot be configured away.
 - **It never types the "do nothing" sentinel at an agent.**
 - **At most one escalation per agent per sweep**, so two ageing out together can

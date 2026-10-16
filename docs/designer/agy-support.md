@@ -428,8 +428,12 @@ Question 1/1: Which fruit do you prefer?
 - **Salient:** `permission:trust | options:yes, i trust this folder;no, exit`.
 - **Answer:** no digits. Move the caret with `up`/`down` (verified), re-read that it rests on
   the chosen row, then `enter`. The caret starts on `Yes`. `No, exit` quits agy.
-- **Safety:** trusting grants read/edit/execute in the folder. Seed a never-auto pattern and
-  keep it operator-only until someone decides otherwise.
+- **Safety:** trusting grants read/edit/execute in the folder, so it is operator-only, enforced
+  like Claude's folder-trust dialog (`domain.FolderTrustPrompt`): `domain.Decide` escalates it as
+  `folder_trust` naming the folder (with no suggestion), and no learned rule, LLM, auto-accept or
+  orchestrator answers it. The operator resolves it by label through the caret walk below; an
+  answer decided for one folder is refused at another folder's prompt.
+- **Status (herdr 0.9.1, agy 1.4.0):** reported `blocked`, unlike every other agy modal.
 
 ### 4.10 First-run: sign-in and terms — operator-only, always
 

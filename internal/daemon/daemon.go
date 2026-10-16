@@ -2949,12 +2949,12 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 		irrevHit, suspected = allow.SuspectedIrreversible(situation.AgentType, scan)
 	}
 
-	// The folder-trust dialog names its folder on screen, but a capture can
-	// start below that header; the pane's cwd then names it instead (cached and
-	// refreshed off the loop, so a cold pane may still answer "").
+	// A folder-trust prompt names its folder on screen, but the capture is a
+	// consuming delta that can start below that header; the agent's cwd then
+	// names it instead.
 	paneCwd := ""
-	if form, ok := domain.ClaudeFolderTrustSituation(situation); ok && form.Folder == "" {
-		paneCwd = d.paneCwd(ctx, situation.PaneID)
+	if p, ok := domain.FolderTrustSituation(situation); ok && p.Folder() == "" {
+		paneCwd = d.knownCwd(ctx, situation)
 	}
 
 	// NOTE: the LLM review of a declared task deliberately does NOT fork here.
@@ -3252,13 +3252,14 @@ func (d *Daemon) act(ctx context.Context, s domain.Situation, sig domain.Signatu
 	// line from a task file (or any learned action) naming an irreversible
 	// operation must never be delivered automatically (FR-015).
 	cfg, allow, _ := d.snapshot()
-	// Claude's folder-trust dialog is the operator's alone (ReasonFolderTrust).
+	// A folder-trust prompt is the operator's alone (ReasonFolderTrust).
 	// domain.Decide already refuses it; this is the last word for any path that
-	// reaches act with it standing, ahead of every keystroke route below.
-	if form, ok := domain.ClaudeFolderTrustSituation(s); ok {
+	// reaches act with one standing, ahead of every keystroke route below —
+	// agy's keyed deliverer included.
+	if p, ok := domain.FolderTrustSituation(s); ok {
 		d.escalate(ctx, s, sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonFolderTrust,
-			Rationale: form.Summary(""), Confidence: dec.Confidence,
+			Rationale: p.Summary(""), Confidence: dec.Confidence,
 		}, tr, now)
 		return
 	}
@@ -6153,16 +6154,18 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 			computedConf, &llmConf, now)
 		return
 	}
-	// Claude's folder-trust dialog is never answered by an LLM: trusting applies
-	// the folder's settings without asking. `pane` is the visible re-read, so
-	// this also catches a dialog that appeared after the consult was asked.
-	// Escalated WITHOUT the LLM's answer as a suggestion — reject() would attach
-	// it, and the operator decides this row by naming a row, not by one key.
-	if form, ok := domain.ClaudeFolderTrust(pane); ok && strings.EqualFold(s.AgentType, "claude") {
+	// A folder-trust prompt is never answered by an LLM: trusting lets the agent
+	// read, edit and execute there (and applies Claude's folder settings without
+	// asking). `pane` is the visible re-read, so this also catches a prompt that
+	// appeared after the consult was asked. Ahead of the agy keyed deliverer
+	// below. Escalated WITHOUT the LLM's answer as a suggestion — reject() would
+	// attach it, and the operator decides this row by naming a row, not by one key.
+	if p, ok := domain.FolderTrustSituation(domain.Situation{
+		Type: domain.SituationApproval, AgentType: s.AgentType, Content: pane}); ok {
 		d.opt.Store.UpdateLLMDecisionStatus(ctx, llmDec.ID, "rejected")
 		d.escalate(ctx, s, res.sig, domain.Decision{
 			Action: domain.ActionEscalate, Reason: domain.ReasonFolderTrust,
-			Rationale: form.Summary(""),
+			Rationale: p.Summary(""),
 		}.WithLLMSession(res.request.SessionID), tr, now)
 		return
 	}
@@ -7093,6 +7096,25 @@ func (d *Daemon) paneCwd(ctx context.Context, paneID string) string {
 		d.refreshPaneCwd(ctx, paneID)
 	}
 	return entry.cwd
+}
+
+// knownCwd is the agent's working directory from what the daemon already holds
+// — the pane-cwd cache, then the roster's published cwd for the same terminal —
+// without a herdr call on the loop. "" when neither has it yet.
+func (d *Daemon) knownCwd(ctx context.Context, s domain.Situation) string {
+	if cwd := d.paneCwd(ctx, s.PaneID); cwd != "" {
+		return cwd
+	}
+	roster, _, err := d.opt.Store.LiveRoster(ctx)
+	if err != nil {
+		return ""
+	}
+	for _, a := range roster {
+		if a.AgentID == s.AgentID && (s.TerminalID == "" || a.TerminalID == "" || a.TerminalID == s.TerminalID) {
+			return strings.TrimSpace(a.Cwd)
+		}
+	}
+	return ""
 }
 
 // refreshPaneCwd resolves a pane's working directory off the main loop and

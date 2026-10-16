@@ -167,6 +167,16 @@ func TestClaudeFolderTrustRowsAndIdentity(t *testing.T) {
 	if f.SameAs(other) {
 		t.Error("a different permission list compared equal")
 	}
+	// A different folder is a different dialog; a capture that did not reach
+	// the folder line is not evidence of one.
+	elsewhere, _ := ClaudeFolderTrust(strings.ReplaceAll(pane, "/var/tmp/hap-trust-long-0zze", "/srv/other"))
+	if f.SameAs(elsewhere) {
+		t.Error("a different folder compared equal")
+	}
+	headless, ok := ClaudeFolderTrust(pane[strings.Index(pane, " Quick safety check:"):])
+	if !ok || headless.Folder != "" || !headless.SameAs(f) || !f.SameAs(headless) {
+		t.Errorf("a capture without the folder line did not match the full dialog: %+v", headless)
+	}
 	for reply, want := range map[string]int{
 		"Yes, I trust this folder": 1, "yes, i trust this folder": 1, "Yes": 1,
 		"No, exit": 0, "No": 0, "2": 1,

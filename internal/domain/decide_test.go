@@ -851,3 +851,26 @@ func TestFolderTrustIsAlwaysTheOperatorsCall(t *testing.T) {
 		t.Errorf("codex situation vetoed as Claude folder trust: %+v", d)
 	}
 }
+
+// agy's trust prompt is operator-only too (docs/designer/agy-support.md §4.9):
+// a rule that learned to trust never answers it, and the LLM is not consulted.
+func TestAgyTrustIsAlwaysTheOperatorsCall(t *testing.T) {
+	b, err := os.ReadFile("../classify/testdata/transcripts/approval_agy_trust_folder.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	trust := "Yes, I trust this folder"
+	in := autonomous(baseInput(SituationApproval), trust, trust, trust, trust, trust, trust, trust, trust)
+	in.Situation.AgentType = AgentTypeAgy
+	in.Situation.Content = string(b)
+	in.Situation.PermissionVerb = PermissionVerbAgyTrust
+	in.Situation.Options = []string{trust, "No, exit"}
+	in.LLMConfigured = true
+	d := Decide(in)
+	if d.Action != ActionEscalate || d.Reason != ReasonFolderTrust || d.Suggestion != "" {
+		t.Fatalf("got %+v, want a folder_trust escalation with no suggestion", d)
+	}
+	if !strings.Contains(d.Rationale, "/tmp/agyscratch.H2CE") {
+		t.Errorf("rationale = %q, want the folder named", d.Rationale)
+	}
+}

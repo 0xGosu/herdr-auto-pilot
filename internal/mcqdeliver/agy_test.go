@@ -170,6 +170,29 @@ func TestAgyTrustWalksTheCaretThenConfirms(t *testing.T) {
 			t.Errorf("keys = %v, want %v", s.keys, want)
 		}
 	})
+	// An answer decided for one folder is never delivered to another's prompt.
+	t.Run("another folder's prompt", func(t *testing.T) {
+		other := strings.Replace(onYes, "/tmp/agyscratch.H2CE", "/tmp/elsewhere", 1)
+		s := &agyScreen{screen: other}
+		if err := Agy(context.Background(), s.cfg(), onYes, "Yes, I trust this folder"); err == nil {
+			t.Fatal("answered a different folder's trust prompt")
+		}
+		if len(s.keys) != 0 {
+			t.Errorf("keys = %v, want none", s.keys)
+		}
+	})
+	// The classification capture often starts below "Accessing workspace:"
+	// (a consuming delta); a decision made on it still answers the live prompt.
+	t.Run("a decision whose capture did not reach the folder", func(t *testing.T) {
+		decided := onYes[strings.Index(onYes, "Do you trust"):]
+		s := &agyScreen{screen: onYes, steps: []agyStep{{"down", onNo}, {"enter", gone}}}
+		if err := Agy(context.Background(), s.cfg(), decided, "No, exit"); err != nil {
+			t.Fatal(err)
+		}
+		if want := []string{"down", "enter"}; !reflect.DeepEqual(s.keys, want) {
+			t.Errorf("keys = %v, want %v", s.keys, want)
+		}
+	})
 	t.Run("a caret that does not move is never confirmed", func(t *testing.T) {
 		s := &agyScreen{screen: onYes} // swallows the arrow
 		err := Agy(context.Background(), s.cfg(), onYes, "No, exit")

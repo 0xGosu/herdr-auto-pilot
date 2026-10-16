@@ -77,10 +77,11 @@ tab-separated; `hap state-dir` and `hap config path` always print a bare value.
 `approval` (asking permission), `choice` (multiple-choice question), `error`
 (hit an error, waiting for guidance). Structural forms herdr reports as idle —
 Codex's Plan approval, Claude's "Select remote environment" picker — are
-detected and classified as parked approvals. Claude's folder-trust dialog
-("Quick safety check: … trust?") is an approval hap **never** answers itself:
-it escalates as `folder_trust` with the folder and the permissions and
-directories its `.claude/settings.json` would apply, and you answer by label —
+detected and classified as parked approvals. A folder-trust prompt — Claude's
+dialog ("Quick safety check: … trust?") or agy's ("Do you trust the contents of
+this project?") — is an approval hap **never** answers itself: it escalates as
+`folder_trust` with the folder (and, for Claude, the permissions and directories
+its `.claude/settings.json` would apply), and you answer by label —
 `hap resolve <id> --action "Yes, I trust this folder" --send` (or `"No, exit"`,
 which ends that session).
 
