@@ -8,6 +8,12 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.75
+
+- Recognised Claude Code's folder-trust dialog as an approval instead of an unclassifiable screen: it now escalates as `folder_trust` naming the folder and the tool permissions and directories its `.claude/settings.json` would apply without asking
+- Kept Claude Code's folder-trust dialog operator-only: no learned rule, LLM, auto-accept or orchestrator answers it; resolve it by label with `hap resolve <id> --action "Yes, I trust this folder" --send` (or `"No, exit"`), which walks the caret to that row
+- Refused task hand-outs and other typed text while the folder-trust dialog stands, so a stray Enter can no longer quit or trust a fresh claude session
+
 ## 0.9.74
 
 - Raised the default runaway-loop limits to 50 consecutive auto-prompts and 10 auto-prompts per minute per agent (was 30 and 5); a config that sets these keys explicitly keeps its own values
