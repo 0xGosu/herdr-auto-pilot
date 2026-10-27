@@ -1,0 +1,1 @@
+- Added a numbered Quickstart path from installation to safely observing your first escalation, with checks for when none appears
