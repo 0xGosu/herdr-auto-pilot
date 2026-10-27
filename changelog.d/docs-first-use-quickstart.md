@@ -1,1 +1,2 @@
 - Added a numbered Quickstart path from installation to safely observing your first escalation, with checks for when none appears
+- Fixed CONTRIBUTING.md telling contributors to edit CHANGELOG.md by hand; it now describes the changelog.d fragment CI requires

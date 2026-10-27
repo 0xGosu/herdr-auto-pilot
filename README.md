@@ -41,8 +41,8 @@ correctable.
 
 ## Quickstart
 
-Follow these steps from installation to your first escalation. Nothing here
-answers an agent or changes a setting.
+Follow these steps from installation to your first escalation. None of them
+answers an agent or turns on an automatic response.
 
 1. **Check the prerequisites.** Herdr ≥ 0.7.0 on Linux (amd64/arm64) or
    Apple Silicon macOS, with `git`, `curl`, `tar`, and `sha256sum` or `shasum`.
@@ -93,6 +93,13 @@ answers an agent or changes a setting.
    the suggestion. Leave the escalation pending: the agent keeps waiting, and
    hap sends and learns nothing.
 
+   To be sure hap answers nothing while you watch, press `p` in the pane (or
+   run `herdr plugin action invoke pause --plugin herd-auto-prompter`) before
+   step 6. The header then reads `■ PAUSED (kill switch)`, and every situation
+   escalates without a suggestion, even one a learned rule could answer. Press
+   `r` once to resume; `rr` turns on full self-prompting instead. See
+   [Pause/kill switch & audit](#pausekill-switch--audit).
+
 **If no escalation appears.** An escalation appears only when a supported
 agent needs input *and* hap declines to answer it. Not every agent event
 qualifies: a working agent does not escalate, and an agent that finishes
@@ -107,6 +114,10 @@ without asking may produce nothing, or a queue notice such as
   `SNOOZED` one gets no queue notices.
 - **The Audit tab.** It lists every decision hap made, and why. A situation
   hap answered by itself shows here, not on the Escalations tab.
+- **Re-read the pane.** If the agent clearly waits for input and none of the
+  above explains it, `hap capture <agent>` (with the
+  [CLI](#make-the-cli-available-from-any-shell)) asks the daemon to classify
+  that pane now. Check the Escalations tab a few seconds later.
 
 **Observing, answering, and automatic responses are different.**
 
