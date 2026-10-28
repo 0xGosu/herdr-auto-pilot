@@ -95,9 +95,9 @@ answers an agent or turns on an automatic response.
    an agent started in a folder Claude does not trust yet escalates its trust
    dialog as `[folder_trust]`.
 7. **Observe the escalation without answering it.** On the **Escalations** tab
-   (press `tab` to switch tabs), select the row and press `v` to read the details, then `esc` to close them.
-   Do not press `enter`: in the list and in the details it confirms and sends
-   the suggestion. Leave the escalation pending: the agent keeps waiting, and
+   (press `tab` to switch tabs), select the row and press `v` to read the
+   details, then `esc` to close them. Do not press `enter`: in the list and in
+   the details it confirms and sends the suggestion. Leave the escalation pending: the agent keeps waiting, and
    hap sends and learns nothing.
 
    To be sure hap answers nothing while you watch, press `p` in the pane (or
