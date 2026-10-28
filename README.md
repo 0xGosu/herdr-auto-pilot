@@ -67,8 +67,10 @@ answers an agent or turns on an automatic response.
    This needs no CLI symlink. To open it with a key instead, see
    [Open the pane with a hotkey](#open-the-pane-with-a-hotkey-recommended).
 5. **Check the agent and the daemon.**
-   - **Agent:** the pane's **Agents** tab lists your agent with its `STATUS`.
-     `no agents detected` means the daemon has not seen one yet.
+   - **Agent:** the pane's **Agents** tab lists your agent with its `STATUS`,
+     under a hap-assigned name such as `silver-wombat` (see
+     [Agent short names](#agent-short-names)). `no agents detected` means the
+     daemon has not seen one yet.
    - **Daemon:** from a shell inside Herdr, run the plugin's `status` action,
      then read its output from the plugin log. The log lists the newest entry
      first; when it shows `"action_id":"status"` and `"status":"succeeded"`,
@@ -84,9 +86,14 @@ answers an agent or turns on an automatic response.
      Once the [CLI is on your PATH](#make-the-cli-available-from-any-shell),
      `hap status` prints the same report. The pane header's `● running` shows
      the pause state (`■ PAUSED` when paused), not whether the daemon runs.
-6. **Wait for the agent to need input.** For example, ask it to run a shell
-   command it must ask your approval for. When hap does not answer on its own,
-   the **Escalations** tab count goes up, for example `Escalations(1)`.
+6. **Wait for the agent to need input.** For example, ask Claude to use its
+   AskUserQuestion tool to ask you to pick between two options. A request for
+   tool approval works too, but only if your agent's permission settings do not
+   already allow that tool. When hap does not answer on its own, the
+   **Escalations** tab count goes up, for example `Escalations(1)`. Other
+   agents that are already idle may escalate too, as `[no_task_source]`, and
+   an agent started in a folder Claude does not trust yet escalates its trust
+   dialog as `[folder_trust]`.
 7. **Observe the escalation without answering it.** On the **Escalations** tab,
    select the row and press `v` to read the details, then `esc` to close them.
    Do not press `enter`: in the list and in the details it confirms and sends
