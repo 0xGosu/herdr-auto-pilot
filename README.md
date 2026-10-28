@@ -41,18 +41,116 @@ correctable.
 
 ## Quickstart
 
-Requires Herdr ≥ 0.7.0 and `curl`. **No Go toolchain needed** — the install step
-downloads the prebuilt binary for your platform (Linux/macOS, amd64/arm64) from
-the matching GitHub Release and verifies it against the published SHA256SUMS.
+Follow these steps from installation to your first escalation. None of them
+answers an agent or turns on an automatic response.
+
+1. **Check the prerequisites.** Herdr ≥ 0.7.0 on Linux (amd64/arm64) or
+   Apple Silicon macOS, with `git`, `curl`, `tar`, and `sha256sum` or `shasum`.
+   **No Go toolchain needed.**
+2. **Install the plugin.** The install step downloads the prebuilt binary for
+   your platform from the matching GitHub Release and verifies it against the
+   published SHA256SUMS.
+
+   ```sh
+   herdr plugin install 0xGosu/herdr-auto-pilot
+   ```
+
+3. **Start a supported agent.** Run `claude` or `codex` in a Herdr pane (see
+   *Agent compatibility* above). The monitoring daemon starts automatically when
+   Herdr detects an agent, so there is nothing to start by hand.
+4. **Open the control pane.** From any shell inside Herdr:
+
+   ```sh
+   herdr plugin pane open --plugin herd-auto-prompter --entrypoint control
+   ```
+
+   This needs no CLI symlink. To open it with a key instead, see
+   [Open the pane with a hotkey](#open-the-pane-with-a-hotkey-recommended).
+5. **Check the agent and the daemon.**
+   - **Agent:** the pane's **Agents** tab lists your agent with its `STATUS`,
+     under a hap-assigned name such as `silver-wombat` (see
+     [Agent short names](#agent-short-names)). `no agents detected` means the
+     daemon has not seen one yet.
+   - **Daemon:** from a shell inside Herdr, run the plugin's `status` action,
+     then read its output from the plugin log. The log lists the newest entry
+     first; when it shows `"action_id":"status"` and `"status":"succeeded"`,
+     its `stdout` field should have a `daemon:` line reading `running …` and a
+     `monitored agents:` count above 0. If it still shows
+     `"status":"running"`, or another action, run the second command again.
+
+     ```sh
+     herdr plugin action invoke status --plugin herd-auto-prompter
+     herdr plugin log list --plugin herd-auto-prompter --limit 1
+     ```
+
+     Once the [CLI is on your PATH](#make-the-cli-available-from-any-shell),
+     `hap status` prints the same report. The pane header's `● running` shows
+     the pause state (`■ PAUSED` when paused), not whether the daemon runs.
+6. **Wait for the agent to need input.** For example, ask Claude to use its
+   AskUserQuestion tool to ask you to pick between two options. A request for
+   tool approval works too, but only if your agent's permission settings do not
+   already allow that tool. When hap does not answer on its own, the
+   **Escalations** tab count goes up, for example `Escalations(1)`. Other
+   agents that are already idle may escalate too, as `[no_task_source]`, and
+   an agent started in a folder Claude does not trust yet escalates its trust
+   dialog as `[folder_trust]`.
+7. **Observe the escalation without answering it.** On the **Escalations** tab
+   (press `tab` to switch tabs), select the row and press `v` to read the
+   details, then `esc` to close them. Do not press `enter`: in the list and in
+   the details it confirms and sends the suggestion. Leave the escalation pending: the agent keeps waiting, and
+   hap sends and learns nothing.
+
+   To be sure hap answers nothing while you watch, press `p` in the pane (or
+   run `herdr plugin action invoke pause --plugin herd-auto-prompter`) before
+   step 6. The header then reads `■ PAUSED (kill switch)`, and every situation
+   escalates without a suggestion, even one a learned rule could answer. Press
+   `r` once to resume; `rr` turns on full self-prompting instead. See
+   [Pause/kill switch & audit](#pausekill-switch--audit).
+
+**If no escalation appears.** An escalation appears only when a supported
+agent needs input *and* hap declines to answer it. Not every agent event
+qualifies: a working agent does not escalate, and an agent that finishes
+without asking may produce nothing, or a queue notice such as
+`no_task_source` that hap can hold back for a while. Check, in order:
+
+- **The daemon** (step 5). If `daemon:` is not `running`, or the pane shows a
+  `⚠ DAEMON …` banner, nothing is being watched — see
+  [Health and disk usage](#health-and-disk-usage).
+- **The agent** (step 5). If it is missing from the **Agents** tab, Herdr has
+  not detected it as an agent. A `DISABLED` agent gets no escalations; a
+  `SNOOZED` one gets no queue notices.
+- **The Audit tab.** It lists every decision hap made, and why. A situation
+  hap answered by itself shows here, not on the Escalations tab.
+- **Re-read the pane.** If the agent clearly waits for input and none of the
+  above explains it, `hap capture <agent>` (with the
+  [CLI](#make-the-cli-available-from-any-shell)) asks the daemon to classify
+  that pane now. Check the Escalations tab a few seconds later.
+
+**Observing, answering, and automatic responses are different.**
+
+- **Observe:** `v` (details), `esc` (close), `f` (focus the agent in Herdr).
+  Nothing is sent or learned.
+- **Answer:** on the Escalations tab, `enter` (confirm and send), `y` (confirm
+  only), and `c` (correct) all answer. So do `hap confirm` and `hap resolve`
+  from the [CLI](#make-the-cli-available-from-any-shell). hap learns from every
+  answer, including `y`, which sends nothing to the agent.
+- **Automatic response:** hap answers by itself. A learned rule does this once
+  it *graduates*: under the default settings (`learning.graduation_n = 1`),
+  **one** confirmed answer can be enough for the next matching prompt to be
+  answered without you. Task sources, the LLM helper
+  and the unattended modes are separate, opt-in paths; `rr` in the pane turns
+  on full self-prompting, so do not press it while observing.
+
+Before you answer, read
+[How learned rules work (shadow mode)](#how-learned-rules-work-shadow-mode).
+To change thresholds or other settings, see [Configuration](#configuration).
+
+### Install options
 
 ```sh
-herdr plugin install 0xGosu/herdr-auto-pilot
-
 herdr plugin install 0xGosu/herdr-auto-pilot --ref v0.6.20   # pin a release
 herdr plugin install 0xGosu/herdr-auto-pilot --yes           # non-interactive
 ```
-
-The monitoring daemon starts automatically when an agent appears in the herd.
 
 A newly tagged release takes about 15 minutes to build. Install during that
 window and you get the newest *earlier* release instead of an error — the output

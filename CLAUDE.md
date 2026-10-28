@@ -68,7 +68,7 @@ Traps:
   ```
   Flat verb-first one-liners, what it means for the reader; mark **Breaking.** Auto-release assembles them.
   For minor/major, run `bash scripts/assemble-changelog.sh X.Y.0` in the same PR (release refuses to tag
-  otherwise). (`CONTRIBUTING.md`'s changelog paragraph is stale; this section wins.)
+  otherwise).
 - **Release** (`.github/workflows/auto-release.yml`): `version` in `herdr-plugin.toml` TRAILS releases.
   Patch: just merge — never bump by hand. Minor/major: set `version` inside the feature PR.
   - Never put `[skip ci]`-family keywords in a squash-merge message that should release (suppresses the
