@@ -287,7 +287,10 @@ func AgyComposerVisible(pane string) bool {
 
 func agyBody(pane string) []string {
 	lines := strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")
-	lines = trimTrailingBlank(lines)
+	// The tray of running work sits between the composer and the bar on an
+	// idle screen; agyTranscript and AgyErrorForm read through it, or an
+	// interrupted turn with a background task running reads as idle.
+	lines = agyDropBackgroundStrip(trimTrailingBlank(lines))
 	if n := len(lines); n > 0 && agyStatusBarLine(lines[n-1]) {
 		lines = trimTrailingBlank(lines[:n-1])
 	}
@@ -530,7 +533,9 @@ const agyDiffScan = 40
 // question at q.
 func agyDiffPath(lines []string, q int) string {
 	above := func(i int) int { // the nearest non-blank row above i, or -1
-		for i--; i >= 0 && strings.TrimSpace(lines[i]) == ""; i-- {
+		i--
+		for i >= 0 && strings.TrimSpace(lines[i]) == "" {
+			i--
 		}
 		return i
 	}
@@ -775,10 +780,17 @@ func ParseAgyMCQ(pane string) (AgyMCQForm, bool) {
 const (
 	AgyErrorInterrupted      = "interrupted"
 	AgyErrorEligibilityCheck = "eligibility-check-failed"
+	// AgyErrorDeclined is the interrupt agy 1.5 prints right after a DECLINE
+	// ("⎿  User declined the tool call" directly above the Interrupted row).
+	// It is a kind of its own so a rule learned for a genuine interrupt —
+	// "continue" after an Esc — never fires straight after a "No" hap or the
+	// operator chose, nudging the agent back into what was just refused.
+	AgyErrorDeclined = "declined"
 )
 
 var (
 	agyInterruptedRE     = regexp.MustCompile(`^\s*(?:⎿\s*)?Interrupted · What should Antigravity CLI do instead\?\s*$`)
+	agyDeclinedRE        = regexp.MustCompile(`^\s*(?:⎿\s*)?User declined the tool call\s*$`)
 	agyEligibilityHeadRE = regexp.MustCompile(`^\s*⚠ Eligibility Check\s*$`)
 	agyEligibilityFailRE = regexp.MustCompile(`(?i)eligibility check failed`)
 	agyNoticeContRE      = regexp.MustCompile(`^\s*⎿|^\s{3,}\S`)
@@ -814,6 +826,13 @@ func AgyErrorForm(pane string) (kind string, ok bool) {
 	}
 	last := len(lines) - 1
 	if agyInterruptedRE.MatchString(lines[last]) {
+		prev := last - 1
+		for prev >= 0 && strings.TrimSpace(lines[prev]) == "" {
+			prev--
+		}
+		if prev >= 0 && agyDeclinedRE.MatchString(lines[prev]) {
+			return AgyErrorDeclined, true
+		}
 		return AgyErrorInterrupted, true
 	}
 	head := lastLineIndex(lines, len(lines), agyEligibilityHeadRE)

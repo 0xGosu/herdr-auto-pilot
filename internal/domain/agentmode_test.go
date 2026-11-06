@@ -426,6 +426,7 @@ func TestAgyAgentModeOverEveryRecordedScreen(t *testing.T) {
 		"idle_agy_auto_after_turn":       {AgentModeAuto, true},
 		"error_agy_auto_declined":        {AgentModeAuto, true},
 		"error_agy_declined_interrupted": {AgentModeDefault, true},
+		"error_agy_declined_tray":        {AgentModeDefault, true},
 		"working_agy_auto":               {AgentModeAuto, false},
 		// The tray (task and subagent rows in a rule-framed box under the
 		// composer) is furniture: the mode reads and the composer is ready.

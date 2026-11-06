@@ -111,9 +111,13 @@ var agyFixtures = map[string]agyCase{
 		options: []string{"Yes, allow creation", "Yes, and always allow non-workspace access", "No, deny creation"}},
 	// A decline now ends the turn as interrupted ("User declined the tool
 	// call" + "Interrupted · What should Antigravity CLI do instead?"), in
-	// every mode — agy stops and asks for direction.
-	"error_agy_auto_declined.txt":        {typ: domain.SituationError, errSum: domain.AgyErrorInterrupted},
-	"error_agy_declined_interrupted.txt": {typ: domain.SituationError, errSum: domain.AgyErrorInterrupted},
+	// every mode — agy stops and asks for direction. Its own kind, so a rule
+	// learned for a genuine interrupt never fires right after a "No".
+	"error_agy_auto_declined.txt":        {typ: domain.SituationError, errSum: domain.AgyErrorDeclined},
+	"error_agy_declined_interrupted.txt": {typ: domain.SituationError, errSum: domain.AgyErrorDeclined},
+	// The same with a background task's tray under the composer: it read as
+	// IDLE (and would be offered a task) until agyBody dropped the tray.
+	"error_agy_declined_tray.txt": {typ: domain.SituationError, errSum: domain.AgyErrorDeclined},
 	"approval_agy_shell_blocked.txt": {typ: domain.SituationApproval,
 		verb: "run command: ls -la /var/tmp/hapagy1",
 		options: []string{

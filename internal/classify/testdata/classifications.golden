@@ -37,6 +37,7 @@ choice_library.txt status=blocked type=choice verb= options=3
 codex_idle.txt status=idle type=idle verb= options=0
 error_agy_auto_declined.txt status=done type=error verb= options=0
 error_agy_declined_interrupted.txt status=done type=error verb= options=0
+error_agy_declined_tray.txt status=done type=error verb= options=0
 error_agy_interrupted.txt status=done type=error verb= options=0
 error_agy_model_warning.txt status=idle type=idle verb= options=0
 error_agy_offline.txt status=idle type=error verb= options=0

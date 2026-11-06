@@ -75,6 +75,7 @@ func TestGoldenTranscripts(t *testing.T) {
 		"choice_agy_mcq_submit_all.txt":            "blocked",
 		"error_agy_auto_declined.txt":              "done",
 		"error_agy_declined_interrupted.txt":       "done",
+		"error_agy_declined_tray.txt":              "done",
 		"idle_agy_auto_after_turn.txt":             "done",
 		"idle_agy_mode_auto.txt":                   "idle",
 		"idle_agy_subagent_approval_card.txt":      "done",

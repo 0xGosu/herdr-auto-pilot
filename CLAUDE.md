@@ -304,7 +304,8 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   directories (truncated "…, and N more") but not hooks, env or `.mcp.json` servers. No dialog appears
   under a trusted ancestor folder (`/tmp` and `/workspaces` here — use `/var/tmp` to reproduce).
 - agy's trust prompt (agy 1.4.0, herdr 0.9.1) is reported `blocked`, so `agent start --kind agy`
-  refuses with `agent_not_ready` in an untrusted folder (and the shared itest helper skips agy there).
+  refuses with `agent_not_ready` in an untrusted folder; `startAgentInPane` tolerates that for agy and
+  `startAgyAgent` clears the prompt (before agy 1.5 support every real-agy case silently skipped there).
 - Concurrent tool approvals (parallel subagents) are PAGED in one dialog ("1 of 3"); answering a page draws
   the next in place with herdr still `blocked` — no event. Only the post-action self-check sees it
   (`followUpPromptStanding`, gated on `domain.ClaudeModalAdvanced`); every unattended send must arm it.

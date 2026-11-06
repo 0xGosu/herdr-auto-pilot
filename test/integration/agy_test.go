@@ -445,14 +445,16 @@ func TestRealAgyModeToggle(t *testing.T) {
 func TestRealAgyEditApprovalIsNotIdle(t *testing.T) {
 	requireAgy(t)
 	cli := herdr.NewCLI()
-	work := t.TempDir()
+	// An untrusted /var/tmp folder: the 1.5.2 run that raised the modal on
+	// every edit used one, while a t.TempDir() under /tmp did not (below).
+	work := untrustedDir(t, "")
 
 	// The target sits INSIDE agy's start directory. Measured live on agy
 	// 1.2.2, an in-workspace edit under /tmp was applied with no modal; on agy
 	// 1.5.2 (default mode, a /var/tmp workspace) the same edit raised
-	// "Pending edit" / "Accept this file edit?" every time. Whether /tmp is
-	// still exempt is untested, so the case still SKIPS, with the pane logged,
-	// when no modal appears. The corpus fixtures it guards
+	// "Pending edit" / "Accept this file edit?" every time, while this case
+	// under /tmp skipped with no modal — so /tmp still looks exempt. It still
+	// SKIPS, with the pane logged, when no modal appears. The corpus fixtures it guards
 	// (idle_agy_edit_approval, approval_agy_edit_pending) do not depend on
 	// reproducing it here.
 	target := filepath.Join(work, "hello.txt")

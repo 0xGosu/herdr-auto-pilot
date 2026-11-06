@@ -3,3 +3,4 @@
 - Added recognition of agy's in-workspace "Create file" and "Pending edit" (Accept this file edit?) approvals, so they are answered by your rules instead of escalating as unknown screens
 - Fixed agy's last question in a multi-question form ("enter Submit All") escalating as unknown, and made a reply naming an option without agy's "(Recommended)" marker (or with Claude's) match that option
 - Added a held escalation for an agy subagent waiting on you (a question or approval card above the prompt) and for the subagent view; hap never answers these and never offers the agent a task while one stands
+- Fixed an agy turn that ended in "Interrupted" while a background task ran being read as idle (and offered a task); a decline's interrupt is now its own `declined` error, so a rule learned for an Esc-interrupt never fires right after a "No"

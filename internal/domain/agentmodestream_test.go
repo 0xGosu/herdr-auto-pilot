@@ -23,6 +23,8 @@ func TestAutonomousModeFor(t *testing.T) {
 		{AgentTypeAgy, AgentModeDefault, AgentModeAcceptEdits, true},
 		{AgentTypeAgy, AgentModePlan, AgentModeUnknown, false},
 		{AgentTypeAgy, AgentModeAcceptEdits, AgentModeUnknown, false},
+		// agy 1.5 Auto is past the restrictive end, and never the target.
+		{AgentTypeAgy, AgentModeAuto, AgentModeUnknown, false},
 		// codex's default is its UNRESTRICTED mode: nothing to promote.
 		{"codex", AgentModeDefault, AgentModeUnknown, false},
 		{"codex", AgentModePlan, AgentModeUnknown, false},

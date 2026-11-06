@@ -525,7 +525,7 @@ As built, keys go through `pane send-keys` rather than `pane send-text` (§10).
 - `2`/`3` "always allow" options, unless an operator's rule names them explicitly (seeded
   never-auto)
 - `ctrl+k`, `alt+j`, `shift+k` (agy 1.5's subagent card and view: ctrl+k APPROVES an approval
-  card unseen; shift+k kills the subagent — §13.3)
+  card unseen; shift+k kills the subagent — §13.4)
 
 `domain.UnmatchedMenuReply` applies unchanged: a label mapping to no option must not be
 delivered, because agy has the same caret-commits-on-Enter shape Claude has.
@@ -879,6 +879,8 @@ and a digit committing on every numbered form, the final `Submit All` question i
   (it may only withhold).
 - **`AgyComposerVisible`** now also requires the row between the two rules to be a `>`
   caret line, so an unremoved tray row cannot pass for a composer.
+- **Errors**: `declined` split off `interrupted` (§13.4); the tray is dropped before the
+  transcript is read.
 - **Held** (`AgyHeldForm`, unclassifiable, escalated with no suggestion and no key):
   `subagent:blocked` (a `Blocked ·` tray row in the bottom 14 rows, or the card's
   `ctrl+k answer|approve · alt+j manage` row in the bottom 24) and `ui:subagent-view` (the
@@ -894,7 +896,18 @@ and a digit committing on every numbered form, the final `Submit All` question i
   `MenuKeystrokeFrom` gained a last, unique-or-refuse pass comparing with the marker
   removed from both sides (prefix for agy, suffix for Claude).
 
-### 13.3 Decided, not built
+### 13.3 Integration cases
+
+Every real-agy case (§12) had been **silently skipping** since herdr began reporting the
+trust prompt `blocked`: `herdr agent start` refuses with `agent_not_ready`, and the shared
+start helper skipped on it. It now tolerates that refusal for agy as it does for Claude, and
+`startAgyAgent` clears the prompt. On agy 1.5.2 / herdr 0.9.5 (model `gemini-3.8-flash-low`,
+the itest default now that `gemini-3.6-flash-low` is gone) detection, approval confirm,
+choice confirm, task hand-out and the mode toggle pass; the toggle observed and reached
+`default → acceptEdits → auto → plan`. The edit-approval case now runs in an untrusted
+`/var/tmp` folder (under `/tmp` agy raised no modal) and expects the `edit file` approval.
+
+### 13.4 Decided, not built
 
 - **Subagent cards are escalated, never answered.** On an approval card ctrl+k approves
   outright (verified: `sleep 30` ran with no form shown), and the card shows only the call.
@@ -902,8 +915,19 @@ and a digit committing on every numbered form, the final `Submit All` question i
   stays open until `esc back`. Answering them unattended would need a new deliverer
   (open, verify the form, press, close) and is left for a follow-up. **Never send** ctrl+k,
   alt+j or shift+k (kill) — added to §5's list.
-- **A decline that ends `Interrupted` stays an error.** agy really has stopped and asked for
-  direction, whoever chose "No"; reading it as idle would hand the next task to an agent
-  that has abandoned the current one.
+- **A decline that ends `Interrupted` stays an error, of its own kind.** agy really has
+  stopped and asked for direction, whoever chose "No"; reading it as idle would hand the next
+  task to an agent that has abandoned the current one. When `⎿ User declined the tool call`
+  sits directly above the Interrupted row the kind is `declined` (`AgyErrorDeclined`), not
+  `interrupted`, so a rule learned for a genuine Esc-interrupt ("continue") never fires right
+  after a "No" and steers the agent back into what was refused.
+- **Forms are not drawn with the tray.** Captured live with a background task running: the
+  shell approval and the question form show only the `· 1 task(s)` suffix in the bar. An
+  idle or error screen does show the tray, so `agyBody` (and with it `AgyErrorForm`) drops
+  it too — an interrupted turn with a task running had read as idle
+  (`error_agy_declined_tray`).
+- **The orchestrator still promotes agy `default → acceptEdits`, not `auto`.** agy's Auto runs
+  commands its reviewer deems safe without asking; that widening is left to the operator
+  (`AutonomousModeFor`).
 - `agy --mode auto` at launch did not take effect after the trust prompt in this session
   (the bar showed default); hap does not rely on the launch flag.

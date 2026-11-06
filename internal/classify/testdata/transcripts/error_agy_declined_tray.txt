@@ -1,0 +1,41 @@
+user@host:/var/tmp/hapagy5$ agy --model gemini-3.8-flash-low
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.2
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (Low)
+   ▄▀▀    ▀▀▄     /var/tmp/hapagy5
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Run 'sleep 300' as a background command without waiting. Then run the shell command 'ls -la' (foreground). Then use your question tool to ask me:
+  Tea or Coffee?
+
+● Ran 2 commands (sleep 300 · ls -la) (ctrl+o to expand)
+
+? Tea or Coffee?
+(skipped)
+
+  The background task sleep 300 has been launched, and ls -la executed successfully:
+
+    total 8
+    drwxr-xr-x  2 box  box  4096 Nov  7 00:51 .
+    drwxrwxrwt. 3 root root 4096 Nov  7 00:51 ..
+
+  Let me know what you would like to do next!
+
+────────────────────────────────────────────────────────────
+> Run the shell command: rm -f nothing.txt
+
+● Ran (rm -f nothing.txt) failed (ctrl+o to expand)
+
+Command
+  ⎿  User declined the tool call
+
+  ⎿  Interrupted · What should Antigravity CLI do instead?
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ● [00:51:14] sleep 300 running
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                            Gemini 3.8 Flash · low · 1 task(s) · /tasks
