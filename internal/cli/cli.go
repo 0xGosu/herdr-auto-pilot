@@ -1808,8 +1808,9 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		return nil
 	case "set":
 		if len(args) < 3 {
-			return fmt.Errorf("usage: config set <field> <value>, or config set <command field> --preset <%s> (see: config fields)",
-				strings.Join(frontend.LLMPresetNames, "|"))
+			return fmt.Errorf("usage: config set <field> <value>, config set <command field> --preset <%s|%s>, or config set llm --preset <%s|%s> (see: config fields)",
+				strings.Join(frontend.LLMPresetNames, "|"), frontend.LLMPresetAuto,
+				frontend.LLMPresetAuto, strings.Join(frontend.LLMSetupPresetNames, "|"))
 		}
 		// --preset is intercepted BEFORE the join below, which would otherwise
 		// flatten it into the value and store the literal string "--preset
@@ -1829,6 +1830,12 @@ func configCmd(ctx context.Context, app *frontend.App, out io.Writer, args []str
 		// "--preset" is not a command anyone can run.
 		if args[2] == "--preset" && frontend.HasLLMPresets(args[1]) {
 			return configSetPreset(ctx, app, out, args[1], args[3:])
+		}
+		// `config set llm --preset …` is first-run setup: every unset [llm]
+		// command at once. "llm" is a section, never a settable field, so
+		// the word cannot shadow a stored value.
+		if args[1] == "llm" && args[2] == "--preset" {
+			return configSetLLMPreset(ctx, app, out, args[3:])
 		}
 		value := strings.Join(args[2:], " ")
 		// A moved key still resolves; say so once, on STDERR, for the same

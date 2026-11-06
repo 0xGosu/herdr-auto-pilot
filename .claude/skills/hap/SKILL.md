@@ -691,7 +691,17 @@ switch off exactly the paraphrase matching the feature exists for.
 ### LLM commands: use the presets
 
 The four `[llm]` command fields ship disabled and their argv is far too long
-to retype. Bootstrap one:
+to retype. Bootstrap all of them at once:
+
+```bash
+hap config set llm --preset auto   # detects an installed, logged-in claude (preferred) or codex
+hap config set llm --preset claude # or: codex — fills every UNSET [llm] field, keeps configured ones
+```
+
+`auto` fails, naming each CLI's state (not installed / not logged in), when
+neither is ready. The TUI makes the same offer as a popup on launch when no
+`[llm]` command is configured. Or bootstrap one field at a time (`auto` works
+here too, except on the orchestrator command):
 
 ```bash
 hap config set llm.command --preset claude              # or: codex

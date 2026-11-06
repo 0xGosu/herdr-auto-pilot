@@ -66,6 +66,9 @@ answers an agent or turns on an automatic response.
 
    This needs no CLI symlink. To open it with a key instead, see
    [Open the pane with a hotkey](#open-the-pane-with-a-hotkey-recommended).
+   If `claude` or `codex` is installed and logged in, the pane may first offer
+   to set up [the optional LLM helper](#the-optional-llm-helper). Choose
+   `not now` to keep this first run to learned rules and escalations only.
 5. **Check the agent and the daemon.**
    - **Agent:** the pane's **Agents** tab lists your agent with its `STATUS`,
      under a hap-assigned name such as `silver-wombat` (see
@@ -1197,7 +1200,18 @@ through hap's own MCP server (`hap mcp` — tools `get_context` and
 `submit_decision`); its stdout is captured for audit only.
 
 The four `[llm]` command fields ship disabled, and their argv is far too long
-to retype. **Use a preset:**
+to retype. **The quickest way is to let hap detect your CLI.** When the TUI opens
+and no `[llm]` command is configured, hap checks whether `claude` or `codex` is
+installed and logged in (`claude auth status`, `codex login status`). If one is,
+the TUI offers to install that CLI's recipes into all four fields. It prefers
+`claude` when both are ready. Declining lasts for that TUI session only. The same
+setup from the command line:
+
+```sh
+hap config set llm --preset auto     # or: claude, codex — fills every UNSET [llm] field
+```
+
+Or set one field at a time with a preset (`auto` works here too):
 
 ```sh
 hap config set llm.command --preset claude                # or: codex

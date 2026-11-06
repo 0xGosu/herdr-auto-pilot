@@ -1034,6 +1034,8 @@ type Model struct {
 	// updateChecking is true while a background release check is in flight, so
 	// the 2s tick fires at most one at a time.
 	updateChecking bool
+	// llmSetup is the first-run LLM setup offer (llmsetup.go).
+	llmSetup llmSetupState
 	// lastUpdateCheck is when this TUI last LAUNCHED a check. The persisted
 	// cache is the normal backoff, but it is written by the check itself: a
 	// state dir that cannot be written (read-only, full) would leave the cache
@@ -2523,6 +2525,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// First-run LLM setup: probe once nothing is configured, and offer
+		// once the probe is in (either may arrive first).
+		var setupCmd tea.Cmd
+		if msg.err == nil {
+			setupCmd = m.maybeStartLLMDetect(msg.cfg)
+			m.maybeOfferLLMSetup()
+		}
+		return m, setupCmd
+	case llmDetectedMsg:
+		m.llmSetup.results = msg.results
+		m.maybeOfferLLMSetup()
 		return m, nil
 	case doubleRTimerMsg:
 		if msg.seq != m.doubleRSeq || !m.doubleRArmed {
@@ -2711,6 +2724,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// The operator is here: back to the live cadence. Stamped BEFORE
 		// handleKey so the model it returns carries it (value receiver).
 		m.lastActivity = time.Now()
+		// Any key ends the first-run LLM popup's window (llmsetup.go).
+		m.llmSetup.keyPressed = true
 		wasSlow := m.slowPoll
 		m.slowPoll = false
 		if wasSlow {
@@ -8776,6 +8791,7 @@ func Run(ctx context.Context, app *frontend.App) error {
 func run(ctx context.Context, app *frontend.App, extra ...tea.ProgramOption) error {
 	m := New(ctx, app)
 	m.bellOut = os.Stdout
+	m.llmSetup.enabled = true
 	opts := append([]tea.ProgramOption{
 		tea.WithAltScreen(), tea.WithContext(ctx), tea.WithoutSignalHandler(),
 	}, extra...)
