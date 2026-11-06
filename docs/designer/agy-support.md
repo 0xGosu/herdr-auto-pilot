@@ -1,12 +1,14 @@
 # Design: agy (Antigravity CLI) as a first-class agent type — phase 1
 
-**Date:** 2026-09-11 · **Status:** inventory + corpus + design; nothing implemented
+**Date:** 2026-09-11 · **Status:** phases 1–5 implemented
 **Captured against:** agy 1.2.1, herdr 0.8.2 (agy manifest `2026.06.24.1`), hap 0.9.16
-**Corpus:** `internal/classify/testdata/transcripts/*_agy_*.txt` (31 fixtures, golden-pinned)
+**Corpus:** `internal/classify/testdata/transcripts/*_agy_*.txt` (33 fixtures, golden-pinned)
 
-This is the plan phases 2–5 build on. Every claim below was observed live on scratch agy
-agents (model `gemini-3.6-flash-low`, cwd a temp dir, hap disabled on each) unless it is
-marked **unverified**.
+§1–8 are the phase-1 inventory and design that phases 2–5 were built from. They are kept as
+the record of what was observed, and they read as of that capture. §9–12 describe what was
+built and where it departs from §1–8; **where the two disagree, §9–12 and the code win.**
+Every claim in §1–8 was observed live on scratch agy agents (model `gemini-3.6-flash-low`,
+cwd a temp dir, hap disabled on each) unless it is marked **unverified**.
 
 ---
 
@@ -18,15 +20,14 @@ marked **unverified**.
    herdr ever matched was `spinner_working`. So, as with Codex's Plan approval and Claude's
    remote-environment picker, **hap must detect every agy form structurally, while it is
    parked at idle/done.** Section 3 explains why herdr's rule misses.
-2. **What hap does with agy today:** every agy screen classifies `idle` (the new golden rows;
+2. **What hap did with agy at capture time (before phase 2):** every agy screen classified `idle` (the golden rows;
    36 live audit rows from today agree — `type=idle` for approvals and MCQs alike). None of
    the claude/codex structural detectors run, and `DefaultRules()` has no agy error rule,
    so agy can never reach `SituationError` either.
-   - **Hazard, unverified:** with a task source flagged `enable_auto_send_task_when_idle`,
+   - **Hazard, unverified (closed by phases 2–3, §8):** with a task source flagged `enable_auto_send_task_when_idle`,
      the idle poll would treat an agy approval as a parked agent and hand it a task.
      `agent prompt` is refused (`agent_blocked`) only when herdr says blocked, and herdr
-     never does. Structural detection in phase 2 is therefore a **safety** fix as well as a
-     feature.
+     never does. Structural detection was therefore a **safety** fix as well as a feature.
 3. **A digit COMMITS.** At a numbered agy menu, a single digit sent as a key (`pane
    send-text`) answers immediately. No Enter is needed. Verified on the shell approval
    (`1`, `4`), the file-access approval (`3`), the file-create approval (`1`), and both the
@@ -110,10 +111,12 @@ marked **unverified**.
 | `error_agy_offline` | idle | 91 | error `eligibility check` | idle |
 | `error_agy_model_warning` | idle | 91 | idle; a warning, not an error | idle |
 | `working_agy_spinner` | working | 92 | working (herdr's `spinner_working` rule) | unclassifiable |
+| `idle_agy_background_task` | done | — | idle; the `· N task(s) · /tasks` status-bar strip is chrome (§11) | — |
+| `idle_agy_edit_approval` | done | — | unclassifiable: the file-edit approval, `Accept this file edit?` (§4.5) | — |
 
 `TestGoldenTranscripts` gives every agy fixture its captured status and agent type `agy`
-(any `_agy_` name). Phase 2 flips the "hap today" column, and the golden diff is its
-before/after.
+(any `_agy_` name). The "hap today" column is the phase-1 baseline; phase 2 flipped it, and
+`internal/classify/agy_test.go` pins the current expectation per fixture.
 
 ---
 
@@ -187,7 +190,7 @@ root ➜ /tmp/x $ agy --model gemini-3.6-flash-low      ← launching shell line
 - **Other right-aligned chrome:** `1 artifact · /artifact to review` above the composer,
   and a transient feedback survey (§4.12).
 
-### Salient rules (phase 2: `StripAgyChrome`, the analogue of `StripClaudeChrome`)
+### Salient rules (`domain.StripAgyChrome`, the analogue of `StripClaudeChrome`)
 
 These are pane-tail salients, gated on agent type `agy`. Every filter must be ANCHORED and
 positively identified, following the `StripClaudeChrome` rules in `CLAUDE.md`: an
@@ -333,8 +336,13 @@ This is agy's "file-edit approval".
   `Reason: outside workspace`, then `Allow creation of this file?` with options
   `1. Yes, allow creation` / `2. Yes, and always allow non-workspace access` /
   `3. No, deny creation`, and hint `↑/↓ Navigate · tab Amend · f full diff`.
-- **Classify:** approval, verb `create`. Edit is presumably `Allow edit of this file?`
-  (**unverified**), so match `Allow (\w+) of this file\?` and take the verb from it.
+- **Classify:** approval, verb `create`. The verb comes from the prompt's noun
+  (`Allow creation of this file?`, `agyFileNounVerbs`).
+- **File edit is a different screen:** `Accept this file edit?` with `1. Yes, accept this
+  change` / `2. No, reject this change` and hint `↑/↓ Navigate · tab Amend · f full diff ·
+  ctrl+r Review` (`idle_agy_edit_approval`, captured from a real stall). No parser knows it,
+  and it classifies **unclassifiable** structurally because the composer is not on screen. It
+  escalates, and hap answers nothing. It is not reproducible on demand.
 - **Salient:** `permission:create | reason:… | options:…`. The diff body stays in the LLM
   excerpt and out of the salient, or every file mints its own rule.
 - **Answer:** the digit (`1` allowed it, and the tool ran).
@@ -376,7 +384,7 @@ Question 1/1: Which fruit do you prefer?
 - **Classify:** choice, parked.
   - **Anchors:** `Question <i>/<N>: <text>`, then numbered options, then a hint line starting
     `↑/↓ Navigate` that contains `enter Select`.
-  - **New `MCQKind`:** `agy_questions`, alongside `claude_tabs` and `codex_questions`.
+  - **No `MCQKind`** (phase 1 proposed `agy_questions`; §9–10 explain why it was dropped).
   - **The form shows ONE question at a time.** Questions not yet shown are listed only as
     `? <text>` headers above it, without their options, so options for question 2 are
     unknowable until question 1 is answered.
@@ -385,8 +393,8 @@ Question 1/1: Which fruit do you prefer?
   - A digit commits AND advances: `3` moved 1/2 → 2/2.
   - The last digit submits. There is no Submit/review tab. `1` → `Thank you! You selected
     Blue … and Cat`.
-  - So a series `3 1` is two keypresses, each re-verified against a fresh read of the next
-    question, the way `codexSeries` does.
+  - So each question is its own keypress, answered against a fresh read of the next one (as
+    built, each question is a separate situation; §10).
   - `Write-in...` expects free text (**unverified**); refuse to auto-answer it.
   - `← Back` exists, so a stale second question can be walked back. `esc Skip` skips a
     question and is never sent.
@@ -448,11 +456,12 @@ Question 1/1: Which fruit do you prefer?
     toggle and `[Previous]  [Done]`.
   - Hint: `↑/↓ Navigate · enter Toggle`.
   - The keys that reach `[Done]` are **unverified**: it needs a completed sign-in.
-- **Classify:** a new `idle`-parked structured situation, `setup`.
+- **Classify (as designed):** a new `idle`-parked structured situation, `setup`. As built it is
+  **unclassifiable** instead (§9).
   - Escalate with a fixed, plain summary: "agy needs sign-in" / "agy needs the operator to
     accept its terms".
-  - **Never** hand these to the generate-task LLM. Today they reach it and come back with
-    suggestions like "Complete Google authentication…" and "select Done".
+  - **Never** hand these to the generate-task LLM. Before phase 2 they reached it and came
+    back with suggestions like "Complete Google authentication…" and "select Done".
   - **Never** deliver keystrokes: sign-in needs a browser, and `enter Toggle` on the terms
     screen FLIPS the data-sharing consent.
 - **Salients:**
@@ -468,7 +477,7 @@ Question 1/1: Which fruit do you prefer?
   tabs), and the slash popup (`> /model  Set a model…` with `↑/↓ Navigate · enter Select ·
   tab Complete`).
 - **They are there only because a human opened them.**
-- **Classify:** idle, composer NOT ready. Their footers never carry `? for shortcuts`, and
+- **Classify (as designed; built as unclassifiable, §9):** idle, composer NOT ready. Their footers never carry `? for shortcuts`, and
   most end in a `Keyboard: …` line. hap sends nothing, escalates nothing, and hands out
   nothing.
   - **Anchors:** `Switch Model`, `Set Effort`, `Permission Config Editor`, `Settings` +
@@ -502,6 +511,8 @@ Question 1/1: Which fruit do you prefer?
 | Trust folder (§4.9) | `up`/`down` to target, re-read, `enter` | `pane send-keys` | ✔ caret moves; `enter` on Yes |
 | Hand-out / resolve text (§4.1) | the text, then Enter | `agent prompt` (paste-aware); single-line may use `send-text` + `enter` like the other kinds | ✔ multi-line = one message |
 | Mode cycle (§6) | CSI Z | `pane send-text "\x1b[Z"` | ✔ (herdr 0.8.2 `send-keys shift+tab` also works) |
+
+As built, keys go through `pane send-keys` rather than `pane send-text` (§10).
 
 **Never sent:**
 
@@ -542,6 +553,10 @@ delivered, because agy has the same caret-commits-on-Enter shape Claude has.
 
 ## 7. Where agy plugs in (inventory of per-type touchpoints)
 
+This is the phase-1 plan, and every row has since landed (§9–12). Names that differ in the
+code: errors live in `agy.go` (there is no `agyerror.go`), there is no `agySeries` or
+`MCQAgyQuestions`, and the `mcpserver` kind needed no mirror.
+
 hap has **no agent-type enum**: herdr's `agent` string is stored verbatim
 (`internal/herdr/cli.go` `AgentType: a.Agent`), and `domain.IsPlaceholderAgent` drops only
 `""`/`undefined`/`unknown`. So agy is already monitored, subscribed and audited. It only gets
@@ -552,16 +567,16 @@ the agent-agnostic path. `internal/llm/normalize.go` already has `agy` argv repa
 |---|---|---|---|
 | 2 | `domain` | `claudechrome.go` `StripClaudeChrome`, `signature.go` `SalientContent` | add `StripAgyChrome` (§4 rules), gate on `agy` |
 | 2 | `domain` | `clauderemoteenv.go` / `codex.go` form extractors | new `agy.go`: approval, MCQ, trust, review, setup, and operator-UI detectors |
-| 2 | `domain` | `codexerror.go`, `claudeerror.go` | new `agyerror.go`: interrupted + eligibility |
-| 2 | `domain` | `mcqform.go` `ParseMCQForm` / `ExtractAgentMCQForm` / `AggregateAgentMCQFrames`, `codex.go` `MCQKind` | `MCQAgyQuestions` |
+| 2 | `domain` | `codexerror.go`, `claudeerror.go` | `AgyErrorForm` (interrupted + eligibility) |
+| 2 | `domain` | `mcqform.go` `ParseMCQForm` / `ExtractAgentMCQForm` / `AggregateAgentMCQFrames`, `codex.go` `MCQKind` | none: agy sets no `MCQKind` (§9–10) |
 | 2 | `domain` | `menu.go` `ParseNumberedOptions`, `MenuSituation` | column-0 continuation joining; the agy approval counts as a menu |
 | 2 | `classify` | `DefaultRules` scoped error rules; the codex/claude pre-strip and structural flags (`classify.go` ~130–307); approvals allowed while parked | agy error rule + parked-form flags |
 | 2 | `domain/testdata` | `irreversible_corpus.txt` | add any agy-specific destructive phrasings |
 | 3 | `herdr` | `cli.go` `sendBehavior` (agy gets NO retry Enters today); `paneShowsStandingForm` | decide retry-Enter; add the agy standing forms |
-| 3 | `deliver` | `deliver.go` form dispatch; `claudetabs.go` `tabSeries`; `codex.go` `codexSeries` | `agySeries` (digit, re-read, next) |
+| 3 | `deliver` / `mcqdeliver` | `deliver.go` form dispatch | `mcqdeliver.Agy` (one key, re-read), no series |
 | 3 | `domain` | `agentmode.go` `ComposerReadyForMode` | `AgyComposerReady` (§4.1) |
 | 3 | `daemon` | `sweep.go` MCQ dispatch; `daemon.go` LLM excerpt strip (`StripCodexComposer` site) + MCQ kind prompt text; `autoaccept.go` | agy branches |
-| 3 | `mcpserver` | `mcpserver.go` compares the literal `"codex_questions"` | mirror the new kind |
+| 3 | `mcpserver` | `mcpserver.go` compares the literal `"codex_questions"` | none (no agy kind) |
 | 4 | `domain` | `agentmode.go` `AgentModesFor`, `ModePressCap`, `AgentModeFromPane` | agy modes (§6) |
 | 4 | `cli` / `tui` / docs | `cli.go` `modeReadError` text "(claude and codex do)", help mode list, TUI "Claude / Codex / others" label, README, `CLAUDE.md`, hap skill | text |
 | 4 | `fakeherdr` | carries any agent label already | fixtures for agy tests |
@@ -580,8 +595,9 @@ The following do **not** need an agy branch:
 ## 8. Open questions / unverified
 
 - The keys that reach the terms screen's `[Done]`: needs a completed sign-in (§4.10).
-- The wording of the file-EDIT approval (`Allow edit of this file?` presumed), and whether
-  `Tool Permission = strict` prompts for in-workspace edits (§4.5).
+- What raises the file-EDIT approval (`Accept this file edit?`, §4.5): in-workspace and
+  `/tmp` edits were applied with no modal, and whether `Tool Permission = strict` prompts
+  for in-workspace edits is untested.
 - Quota / rate-limit error text (§4.8).
 - Whether agy queues typed input while working (§4.2).
 - `Write-in...` free-text answers (§4.7).
@@ -591,9 +607,6 @@ The following do **not** need an agy branch:
   choice, and every hand-out branch requires the IDLE situation. A generated-task `--send` is
   not covered, because `refuseIfAgentBusy` reads herdr's status only (which reads idle under an
   agy modal). Phase 3's composer-ready proof closes that path.
-- Resolved: `TestRealShiftTabKeyNameIsStillBroken` is now gated on the running server's
-  version and skips from herdr 0.8.2 (§1.6). The `CLAUDE.md` gotcha is updated. The CSI Z
-  path stays for older herdr.
 
 ---
 
@@ -636,25 +649,19 @@ What shipped, and where it deliberately departs from §4:
     `(ctrl+o to expand)` suffix, and the composer + status bar. A capture that is nothing but
     chrome gets one fixed salient instead of an over-masked empty one, which would escalate
     before the task source is ever consulted.
-- **Replies are withheld** (`domain.AgyReplyWithheld`, `deliver.ErrReplyWithheld`,
-  `domain.ReasonReplyWithheld`).
-  - **Why:** every send path types the digit and then Enter, and agy commits on the digit
-    alone.
-  - **Where it is refused:** all four send paths (`daemon.act` ahead of the action-review
-    dispatch, the action-review outcome, the LLM promotion, and `deliver.Deliver`), for agy
-    approvals and choices.
-  - **Auto-accept:** a `reply_withheld` escalation is excluded outright
-    (`autoAcceptExcludedReasons`). An agy form escalated for any other reason is claimed, and
-    the refusal is read as `errOutboundRefused`, so it never burns the attempt budget or
-    dismisses the row (`TestAutoAcceptLeavesAWithheldAgyReplyPending`).
-  - **What is not withheld:** idle hand-outs and error replies are free text into the
-    composer and still go.
-  - Phase 3 lifts the gate form by form as the agy deliverer lands.
-- **No `MCQKind` / `AnswerCount` for agy yet.** Either routes a form into the multi-question
-  sweep and the Claude/Codex deliverers, which press Right/Left into the pane before they
-  refuse. `domain.MCQAgyQuestions` is declared for phase 3 but never set, and
-  `domain.ParseMCQForm` still answers false for agy. The agy question form is matched at the
-  choice position directly.
+- **Replies were withheld, until phase 3.** Phase 2 refused every reply to an agy approval or
+  choice (`domain.AgyReplyWithheld`, since removed) on all four send paths, because those paths
+  type the digit and then Enter while agy commits on the digit alone. Phase 3 lifted it with
+  the keystroke deliverer (§10). What remains is `deliver.ErrReplyWithheld` /
+  `domain.ReasonReplyWithheld` for a form hap cannot answer (the Write-in row and a rewritten
+  action-review reply). Auto-accept excludes `reply_withheld` rows (`autoAcceptExcludedReasons`),
+  and a refusal is read as `errOutboundRefused`, so it never burns the attempt budget or
+  dismisses the row. Idle hand-outs and error replies are free text into the composer and
+  were never withheld.
+- **No `MCQKind` / `AnswerCount` for agy.** Either routes a form into the multi-question sweep
+  and the Claude/Codex deliverers, which press Right/Left into the pane before they refuse.
+  `domain.ParseMCQForm` answers false for agy, and the agy question form is matched at the
+  choice position directly (`MCQAgyQuestions` was declared in phase 2 and removed in phase 3).
 - **Corpus.** `irreversible_corpus.txt` gained agy-rendered lines (the command between agy's
   anchors, and an "always allow" option carrying a force-push prefix). The existing seed
   patterns already match them, because agy prints commands verbatim.
@@ -675,7 +682,7 @@ What shipped, and where it deliberately departs from §4:
     question, the next review item) is success. One still standing unchanged is an error, and
     the key is never pressed again.
   - The trust prompt walks the caret with `up`/`down`, verifying each move before it presses
-    Enter.
+    Enter. Only the operator reaches this path; hap never answers a trust prompt (§4.9).
   - **Stale guard:** when the decision's excerpt holds an agy form, the live form must be that
     same form (`AgyForm.SameAs`: the same command, the same `Question i/N` and text, the same
     review items). The trust prompt's caret is not part of the identity.
@@ -701,10 +708,9 @@ What shipped, and where it deliberately departs from §4:
   launched before the daemon is one example; the startup resubscribe burst replays it. Its
   parse and classification were checked live with this build (approval, `trust this folder`,
   both rows). Its keys are covered by `mcqdeliver` tests on the recorded screen.
-- **Questions stay one situation each.** No `MCQKind`, no answer series: `MCQAgyQuestions` was
-  removed. Each question classifies, decides and is answered on its own. §4.7's series protocol
-  is unnecessary because agy renders later questions' options only after the earlier ones are
-  answered.
+- **Questions stay one situation each.** No answer series: each question classifies, decides and
+  is answered on its own. §4.7's series protocol is unnecessary because agy renders later
+  questions' options only after the earlier ones are answered.
 - **Re-capture after every answer.** agy draws a form's next question in place, and herdr
   reports no status change for it. Without a fresh capture the daemon never looked again, and
   the form stalled after question 1 with nothing escalated (observed live).
@@ -737,10 +743,11 @@ What shipped, and where it deliberately departs from §4:
   `send-text` plus `enter`. agy gets no retry Enters (`sendBehavior`), so `paneShowsStandingForm`
   needs no agy forms.
 - **Not done here:**
-  - A never-auto seed for the trust prompt (§4.9). The seed list is scoped to major-risk remote
-    operations, and Claude's own trust prompt is not seeded. The trust prompt is answered when a
-    rule or the operator says so, like any approval.
+  - A never-auto seed for the trust prompt (§4.9): `domain.Decide` already vetoes it as
+    `folder_trust`, so no rule can answer it.
   - agy permission modes (phase 4, §11).
+
+---
 
 ## 11. Phase 4 as built (modes, session ids, the rest of the surface)
 
@@ -784,6 +791,8 @@ What shipped, and where it deliberately departs from §4:
 - **fakeherdr.** It already carries any agent label verbatim (`AddAgentPane(pane, ws, "agy")`),
   so only its comment changed.
 
+---
+
 ## 12. Phase 5 as built (real-agy integration cases)
 
 `test/integration/agy_test.go`, gated on `HAP_ITEST_AGY=1`. It uses the cheapest model,
@@ -798,8 +807,9 @@ composer.
 | `TestRealAgyChoiceConfirm` | a live question form commits `Banana` and closes | one turn |
 | `TestRealAgyTaskHandout` | the operator hand-out (`hap task send`) is refused over a draft with the list untouched, then delivered at an empty composer and answered | one turn |
 | `TestRealAgyModeToggle` | the cycle is exactly `default → acceptEdits → plan`, every mode is reached by `SetAgentMode`, and a draft refuses the set with the mode unchanged | none |
+| `TestRealAgyEditApprovalIsNotIdle` | the file-edit approval (§4.5) is not read as idle; it skips, logging the pane, when agy raises no modal | one turn |
 
-All five pass live (agy 1.2.1, herdr 0.8.2). Found and fixed on the way:
+The first five passed live (agy 1.2.1, herdr 0.8.2). Found and fixed on the way:
 
 - **The suite opened its agents beside the operator.** `newScratchPane` ran `tab create` with
   no `--workspace`, which lands in whatever workspace the UI has focused. It now creates a
