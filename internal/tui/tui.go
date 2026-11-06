@@ -331,6 +331,11 @@ type prompt struct {
 	// starts with the caret at the end — see openPrompt, which is how every
 	// prompt must be installed so this can never be left at 0 by accident.
 	cursor int
+	// armedAt, when set, is the moment the prompt starts taking keys; any
+	// key but ctrl+c before it is swallowed. Only a prompt that opens on its
+	// own (the first-run LLM offer) sets it — the operator cannot have aimed
+	// a keystroke at a prompt they did not see appear.
+	armedAt time.Time
 }
 
 // openPrompt installs p as the active prompt, parking the caret at the end of
@@ -2940,6 +2945,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.acceptConfirmation(confirm, alt.onConfirm, alt.revalidate)
 			}
 		}
+		return m, nil
+	}
+
+	// A prompt that opened UNASKED swallows every key but ctrl+c until it is
+	// armed, so a keystroke meant for the screen underneath cannot answer it
+	// (see llmsetup.go). Ahead of both prompt branches, picker and text.
+	if m.prompt != nil && msg.Type != tea.KeyCtrlC && time.Now().Before(m.prompt.armedAt) {
 		return m, nil
 	}
 

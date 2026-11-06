@@ -32,8 +32,9 @@ import (
 // likely to be a value the operator expected to be stored than something safe
 // to ignore.
 func configSetPreset(ctx context.Context, app *frontend.App, out io.Writer, key string, args []string) error {
-	usage := fmt.Sprintf("usage: config set <field> --preset <%s> (fields with presets: %s)",
-		strings.Join(frontend.LLMPresetNames, "|"), strings.Join(frontend.LLMPresetKeys, ", "))
+	usage := fmt.Sprintf("usage: config set <field> --preset <%s|%s> (fields with presets: %s; %s only for: %s)",
+		strings.Join(frontend.LLMPresetNames, "|"), frontend.LLMPresetAuto, strings.Join(frontend.LLMPresetKeys, ", "),
+		frontend.LLMPresetAuto, strings.Join(frontend.LLMSetupKeys, ", "))
 	if len(args) != 1 {
 		return fmt.Errorf("%s", usage)
 	}

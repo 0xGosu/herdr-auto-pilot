@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -25,6 +26,9 @@ var (
 // first-run offer enabled, as run() does, and a fake probe that counts calls.
 func setupModel(t *testing.T, results ...llm.CLIReadiness) (Model, *frontend.App, *atomic.Int32) {
 	t.Helper()
+	orig := llmSetupArmDelay
+	llmSetupArmDelay = 0
+	t.Cleanup(func() { llmSetupArmDelay = orig })
 	m, app := presetModel(t)
 	m.tab = tabAgents
 	m.llmSetup.enabled = true
@@ -268,5 +272,37 @@ func TestLLMSetupOffForPlainModels(t *testing.T) {
 	}
 	if _, cmd := refreshOnce(t, m); cmd != nil {
 		t.Error("a plain Model's refresh started a probe")
+	}
+}
+
+// TestLLMSetupSwallowsKeysUntilArmed: a key pressed just after the offer
+// draws was aimed at the screen it covered — it must not answer the offer.
+func TestLLMSetupSwallowsKeysUntilArmed(t *testing.T) {
+	m, app, _ := setupModel(t, claudeReady)
+	llmSetupArmDelay = time.Hour
+	m, cmd := refreshOnce(t, m)
+	m = runProbeCmd(t, m, cmd)
+	if m.prompt == nil {
+		t.Fatal("no offer")
+	}
+	for _, k := range []tea.KeyMsg{{Type: tea.KeyEnter}, {Type: tea.KeyDown}, {Type: tea.KeyEsc}} {
+		upd, c := m.Update(k)
+		m = upd.(Model)
+		if c != nil || m.prompt == nil || m.prompt.optIdx != 0 {
+			t.Fatalf("%v reached the unarmed offer (prompt %v)", k, m.prompt)
+		}
+	}
+	if !frontend.LLMUnconfigured(loadCfg(t, app)) {
+		t.Fatal("an unarmed enter wrote config")
+	}
+	// Once armed, enter answers it.
+	m.prompt.armedAt = time.Time{}
+	if _, c := m.Update(tea.KeyMsg{Type: tea.KeyEnter}); c == nil {
+		t.Fatal("armed enter ran nothing")
+	} else if res := c().(actionResultMsg); res.err != nil {
+		t.Fatal(res.err)
+	}
+	if frontend.LLMUnconfigured(loadCfg(t, app)) {
+		t.Error("armed enter did not install")
 	}
 }

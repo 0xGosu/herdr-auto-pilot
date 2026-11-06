@@ -2,6 +2,7 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,7 +41,9 @@ func stubProbe(t *testing.T, answers map[string]probeAnswer) {
 		}
 		a, ok := answers[name]
 		if !ok {
-			t.Fatalf("unexpected probe of %s", name)
+			// Errorf, not Fatalf: this runs on DetectCLIs' probe goroutine.
+			t.Errorf("unexpected probe of %s", name)
+			return nil, -1, errors.New("unexpected probe")
 		}
 		if a.err == context.DeadlineExceeded {
 			<-ctx.Done()

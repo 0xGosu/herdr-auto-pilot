@@ -70,6 +70,9 @@ var runProbe = func(ctx context.Context, env []string, dir, path string, args ..
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = env
 	cmd.Dir = dir
+	// After the timeout kills the CLI, don't wait on lingering grandchildren
+	// holding stdout open — the same bound every LLM run takes.
+	cmd.WaitDelay = 2 * time.Second
 	out, err := cmd.Output()
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -121,18 +124,12 @@ func PreferredCLI(rs []CLIReadiness) (string, bool) {
 
 func detectOne(ctx context.Context, env []string, dir, name string) CLIReadiness {
 	r := CLIReadiness{Name: name}
-	path, err := lookPathIn(env, name)
+	// The same resolution a real run takes (child PATH first, exec's own
+	// lookup for an entry lookPathIn declines to resolve).
+	path, err := preflight(name, env)
 	if err != nil {
 		r.Reason = ReasonNotInstalled
 		return r
-	}
-	if path == "" {
-		// A relative PATH entry lookPathIn declines to resolve; fall back to
-		// exec's own lookup rather than report a present CLI as missing.
-		if path, err = exec.LookPath(name); err != nil {
-			r.Reason = ReasonNotInstalled
-			return r
-		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, detectTimeout)
 	defer cancel()

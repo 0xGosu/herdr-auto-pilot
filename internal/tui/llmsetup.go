@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -35,10 +36,17 @@ import (
 //     pressed a key. The popup arrives asynchronously, and an enter meant
 //     for a Config row landing on it would install recipes — one of which
 //     (learn) runs with edit permission — unasked. A busy operator gets a
-//     one-line hint instead.
+//     one-line hint instead. And because a key pressed just AFTER it draws
+//     was aimed at the screen it covered, the popup swallows every key but
+//     ctrl+c for llmSetupArmDelay (prompt.armedAt).
 //   - The install refuses to overwrite: the apply re-checks each key under
 //     the config lock, so a key configured between the offer and the answer
 //     is kept.
+
+// llmSetupArmDelay is how long the offer ignores keys after it opens —
+// longer than a keystroke already in flight, shorter than reading the label.
+// A variable so tests can arm it at once.
+var llmSetupArmDelay = time.Second
 
 // llmSetupDecline is the picker's "no" option.
 const llmSetupDecline = "not now"
@@ -92,7 +100,9 @@ func (m *Model) maybeStartLLMDetect(cfg config.Config) tea.Cmd {
 // land first.
 func (m *Model) maybeOfferLLMSetup() {
 	s := &m.llmSetup
-	if s.offered || s.results == nil || !m.initialized || !frontend.LLMUnconfigured(m.data.cfg) {
+	// m.data.err: a failed refresh carries a zero config, which would read
+	// as "nothing configured" — the probe landing then must not offer.
+	if s.offered || s.results == nil || !m.initialized || m.data.err != nil || !frontend.LLMUnconfigured(m.data.cfg) {
 		return
 	}
 	var ready []string
@@ -125,19 +135,30 @@ func (m *Model) maybeOfferLLMSetup() {
 // openLLMSetupPrompt opens the single-choice picker. ready is in preference
 // order, so the highlight starts on the preferred CLI.
 func (m *Model) openLLMSetupPrompt(ready []string) {
-	app, ctx := m.app, m.ctx
-	m.beginAction()
+	app, ctx, wg := m.app, m.ctx, m.inflight
+	// Not beginAction: this opens unasked, so it must not wipe a durable
+	// status note (the TUI-limit notice, an action error) the operator has
+	// not read yet.
 	m.openPrompt(&prompt{
 		// Short enough for an 80-column pane: the picker truncates its label.
 		label:   "No LLM configured — install the default recipes for a ready CLI? (learning edits AUTO.md)",
 		options: append(ready, llmSetupDecline),
+		armedAt: time.Now().Add(llmSetupArmDelay),
 		onSubmit: func(choice string) tea.Cmd {
 			if choice == llmSetupDecline {
 				return func() tea.Msg {
 					return actionResultMsg{message: "LLM left unconfigured — `hap config set llm --preset auto` sets it up later"}
 				}
 			}
+			// Joins m.inflight like every mutation (see do), so quitting
+			// right after enter does not exit mid-write.
+			if wg != nil {
+				wg.Add(1)
+			}
 			return func() tea.Msg {
+				if wg != nil {
+					defer wg.Done()
+				}
 				return applyLLMSetup(ctx, app, choice)
 			}
 		},
