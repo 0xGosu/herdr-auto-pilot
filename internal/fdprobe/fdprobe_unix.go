@@ -17,23 +17,23 @@ func read() Probe {
 	// /proc/self/fd exists on Linux and not on macOS. Absence is "unavailable",
 	// which is why OpenKnown is a separate field: a zero Open on darwin must
 	// never read as "no descriptors are open".
-	if names, err := readDirNames("/proc/self/fd"); err == nil {
+	if n, err := countDirEntries("/proc/self/fd"); err == nil {
 		// One of the entries is the handle the read itself opened; it is closed
 		// by the time a caller sees this, so discount it rather than report a
 		// count that is always one high.
-		if names > 0 {
-			names--
+		if n > 0 {
+			n--
 		}
-		p.Open, p.OpenKnown = names, true
+		p.Open, p.OpenKnown = n, true
 	}
 	p.Exhausted = exhausted()
 	return p
 }
 
-// readDirNames counts the entries in dir. A partial read is still a useful
+// countDirEntries counts the entries in dir. A partial read is still a useful
 // order-of-magnitude answer, so a mid-read error returns what was counted
 // rather than nothing.
-func readDirNames(dir string) (int, error) {
+func countDirEntries(dir string) (int, error) {
 	f, err := os.Open(dir)
 	if err != nil {
 		return 0, err
