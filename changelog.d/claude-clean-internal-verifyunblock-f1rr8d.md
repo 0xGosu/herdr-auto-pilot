@@ -1,0 +1,1 @@
+- Corrected a stale limitation note in the post-action self-check docs (no behaviour change)
