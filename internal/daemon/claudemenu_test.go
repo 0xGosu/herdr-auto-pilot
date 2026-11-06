@@ -269,6 +269,20 @@ func replacedDialogPages(t *testing.T) (one, two string) {
 // assertMovedDialogHandled checks the #571 outcome at a daemon call site: nothing
 // reached the pane, the decided row was retired as ignored (not a delivery
 // failure), and page 2 was captured on its own and escalated.
+// claimStartupEpisode keeps the daemon's startup reconcile off pane, so the
+// test's own push is the ONE capture that drives it. These tests script the
+// pane's reads in order (page 1, then page 2), and under load the startup
+// reconcile can list the agent the test is about to push and drive a second,
+// duplicate capture whose read consumes a scripted page — the staleness
+// re-read then sees page 2 and escalates as llm_no_submit instead (a real CI
+// flake). Marking the episode handled is exactly what that reconcile checks;
+// only a "working" transition clears it.
+func claimStartupEpisode(h *harness, pane string) {
+	h.daemon.mu.Lock()
+	h.daemon.episodeHandled[pane] = true
+	h.daemon.mu.Unlock()
+}
+
 func assertMovedDialogHandled(t *testing.T, h *harness, agentID string) {
 	t.Helper()
 	waitFor(t, 10*time.Second, func() bool {
@@ -304,6 +318,7 @@ func TestRuleAnswerIsNotPressedIntoAReplacedClaudeDialog(t *testing.T) {
 	h := newVerifyUnblockHarness(t, "")
 	one, two := replacedDialogPages(t)
 	h.seedAutonomous(one, domain.SituationApproval, "1")
+	claimStartupEpisode(h, "agent-mv")
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-mv", PaneID: "agent-mv", AgentType: "claude", Status: "blocked"}})
 	// The capture decides on page 1; by the time the digit would go out, page 1
 	// was answered by hand and page 2 stands in its place.
@@ -320,6 +335,7 @@ func TestLLMAnswerIsNotPressedIntoAReplacedClaudeDialog(t *testing.T) {
 	h.daemon.verifyUnblockDelay = 20 * time.Millisecond
 	one, two := replacedDialogPages(t)
 	h.herdr.setPane(one)
+	claimStartupEpisode(h, "agent-mvl")
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-mvl", PaneID: "agent-mvl", AgentType: "claude", Status: "blocked"}})
 	h.llm.configured = true
 	var answered atomic.Bool
@@ -351,6 +367,7 @@ func TestActionReviewedAnswerIsNotPressedIntoAReplacedClaudeDialog(t *testing.T)
 	one, two := replacedDialogPages(t)
 	h.seedAutonomous(one, domain.SituationApproval, "y")
 	h.herdr.setPane(one)
+	claimStartupEpisode(h, "agent-mvr")
 	h.herdr.setAgents([]domain.AgentTransition{{AgentID: "agent-mvr", PaneID: "agent-mvr", AgentType: "claude", Status: "blocked"}})
 	h.llm.configured = true
 	var calls atomic.Int32
