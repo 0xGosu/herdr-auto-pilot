@@ -147,9 +147,6 @@ func agyStatusBar(line string) (segment string, ok bool) {
 	return "", false
 }
 
-// agyBody returns the capture's lines with trailing blank lines and agy's
-// status bar removed — what is left ends with the live form's key-hint line
-// when a form stands.
 // agyDropBackgroundStrip removes agy's background-task rows from directly above
 // the status bar, so the composer sits where the footer-anchored checks expect
 // it again.
@@ -285,6 +282,9 @@ func AgyComposerVisible(pane string) bool {
 		agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-4]))
 }
 
+// agyBody returns the capture's lines with trailing blank lines, the running-
+// work tray or strip (agyDropBackgroundStrip) and agy's status bar removed —
+// what is left ends with the live form's key-hint line when a form stands.
 func agyBody(pane string) []string {
 	lines := strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")
 	// The tray of running work sits between the composer and the bar on an

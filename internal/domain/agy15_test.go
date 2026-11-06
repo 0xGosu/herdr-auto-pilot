@@ -116,6 +116,33 @@ func TestAgySingleBlockedTrayRowIsNotAComposer(t *testing.T) {
 	}
 }
 
+// A hand-out QUEUED in the composer while the tray is up must read back as
+// present: read as AgyDraftNone, agyHandoutQueued reports it delivered, and the
+// queued copy fires later on top of a re-handed item.
+func TestAgyQueuedDraftIsReadThroughTheTray(t *testing.T) {
+	rule := strings.Repeat("─", 60)
+	sent := "run the integration suite and report"
+	pane := strings.Join([]string{
+		"  done",
+		rule,
+		"> " + sent,
+		rule,
+		"  ● Agent(self: Sleep Worker)  Generating · 28s",
+		"  ● [00:29:25] sleep 90 running",
+		rule,
+		"                                        Gemini 3.8 Flash · low · 1 subagent(s) · 1 task(s) · /tasks",
+	}, "\n")
+	draft, verdict := AgyComposerDraft(pane, AgyDraftScanLimit(sent))
+	if verdict != AgyDraftPresent || !AgyDraftMatches(draft, sent) {
+		t.Errorf("AgyComposerDraft = %q/%v, want the queued hand-out present", draft, verdict)
+	}
+	// Control: the same tray under an EMPTY composer is no draft.
+	empty := strings.Replace(pane, "> "+sent, ">", 1)
+	if _, verdict := AgyComposerDraft(empty, AgyDraftScanLimit(sent)); verdict != AgyDraftNone {
+		t.Errorf("empty composer over a tray: verdict = %v, want AgyDraftNone", verdict)
+	}
+}
+
 // The subagent view (opened by the operator with ctrl+k) draws a question
 // form that parses like the main one. Nothing may answer it.
 func TestAgySubagentViewIsHeld(t *testing.T) {
@@ -192,6 +219,19 @@ func TestAgyReasonlessFilePrompts(t *testing.T) {
 	b, _ := ParseAgyForm(agyFixture(t, "approval_agy_file_create_plan_review"))
 	if a.SameAs(b) {
 		t.Error("create prompts for two different files must not be the same form")
+	}
+	// A "Reason:" prompt parses without its diff header, and the consuming
+	// read a decision is made from often starts below it: an unseen path is
+	// not a different file, or the decided answer is refused at its own form.
+	full := agyFixture(t, "approval_agy_file_create_auto")
+	cut := strings.Index(full, "  1  +  hi")
+	if cut < 0 {
+		t.Fatal("fixture approval_agy_file_create_auto lost its diff body row")
+	}
+	whole, ok1 := ParseAgyForm(full)
+	excerpt, ok2 := ParseAgyForm(full[cut:])
+	if !ok1 || !ok2 || !excerpt.SameAs(whole) || !whole.SameAs(excerpt) {
+		t.Errorf("a capture cut below the diff header must be the same form (ok %v/%v)", ok1, ok2)
 	}
 	// Without its frame the edit question is not claimed.
 	bare := "  shift+tab to auto-approve file edits\nAccept this file edit?\n> 1. Yes, accept this change\n" +

@@ -75,6 +75,9 @@ type AgyForm struct {
 	// folder is the trust prompt's folder, "" when the capture does not reach
 	// it. Compared only when both sides show one (SameAs).
 	folder string
+	// path is a file approval's diff-header path (AgyApprovalForm.Path), ""
+	// when the capture does not reach the header. Compared like folder.
+	path string
 }
 
 // SameAs reports whether g is the same standing form as f (the trust caret
@@ -85,9 +88,12 @@ type AgyForm struct {
 // who trusted one folder has not trusted another. A capture that does not reach
 // the folder line (the classification read is a consuming delta that often
 // starts below it) is not evidence either way, so the folder is compared only
-// when both sides show one.
+// when both sides show one. A file approval's diff path is compared the same
+// way: a "Reason:"-anchored prompt parses without its header, while the
+// Reason-less in-workspace prompt needs it to parse at all.
 func (f AgyForm) SameAs(g AgyForm) bool {
-	return f.Kind == g.Kind && f.identity == g.identity && sameFolder(f.folder, g.folder)
+	return f.Kind == g.Kind && f.identity == g.identity &&
+		sameFolder(f.folder, g.folder) && sameFolder(f.path, g.path)
 }
 
 // sameFolder compares two prompts' folders, treating an unseen one ("") as
@@ -112,7 +118,7 @@ func ParseAgyForm(pane string) (AgyForm, bool) {
 			return AgyForm{}, false
 		}
 		return AgyForm{Kind: AgyFormApproval, Options: f.Options, Caret: -1,
-			identity: f.PermissionVerb() + "\x00" + f.Path + "\x00" + optionIdentity(f.Options)}, true
+			identity: f.PermissionVerb() + "\x00" + optionIdentity(f.Options), path: f.Path}, true
 	}
 	if f, ok := ParseAgyMCQ(pane); ok {
 		return AgyForm{Kind: AgyFormQuestion, Options: f.Options, WriteIn: f.WriteIn, Caret: -1,
@@ -319,7 +325,11 @@ func AgyComposerDraft(pane string, scanLimit int) (string, AgyDraftVerdict) {
 	if scanLimit < agyComposerScanLimit {
 		scanLimit = agyComposerScanLimit
 	}
-	lines := trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n"))
+	// agy 1.5's tray sits between the composer and the bar: read through it,
+	// or the closing rule paired here is the tray's, the "block" is a tray
+	// row, and a queued hand-out reads as AgyDraftNone — delivered.
+	lines := agyDropBackgroundStrip(
+		trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")))
 	n := len(lines)
 	if n < 4 || !agyBottomChromeLine(lines[n-1]) ||
 		!agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) {
