@@ -54,8 +54,9 @@ const (
 	// agents that have one. The name is shared, the meaning is not: Codex's
 	// "Default" is its unrestricted mode (it has no "manual"), while agy's
 	// "default" is its MOST restrictive — it asks before edits and commands.
-	// Codex cycles default/plan; agy default/acceptEdits/plan, and agy's own
-	// spelling "accept-edits" parses to AgentModeAcceptEdits (ParseAgentMode).
+	// Codex cycles default/plan; agy default/acceptEdits/auto/plan, and agy's
+	// own spelling "accept-edits" parses to AgentModeAcceptEdits
+	// (ParseAgentMode).
 	AgentModeDefault AgentMode = "default"
 )
 
@@ -78,13 +79,13 @@ const (
 const ShiftTab = "\x1b[Z"
 
 // Press ceilings for the rotate-until-target loop, one full extra cycle beyond
-// what each agent needs (Claude has 4 modes, Codex 2, agy 3). The loop exits as
+// what each agent needs (Claude has 4 modes, Codex 2, agy 4). The loop exits as
 // soon as the pane reports the target, so these only bound a pane that is not
 // rotating — an agent build whose cycle differs, or a chord that is not landing.
 const (
 	ClaudeModePresses = 8
 	CodexModePresses  = 4
-	AgyModePresses    = 6
+	AgyModePresses    = 8
 )
 
 // modeAgentKind folds an agent type for the per-type switches below: agy
@@ -115,7 +116,12 @@ func AgentModesFor(agentType string) []AgentMode {
 	case "codex":
 		return []AgentMode{AgentModeDefault, AgentModePlan}
 	case AgentTypeAgy:
-		return []AgentMode{AgentModeDefault, AgentModeAcceptEdits, AgentModePlan}
+		// agy 1.5 added Auto between accept-edits and plan (verified live,
+		// agy 1.5.2: default → accept-edits → auto → plan → default). Its
+		// changelog gates Auto by platform and account, so a session may
+		// rotate through three of these — the closed-rotation detection
+		// handles that, as for Claude above.
+		return []AgentMode{AgentModeDefault, AgentModeAcceptEdits, AgentModeAuto, AgentModePlan}
 	default:
 		return nil
 	}
@@ -335,8 +341,9 @@ func codexFooterLine(pane string) (string, bool) {
 // capture. ok=false means the capture does not show agy's composer status bar
 // with its model segment, which is UNKNOWN rather than any mode.
 //
-// agy prefixes the right-aligned half of its status bar with "accept-edits · "
-// or "plan · " and shows NO prefix in default mode (verified live, agy 1.2.1).
+// agy prefixes the right-aligned half of its status bar with "accept-edits · ",
+// "auto · " (agy 1.5) or "plan · " and shows NO prefix in default mode
+// (verified live, agy 1.2.1 and 1.5.2).
 // So, as with Codex, "default" is concluded only from a bar positively
 // recognized, and the bar only counts directly under the composer's bottom rule:
 // under a form, a picker or the slash popup the line above it is a key hint,
@@ -363,6 +370,8 @@ func AgyAgentMode(pane string) (AgentMode, bool) {
 	switch {
 	case strings.HasPrefix(segment, "accept-edits · "):
 		return AgentModeAcceptEdits, true
+	case strings.HasPrefix(segment, "auto · "):
+		return AgentModeAuto, true
 	case strings.HasPrefix(segment, "plan · "):
 		return AgentModePlan, true
 	}

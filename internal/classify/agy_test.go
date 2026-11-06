@@ -83,15 +83,14 @@ var agyFixtures = map[string]agyCase{
 	"idle_agy_fresh.txt":             {typ: domain.SituationIdle},
 	"idle_agy_mode_accept_edits.txt": {typ: domain.SituationIdle},
 	"idle_agy_mode_plan.txt":         {typ: domain.SituationIdle},
-	// The screen from the reported stall: agy's file-edit approval, which no
-	// parser recognises. Recorded from the live run (signature
-	// idle:6c4846ec20090256ca937aa0, audit #224376287763128320 — the
-	// [noop_vs_pending_tasks] escalation raised while this modal stood).
-	//
-	// It earns unclassifiable STRUCTURALLY, because the composer is not on
-	// screen, and NOT through AgyHeldForm, which does not know this modal
-	// either — which is exactly why it is the case worth pinning.
-	"idle_agy_edit_approval.txt":     {typ: domain.SituationUnclassifiable},
+	// The screen from the reported stall: agy's file-edit approval, recorded
+	// from the live run (signature idle:6c4846ec20090256ca937aa0, audit
+	// #224376287763128320 — the [noop_vs_pending_tasks] escalation raised
+	// while this modal stood). Unclassifiable until agy 1.5.2 made it
+	// reproducible; now parsed from its "Pending edit" frame (a pure
+	// deletion: the diff header reads "-5").
+	"idle_agy_edit_approval.txt": {typ: domain.SituationApproval, verb: "edit file",
+		options: agyEditOptions},
 	"idle_agy_effort_picker.txt":     {typ: domain.SituationUnclassifiable, held: domain.AgyHeldPanel},
 	"idle_agy_model_picker.txt":      {typ: domain.SituationUnclassifiable, held: domain.AgyHeldPanel},
 	"idle_agy_shortcuts_overlay.txt": {typ: domain.SituationUnclassifiable, held: domain.AgyHeldPanel},
@@ -100,7 +99,59 @@ var agyFixtures = map[string]agyCase{
 	"idle_agy_signin_url.txt":        {typ: domain.SituationUnclassifiable, held: domain.AgyHeldSignInOAuth},
 	"idle_agy_terms.txt":             {typ: domain.SituationUnclassifiable, held: domain.AgyHeldTerms},
 	"working_agy_spinner.txt":        {typ: domain.SituationIdle}, // a finished turn once herdr says idle
+
+	// agy 1.5.2 (herdr 0.9.5). Auto mode's "auto · " status-bar prefix used
+	// to fail the footer parse, which took every form and idle screen in
+	// auto mode down to unclassifiable.
+	"idle_agy_mode_auto.txt":       {typ: domain.SituationIdle},
+	"idle_agy_auto_after_turn.txt": {typ: domain.SituationIdle},
+	"working_agy_auto.txt":         {typ: domain.SituationIdle},
+	"approval_agy_file_create_auto.txt": {typ: domain.SituationApproval,
+		verb:    "create file (outside workspace)",
+		options: []string{"Yes, allow creation", "Yes, and always allow non-workspace access", "No, deny creation"}},
+	// A decline now ends the turn as interrupted ("User declined the tool
+	// call" + "Interrupted · What should Antigravity CLI do instead?"), in
+	// every mode — agy stops and asks for direction.
+	"error_agy_auto_declined.txt":        {typ: domain.SituationError, errSum: domain.AgyErrorInterrupted},
+	"error_agy_declined_interrupted.txt": {typ: domain.SituationError, errSum: domain.AgyErrorInterrupted},
+	"approval_agy_shell_blocked.txt": {typ: domain.SituationApproval,
+		verb: "run command: ls -la /var/tmp/hapagy1",
+		options: []string{
+			"Yes, run command",
+			"Yes, and always allow in this conversation for commands that start with 'ls'",
+			"Yes, and always allow for commands that start with 'ls' (Persist to settings.json)",
+			"No, cancel",
+		}},
+	"approval_agy_trust_folder_blocked.txt": {typ: domain.SituationApproval, verb: domain.PermissionVerbAgyTrust,
+		options: []string{"Yes, I trust this folder", "No, exit"}},
+	// File prompts INSIDE the workspace carry no "Reason:" row; they are
+	// anchored on their title / rule / "<path>  +N" frame instead.
+	"approval_agy_file_create_workspace.txt":   {typ: domain.SituationApproval, verb: "create file", options: agyCreateOptions},
+	"approval_agy_file_create_plan_review.txt": {typ: domain.SituationApproval, verb: "create file", options: agyCreateOptions},
+	"approval_agy_edit_pending.txt":            {typ: domain.SituationApproval, verb: "edit file", options: agyEditOptions},
+	// The question form: "(Recommended)" is folded off the model's pick, and
+	// the LAST question's hint reads "enter Submit All".
+	"choice_agy_mcq_recommended.txt": {typ: domain.SituationChoice, options: []string{"Red", "Blue", "Green"}},
+	"choice_agy_mcq_submit_all.txt":  {typ: domain.SituationChoice, options: []string{"Cat", "Dog"}},
+	// The tray: running tasks and subagents in a rule-framed box under the
+	// composer. Furniture — the agent is parked.
+	"idle_agy_tray_task.txt":              {typ: domain.SituationIdle},
+	"idle_agy_tray_subagent.txt":          {typ: domain.SituationIdle},
+	"idle_agy_tray_subagent_and_task.txt": {typ: domain.SituationIdle},
+	// A subagent BLOCKED on the operator. The main composer is empty under
+	// "? for shortcuts", so without the held check these read as idle.
+	"idle_agy_subagent_question_card.txt": {typ: domain.SituationUnclassifiable, held: domain.AgyHeldSubagent},
+	"idle_agy_subagent_approval_card.txt": {typ: domain.SituationUnclassifiable, held: domain.AgyHeldSubagent},
+	// The subagent view an operator opened with ctrl+k: a question form
+	// parses inside it, and must not be answered.
+	"idle_agy_subagent_view_question.txt": {typ: domain.SituationUnclassifiable, held: domain.AgyHeldSubagentView},
+	"idle_agy_subagent_view_pager.txt":    {typ: domain.SituationUnclassifiable, held: domain.AgyHeldSubagentView},
 }
+
+var (
+	agyCreateOptions = []string{"Yes, allow creation", "No, deny creation"}
+	agyEditOptions   = []string{"Yes, accept this change", "No, reject this change"}
+)
 
 func readAgyFixture(t *testing.T, name string) string {
 	t.Helper()

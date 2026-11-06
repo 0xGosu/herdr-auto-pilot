@@ -34,8 +34,9 @@ func agyComposerPane(caret string) string {
 
 // An unrecognised modal covering the composer. Deliberately NOT presented as a
 // recorded agy screen: it stands for "some form hap cannot parse", which is the
-// population this rule exists for. The reported edit-accept modal is one member
-// of it, and is not reproduced verbatim here because no capture of it exists.
+// population this rule exists for. It is the edit-accept modal with its frame
+// (title, rule, diff header) cut away — without that frame no parser may claim
+// it, so it must still fall to the structural rule.
 const agyUnknownModalPane = "● Edit(main.go) (ctrl+o to expand)\n\n" +
 	"  shift+tab to auto-approve file edits\n" +
 	"Accept this file edit?\n" +
@@ -57,16 +58,18 @@ func TestAgyUnknownModalSuppressesTheIdleVerdict(t *testing.T) {
 // above is no longer the only evidence. This is the pane hap read as idle while
 // the agent sat behind it for ten minutes; the audit row it produced was
 // [noop_vs_pending_tasks], i.e. hap offering the next task to a blocked agent.
+// Since agy 1.5.2 made the modal reproducible it is parsed as the edit approval
+// it is; what must never come back is the idle verdict.
 //
 // Asserting the two composer predicates alongside the verdict is the point: the
-// suppression must come from the composer being absent, and AgyComposerReady
-// must stay false so no send path can ever type into this screen.
+// composer is absent, and AgyComposerReady must stay false so no send path can
+// ever type into this screen.
 func TestAgyRecordedEditApprovalSuppressesTheIdleVerdict(t *testing.T) {
 	c := New(nil)
 	pane := readAgyFixture(t, "idle_agy_edit_approval.txt")
 	for _, status := range []string{"idle", "done"} {
-		if s := c.Classify(domain.AgentTypeAgy, status, pane); s.Type != domain.SituationUnclassifiable {
-			t.Errorf("@%s: type = %s, want unclassifiable — this is the recorded screen "+
+		if s := c.Classify(domain.AgentTypeAgy, status, pane); s.Type != domain.SituationApproval {
+			t.Errorf("@%s: type = %s, want approval — this is the recorded screen "+
 				"hap reported as a parked agent free to take the next task", status, s.Type)
 		}
 	}

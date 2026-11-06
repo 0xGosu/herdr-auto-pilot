@@ -1,0 +1,62 @@
+  main › self
+  ● running · 34s · 3 steps
+  ID: 8a35ac45-df63-4c8a-8964-613a61388a5c
+  ────────────────────────────────────────────────────────────
+
+  Prompt
+  Ask the user a multiple-choice question using your question tool: "Cat or Dog?" with options ["Cat", "Dog"]. Once the user answers, send a message
+  back to me with their answer.
+  ────────────────────────────────────────────────────────────
+
+  Tools
+    No tools used yet
+  ────────────────────────────────────────────────────────────
+
+  ⚠ Approval Required
+    AskQuestion
+      ? Cat or Dog?
+  ────────────────────────────────────────────────────────────
+
+  Trajectory — self (3 steps)
+
+  ? Cat or Dog?
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Question
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Question 1/1: Cat or Dog?
+
+> 1. (Recommended) Cat
+  2. Dog
+  3. Write-in...
+
+  ↑/↓ Navigate · enter Select · esc Skip
+                                                                                                         auto · Gemini 3.8 Flash · low · 2 subagent(s)

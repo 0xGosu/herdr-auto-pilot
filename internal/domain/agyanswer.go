@@ -101,12 +101,18 @@ func sameFolder(a, b string) bool {
 // operator is typing into it, and Esc there cancels the call). Callers must
 // gate on agent type agy.
 func ParseAgyForm(pane string) (AgyForm, bool) {
+	// A held screen is never a form to answer, even when a form parses on it:
+	// a question drawn inside the operator's subagent view, a form under the
+	// feedback survey (whose digits a key would answer instead).
+	if _, held := AgyHeldForm(pane); held {
+		return AgyForm{}, false
+	}
 	if f, ok := ParseAgyApproval(pane); ok {
 		if f.Amending {
 			return AgyForm{}, false
 		}
 		return AgyForm{Kind: AgyFormApproval, Options: f.Options, Caret: -1,
-			identity: f.PermissionVerb() + "\x00" + optionIdentity(f.Options)}, true
+			identity: f.PermissionVerb() + "\x00" + f.Path + "\x00" + optionIdentity(f.Options)}, true
 	}
 	if f, ok := ParseAgyMCQ(pane); ok {
 		return AgyForm{Kind: AgyFormQuestion, Options: f.Options, WriteIn: f.WriteIn, Caret: -1,
@@ -171,7 +177,7 @@ func AgyAnswerKey(f AgyForm, reply string) (string, error) {
 // agyModePlaceholderRE matches the placeholder agy shows in an EMPTY composer
 // outside the default mode ("> Plan mode: research & plan only (shift+tab to
 // cycle)"). It is not a draft: nothing has been typed.
-var agyModePlaceholderRE = regexp.MustCompile(`^>\s*(?:Plan|Accept-edits) mode: .*\(shift\+tab to cycle\)$`)
+var agyModePlaceholderRE = regexp.MustCompile(`^>\s*(?:Plan|Accept-edits|Auto) mode: .*\(shift\+tab to cycle\)$`)
 
 // AgyComposerReady proves agy is parked at an EMPTY composer ready for a
 // message — the one state in which typing a hand-out or a free-text reply is

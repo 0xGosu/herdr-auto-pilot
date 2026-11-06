@@ -1,0 +1,62 @@
+  main › self
+  ● running · 43s · 3 steps
+  ID: 8a35ac45-df63-4c8a-8964-613a61388a5c
+  ────────────────────────────────────────────────────────────
+
+  Prompt
+  Ask the user a multiple-choice question using your question tool: "Cat or Dog?" with options ["Cat", "Dog"]. Once the user answers, send a message
+  back to me with their answer.
+  ────────────────────────────────────────────────────────────
+
+  Tools
+    No tools used yet
+  ────────────────────────────────────────────────────────────
+
+  Trajectory — self (3 steps)
+
+  ? Cat or Dog?
+  > Dog
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ↑/↓ scroll · pgup/pgdown page · ctrl+end bottom · ctrl+home top · ctrl+o expand · shift+k kill · esc back
+                                                                                                         auto · Gemini 3.8 Flash · low · 2 subagent(s)

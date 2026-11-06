@@ -331,7 +331,7 @@ func TestParseAgentModeAcceptsOnlyTheTypesOwnModes(t *testing.T) {
 		{"agy", "accept-edits", AgentModeAcceptEdits, true},
 		{"agy", "acceptEdits", AgentModeAcceptEdits, true},
 		{"antigravity", "plan", AgentModePlan, true},
-		{"agy", "auto", AgentModeUnknown, false},
+		{"agy", "auto", AgentModeAuto, true}, // agy 1.5 added Auto
 		{"agy", "manual", AgentModeUnknown, false},
 		// bypassPermissions is reportable but never settable: it is entered at
 		// launch, so the Shift+Tab cycle can never reach it and the loop would
@@ -421,6 +421,32 @@ func TestAgyAgentModeOverEveryRecordedScreen(t *testing.T) {
 		"idle_agy_signin_url":        {unknown, false},
 		"idle_agy_slash_popup":       {unknown, false},
 		"idle_agy_terms":             {unknown, false},
+		// agy 1.5.2. Auto mode paints "auto · " like the other prefixes.
+		"idle_agy_mode_auto":             {AgentModeAuto, true},
+		"idle_agy_auto_after_turn":       {AgentModeAuto, true},
+		"error_agy_auto_declined":        {AgentModeAuto, true},
+		"error_agy_declined_interrupted": {AgentModeDefault, true},
+		"working_agy_auto":               {AgentModeAuto, false},
+		// The tray (task and subagent rows in a rule-framed box under the
+		// composer) is furniture: the mode reads and the composer is ready.
+		"idle_agy_tray_task":              {AgentModeDefault, true},
+		"idle_agy_tray_subagent":          {AgentModeDefault, true},
+		"idle_agy_tray_subagent_and_task": {AgentModeAuto, true},
+		// A subagent BLOCKED on the operator: the bar still names the mode,
+		// but the screen is held, so nothing may be pressed into it.
+		"idle_agy_subagent_question_card": {AgentModeAuto, false},
+		"idle_agy_subagent_approval_card": {AgentModeDefault, false},
+		// The operator's subagent view has no composer under its bar.
+		"idle_agy_subagent_view_question":      {unknown, false},
+		"idle_agy_subagent_view_pager":         {unknown, false},
+		"approval_agy_edit_pending":            {unknown, false},
+		"approval_agy_file_create_auto":        {unknown, false},
+		"approval_agy_file_create_plan_review": {unknown, false},
+		"approval_agy_file_create_workspace":   {unknown, false},
+		"approval_agy_shell_blocked":           {unknown, false},
+		"approval_agy_trust_folder_blocked":    {unknown, false},
+		"choice_agy_mcq_recommended":           {unknown, false},
+		"choice_agy_mcq_submit_all":            {unknown, false},
 	}
 	files, err := filepath.Glob(filepath.Join("..", "classify", "testdata", "transcripts", "*_agy_*.txt"))
 	if err != nil || len(files) == 0 {

@@ -364,7 +364,7 @@ func buildCommands() {
 			Details: "With one argument it prints the mode alone, for scripts to capture:\n" +
 				"  claude: manual | acceptEdits | plan | auto\n" +
 				"  codex:  default | plan\n" +
-				"  agy:    default | acceptEdits | plan   (agy spells it accept-edits; both work)\n" +
+				"  agy:    default | acceptEdits | auto | plan   (agy spells it accept-edits; both work)\n" +
 				"With two it presses shift+tab until the agent's own pane reports the mode you\n" +
 				"asked for — so it is idempotent: an agent already in that mode is left alone\n" +
 				"and no keystroke is sent.\n\n" +

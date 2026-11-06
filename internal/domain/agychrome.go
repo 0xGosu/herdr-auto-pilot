@@ -69,11 +69,15 @@ const agyLogoMinGlyphs = 4
 
 // StripAgyChrome removes agy's TUI furniture from pane text: the launching
 // shell line, the startup banner, turn-separator rules, the spinner line, the
-// artifact marker, the tool-call "(ctrl+o to expand)" suffix, and the trailing
-// composer and status bar. Everything agy and the operator actually said
+// artifact marker, the tool-call "(ctrl+o to expand)" suffix, the running-work
+// tray, and the trailing composer and status bar. Everything agy and the operator actually said
 // survives. Callers MUST gate this on agent type agy.
 func StripAgyChrome(pane string) string {
-	lines := strings.Split(pane, "\n")
+	// The background-task strip / agy 1.5 tray goes first, while the rules
+	// that frame it are still there to recognise it by: its rows carry
+	// clocks and elapsed times that would otherwise mint a signature per
+	// second.
+	lines := agyDropBackgroundStrip(trimTrailingBlank(strings.Split(pane, "\n")))
 	drop := make([]bool, len(lines))
 	markAgyBanner(lines, drop)
 	kept := make([]string, 0, len(lines))

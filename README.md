@@ -924,8 +924,9 @@ LLM-approved response may be sent.
 
 The permission mode is what `shift+tab` cycles inside the agent's own TUI —
 `acceptEdits`, `plan`, `auto`, `manual` for claude; `default`, `plan` for codex;
-`default`, `acceptEdits`, `plan` for agy (agy's own `accept-edits` spelling is
-accepted too). Other agent types have none. The shared names do not share a
+`default`, `acceptEdits`, `auto`, `plan` for agy (agy's own `accept-edits` spelling is
+accepted too; `auto` arrived in agy 1.5 and is not offered on every platform or
+account — a session without it rotates through the other three). Other agent types have none. The shared names do not share a
 meaning: codex's `default` is its unrestricted mode, agy's is the one that asks
 before every edit and command.
 
