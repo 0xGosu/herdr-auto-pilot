@@ -1,0 +1,1 @@
+- Corrected the profiling package docs to mention the per-window memory summary file

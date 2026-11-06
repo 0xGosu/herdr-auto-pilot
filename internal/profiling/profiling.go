@@ -71,9 +71,10 @@ func FromEnv(name string) (stop func()) {
 }
 
 // Start writes rolling CPU and heap profiles for this process into dir as
-// <name>-<pid>.cpu.pprof and <name>-<pid>.heap.pprof, closing a window every
-// window. The returned stop finalizes the current window; calling it more
-// than once is safe.
+// <name>-<pid>.cpu.pprof and <name>-<pid>.heap.pprof, plus the
+// <name>-<pid>.mem.txt memory summary, closing a window every window. The
+// returned stop finalizes the current window; calling it more than once is
+// safe.
 func Start(dir, name string, window time.Duration) (stop func(), err error) {
 	if window <= 0 {
 		return nil, fmt.Errorf("profile window must be positive, got %s", window)
