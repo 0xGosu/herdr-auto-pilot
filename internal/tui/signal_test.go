@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
+	"github.com/0xGosu/herdr-auto-pilot/internal/llm"
 	"github.com/0xGosu/herdr-auto-pilot/internal/store"
 )
 
@@ -44,6 +45,8 @@ func runTestApp(t *testing.T) *frontend.App {
 		ConfigPath: seedLocalFSConfigIn(t, dir),
 		StateDir:   dir,
 		Author:     "operator",
+		// run() turns the first-run LLM offer on; never spawn a real CLI.
+		DetectLLM: func(context.Context, llm.EnvSpec) []llm.CLIReadiness { return nil },
 	}
 }
 

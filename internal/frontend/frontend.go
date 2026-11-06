@@ -29,6 +29,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/control"
 	"github.com/0xGosu/herdr-auto-pilot/internal/domain"
 	"github.com/0xGosu/herdr-auto-pilot/internal/embedder"
+	"github.com/0xGosu/herdr-auto-pilot/internal/llm"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
 	"github.com/0xGosu/herdr-auto-pilot/internal/reembed"
 	"github.com/0xGosu/herdr-auto-pilot/internal/taskfile"
@@ -78,6 +79,10 @@ type App struct {
 	// update check; nil means the real GitHub call (updatecheck.Latest).
 	// Tests inject it so no test ever opens a network connection.
 	FetchLatestVersion func(ctx context.Context) (string, error)
+	// DetectLLM probes which LLM CLIs are installed and logged in, under the
+	// [llm] env base; nil means the real probe (llm.DetectCLIs). Tests inject
+	// it so no test ever spawns a real claude or codex.
+	DetectLLM func(ctx context.Context, base llm.EnvSpec) []llm.CLIReadiness
 	// LoadConfig reads config.toml; nil means config.Load. A load is ~9ms of
 	// TOML decoding and is deliberately NOT cached (an operator edit must take
 	// effect on the next read), so call sites must not put one in a loop —

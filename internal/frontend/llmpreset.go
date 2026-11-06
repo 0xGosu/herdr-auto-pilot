@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/0xGosu/herdr-auto-pilot/internal/config"
+	"github.com/0xGosu/herdr-auto-pilot/internal/llm"
 )
 
 // ── Built-in LLM command recipes ────────────────────────────────────────────
@@ -575,4 +576,120 @@ func (a *App) ClearLLMCommand(ctx context.Context, key string, expected []string
 		*argv = nil
 		return nil
 	})
+}
+
+// ── First-run LLM setup ─────────────────────────────────────────────────────
+//
+// The per-key preset above is a deliberate, one-field act. First-run setup is
+// the other shape: an operator who has configured NO LLM command at all and
+// has claude or codex installed and logged in is offered every [llm] recipe
+// for that CLI at once (the TUI's launch popup, `config set llm --preset`).
+//
+// The set is the four [llm] keys only. The FSP orchestrator command is NOT in
+// it: that one launches a standing agent, and turning it on stays the
+// deliberate per-key act it is today.
+
+// LLMPresetAuto is the preset name that resolves to the preferred ready CLI
+// (claude over codex) at the moment it is applied.
+const LLMPresetAuto = "auto"
+
+// LLMSetupKeys are the keys first-run setup fills, in registry order.
+var LLMSetupKeys = []string{LLMCommandKey, LLMTaskGenerateCommandKey, LLMLearnFromUserCommandKey, LLMRerankingCommandKey}
+
+// LLMSetupPresetNames are the CLIs first-run setup can install, in
+// preference order. Every one of them has a recipe for every LLMSetupKeys
+// entry (TestLLMSetupPresetsCoverEverySetupKey); agy does not serve
+// llm.command, so it is not offered.
+var LLMSetupPresetNames = []string{LLMPresetClaude, LLMPresetCodex}
+
+// LLMUnconfigured reports whether no LLMSetupKeys entry carries a template —
+// the only state in which first-run setup is offered. Any one configured key
+// means the operator has already made their own choice.
+func LLMUnconfigured(cfg config.Config) bool {
+	for _, key := range LLMSetupKeys {
+		if unset, ok := LLMCommandUnset(cfg, key); !ok || !unset {
+			return false
+		}
+	}
+	return true
+}
+
+// DetectLLMCLIs probes claude and codex under cfg's shared [llm] env — the
+// layer every LLM command inherits — through the injectable App.DetectLLM.
+// It spawns the CLIs' status commands, so it must never run on a UI or
+// daemon loop.
+func (a *App) DetectLLMCLIs(ctx context.Context, cfg config.Config) []llm.CLIReadiness {
+	base := llm.EnvSpec{Vars: cfg.LLM.Env, File: cfg.LLM.EnvFile}
+	if a.DetectLLM != nil {
+		return a.DetectLLM(ctx, base)
+	}
+	return llm.DetectCLIs(ctx, base)
+}
+
+// ResolveLLMPreset turns preset into a concrete CLI name. A named preset is
+// returned as is; "auto" probes and picks the preferred ready CLI, or fails
+// with each CLI's reason and how to fix it.
+func (a *App) ResolveLLMPreset(ctx context.Context, cfg config.Config, preset string) (string, error) {
+	if preset != LLMPresetAuto {
+		return preset, nil
+	}
+	results := a.DetectLLMCLIs(ctx, cfg)
+	if name, ok := llm.PreferredCLI(results); ok {
+		return name, nil
+	}
+	return "", fmt.Errorf("no ready LLM CLI found (%s) — log in with `claude auth login` or `codex login`, then retry",
+		DescribeLLMCLIs(results))
+}
+
+// DescribeLLMCLIs renders probe results as "claude: ready, codex: not logged
+// in", for messages.
+func DescribeLLMCLIs(results []llm.CLIReadiness) string {
+	parts := make([]string, 0, len(results))
+	for _, r := range results {
+		state := "ready"
+		if !r.Ready {
+			state = r.Reason
+		}
+		parts = append(parts, r.Name+": "+state)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// ApplyLLMPresetAll installs preset's recipe into every LLMSetupKeys entry
+// that is still unset, in ONE config write (so the daemon reloads once), and
+// reports which keys it filled and which it skipped as already configured.
+//
+// Like ApplyLLMPreset it writes argv verbatim and never overwrites: the
+// unset check runs inside the mutator, against the config freshly loaded
+// under the lock. A call that finds nothing left to fill is refused rather
+// than reported as a no-op success.
+func (a *App) ApplyLLMPresetAll(ctx context.Context, preset string) (applied, skipped []string, reloaded bool, err error) {
+	if !slices.Contains(LLMSetupPresetNames, preset) {
+		return nil, nil, false, fmt.Errorf("unknown preset %q for llm (known presets: %s, %s)",
+			preset, strings.Join(LLMSetupPresetNames, ", "), LLMPresetAuto)
+	}
+	reloaded, err = a.updateConfigReloaded(ctx, func(cfg *config.Config) error {
+		applied, skipped = nil, nil
+		for _, key := range LLMSetupKeys {
+			argv := llmCommandArgv(cfg, key)
+			if len(*argv) > 0 {
+				skipped = append(skipped, key)
+				continue
+			}
+			recipe, ok := LLMPreset(key, preset)
+			if !ok {
+				return fmt.Errorf("no %s preset for %s", preset, key)
+			}
+			*argv = recipe
+			applied = append(applied, key)
+		}
+		if len(applied) == 0 {
+			return fmt.Errorf("every llm command is already configured — a preset only bootstraps unset commands; edit config.toml to change them")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return applied, skipped, reloaded, nil
 }

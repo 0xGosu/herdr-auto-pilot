@@ -1009,7 +1009,7 @@ func buildCommands() {
 			},
 			Flags: []FlagDoc{
 				{Name: "--value", Arg: "V", Desc: "config env set: the value; omit it and the value is read from stdin, which keeps a secret out of shell history and `ps`"},
-				{Name: "--preset", Arg: "NAME", Desc: "config set: install a built-in recipe into an UNSET [llm] command field or full_self_prompting.orchestrator_agent_command. Not every CLI serves every field: task_generate_command / learn_from_user_command / reranking_command take claude, codex or agy; llm.command takes claude or codex (agy cannot be handed an MCP server on the command line); the orchestrator takes claude only (herdr starts it by agent kind). Refused once the field is configured"},
+				{Name: "--preset", Arg: "NAME", Desc: "config set: install a built-in recipe into an UNSET [llm] command field or full_self_prompting.orchestrator_agent_command. Not every CLI serves every field: task_generate_command / learn_from_user_command / reranking_command take claude, codex or agy; llm.command takes claude or codex (agy cannot be handed an MCP server on the command line); the orchestrator takes claude only (herdr starts it by agent kind). Refused once the field is configured. `config set llm --preset auto|claude|codex` fills every unset [llm] field at once; auto picks an installed, logged-in claude, else codex"},
 			},
 			Details: "Every command that writes config.toml lives here — nothing else in hap does,\n" +
 				"so `hap config …` is the whole surface and the file never has to be opened by\n" +

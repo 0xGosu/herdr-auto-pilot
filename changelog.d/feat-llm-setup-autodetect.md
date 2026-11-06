@@ -1,0 +1,2 @@
+- Offer to set up the LLM helper when the TUI opens with no `[llm]` command configured: hap detects an installed, logged-in `claude` (preferred) or `codex` and installs its default recipes into all four `[llm]` fields with one keystroke
+- Add `hap config set llm --preset auto|claude|codex` to fill every unset `[llm]` command at once, and accept `--preset auto` on each `[llm]` field
