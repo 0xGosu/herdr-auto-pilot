@@ -4,13 +4,16 @@ Thanks for helping keep herds unblocked! This guide covers the essentials.
 
 ## Ground rules
 
-- **Conventional Commits.** Commit messages follow
-  [Conventional Commits](https://www.conventionalcommits.org/):
-  `feat: ...`, `fix: ...`, `docs: ...`, `test: ...`, `refactor: ...`,
-  `chore: ...`. Breaking changes use `!` (e.g. `feat!: ...`).
-- **SemVer.** Releases are tagged `vMAJOR.MINOR.PATCH`; the release workflow
-  builds artifacts from the tag. `min_herdr_version` in `herdr-plugin.toml`
-  is bumped only deliberately when new Herdr APIs are adopted.
+- **Conventional Commits.** Commit messages are
+  [Conventional Commits](https://www.conventionalcommits.org/) prefixed with
+  the issue number: `#<issue> <type>: <subject>` (`#0` when there is no
+  issue). Types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`; breaking
+  changes use `!` (e.g. `#42 feat!: ...`). Never commit to `main`, and never
+  skip hooks with `--no-verify`.
+- **SemVer.** Releases are tagged `vMAJOR.MINOR.PATCH` (see
+  [Release flow](#release-flow-maintainers)). `min_herdr_version` in
+  `herdr-plugin.toml` is bumped only deliberately, when new Herdr APIs are
+  adopted.
 - **The domain core stays pure.** `internal/domain` must not import Herdr,
   SQLite, LLM, or any adapter package — `TestDomainPurity` enforces this.
   Side effects live behind the ports in `internal/ports`.
@@ -37,7 +40,11 @@ golangci-lint run --build-tags "vectors,cpu" # lint (CI runs this too)
 ```
 
 Both tags are always required — a build without them fails to link, so there is
-no tag-free shortcut for a quick check.
+no tag-free shortcut for a quick check. `make check` runs the submodule check,
+lint, tests, race tests and corpus gate in one go (see the `Makefile`).
+
+On a loaded machine, export `HAP_TEST_TIMEOUT_SCALE` (CI uses `4`) so timing
+waits are not mistaken for failures.
 
 Never `git add` the llama-go submodule directory after pointing it at another
 checkout with a symlink (a common local trick for reusing prebuilt native
@@ -57,34 +64,35 @@ and review the diff carefully.
 To exercise your working tree inside Herdr:
 
 ```sh
-go build -tags "vectors cpu" -o bin/hap ./cmd/hap
+make build        # builds bin/hap with the right tags and rpath
 herdr plugin link .
 ```
 
 ## Pull requests
 
-1. Fork/branch from `main`.
+1. Branch from `main`.
 2. Keep PRs focused; include tests for behavior changes.
 3. Make sure the tagged commands above pass — `go test -tags "vectors cpu" ./...`,
    `gofmt`, `go vet`, and `golangci-lint`. CI gates on all of them, plus:
    - the never-auto patterns-corpus regression (`corpus-gate`);
-   - a **race-detector** job over `internal/{store,domain,control,embedder,match,daemon}`,
-     retried up to 3 times because the detector is flaky under CI load;
+   - a **race-detector** step over `internal/{store,domain,control,embedder,match,daemon}`,
+     run up to 3 attempts because the detector is flaky under CI load;
    - a **macOS** matrix leg, where test binaries need `-ldflags "-r /usr/local/lib"`
      to reach the FAISS dylibs.
 4. Describe *what* and *why* in the PR body; link related issues.
-5. **Add a changelog fragment** — required for every change, including
-   patch-level fixes. Never edit `CHANGELOG.md` and never write a version
-   number: put the entry in a new `changelog.d/<your-branch>.md` (branch name
-   with `/` replaced by `-`), and the release assembles the fragments. CI
-   fails a PR that changes released code without a fragment, or that adds a
-   `CHANGELOG.md` section by hand. For a deliberate minor/major bump, also run
+5. **Add a changelog fragment** for every change to released code, patch-level
+   fixes included (docs-, `.md`- and workflow-only changes need none). Never
+   edit `CHANGELOG.md` and never write a version number: put the entry in a new
+   `changelog.d/<your-branch>.md` (branch name with `/` replaced by `-`), and
+   the release assembles the fragments. CI fails a PR that changes released
+   code without a fragment, or that adds a `CHANGELOG.md` section by hand. For
+   a deliberate minor/major bump, also run
    `bash scripts/assemble-changelog.sh X.Y.0` in the same PR. See
    `changelog.d/README.md`.
-   Verb-first one-liners (`Added …`, `Fixed …`); write what it means for the
-   reader, not what the diff did. GitHub already generates a list of PR titles
-   per release; the fragment is for what a title cannot convey, like the bounds of
-   a new action. See the Changelog section in `CLAUDE.md`.
+   Write verb-first one-liners (`Added …`, `Fixed …`) that say what it means
+   for the reader, not what the diff did. GitHub already lists PR titles per
+   release; the fragment is for what a title cannot convey, like the bounds of
+   a new action. Mark breaking changes **Breaking.**
 
 Never put `[skip ci]`, `[ci skip]`, or `[no ci]` anywhere in the squash-merge
 message (title or body) of a PR that should release. GitHub suppresses *all*
