@@ -10,12 +10,13 @@
 // operator sends reuse one implementation — and it unit-tests without the full
 // store or herdr adapter.
 //
-// LIMITATION: the check looks only at the agent's reported status
+// LIMITATION: Check looks only at the agent's reported status
 // (agent_status == "blocked"); it cannot distinguish the original prompt from a
-// NEW one the agent raised after answering. An agent that answers and then
-// immediately blocks on a follow-up prompt within the fixed one-second delay
-// can trip a benign false-positive delivery_failed row. Operators should read
-// delivery_failed as "still blocked shortly after the action."
+// NEW one the agent raised after answering. The daemon screens that case out
+// before calling Check (followUpPromptStanding), so a caller that skips the
+// screen can get a benign false-positive delivery_failed row. Read
+// delivery_failed as "still blocked shortly after the action." The delay before
+// the check is the daemon's (unblockCheckDelay), not this package's.
 package verifyunblock
 
 import (
