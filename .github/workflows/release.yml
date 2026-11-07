@@ -71,7 +71,7 @@ jobs:
           # 24.04's glibc 2.39 breaks Debian 12 / Ubuntu 22.04 hosts.
           - { os: ubuntu-22.04,     target: linux-amd64 }
           - { os: ubuntu-22.04-arm, target: linux-arm64 }
-          - { os: macos-14,         target: darwin-arm64 }
+          - { os: macos-15,         target: darwin-arm64 }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

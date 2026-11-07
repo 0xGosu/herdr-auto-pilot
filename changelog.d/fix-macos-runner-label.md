@@ -1,0 +1,1 @@
+- Fixed releases stalling without a published build: the macOS release and CI jobs now run on the supported `macos-15` runner, so the darwin-arm64 binary builds again
