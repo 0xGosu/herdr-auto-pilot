@@ -214,7 +214,7 @@ frameworks); `WithGPULayers` plumbing exists end-to-end.
    (Makefile adds `-DGGML_METAL=ON`, copies `libggml-metal.a` + `libggml-blas.a`)
    instead of `-DGGML_METAL=OFF -DGGML_ACCELERATE=OFF`.
 2. Per-target build tags: darwin `-tags vectors`, linux `-tags "vectors cpu"` — move
-   `GO_BUILD_TAGS` from workflow env into the release matrix. The macos-14 CI job
+   `GO_BUILD_TAGS` from workflow env into the release matrix. The macOS CI job
    then exercises the Metal link (GH Apple Silicon runners expose Metal).
 3. Config: either allow `gpu_layers = -1` = offload-all (today clamped to 0 at
    `config.go:398`), or document "any value ≥ layer count offloads all".
