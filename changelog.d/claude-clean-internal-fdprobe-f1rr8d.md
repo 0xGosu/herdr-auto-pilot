@@ -1,1 +1,0 @@
-- Tidied the descriptor-probe internals (no behaviour change)
