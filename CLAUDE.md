@@ -215,8 +215,14 @@ real confirm is proven only in `internal/frontend`, and TUI/CLI suites must drai
   never enters the database; front ends draw ids from the daemon with no local fallback.
 
 ### agy
-herdr reports agy's modals idle/done (the trust prompt is the one exception seen: `blocked` on herdr 0.9.1);
-forms are parsed structurally (`internal/domain/agy.go`, `docs/designer/agy-support.md`).
+herdr 0.9.5 reports agy's shell approval, question form and trust prompt `blocked`, its file prompts and
+everything else idle/done; forms are parsed structurally (`internal/domain/agy.go`,
+`docs/designer/agy-support.md` §13 for agy 1.5).
+- Every footer check counts up from the status bar: a segment `agyModelSegmentRE` rejects (a new mode
+  prefix, effort, or `· N …(s)` suffix) breaks every form AND idle at once. agy 1.5's tray (task and
+  subagent rows framed by a rule under the composer) goes through `agyDropTray`; a `Blocked ·` subagent
+  row is never dropped, and its screen is held (`AgyHeldSubagent`). Never send ctrl+k / alt+j / shift+k:
+  ctrl+k on a subagent approval card APPROVES it unseen.
 - A reply to an agy form is KEYS (agy commits on the digit alone; a trailing Enter answers the next screen).
   Every send path must ask `domain.AgyFormSituation` and route to `mcqdeliver.Agy` — today `daemon.act`
   (ahead of the action-review rewrite), the LLM promotion in `handleLLMOutcome`, and `deliver.Deliver`.
@@ -298,7 +304,8 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   directories (truncated "…, and N more") but not hooks, env or `.mcp.json` servers. No dialog appears
   under a trusted ancestor folder (`/tmp` and `/workspaces` here — use `/var/tmp` to reproduce).
 - agy's trust prompt (agy 1.4.0, herdr 0.9.1) is reported `blocked`, so `agent start --kind agy`
-  refuses with `agent_not_ready` in an untrusted folder (and the shared itest helper skips agy there).
+  refuses with `agent_not_ready` in an untrusted folder; `startAgentInPane` tolerates that for agy and
+  `startAgyAgent` clears the prompt (before agy 1.5 support every real-agy case silently skipped there).
 - Concurrent tool approvals (parallel subagents) are PAGED in one dialog ("1 of 3"); answering a page draws
   the next in place with herdr still `blocked` — no event. Only the post-action self-check sees it
   (`followUpPromptStanding`, gated on `domain.ClaudeModalAdvanced`); every unattended send must arm it.

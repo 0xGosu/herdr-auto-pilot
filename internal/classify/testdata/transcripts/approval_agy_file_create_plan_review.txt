@@ -1,0 +1,52 @@
+user@host:/var/tmp/hapagy3$ agy --model gemini-3.8-flash-low
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.2
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (Low)
+   ▄▀▀    ▀▀▄     /var/tmp/hapagy3
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Use your question tool to ask me two multiple-choice questions at once: my favourite colour (Red, Blue, Green) and my favourite pet (Cat, Dog).
+  Then repeat my answers.
+
+? What is your favourite colour?
+> Blue
+? What is your favourite pet?
+> Dog
+
+  Here are your answers:
+
+  • Favourite colour: Blue
+  • Favourite pet: Dog
+
+────────────────────────────────────────────────────────────
+> /plan Create a file hello.py in this folder that prints hello.
+
+● Edited 1 file (create_hello_py_plan.md) (ctrl+o to expand)
+
+  I have created the implementation plan artifact for hello.py. Please review the plan and click Proceed (or let me know if you would like any
+  modifications) to begin execution.
+
+> /artifact
+  ⎿  Review submitted
+
+────────────────────────────────────────────────────────────
+> [Approved] create_hello_py_plan.md
+
+
+● Edited 1 file (hello.py) (ctrl+o to expand)
+
+Create file
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/var/tmp/hapagy3/hello.py  +1
+  1  +  print("hello")
+
+Allow creation of this file?
+> 1. Yes, allow creation
+  2. No, deny creation
+
+  ↑/↓ Navigate · f full diff · ctrl+r Review
+esc to cancel                                                                                                            plan · Gemini 3.8 Flash · low

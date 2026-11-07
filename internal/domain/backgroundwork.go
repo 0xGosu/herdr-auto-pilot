@@ -74,7 +74,8 @@ var (
 	// (agyBackgroundTaskRE) because the strip's rows carry a state word this
 	// package has never seen a completed sample of, while the count is by
 	// construction the number still running.
-	agyTaskCountRE = regexp.MustCompile(`(?:^|·)\s*(\d+)\s+task\(s\)`)
+	// agy 1.5 counts running subagents the same way ("· 1 subagent(s)").
+	agyTaskCountRE = regexp.MustCompile(`(?:^|·)\s*(\d+)\s+(?:task|subagent)\(s\)`)
 	// codexBackgroundTerminalRE matches codex's own background-terminal line.
 	// Verified live (codex-cli 0.155.0, 2026-09-20) on a session asked to start
 	// a background terminal and end its turn — herdr reported the agent `done`
@@ -217,10 +218,10 @@ func agyBackgroundWork(pane string) bool {
 	if !ok {
 		return false
 	}
-	m := agyTaskCountRE.FindStringSubmatch(segment)
-	if m == nil {
-		return false
+	for _, m := range agyTaskCountRE.FindAllStringSubmatch(segment, -1) {
+		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
+			return true
+		}
 	}
-	n, err := strconv.Atoi(m[1])
-	return err == nil && n > 0
+	return false
 }

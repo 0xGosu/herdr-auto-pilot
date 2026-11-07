@@ -74,9 +74,25 @@ var (
 	// "skip a line above the footer" rule would let a modal's last row be
 	// skipped and turn a standing prompt into a ready composer.
 	agyBackgroundTaskRE = regexp.MustCompile(`^\s*●\s+\[\d{1,2}:\d{2}:\d{2}\]\s`)
+	// agySubagentRowRE matches one SUBAGENT row of the tray agy 1.5 draws
+	// under the composer while subagents run:
+	//
+	//	  ● Agent(self: Sleep Runner)  Run sleep 30 · 19s
+	//	  ● Agent(self: Question Subagent B)  Blocked · AskQuestion · 4s
+	//
+	// Anchored on the bullet, the literal "Agent(" call and the two-space gap
+	// before the activity, for the same reason agyBackgroundTaskRE is: a loose
+	// row match decides whether hap may TYPE into the pane.
+	agySubagentRowRE = regexp.MustCompile(`^\s*●\s+Agent\(.*\)\s{2,}\S`)
+	// agySubagentBlockedRE is a subagent row whose subagent is waiting on the
+	// OPERATOR ("Blocked · AskQuestion", "Blocked · Bash"). Such a row is never
+	// dropped as tray furniture: the agent is not free (AgyHeldSubagent).
+	agySubagentBlockedRE = regexp.MustCompile(`^\s*●\s+Agent\(.*\)\s{2,}Blocked\b`)
 	// agyModelSegmentRE matches the right-aligned half of agy's status bar:
-	// "[accept-edits · |plan · ]<model>[ · <effort>]", e.g.
+	// "[accept-edits · |auto · |plan · ]<model>[ · <effort>]", e.g.
 	// "plan · Gemini 3.6 Flash · low" or "Claude Sonnet 4.6 (Thinking)".
+	// "auto · " is agy 1.5's Auto mode (verified live, agy 1.5.2), and the
+	// effort ladder gained "xhigh" and "max" (agy --effort).
 	// It must END on a word character or ")", never on the period a sentence
 	// ends with: a right-indented "Done." as the last line is prose.
 	// The trailing "· N task(s) · /tasks" is agy's BACKGROUND-TASK suffix: it
@@ -85,8 +101,10 @@ var (
 	// footer fails to parse, so the mode reads UNKNOWN and `hap mode` refuses
 	// -- putting acceptEdits out of reach for exactly those agents. The count
 	// and the "/tasks" hint are matched separately because only the count was
-	// observed varying.
-	agyModelSegmentRE = regexp.MustCompile(`^(?:(?:accept-edits|plan) · )?[A-Za-z](?:[\w.() -]*[\w)])?(?: · (?:low|medium|high))?(?: · \d+ task\(s\))?(?: · /tasks)?$`)
+	// observed varying. agy 1.5 adds "· N subagent(s)" while subagents run,
+	// BEFORE the task count when both show ("… · low · 1 subagent(s) · 1
+	// task(s) · /tasks", verified live).
+	agyModelSegmentRE = regexp.MustCompile(`^(?:(?:accept-edits|auto|plan) · )?[A-Za-z](?:[\w.() -]*[\w)])?(?: · (?:low|medium|high|xhigh|max))?(?: · \d+ subagent\(s\))?(?: · \d+ task\(s\))?(?: · /tasks)?$`)
 	// agyStatusPadRE is the terminal-width padding run that separates the status
 	// bar's left token from its right-aligned model segment.
 	agyStatusPadRE = regexp.MustCompile(`\s{10,}`)
@@ -129,9 +147,6 @@ func agyStatusBar(line string) (segment string, ok bool) {
 	return "", false
 }
 
-// agyBody returns the capture's lines with trailing blank lines and agy's
-// status bar removed — what is left ends with the live form's key-hint line
-// when a form stands.
 // agyDropBackgroundStrip removes agy's background-task rows from directly above
 // the status bar, so the composer sits where the footer-anchored checks expect
 // it again.
@@ -161,6 +176,9 @@ func agyDropBackgroundStrip(lines []string) []string {
 	if n < 2 || !agyStatusBarLine(lines[n-1]) {
 		return lines
 	}
+	if out, ok := agyDropTray(lines); ok {
+		return out
+	}
 	// The composer sandwich is three rows; the window leaves room for it plus
 	// several task rows, and bounds how far a match can reach into the
 	// transcript body.
@@ -175,6 +193,60 @@ func agyDropBackgroundStrip(lines []string) []string {
 		out = append(out, line)
 	}
 	return append(out, lines[n-1])
+}
+
+// agyTrayRows bounds how many rows agyDropTray will accept between the two
+// rules: agy draws one row per running task or subagent.
+const agyTrayRows = 12
+
+// agyDropTray removes agy 1.5's TRAY: the block of background-task and
+// subagent rows it draws in a rule-framed box between the composer and the
+// status bar (verified live, agy 1.5.2):
+//
+//	────────────   composer top rule
+//	>
+//	────────────   composer bottom rule
+//	  ● Agent(self: Sleep Worker)  Generating · 28s
+//	  ● [00:29:25] sleep 90 running
+//	────────────   the tray's own rule
+//	? for shortcuts            auto · Gemini 3.8 Flash · low · 1 subagent(s) · 1 task(s) · /tasks
+//
+// The tray is removed only as a whole and only when positively recognised:
+// the status bar last, a rule above it, one or more rows that are ALL
+// running-task or running-subagent rows, and a rule above those (the
+// composer's bottom rule, which is kept). A row agy draws for a subagent that
+// is BLOCKED on the operator is not tray furniture, so its presence leaves the
+// lines untouched — the composer then does not read as ready, which is the
+// cautious answer (AgyHeldForm reports the screen as held besides).
+//
+// Removing the tray's own rule matters as much as removing its rows: dropping
+// the rows alone leaves two rules stacked above the status bar, and a footer
+// check counting lines up from the bottom then lands on the wrong rule.
+func agyDropTray(lines []string) ([]string, bool) {
+	n := len(lines)
+	if n < 4 || !agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) {
+		return nil, false
+	}
+	top := n - 3
+	for top >= 0 && n-2-top <= agyTrayRows {
+		line := lines[top]
+		if agyRuleLineRE.MatchString(strings.TrimSpace(line)) {
+			break
+		}
+		if agySubagentBlockedRE.MatchString(line) ||
+			(!agyBackgroundTaskRE.MatchString(line) && !agySubagentRowRE.MatchString(line)) {
+			return nil, false
+		}
+		top--
+	}
+	// top is the composer's bottom rule; at least one tray row must sit
+	// between it and the tray rule.
+	if top < 0 || top == n-3 || !agyRuleLineRE.MatchString(strings.TrimSpace(lines[top])) {
+		return nil, false
+	}
+	out := make([]string, 0, top+2)
+	out = append(out, lines[:top+1]...)
+	return append(out, lines[n-1]), true
 }
 
 // AgyComposerVisible reports that agy's composer is STRUCTURALLY on screen: the
@@ -201,13 +273,24 @@ func AgyComposerVisible(pane string) bool {
 	if n < 4 || !agyStatusBarLine(lines[n-1]) {
 		return false
 	}
+	// The row between the rules must be the composer's own caret line: agy
+	// 1.5's tray (agyDropTray) is ALSO a row between two rules, and a tray
+	// it could not remove — one holding a BLOCKED subagent — must not pass
+	// for a composer.
 	return agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-2])) &&
+		strings.HasPrefix(strings.TrimSpace(lines[n-3]), ">") &&
 		agyRuleLineRE.MatchString(strings.TrimSpace(lines[n-4]))
 }
 
+// agyBody returns the capture's lines with trailing blank lines, the running-
+// work tray or strip (agyDropBackgroundStrip) and agy's status bar removed —
+// what is left ends with the live form's key-hint line when a form stands.
 func agyBody(pane string) []string {
 	lines := strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n")
-	lines = trimTrailingBlank(lines)
+	// The tray of running work sits between the composer and the bar on an
+	// idle screen; agyTranscript and AgyErrorForm read through it, or an
+	// interrupted turn with a background task running reads as idle.
+	lines = agyDropBackgroundStrip(trimTrailingBlank(lines))
 	if n := len(lines); n > 0 && agyStatusBarLine(lines[n-1]) {
 		lines = trimTrailingBlank(lines[:n-1])
 	}
@@ -306,6 +389,11 @@ type AgyApprovalForm struct {
 	// Target is a file prompt's "<Op>: <path>" line ("Read: /etc/hostname");
 	// "" when the prompt shows none (the create prompt shows a diff instead).
 	Target string
+	// Path is the file named by a diff prompt's header row ("Create file" /
+	// "Pending edit"). It is part of the form's IDENTITY (AgyForm.SameAs), so
+	// an answer decided for one file is refused at the next file's prompt, but
+	// deliberately not of PermissionVerb, which keys learned rules.
+	Path string
 	// Reason is a file prompt's "Reason:" text ("outside workspace").
 	Reason string
 	// Options are the numbered choices, wrapped labels rejoined.
@@ -318,9 +406,24 @@ type AgyApprovalForm struct {
 var (
 	agyRunQuestionRE  = regexp.MustCompile(`^\s*Run this command\?\s*$`)
 	agyFileQuestionRE = regexp.MustCompile(`^\s*Allow (\w+) (?:of|to) this file\?\s*$`)
-	agyRequestingRE   = regexp.MustCompile(`^\s*Requesting permission for:\s*$`)
-	agyReasonRE       = regexp.MustCompile(`^\s*Reason:\s*(\S.*?)\s*$`)
-	agyFileTargetRE   = regexp.MustCompile(`^\s*([A-Z][a-z]+):\s+(\S.*?)\s*$`)
+	// agyEditQuestionRE is the file-EDIT approval ("Pending edit" … "Accept
+	// this file edit?" / "1. Yes, accept this change" / "2. No, reject this
+	// change"), raised in default mode for an edit inside the workspace
+	// (verified live, agy 1.5.2).
+	agyEditQuestionRE = regexp.MustCompile(`^\s*Accept this file edit\?\s*$`)
+	// agyDiffHeaderRE is the first row of a file prompt's diff, directly under
+	// the form's rule: "<path>  +N[ -M]", or "<path>  -M" for a pure
+	// deletion.
+	agyDiffHeaderRE = regexp.MustCompile(`^\s*(\S.*?)\s{2,}(?:\+\d+(?:\s+-\d+)?|-\d+)\s*$`)
+	// agyFormTitleRE is a form's title row above its rule ("Create file",
+	// "Pending edit", "Command", "File access").
+	agyFormTitleRE = regexp.MustCompile(`^[A-Z][a-z]+(?: [a-z]+){0,3}$`)
+	// agyAutoApproveEditsRE is the hint agy draws between an edit's diff and
+	// its question. It names Shift+Tab, which hap never sends at a form.
+	agyAutoApproveEditsRE = regexp.MustCompile(`^\s*shift\+tab to auto-approve file edits\s*$`)
+	agyRequestingRE       = regexp.MustCompile(`^\s*Requesting permission for:\s*$`)
+	agyReasonRE           = regexp.MustCompile(`^\s*Reason:\s*(\S.*?)\s*$`)
+	agyFileTargetRE       = regexp.MustCompile(`^\s*([A-Z][a-z]+):\s+(\S.*?)\s*$`)
 	// agyApprovalHintRE / agyAmendHintRE: the key-hint line under an approval's
 	// options ("↑/↓ Navigate · tab Amend · …"), and the one the amend field
 	// replaces it with.
@@ -350,7 +453,8 @@ func ParseAgyApproval(pane string) (AgyApprovalForm, bool) {
 	}
 	run := lastLineIndex(lines, n-1, agyRunQuestionRE)
 	file := lastLineIndex(lines, n-1, agyFileQuestionRE)
-	q := max(run, file)
+	edit := lastLineIndex(lines, n-1, agyEditQuestionRE)
+	q := max(run, file, edit)
 	if q < 0 {
 		return AgyApprovalForm{}, false
 	}
@@ -378,24 +482,36 @@ func ParseAgyApproval(pane string) (AgyApprovalForm, bool) {
 		form.Verb, form.Command = "run", strings.Join(cmd, " ")
 		return form, true
 	}
-	noun := strings.ToLower(agyFileQuestionRE.FindStringSubmatch(lines[q])[1])
-	form.Verb = noun
-	if v, ok := agyFileNounVerbs[noun]; ok {
-		form.Verb = v
+	if q == edit {
+		form.Verb = "edit"
+	} else {
+		noun := strings.ToLower(agyFileQuestionRE.FindStringSubmatch(lines[q])[1])
+		form.Verb = noun
+		if v, ok := agyFileNounVerbs[noun]; ok {
+			form.Verb = v
+		}
 	}
 	// "Reason:" is the file prompt's own anchor, directly above the question
-	// (blank lines aside); the "<Op>: <path>" line, when shown, sits right above
-	// it.
+	// (blank lines and the edit prompt's Shift+Tab hint aside); the
+	// "<Op>: <path>" line, when shown, sits right above it.
 	r := q - 1
-	for r >= 0 && strings.TrimSpace(lines[r]) == "" {
+	for r >= 0 && (strings.TrimSpace(lines[r]) == "" || agyAutoApproveEditsRE.MatchString(lines[r])) {
 		r--
 	}
 	if r < 0 {
 		return AgyApprovalForm{}, false
 	}
+	form.Path = agyDiffPath(lines, q)
 	m := agyReasonRE.FindStringSubmatch(lines[r])
 	if m == nil {
-		return AgyApprovalForm{}, false
+		// agy 1.5 asks for a create or an edit INSIDE the workspace with no
+		// "Reason:" row (verified live, agy 1.5.2). Its anchor is then the
+		// form's own frame: a title, a rule, and the diff's "<path>  +N"
+		// header (agyDiffPath).
+		if form.Path == "" {
+			return AgyApprovalForm{}, false
+		}
+		return form, true
 	}
 	form.Reason = m[1]
 	if r > 0 {
@@ -404,6 +520,39 @@ func ParseAgyApproval(pane string) (AgyApprovalForm, bool) {
 		}
 	}
 	return form, true
+}
+
+// agyDiffScan bounds the search for a file prompt's diff header above its
+// question: agy collapses a long diff ("… N more lines (f for full diff)"), so
+// the header is never far up.
+const agyDiffScan = 40
+
+// agyDiffPath returns the file a diff prompt is about: the "<path>  +N[ -M]"
+// row directly under the form's rule, itself directly under a title row
+// ("Create file", "Pending edit"). "" when that frame is not found above the
+// question at q.
+func agyDiffPath(lines []string, q int) string {
+	above := func(i int) int { // the nearest non-blank row above i, or -1
+		i--
+		for i >= 0 && strings.TrimSpace(lines[i]) == "" {
+			i--
+		}
+		return i
+	}
+	for i := q - 1; i >= 0 && i >= q-agyDiffScan; i-- {
+		m := agyDiffHeaderRE.FindStringSubmatch(lines[i])
+		if m == nil {
+			continue
+		}
+		rule := above(i)
+		if rule < 0 || !agyRuleLineRE.MatchString(strings.TrimSpace(lines[rule])) {
+			continue
+		}
+		if title := above(rule); title >= 0 && agyFormTitleRE.MatchString(strings.TrimSpace(lines[title])) {
+			return m[1]
+		}
+	}
+	return ""
 }
 
 // PermissionVerb renders the approval as the salient permission verb: what is
@@ -576,8 +725,11 @@ type AgyMCQForm struct {
 
 var (
 	agyQuestionRE = regexp.MustCompile(`^\s*Question (\d+)/(\d+):\s*(.*?)\s*$`)
-	agyMCQHintRE  = regexp.MustCompile(`^\s*↑/↓ Navigate\b.*\benter Select\b.*\besc Skip\b`)
-	agyWriteInRE  = regexp.MustCompile(`(?i)^write-in(?:\.\.\.|…)?$`)
+	// agyMCQHintRE: "enter Select" on every question but the LAST of a
+	// multi-question form, which reads "enter Submit All" in agy 1.5 — the
+	// digit still commits there (verified live, agy 1.5.2).
+	agyMCQHintRE = regexp.MustCompile(`^\s*↑/↓ Navigate\b.*\benter (?:Select|Submit All)\b.*\besc Skip\b`)
+	agyWriteInRE = regexp.MustCompile(`(?i)^write-in(?:\.\.\.|…)?$`)
 )
 
 // ParseAgyMCQ parses the live question form. Callers must gate on agent type
@@ -608,6 +760,10 @@ func ParseAgyMCQ(pane string) (AgyMCQForm, bool) {
 			form.WriteIn = o.Number
 			continue
 		}
+		// agy 1.5 marks the model's pick "(Recommended) <label>". Which
+		// option carries it varies per run, so it is dropped: kept, it would
+		// split one question into a signature per recommendation.
+		o.Label = StripRecommendedMarker(o.Label)
 		form.Options = append(form.Options, o)
 	}
 	if len(form.Options) == 0 {
@@ -624,10 +780,17 @@ func ParseAgyMCQ(pane string) (AgyMCQForm, bool) {
 const (
 	AgyErrorInterrupted      = "interrupted"
 	AgyErrorEligibilityCheck = "eligibility-check-failed"
+	// AgyErrorDeclined is the interrupt agy 1.5 prints right after a DECLINE
+	// ("⎿  User declined the tool call" directly above the Interrupted row).
+	// It is a kind of its own so a rule learned for a genuine interrupt —
+	// "continue" after an Esc — never fires straight after a "No" hap or the
+	// operator chose, nudging the agent back into what was just refused.
+	AgyErrorDeclined = "declined"
 )
 
 var (
 	agyInterruptedRE     = regexp.MustCompile(`^\s*(?:⎿\s*)?Interrupted · What should Antigravity CLI do instead\?\s*$`)
+	agyDeclinedRE        = regexp.MustCompile(`^\s*(?:⎿\s*)?User declined the tool call\s*$`)
 	agyEligibilityHeadRE = regexp.MustCompile(`^\s*⚠ Eligibility Check\s*$`)
 	agyEligibilityFailRE = regexp.MustCompile(`(?i)eligibility check failed`)
 	agyNoticeContRE      = regexp.MustCompile(`^\s*⎿|^\s{3,}\S`)
@@ -663,6 +826,13 @@ func AgyErrorForm(pane string) (kind string, ok bool) {
 	}
 	last := len(lines) - 1
 	if agyInterruptedRE.MatchString(lines[last]) {
+		prev := last - 1
+		for prev >= 0 && strings.TrimSpace(lines[prev]) == "" {
+			prev--
+		}
+		if prev >= 0 && agyDeclinedRE.MatchString(lines[prev]) {
+			return AgyErrorDeclined, true
+		}
 		return AgyErrorInterrupted, true
 	}
 	head := lastLineIndex(lines, len(lines), agyEligibilityHeadRE)
@@ -697,6 +867,21 @@ const (
 	AgyHeldSlashPopup   = "ui:slash-popup"
 	AgyHeldAmend        = "ui:amend"
 	AgyHeldSurvey       = "ui:survey"
+	// AgyHeldSubagent: a subagent is BLOCKED on the operator (agy 1.5) — a
+	// question or a tool approval, announced by a "┃ … has a question" /
+	// "┃ … needs approval for <Tool>" card above the composer and a
+	// "Blocked · <Tool>" tray row below it. The main composer stays empty and
+	// "? for shortcuts" stays up, so without this the screen reads as a
+	// ready, idle agent. It is escalated, never answered: the card's own key
+	// (ctrl+k) APPROVES an approval outright with nothing shown but the call,
+	// and opens a subagent view for a question.
+	AgyHeldSubagent = "subagent:blocked"
+	// AgyHeldSubagentView: the per-subagent view (ctrl+k / alt+j) an operator
+	// opened — a "main › <agent>" breadcrumb, the subagent's prompt, tools and
+	// "Trajectory — …", and a pager hint ending "esc back". A question form
+	// drawn inside it parses like the main one, but it stands only because a
+	// human is driving.
+	AgyHeldSubagentView = "ui:subagent-view"
 )
 
 var (
@@ -713,7 +898,63 @@ var (
 	agySlashHintRE    = regexp.MustCompile(`^\s*↑/↓ Navigate · enter Select · tab Complete\s*$`)
 	agySurveyRE       = regexp.MustCompile(`How['’]s the CLI experience so far\?`)
 	agySurveySkipRE   = regexp.MustCompile(`\[0\] Skip`)
+	// agySubagentCardHintRE is the last row of the subagent card:
+	// " ┃ ctrl+k answer · alt+j manage" or " ┃ ctrl+k approve · alt+j manage".
+	agySubagentCardHintRE = regexp.MustCompile(`^\s*┃\s*ctrl\+k (?:answer|approve)\b.*\balt\+j manage\s*$`)
+	// agySubagentViewMarkRE / agySubagentPagerRE mark the subagent view: its
+	// "Trajectory — <agent> (N steps)" section header, its "main › <agent>"
+	// breadcrumb, and the pager hint it shows once no form stands.
+	agySubagentViewMarkRE = regexp.MustCompile(`^\s*(?:Trajectory — \S.*\(\d+ steps?\)|main › \S+)\s*$`)
+	agySubagentPagerRE    = regexp.MustCompile(`^\s*↑/↓ scroll · .*\besc back\s*$`)
 )
+
+// agySubagentCardWindow / agySubagentRowWindow bound how far above the status
+// bar the subagent card and the blocked tray rows are looked for: the card sits
+// directly above the composer and the rows directly below it, so a stale card
+// further up a recent capture is history, not a live wait.
+const (
+	agySubagentCardWindow = 24
+	agySubagentRowWindow  = 14
+)
+
+// agySubagentBlocked reports the blocked-subagent screen (AgyHeldSubagent).
+func agySubagentBlocked(lines []string) bool {
+	n := len(lines)
+	for i := n - 1; i >= 0 && i >= n-agySubagentRowWindow; i-- {
+		if agySubagentBlockedRE.MatchString(lines[i]) {
+			return true
+		}
+	}
+	for i := n - 1; i >= 0 && i >= n-agySubagentCardWindow; i-- {
+		if agySubagentCardHintRE.MatchString(lines[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// agySubagentView reports the operator-opened subagent view
+// (AgyHeldSubagentView). Its status bar carries no left token — every
+// main-view form shows "esc to cancel" there — and the view is marked by its
+// breadcrumb or trajectory header, or ends in its pager hint.
+func agySubagentView(lines []string, bar string) bool {
+	n := len(lines)
+	if n == 0 {
+		return false
+	}
+	if agySubagentPagerRE.MatchString(lines[n-1]) {
+		return true
+	}
+	if t := strings.TrimSpace(bar); strings.HasPrefix(t, "? for shortcuts") || strings.HasPrefix(t, "esc to cancel") {
+		return false
+	}
+	for _, l := range lines {
+		if agySubagentViewMarkRE.MatchString(l) {
+			return true
+		}
+	}
+	return false
+}
 
 // AgyHeldForm reports whether the pane shows an agy screen hap must never
 // answer, and which: first-run setup (sign-in, terms — they need a browser and
@@ -733,6 +974,17 @@ func AgyHeldForm(pane string) (kind string, ok bool) {
 	}
 	last := lines[n-1]
 	text := strings.Join(lines, "\n")
+	raw := trimTrailingBlank(strings.Split(strings.ReplaceAll(pane, "\r", ""), "\n"))
+	bar := ""
+	if len(raw) > 0 && agyStatusBarLine(raw[len(raw)-1]) {
+		bar = raw[len(raw)-1]
+	}
+	if agySubagentBlocked(lines) {
+		return AgyHeldSubagent, true
+	}
+	if agySubagentView(lines, bar) {
+		return AgyHeldSubagentView, true
+	}
 	switch {
 	case agySelectHintRE.MatchString(last) && agyNotSignedInRE.MatchString(text) &&
 		lastLineIndex(lines, n-1, agySignInSelectRE) >= 0:

@@ -1,12 +1,14 @@
 # Design: agy (Antigravity CLI) as a first-class agent type — phase 1
 
-**Date:** 2026-09-11 · **Status:** phases 1–5 implemented
+**Date:** 2026-09-11 · **Status:** phases 1–5 implemented; agy 1.5 re-survey (§13) 2026-11-07
 **Captured against:** agy 1.2.1, herdr 0.8.2 (agy manifest `2026.06.24.1`), hap 0.9.16
 **Corpus:** `internal/classify/testdata/transcripts/*_agy_*.txt` (33 fixtures, golden-pinned)
 
 §1–8 are the phase-1 inventory and design that phases 2–5 were built from. They are kept as
 the record of what was observed, and they read as of that capture. §9–12 describe what was
 built and where it departs from §1–8; **where the two disagree, §9–12 and the code win.**
+§13 records what changed in agy 1.5 (captured on 1.5.2 under herdr 0.9.5) and wins over all
+of the above where they disagree.
 Every claim in §1–8 was observed live on scratch agy agents (model `gemini-3.6-flash-low`,
 cwd a temp dir, hap disabled on each) unless it is marked **unverified**.
 
@@ -522,6 +524,8 @@ As built, keys go through `pane send-keys` rather than `pane send-text` (§10).
 - anything into the survey, a picker, the amend field, sign-in or terms
 - `2`/`3` "always allow" options, unless an operator's rule names them explicitly (seeded
   never-auto)
+- `ctrl+k`, `alt+j`, `shift+k` (agy 1.5's subagent card and view: ctrl+k APPROVES an approval
+  card unseen; shift+k kills the subagent — §13.4)
 
 `domain.UnmatchedMenuReply` applies unchanged: a label mapping to no option must not be
 delivered, because agy has the same caret-commits-on-Enter shape Claude has.
@@ -830,3 +834,100 @@ Two constraints of a working machine shape these cases:
 - **That daemon also reads `--source recent`.** That source is a delta every reader consumes,
   so the hand-out case uses the operator path, which reads `--source visible` only, rather than
   the idle poll. The poll's agy gate stays covered by the daemon unit suite.
+
+---
+
+## 13. agy 1.5 (captured on agy 1.5.2, herdr 0.9.5)
+
+Re-surveyed live on three scratch agents (`/var/tmp/hapagy{1,2,3}`, model
+`gemini-3.8-flash-low`, each `hap disable`d), one per track: default-mode approvals,
+Auto mode, questions and plan mode. Twenty new fixtures, all under
+`internal/classify/testdata/transcripts` (email and host redacted).
+
+### 13.1 What changed, and what it broke
+
+| Change in agy 1.5 | Effect on hap before this fix | Fixture(s) |
+|---|---|---|
+| **Auto mode.** The Shift+Tab cycle is now `default → accept-edits → auto → plan`; bar prefix `auto · `, placeholder `> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)` | The bar failed `agyModelSegmentRE`, so **every** screen in Auto mode (forms, idle, errors) read unclassifiable and the mode unknown | `idle_agy_mode_auto`, `idle_agy_auto_after_turn`, `approval_agy_file_create_auto`, `error_agy_auto_declined`, `working_agy_auto` |
+| Effort ladder `low · medium · high · xhigh · max` (`--effort`) | `xhigh`/`max` failed the bar the same way | unit cases only (no model offered them here) |
+| **Tray.** Running background tasks and subagents are drawn in a rule-framed box between the composer and the status bar; the bar gains `· N subagent(s)` before `· N task(s) · /tasks` | The extra rule displaced every footer-anchored check, so an idle agent with background work read unclassifiable | `idle_agy_tray_task`, `idle_agy_tray_subagent`, `idle_agy_tray_subagent_and_task` |
+| **Subagent blocked on the operator.** A card above the composer (`┃ self has a question` / `┃ self needs approval for Bash` … `ctrl+k answer|approve · alt+j manage`) and a `Blocked · <Tool>` tray row | Unclassifiable by accident; widening the bar alone would have read it as a **ready idle composer** (the main composer is empty under `? for shortcuts`) | `idle_agy_subagent_question_card`, `idle_agy_subagent_approval_card` |
+| **Subagent view** (ctrl+k / alt+j): `main › self` breadcrumb, Prompt / Tools / `Trajectory — self (N steps)`, then the subagent's own question form, or a pager hint ending `esc back`; the bar has no left token | The question form inside it would parse like a main-view question | `idle_agy_subagent_view_question`, `idle_agy_subagent_view_pager` |
+| File prompts **inside** the workspace: `Create file` and `Pending edit` / `Accept this file edit?`, with no `Reason:` row; `shift+tab to auto-approve file edits` drawn above the edit question | Unclassifiable (the parser required `Reason:`); the edit prompt is the §4.5 modal, now reproducible on demand | `approval_agy_file_create_workspace`, `approval_agy_file_create_plan_review`, `approval_agy_edit_pending` |
+| Question form: `→ Next` on non-final questions; the **last** reads `enter Submit All` (no `enter Select`); the model's pick is labelled `(Recommended) <label>` | The last question read unclassifiable; the marker split signatures per recommendation and made the reply "Red" miss "(Recommended) Red" | `choice_agy_mcq_recommended`, `choice_agy_mcq_submit_all` |
+| A decline (`No, cancel`, `No, deny creation`) now prints `User declined the tool call` **and** `Interrupted · What should Antigravity CLI do instead?` | Classifies `error:interrupted` (1.2.1 ended the turn cleanly as idle) | `error_agy_declined_interrupted`, `error_agy_auto_declined` |
+| herdr 0.9.5 reports the shell approval, the question form and the trust prompt `blocked`; file prompts still `done` | none (forms classify at any parked status) | `approval_agy_shell_blocked`, `approval_agy_trust_folder_blocked` |
+
+Unchanged and re-verified: the trust prompt (caret starts on Yes), the shell approval's four
+options, `File access` for a read outside the workspace (still `Yes, and always allow
+non-workspace access`, although the 1.5.2 changelog describes per-path options), the
+artifact review panel (`y` approved, execution resumed), the effort picker (held panel),
+and a digit committing on every numbered form, the final `Submit All` question included.
+
+### 13.2 What was built
+
+- **Status bar** (`agyModelSegmentRE`): modes `accept-edits|auto|plan`, effort up to `max`,
+  the `subagent(s)` count. `AgyAgentMode` reads `auto`; `AgentModesFor("agy")` is
+  `default, acceptEdits, auto, plan` (a superset: the changelog gates Auto by platform and
+  account, and `SetAgentMode`'s closed-rotation detection covers a session without it);
+  `AgyModePresses` is 8. The Auto placeholder is not a draft (`agyModePlaceholderRE`).
+- **Tray** (`agyDropTray`, called from `agyDropBackgroundStrip`): removed only as a whole —
+  status bar, its rule, one or more rows that are all running-task or running-subagent
+  rows, and the composer's bottom rule above them. The tray's own rule goes with the rows.
+  A `Blocked ·` row is never removed. `StripAgyChrome` drops the tray first, so idle
+  salients do not carry its clocks. `agyBackgroundWork` counts subagents as background work
+  (it may only withhold).
+- **`AgyComposerVisible`** now also requires the row between the two rules to be a `>`
+  caret line, so an unremoved tray row cannot pass for a composer.
+- **Errors**: `declined` split off `interrupted` (§13.4); the tray is dropped before the
+  transcript is read.
+- **Held** (`AgyHeldForm`, unclassifiable, escalated with no suggestion and no key):
+  `subagent:blocked` (a `Blocked ·` tray row in the bottom 14 rows, or the card's
+  `ctrl+k answer|approve · alt+j manage` row in the bottom 24) and `ui:subagent-view` (the
+  pager hint, or a breadcrumb/trajectory row with a bar carrying no left token).
+  `ParseAgyForm` now refuses every held screen, so no deliverer presses into one.
+- **File prompts without `Reason:`**: anchored on their frame — a title row, a rule, and
+  the diff header `<path>  +N[ -M]` (or `-M`) within 40 rows above the question. Verb
+  `create` or `edit` (`Accept this file edit?`). The path joins the form's identity
+  (`AgyApprovalForm.Path`, `AgyForm.SameAs`) but not `PermissionVerb`, so learned rules keep
+  their signatures while a stale answer for one file is refused at the next.
+  `idle_agy_edit_approval` (the recorded stall) now classifies as this approval.
+- **Questions**: `enter Submit All` accepted; `(Recommended)` stripped from agy labels, and
+  `MenuKeystrokeFrom` gained a last, unique-or-refuse pass comparing with the marker
+  removed from both sides (prefix for agy, suffix for Claude).
+
+### 13.3 Integration cases
+
+Every real-agy case (§12) had been **silently skipping** since herdr began reporting the
+trust prompt `blocked`: `herdr agent start` refuses with `agent_not_ready`, and the shared
+start helper skipped on it. It now tolerates that refusal for agy as it does for Claude, and
+`startAgyAgent` clears the prompt. On agy 1.5.2 / herdr 0.9.5 (model `gemini-3.8-flash-low`,
+the itest default now that `gemini-3.6-flash-low` is gone) detection, approval confirm,
+choice confirm, task hand-out and the mode toggle pass; the toggle observed and reached
+`default → acceptEdits → auto → plan`. The edit-approval case now runs in an untrusted
+`/var/tmp` folder (under `/tmp` agy raised no modal) and expects the `edit file` approval.
+
+### 13.4 Decided, not built
+
+- **Subagent cards are escalated, never answered.** On an approval card ctrl+k approves
+  outright (verified: `sleep 30` ran with no form shown), and the card shows only the call.
+  On a question card ctrl+k opens the subagent view, where the digit commits but the view
+  stays open until `esc back`. Answering them unattended would need a new deliverer
+  (open, verify the form, press, close) and is left for a follow-up. **Never send** ctrl+k,
+  alt+j or shift+k (kill) — added to §5's list.
+- **A decline that ends `Interrupted` stays an error, of its own kind.** agy really has
+  stopped and asked for direction, whoever chose "No"; reading it as idle would hand the next
+  task to an agent that has abandoned the current one. When `⎿ User declined the tool call`
+  sits directly above the Interrupted row the kind is `declined` (`AgyErrorDeclined`), not
+  `interrupted`, so a rule learned for a genuine Esc-interrupt ("continue") never fires right
+  after a "No" and steers the agent back into what was refused.
+- **Forms are not drawn with the tray.** Captured live with a background task running: the
+  shell approval and the question form show only the `· 1 task(s)` suffix in the bar. An
+  idle or error screen does show the tray, so `agyBody` (and with it `AgyErrorForm`) drops
+  it too — an interrupted turn with a task running had read as idle
+  (`error_agy_declined_tray`).
+- **The orchestrator still promotes agy `default → acceptEdits`, not `auto`.** agy's Auto runs
+  commands its reviewer deems safe without asking; that widening is left to the operator
+  (`AutonomousModeFor`).
+- `agy --mode auto` at launch did not take effect after the trust prompt in this session
+  (the bar showed default); hap does not rely on the launch flag.

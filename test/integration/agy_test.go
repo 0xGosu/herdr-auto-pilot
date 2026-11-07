@@ -50,7 +50,7 @@ func agyModel() string {
 	if m := os.Getenv("HAP_ITEST_AGY_MODEL"); m != "" {
 		return m
 	}
-	return "gemini-3.6-flash-low"
+	return "gemini-3.8-flash-low" // gemini-3.6-flash-low is no longer offered (agy 1.5.2)
 }
 
 // quietOperatorDaemon turns off the operator's hap automation for pane, if a
@@ -384,8 +384,16 @@ func TestRealAgyModeToggle(t *testing.T) {
 	}
 	offered := discoverCycle(t, cli, pane, domain.AgentTypeAgy, start)
 	t.Logf("this session's cycle: %v", offered)
-	if len(offered) != 3 {
-		t.Fatalf("observed %v; agy should cycle through default, acceptEdits and plan", offered)
+	// agy 1.5 added Auto (default → acceptEdits → auto → plan); its changelog
+	// gates Auto by platform and account, so a session without it rotates
+	// through the other three.
+	if len(offered) != 3 && len(offered) != 4 {
+		t.Fatalf("observed %v; agy should cycle through default, acceptEdits, [auto,] plan", offered)
+	}
+	for _, m := range offered {
+		if _, ok := domain.ParseAgentMode(domain.AgentTypeAgy, string(m)); !ok {
+			t.Fatalf("observed %v; %s is not one of agy's modes", offered, m)
+		}
 	}
 	for _, want := range offered {
 		if got := driveMode(t, app, pane, want); got != want {
@@ -437,24 +445,19 @@ func TestRealAgyModeToggle(t *testing.T) {
 func TestRealAgyEditApprovalIsNotIdle(t *testing.T) {
 	requireAgy(t)
 	cli := herdr.NewCLI()
-	work := t.TempDir()
+	// An untrusted /var/tmp folder: the 1.5.2 run that raised the modal on
+	// every edit used one, while a t.TempDir() under /tmp did not (below).
+	work := untrustedDir(t, "")
 
-	// The target sits outside agy's start directory, matching the reported
-	// stall's shape (an agent started in the main checkout editing a sibling
-	// worktree). Be warned that this is NOT known to be sufficient.
-	//
-	// Measured live, agy 1.2.2 / Gemini 3.6 Flash Low, twice: an edit INSIDE the
-	// start directory and an edit outside it under /tmp were BOTH applied with
-	// no modal at all — Read, then Edit, then a success message. So whatever
-	// raises "Accept this file edit?" is not simply "outside the workspace";
-	// the remaining candidates (agy trusting /tmp, or the prompt depending on
-	// mode or on how the edit was reached) are untested guesses.
-	//
-	// The case therefore SKIPS with the pane logged rather than failing. The
-	// corpus fixture it guards was captured from the real stall, so the unit
-	// suite's coverage does not depend on reproducing the modal on demand.
-	outside := t.TempDir()
-	target := filepath.Join(outside, "hello.txt")
+	// The target sits INSIDE agy's start directory. Measured live on agy
+	// 1.2.2, an in-workspace edit under /tmp was applied with no modal; on agy
+	// 1.5.2 (default mode, a /var/tmp workspace) the same edit raised
+	// "Pending edit" / "Accept this file edit?" every time, while this case
+	// under /tmp skipped with no modal — so /tmp still looks exempt. It still
+	// SKIPS, with the pane logged, when no modal appears. The corpus fixtures it guards
+	// (idle_agy_edit_approval, approval_agy_edit_pending) do not depend on
+	// reproducing it here.
+	target := filepath.Join(work, "hello.txt")
 	if err := os.WriteFile(target, []byte("one\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -463,8 +466,8 @@ func TestRealAgyEditApprovalIsNotIdle(t *testing.T) {
 	promptAgy(t, cli, pane, "Use your edit tool to change the single line in "+target+
 		" from 'one' to 'two'. Do not run any shell command.")
 
-	// The modal is not one ParseAgyForm knows, which is the whole point, so
-	// poll for its own anchor rather than for a parsed form.
+	// Poll for the modal's own anchor rather than for a parsed form: the
+	// assertion below is what proves the parse.
 	// A skip must carry evidence. "agy did not raise the modal" has several
 	// causes that need different fixes — it auto-approved an in-workspace edit,
 	// it reached for a shell tool instead, or it was still thinking — and a bare
@@ -493,9 +496,10 @@ func TestRealAgyEditApprovalIsNotIdle(t *testing.T) {
 
 	c := classify.New(nil)
 	for _, status := range []string{"idle", "done"} {
-		if s := c.Classify(domain.AgentTypeAgy, status, capture); s.Type != domain.SituationUnclassifiable {
-			t.Errorf("@%s: the live edit approval classified %s, want unclassifiable.\npane:\n%s",
-				status, s.Type, lastLines(capture, 16))
+		if s := c.Classify(domain.AgentTypeAgy, status, capture); s.Type != domain.SituationApproval ||
+			s.PermissionVerb != "edit file" {
+			t.Errorf("@%s: the live edit approval classified %s (verb %q), want approval \"edit file\".\npane:\n%s",
+				status, s.Type, s.PermissionVerb, lastLines(capture, 16))
 		}
 	}
 	if domain.AgyComposerReady(capture) {

@@ -1,0 +1,20 @@
+user@host:/var/tmp/hapagy2$ agy --model gemini-3.8-flash-low --mode auto
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.2
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (Low)
+   ▄▀▀    ▀▀▄     /var/tmp/hapagy2
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Run these shell commands one by one: mkdir -p /var/tmp/hapagy2/sub && touch /var/tmp/hapagy2/sub/a.txt ; then rm -rf /var/tmp/hapagy2/sub ; then
+  git push --force origin main (it may fail, that's fine).
+
+● Ran 2 commands (mkdir -p /var/tmp/hapagy2/sub && touch /var/tmp/hapagy2/sub/a.txt · rm -rf /var/tmp/hapagy2/sub)
+● Ran (git push --force origin main) failed (ctrl+o to expand)
+⣾  Running command...
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                                                                                            auto · Gemini 3.8 Flash · low

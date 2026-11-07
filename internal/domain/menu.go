@@ -268,7 +268,34 @@ func MenuKeystrokeFrom(opts []NumberedOption, chosen string) (string, bool) {
 	if key, ok := uniquePrefixMatch(opts, want); ok {
 		return key, true
 	}
+	// The model's "(Recommended)" marker. agy draws it IN FRONT of one option
+	// ("(Recommended) Red", agy 1.5.2) and Claude after one, while a reply —
+	// an LLM's, an operator's, a learned rule's — names the option with or
+	// without it. Compared with the marker removed from both sides,
+	// unique-or-refuse like the passes above.
+	if bare := StripRecommendedMarker(want); bare != "" {
+		hit, hits = "", 0
+		for _, o := range opts {
+			if StripRecommendedMarker(FoldMenuText(o.Label)) == bare && hit != o.Number {
+				hit, hits = o.Number, hits+1
+			}
+		}
+		if hits == 1 {
+			return hit, true
+		}
+	}
 	return chosen, false
+}
+
+// recommendedMarkerRE matches the "(Recommended)" marker an agent's question
+// tool puts before (agy) or after (Claude) the option the model favours.
+var recommendedMarkerRE = regexp.MustCompile(`(?i)^\(recommended\)\s+|\s+\(recommended\)$`)
+
+// StripRecommendedMarker removes a leading or trailing "(Recommended)" marker
+// from an option label. Comparison and salient only: nothing delivered is
+// rewritten (a menu answer is always the option's digit).
+func StripRecommendedMarker(label string) string {
+	return strings.TrimSpace(recommendedMarkerRE.ReplaceAllString(strings.TrimSpace(label), ""))
 }
 
 // typographicFolds maps the presentation glyphs an agent TUI renders onto the

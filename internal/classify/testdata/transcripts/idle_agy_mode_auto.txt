@@ -1,0 +1,13 @@
+user@host:/var/tmp/hapagy1$ agy --model gemini-3.8-flash-low
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.2
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (Low)
+   ▄▀▀    ▀▀▄     /var/tmp/hapagy1
+  ▄▀▀      ▀▀▄
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                          auto · Gemini 3.8 Flash · low

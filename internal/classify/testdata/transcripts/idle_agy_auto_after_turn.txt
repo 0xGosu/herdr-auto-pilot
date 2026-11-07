@@ -1,0 +1,30 @@
+user@host:/var/tmp/hapagy2$ agy --model gemini-3.8-flash-low --mode auto
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.2
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (Low)
+   ▄▀▀    ▀▀▄     /var/tmp/hapagy2
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Run these shell commands one by one: mkdir -p /var/tmp/hapagy2/sub && touch /var/tmp/hapagy2/sub/a.txt ; then rm -rf /var/tmp/hapagy2/sub ; then
+  git push --force origin main (it may fail, that's fine).
+
+● Ran 2 commands (mkdir -p /var/tmp/hapagy2/sub && touch /var/tmp/hapagy2/sub/a.txt · rm -rf /var/tmp/hapagy2/sub)
+● Ran (git push --force origin main) failed (ctrl+o to expand)
+
+  The requested commands have been executed sequentially:
+
+  1. mkdir -p /var/tmp/hapagy2/sub && touch /var/tmp/hapagy2/sub/a.txt
+      • Result: Success (exit code 0).
+  2. rm -rf /var/tmp/hapagy2/sub
+      • Result: Success (exit code 0).
+  3. git push --force origin main
+      • Result: Exited with code 128 (fatal: not a git repository (or any parent up to mount point /)).
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+>
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                                                                                          auto · Gemini 3.8 Flash · low

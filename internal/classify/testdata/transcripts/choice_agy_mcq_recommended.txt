@@ -1,0 +1,28 @@
+user@host:/var/tmp/hapagy3$ agy --model gemini-3.8-flash-low
+
+
+      ▄▀▀▄        Antigravity CLI 1.5.2
+     ▀▀▀▀▀▀       operator@example.com (Google AI Pro)
+    ▀▀▀▀▀▀▀▀      Gemini 3.8 Flash (Low)
+   ▄▀▀    ▀▀▄     /var/tmp/hapagy3
+  ▄▀▀      ▀▀▄
+
+────────────────────────────────────────────────────────────
+> Use your question tool to ask me two multiple-choice questions at once: my favourite colour (Red, Blue, Green) and my favourite pet (Cat, Dog).
+  Then repeat my answers.
+
+? What is your favourite colour?
+? What is your favourite pet?
+
+Question
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+Question 1/2: What is your favourite colour?
+
+> 1. (Recommended) Red
+  2. Blue
+  3. Green
+  4. Write-in...
+
+  ↑/↓ Navigate · → Next · enter Select · esc Skip
+esc to cancel                                                                                                                   Gemini 3.8 Flash · low

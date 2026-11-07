@@ -21,6 +21,12 @@ package domain
 // refused falls back to acceptEdits; SetAgentMode detects the closed cycle and
 // rotates the agent back before refusing.
 //
+// agy 1.5's Auto mode (edits AND commands its reviewer deems safe) is NOT the
+// promotion target, although it is reachable: unlike claude's, agy's Auto
+// runs shell commands unprompted, and widening an agent that far is left to
+// the operator (`hap mode <agent> auto`). An agy already in auto is past the
+// restrictive end and is left alone like acceptEdits.
+//
 // Accepted: an agy launched with --dangerously-skip-permissions paints no
 // indicator and reads as default (AgyAgentMode), so it is offered acceptEdits
 // too — one needless press into an agent that asks nothing either way.

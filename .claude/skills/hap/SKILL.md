@@ -240,7 +240,7 @@ hap mode backend-dev plan --yes       # rotate the agent into plan mode
 |---|---|
 | `claude` | `acceptEdits`, `plan`, `auto`, `manual` |
 | `codex` | `default`, `plan` |
-| `agy` | `default`, `acceptEdits`, `plan` (agy's `accept-edits` works too) |
+| `agy` | `default`, `acceptEdits`, `auto`, `plan` (agy's `accept-edits` works too; `auto` needs agy 1.5+) |
 
 Other agent types have no toggle and report `-`.
 
