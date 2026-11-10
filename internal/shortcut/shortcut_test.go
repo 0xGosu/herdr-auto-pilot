@@ -201,6 +201,237 @@ func TestDefaultLocationFollowsWritability(t *testing.T) {
 	resolvesTo(t, want, current)
 }
 
+// readOnly makes dir unwritable for the test — what /usr/local/bin is to an
+// ordinary user on macOS and on any per-user herdr install.
+func readOnly(t *testing.T, dir string) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root can write a read-only directory, so the unwritable case cannot be staged")
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+}
+
+// TestAStaleLinkInAnUnwritableDirectoryIsSteppedOver is the second failure
+// report for this feature: /usr/local/bin/hap exists from an earlier install
+// (made with sudo, or when the directory was writable), is now stale, and the
+// operator cannot write /usr/local/bin. Locating it as "the link" made the TUI
+// row and `hap link` fail with "permission denied" on every attempt — nothing
+// they could press would ever give them a working `hap`.
+func TestAStaleLinkInAnUnwritableDirectoryIsSteppedOver(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// retained: the old install is still on disk (herdr ≥0.9.5 keeps it
+		// until its server exits), so the stale link still RESOLVES.
+		retained bool
+	}{
+		{"dangling", false},
+		{"still resolving to a retained old install", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sb := newSandbox(t)
+			t.Setenv("PATH", sb.systemDir+string(os.PathListSeparator)+sb.userDir)
+			old := sb.install095("1-0")
+			if tc.retained {
+				writeExe(t, old)
+			}
+			stale := symlink(t, old, filepath.Join(sb.systemDir, "hap"))
+			current := writeExe(t, sb.install095("2-0"))
+			readOnly(t, sb.systemDir)
+
+			want := filepath.Join(sb.userDir, "hap")
+			got, err := install(current)
+			if err != nil {
+				t.Fatalf("install must not fail on a link it cannot write: %v", err)
+			}
+			if got.Path != want || got.State != Absent || got.Blocked != stale {
+				t.Fatalf("install reported %+v, want %s created with %s reported as blocked", got, want, stale)
+			}
+			// systemDir precedes userDir on this PATH, so the old link wins
+			// in a shell exactly when it still resolves; a dead one is
+			// skipped by the shell's search and shadows nothing.
+			if got.Shadows != tc.retained {
+				t.Errorf("Shadows = %v, want %v", got.Shadows, tc.retained)
+			}
+			resolvesTo(t, want, current)
+			if after, _ := os.Readlink(stale); after != old {
+				t.Errorf("the unwritable link changed to %q", after)
+			}
+
+			// Second press: the link made above is ours, writable and current.
+			// The blocked one is still reported — it still needs removing.
+			again := locate(current)
+			if again.Path != want || again.State != Current || again.Blocked != stale {
+				t.Errorf("locate after the fix = %+v, want %s current, %s still blocked", again, want, stale)
+			}
+		})
+	}
+}
+
+// The reported machine: ~/.local/bin (where herdr lives) comes BEFORE
+// /usr/local/bin on PATH, and the old link still resolves — to a legacy
+// plugins/github/ install that herdr 0.9.5 never cleans up. The new link goes
+// beside herdr and wins; the old one is litter, not something the operator
+// must fix with sudo.
+func TestABlockedLinkLaterOnPathDoesNotShadow(t *testing.T) {
+	sb := newSandbox(t)
+	t.Setenv("PATH", sb.userDir+string(os.PathListSeparator)+sb.systemDir)
+	legacy := writeExe(t, filepath.Join(sb.plugins, "github", "herd-auto-prompter-e001d0f4b256", "bin", "hap"))
+	stale := symlink(t, legacy, filepath.Join(sb.systemDir, "hap"))
+	writeExe(t, filepath.Join(sb.userDir, "herdr"))
+	t.Setenv("HERDR_BIN_PATH", filepath.Join(sb.userDir, "herdr"))
+	current := writeExe(t, sb.install095("73398-0"))
+	readOnly(t, sb.systemDir)
+
+	got, err := install(current)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	want := filepath.Join(sb.userDir, "hap")
+	if got.Path != want || !got.OnPath || got.Blocked != stale {
+		t.Fatalf("install reported %+v, want %s (on PATH) with %s blocked", got, want, stale)
+	}
+	if got.Shadows {
+		t.Error("Shadows = true for a blocked link that comes later on PATH")
+	}
+	resolvesTo(t, want, current)
+}
+
+// The control: an unwritable directory only matters when something has to be
+// WRITTEN. A link there that already points at this binary is the link.
+func TestACurrentLinkInAnUnwritableDirectoryIsStillTheLink(t *testing.T) {
+	sb := newSandbox(t)
+	t.Setenv("PATH", sb.systemDir)
+	current := writeExe(t, sb.install095("2-0"))
+	link := symlink(t, current, filepath.Join(sb.systemDir, "hap"))
+	readOnly(t, sb.systemDir)
+
+	got, err := install(current)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if got.Path != link || got.State != Current || got.Blocked != "" {
+		t.Fatalf("install reported %+v, want the existing link %s, current, nothing blocked", got, link)
+	}
+	if _, err := os.Lstat(filepath.Join(sb.userDir, "hap")); !os.IsNotExist(err) {
+		t.Errorf("a second link was created (lstat err = %v)", err)
+	}
+}
+
+// A writable link of ours further along PATH is repointed in preference to
+// creating a third one.
+func TestAWritableLinkBeatsTheDefaultWhenAnotherIsBlocked(t *testing.T) {
+	sb := newSandbox(t)
+	t.Setenv("PATH", sb.systemDir+string(os.PathListSeparator)+sb.pathDir)
+	blocked := symlink(t, sb.install095("1-0"), filepath.Join(sb.systemDir, "hap"))
+	mine := symlink(t, sb.install095("1-0"), filepath.Join(sb.pathDir, "hap"))
+	current := writeExe(t, sb.install095("2-0"))
+	readOnly(t, sb.systemDir)
+
+	got := locate(current)
+	if got.Path != mine || got.State != Stale || got.Blocked != blocked {
+		t.Fatalf("locate = %+v, want %s stale with %s blocked", got, mine, blocked)
+	}
+
+	// The unattended repair after `hap update` makes the same choice…
+	path, repointed, err := Heal(current)
+	if err != nil || !repointed || path != mine {
+		t.Fatalf("Heal = (%q, %v, %v), want %s repointed", path, repointed, err, mine)
+	}
+	resolvesTo(t, mine, current)
+}
+
+// …and with ONLY a blocked link it changes nothing and says which one, so
+// `hap update` can tell the operator to run `hap link`.
+func TestHealReportsALinkItCannotWrite(t *testing.T) {
+	sb := newSandbox(t)
+	t.Setenv("PATH", sb.systemDir)
+	old := sb.install095("1-0")
+	blocked := symlink(t, old, filepath.Join(sb.systemDir, "hap"))
+	current := writeExe(t, sb.install095("2-0"))
+	readOnly(t, sb.systemDir)
+
+	path, repointed, err := Heal(current)
+	if err == nil || repointed || path != blocked {
+		t.Fatalf("Heal = (%q, %v, %v), want %s reported, unchanged, with an error", path, repointed, err, blocked)
+	}
+	if !strings.Contains(err.Error(), "not writable") {
+		t.Errorf("err = %v, want it to say the directory is not writable", err)
+	}
+	if after, _ := os.Readlink(blocked); after != old {
+		t.Errorf("the unwritable link changed to %q", after)
+	}
+	if _, err := os.Lstat(filepath.Join(sb.userDir, "hap")); !os.IsNotExist(err) {
+		t.Errorf("Heal created a link (lstat err = %v)", err)
+	}
+}
+
+// With /usr/local/bin unwritable, a new link belongs where it works with no
+// further step: the directory herdr itself runs from is the operator's own and
+// is on their PATH. macOS has no ~/.local/bin on PATH by default, so falling
+// straight back to it there trades one manual step for another.
+func TestNewLinkGoesBesideHerdrWhenThatIsOnPath(t *testing.T) {
+	sb := newSandbox(t)
+	current := writeExe(t, sb.install095("2-0"))
+	brew := filepath.Join(sb.root, "homebrew", "bin")
+	herdr := writeExe(t, filepath.Join(brew, "herdr"))
+	readOnly(t, sb.systemDir)
+
+	t.Run("on PATH: used", func(t *testing.T) {
+		t.Setenv("PATH", sb.systemDir+string(os.PathListSeparator)+brew)
+		got := locate(current)
+		if want := filepath.Join(brew, "hap"); got.Path != want || !got.OnPath {
+			t.Fatalf("locate = %+v, want %s, on PATH", got, want)
+		}
+	})
+
+	// HERDR_BIN_PATH may name a resolved, version-stamped location (a
+	// Homebrew Cellar path): a directory nobody has on PATH is no better
+	// than ~/.local/bin, and worse for being replaced on the next upgrade.
+	t.Run("named by HERDR_BIN_PATH but not on PATH: not used", func(t *testing.T) {
+		t.Setenv("PATH", sb.systemDir)
+		t.Setenv("HERDR_BIN_PATH", herdr)
+		got := locate(current)
+		if want := filepath.Join(sb.userDir, "hap"); got.Path != want {
+			t.Fatalf("locate = %+v, want the ~/.local/bin fallback %s", got, want)
+		}
+	})
+
+	t.Run("on PATH but not writable: not used", func(t *testing.T) {
+		t.Setenv("PATH", sb.systemDir+string(os.PathListSeparator)+brew)
+		readOnly(t, brew)
+		got := locate(current)
+		if want := filepath.Join(sb.userDir, "hap"); got.Path != want {
+			t.Fatalf("locate = %+v, want the ~/.local/bin fallback %s", got, want)
+		}
+	})
+}
+
+// The TUI shows an action's error on one truncated line. os.Symlink leads
+// with both paths — "symlink <long install path> <target>: permission denied"
+// — so the reason was exactly the part cut off ("…: symlink /Users…").
+func TestLinkErrorsLeadWithTheReason(t *testing.T) {
+	sb := newSandbox(t)
+	current := writeExe(t, sb.install095("2-0"))
+	target := symlink(t, sb.install095("1-0"), filepath.Join(sb.systemDir, "hap"))
+	readOnly(t, sb.systemDir)
+
+	// Ensure is the low-level call: asked for THIS target, it still tries.
+	err := Ensure(current, target)
+	if err == nil {
+		t.Fatal("repointing a link in a read-only directory succeeded")
+	}
+	want := "repoint " + target + ": permission denied"
+	if err.Error() != want {
+		t.Errorf("err = %q, want %q", err, want)
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Errorf("err = %v, want it to remain a permission error", err)
+	}
+}
+
 func TestHeal(t *testing.T) {
 	type setup struct {
 		sb      sandbox

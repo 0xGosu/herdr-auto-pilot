@@ -56,6 +56,39 @@ func TestLinkReportsWhatItDid(t *testing.T) {
 	}
 }
 
+// A stale link the operator cannot write is left alone and a new one made
+// elsewhere; the verb succeeds and names the one command that needs root,
+// instead of failing on "permission denied" as it used to.
+func TestLinkNamesTheLinkItCouldNotWrite(t *testing.T) {
+	stubInstall(t, shortcut.Link{
+		Path: "/Users/op/.local/bin/hap", Source: "/plugins/2-0/checkout/bin/hap",
+		State: shortcut.Absent, OnPath: true, Blocked: "/usr/local/bin/hap", Shadows: true,
+	}, nil)
+	var out bytes.Buffer
+	if err := link(context.Background(), nil, &out, nil); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	for _, want := range []string{"created /Users/op/.local/bin/hap", "sudo rm /usr/local/bin/hap", "STILL RUNS THE OLD BUILD"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, out.String())
+		}
+	}
+
+	// The same link later on PATH (or dead) wins nothing: say so rather than
+	// alarm the operator into a sudo they do not need.
+	stubInstall(t, shortcut.Link{
+		Path: "/Users/op/.local/bin/hap", Source: "/plugins/2-0/checkout/bin/hap",
+		State: shortcut.Absent, OnPath: true, Blocked: "/usr/local/bin/hap",
+	}, nil)
+	out.Reset()
+	if err := link(context.Background(), nil, &out, nil); err != nil {
+		t.Fatalf("link: %v", err)
+	}
+	if got := out.String(); strings.Contains(got, "OLD BUILD") || !strings.Contains(got, "does not win on PATH") {
+		t.Errorf("output for a harmless blocked link:\n%s", got)
+	}
+}
+
 func TestLinkSurfacesARefusal(t *testing.T) {
 	refusal := errors.New("/usr/local/bin/hap already exists and is not a symlink")
 	stubInstall(t, shortcut.Link{}, refusal)

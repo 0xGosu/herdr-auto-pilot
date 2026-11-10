@@ -330,7 +330,8 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
   submitting — don't remove the status-gated retry-Enter loop in `CLI.send`.
 - `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` override the binary and events socket.
 - Plugin installs (herdr 0.9.5): `<config>/herdr/plugins/github-installations/<id>-<hash>/<generation>/checkout`
-  (before: `plugins/github/<id>-<version>`); every install/update is a FRESH clone in a new `<generation>`.
+  (before: `plugins/github/<id>-<hash>`, reinstalled in place — and that legacy dir is never cleaned up, so a
+  PATH link left on it runs the pre-upgrade release forever); every install/update is a FRESH clone in a new `<generation>`.
   The previous one is RETAINED until the herdr servers using it exit, then removed by a later install or
   server startup (herdr docs, `plugins.mdx` "Install and link"; before 0.9.5 it was unlinked at once). So:
   - "My binary exists" does not mean "I am the installed build": only the registry says
@@ -339,7 +340,10 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
     (`deferToRegisteredInstall`); never under `--replace-only`, which runs inside `[[build]]` while the
     registry still names the install being replaced. `checkOwnBinary` only fires once the files are gone.
   - Anything holding an install path goes stale, then dangles — the operator's `hap` PATH symlink included
-    (`internal/shortcut`: finds a link before proposing a location; `Heal` never creates).
+    (`internal/shortcut`: finds a link before proposing a location; `Heal` never creates). A stale link in
+    an UNWRITABLE directory is never "the link" (`find` reports it as `Link.Blocked` and moves on) — offering
+    it is how the TUI row failed forever with EACCES on macOS. Link errors lead with the reason (`cause`):
+    the TUI status line is one truncated row.
   - Nothing durable survives in the plugin root: `install.sh` `seed_model` carries the optional model over
     (on the release's checksum), and path-keyed caches must prune (`persistModelID`).
   - A new layout is added to `selfpath.installGlobs`. herdr's per-user install is `~/.local/bin`, where

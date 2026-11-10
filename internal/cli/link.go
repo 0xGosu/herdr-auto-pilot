@@ -40,6 +40,19 @@ func link(_ context.Context, _ *frontend.App, out io.Writer, args []string) erro
 	default:
 		fmt.Fprintf(out, "created %s -> %s\n", l.Path, l.Source)
 	}
+	switch {
+	case l.Shadows:
+		// The one step that needs root, so it is the operator's: name the
+		// exact command rather than fail the whole verb on it, which is what
+		// used to happen ("permission denied", every time).
+		fmt.Fprintf(out, "note: %s is a stale hap link in a directory you cannot write, so it was left alone.\n"+
+			"      It comes first on PATH and still resolves, so `hap` STILL RUNS THE OLD BUILD — remove it with: sudo rm %s\n",
+			l.Blocked, l.Blocked)
+	case l.Blocked != "":
+		fmt.Fprintf(out, "note: %s is a stale hap link in a directory you cannot write, so it was left alone.\n"+
+			"      It does not win on PATH, so nothing depends on it; tidy up with: sudo rm %s\n",
+			l.Blocked, l.Blocked)
+	}
 	if !l.OnPath {
 		fmt.Fprintf(out, "note: %s is not on your PATH — add it, or `hap` still will not be found\n", filepath.Dir(l.Path))
 	}

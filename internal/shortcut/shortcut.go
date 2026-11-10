@@ -6,7 +6,7 @@
 // The link is also fragile by construction: herdr installs every update into
 // a NEW directory (herdr ≥0.9.5:
 // plugins/github-installations/<id>-<hash>/<generation>/checkout; earlier:
-// plugins/github/<id>-<version>), so each update strands the link on the
+// plugins/github/<id>-<hash>, reinstalled in place), so an update strands the link on the
 // previous install. Before 0.9.5 that install was removed at once and `hap`
 // read "command not found". From 0.9.5 it is RETAINED until the herdr server
 // exits, which is worse: `hap` keeps working as the OLD build, silently, and
@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
@@ -75,6 +76,19 @@ type Link struct {
 	// link outside PATH is created all the same, but the operator has to be
 	// told, or `hap` still reads "command not found".
 	OnPath bool
+	// Blocked is a stale hap link in a directory this user cannot write —
+	// typically /usr/local/bin/hap made with sudo, or made back when the
+	// directory was writable. It cannot be repointed from here, so Path is
+	// somewhere else; but while Blocked still resolves and comes first on
+	// PATH it SHADOWS the new link, so the operator has to be told to remove
+	// it (the one step that needs root).
+	Blocked string
+	// Shadows reports whether Blocked actually wins over Path in a shell:
+	// it still resolves, and its directory comes earlier on PATH (or Path's
+	// is not on PATH at all). When false Blocked is only litter — as on a
+	// machine whose ~/.local/bin precedes /usr/local/bin — and the operator
+	// has nothing they must do.
+	Shadows bool
 }
 
 // Locate reports the shortcut for the running binary, read-only. It is what
@@ -88,9 +102,37 @@ func Locate() Link {
 }
 
 func locate(source string) Link {
-	path := Path(source)
+	path, blocked := find(source)
 	state, _ := Classify(source, path)
-	return Link{Path: path, Source: source, State: state, OnPath: onPath(filepath.Dir(path))}
+	return Link{
+		Path: path, Source: source, State: state, OnPath: onPath(filepath.Dir(path)),
+		Blocked: blocked, Shadows: shadows(blocked, path),
+	}
+}
+
+// shadows reports whether the link at blocked is what a shell runs for `hap`
+// in preference to the one at path. A dangling link never is: a shell's PATH
+// search skips a name it cannot execute.
+func shadows(blocked, path string) bool {
+	if blocked == "" {
+		return false
+	}
+	if _, err := os.Stat(blocked); err != nil {
+		return false
+	}
+	theirs, ours := pathIndex(filepath.Dir(blocked)), pathIndex(filepath.Dir(path))
+	return theirs >= 0 && (ours < 0 || theirs < ours)
+}
+
+// pathIndex is dir's position in PATH, or -1.
+func pathIndex(dir string) int {
+	dir = filepath.Clean(dir)
+	for i, entry := range filepath.SplitList(os.Getenv("PATH")) {
+		if filepath.IsAbs(entry) && filepath.Clean(entry) == dir {
+			return i
+		}
+	}
+	return -1
 }
 
 // Install links the executable backing this process and reports the link as
@@ -145,6 +187,7 @@ func Heal(source string) (string, bool, error) {
 	if err != nil {
 		return "", false, fmt.Errorf("resolve the installed hap binary %s: %w", source, err)
 	}
+	var blocked string
 	for _, dir := range searchDirs() {
 		path := filepath.Join(dir, name)
 		if !isSymlink(path) {
@@ -157,11 +200,23 @@ func Heal(source string) (string, bool, error) {
 			if !pointsIntoPluginTree(path) {
 				continue
 			}
+			// A link that cannot be rewritten is not the end of the search:
+			// the operator may have a second, user-level one further along
+			// (which is exactly what `hap link` makes in this situation).
+			if !writableDir(dir) {
+				if blocked == "" {
+					blocked = path
+				}
+				continue
+			}
 			if err := repointSymlink(resolved, path); err != nil {
 				return path, false, err
 			}
 			return path, true, nil
 		}
+	}
+	if blocked != "" {
+		return blocked, false, fmt.Errorf("%s is not writable", filepath.Dir(blocked))
 	}
 	return "", false, nil
 }
@@ -188,30 +243,91 @@ func refuseUnderTest() error {
 // inherits herdr's PATH rather than the operator's login shell's. A regular
 // file named hap, or a link to someone else's live binary, is skipped rather
 // than claimed.
+//
+// A stale link in a directory this user cannot write is not returned either:
+// it can only be repointed as root. Offering it anyway is how the TUI row came
+// to fail forever with "permission denied" on a machine whose
+// /usr/local/bin/hap was once made with sudo — the very failure this package
+// exists to remove. See find for what happens instead.
 func Path(source string) string {
-	for _, dir := range searchDirs() {
-		path := filepath.Join(dir, name)
-		if !isSymlink(path) {
-			continue
-		}
-		if state, _ := Classify(source, path); state == Current || state == Stale {
-			return path
-		}
-	}
-	return filepath.Join(defaultDir(), name)
+	path, _ := find(source)
+	return path
 }
 
-// defaultDir picks where a NEW link goes: the system directory when this user
-// can write it (the historical location, and the one every shell has on
-// PATH), otherwise the per-user ~/.local/bin that herdr's own installer uses.
+// find is Path plus the stale link it had to step over (Link.Blocked).
+//
+// A Current link is returned wherever it is — there is nothing to write. A
+// Stale one is returned only from a writable directory. The first Stale link
+// found in an UNWRITABLE directory is reported as blocked, and the search
+// goes on: to a writable link of ours further along, else to the default
+// location, where a new one is created.
+func find(source string) (path, blocked string) {
+	for _, dir := range searchDirs() {
+		candidate := filepath.Join(dir, name)
+		if !isSymlink(candidate) {
+			continue
+		}
+		switch state, _ := Classify(source, candidate); state {
+		case Current:
+			return candidate, blocked
+		case Stale:
+			if writableDir(dir) {
+				return candidate, blocked
+			}
+			if blocked == "" {
+				blocked = candidate
+			}
+		}
+	}
+	return filepath.Join(defaultDir(), name), blocked
+}
+
+// defaultDir picks where a NEW link goes, preferring a directory that is both
+// writable and already on PATH, so the link works with no further step:
+//
+//  1. the system directory (the historical location, on every shell's PATH)
+//     when this user can write it — a root devcontainer;
+//  2. the directory `herdr` itself is run from: the operator installed a
+//     command there and runs it, so it is theirs and on their PATH
+//     (~/.local/bin for herdr's own installer, /opt/homebrew/bin for brew).
+//     macOS has no ~/.local/bin on PATH by default, which is what makes this
+//     step matter there;
+//  3. ~/.local/bin, created if missing, with the PATH note when needed.
+//
 // With no home directory to fall back to it stays the system directory, so
 // the failure names a real path.
 func defaultDir() string {
-	user := userBinDir()
-	if user == "" || writableDir(systemBinDir) {
+	if writableDir(systemBinDir) {
 		return systemBinDir
 	}
-	return user
+	if dir := herdrBinDir(); dir != "" {
+		return dir
+	}
+	if user := userBinDir(); user != "" {
+		return user
+	}
+	return systemBinDir
+}
+
+// herdrBinDir returns the PATH directory herdr is run from, when this user
+// can write it. HERDR_BIN_PATH is tried first because herdr sets it for every
+// plugin command, but it may name a resolved, version-stamped location (a
+// Homebrew Cellar path) rather than the directory on PATH — so each candidate
+// must itself be a PATH entry, and the PATH lookup follows.
+func herdrBinDir() string {
+	var candidates []string
+	if bin := os.Getenv("HERDR_BIN_PATH"); filepath.IsAbs(bin) {
+		candidates = append(candidates, filepath.Dir(bin))
+	}
+	if bin, err := exec.LookPath("herdr"); err == nil && filepath.IsAbs(bin) {
+		candidates = append(candidates, filepath.Dir(bin))
+	}
+	for _, dir := range candidates {
+		if onPath(dir) && writableDir(dir) {
+			return filepath.Clean(dir)
+		}
+	}
+	return ""
 }
 
 func userBinDir() string {
@@ -246,15 +362,7 @@ func searchDirs() []string {
 	return dirs
 }
 
-func onPath(dir string) bool {
-	dir = filepath.Clean(dir)
-	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
-		if filepath.IsAbs(entry) && filepath.Clean(entry) == dir {
-			return true
-		}
-	}
-	return false
-}
+func onPath(dir string) bool { return pathIndex(dir) >= 0 }
 
 // writableDir reports whether this process may create entries in dir. It asks
 // the kernel (access(2), W_OK) rather than probing with a temp file: the TUI
@@ -378,7 +486,7 @@ func Ensure(source, target string) error {
 			return fmt.Errorf("create %s: %w", filepath.Dir(target), err)
 		}
 		if err := os.Symlink(resolvedSource, target); err != nil {
-			return fmt.Errorf("create %s symlink: %w", target, err)
+			return fmt.Errorf("create %s symlink: %w", target, cause(err))
 		}
 		return nil
 	case Stale:
@@ -399,11 +507,24 @@ func repointSymlink(source, target string) error {
 		return fmt.Errorf("clear stale temp link %s: %w", tmp, err)
 	}
 	if err := os.Symlink(source, tmp); err != nil {
-		return fmt.Errorf("create replacement symlink for %s: %w", target, err)
+		return fmt.Errorf("repoint %s: %w", target, cause(err))
 	}
 	if err := os.Rename(tmp, target); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("repoint %s: %w", target, err)
+		return fmt.Errorf("repoint %s: %w", target, cause(err))
 	}
 	return nil
+}
+
+// cause strips the paths os.Symlink and os.Rename put in FRONT of the reason
+// ("symlink <long install path> <target>: permission denied"). The TUI shows
+// an action's error on one truncated line, and with the paths first the only
+// part that mattered — why — was the part cut off. The caller already names
+// the target.
+func cause(err error) error {
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return linkErr.Err
+	}
+	return err
 }

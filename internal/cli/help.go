@@ -274,10 +274,14 @@ func buildCommands() {
 				"only later reads \"command not found\". It is the same action as the TUI Config\n" +
 				"tab's Quick Shortcuts row.\n" +
 				"An existing `hap` symlink is found wherever it is on PATH and reused; a new one\n" +
-				"goes in /usr/local/bin when you can write there, otherwise ~/.local/bin (created\n" +
-				"if missing — the output says so when that directory is not on PATH). A regular\n" +
-				"file named hap, or a symlink to a binary that is not one of hap's own plugin\n" +
-				"installs, is never replaced: remove it yourself first.\n" +
+				"goes in the first of these you can write: /usr/local/bin, the directory herdr\n" +
+				"itself runs from (when it is on PATH), ~/.local/bin (created if missing — the\n" +
+				"output says so when that directory is not on PATH).\n" +
+				"A stale `hap` symlink in a directory you cannot write (a /usr/local/bin/hap once\n" +
+				"made with sudo) is left alone and a new one is created instead; the output then\n" +
+				"names the `sudo rm` that stops the old one shadowing it. A regular file named\n" +
+				"hap, or a symlink to a binary that is not one of hap's own plugin installs, is\n" +
+				"never replaced: remove it yourself first.\n" +
 				"When `hap` is already \"command not found\", run the installed binary by path:\n" +
 				"`<plugin_root>/bin/hap link`, with plugin_root as `herdr plugin list --json`\n" +
 				"reports it for herd-auto-prompter.",

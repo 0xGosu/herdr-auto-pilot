@@ -306,7 +306,11 @@ func fromHerdrRegistry() string {
 //     generations are retained until the herdr servers using them exit, so
 //     several coexist routinely (the newest binary is the current one, bar a
 //     build herdr aborted before registering it).
-//   - earlier:      <root>/github/<id>-<version>/bin/hap.
+//   - earlier:      <root>/github/<id>-<hash>/bin/hap, reinstalled in place.
+//     herdr 0.9.5 never cleans these up ("legacy installations without
+//     cleanup tracking are retained"), so on an upgraded machine one sits
+//     beside the new tree indefinitely, still runnable (seen live: a PATH
+//     link left on it kept running the release from before the herdr upgrade).
 //
 // Both stay: the scan is the fallback for when herdr cannot be asked, which is
 // exactly when its version is unknown. A layout this list does not know makes

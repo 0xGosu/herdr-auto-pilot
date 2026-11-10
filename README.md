@@ -227,9 +227,16 @@ Herdr runs the plugin from its own install directory and puts nothing on
 symlink to this running binary** under **Quick Shortcuts** — or run `hap link`,
 which does the same thing from a shell.
 
-The symlink goes in `/usr/local/bin` when you can write there, otherwise in
+An existing `hap` symlink is found wherever it is on `PATH` and reused. A new
+one goes in the first of these you can write: `/usr/local/bin`; the directory
+`herdr` itself runs from, when that is on your `PATH` (`/opt/homebrew/bin`, say);
 `~/.local/bin` (created if missing; you are told when it is not on your `PATH`).
-An existing `hap` symlink is found wherever it is on `PATH` and reused instead.
+
+A stale `hap` symlink in a directory you cannot write — typically a
+`/usr/local/bin/hap` once made with `sudo` — is left alone and a new one is
+created as above. While the old one still resolves and comes first on `PATH` it
+shadows the new link, so hap tells you the one command that needs root:
+`sudo rm /usr/local/bin/hap`.
 
 Each update installs into its own directory, so an update done outside hap
 (`herdr plugin update`) strands the symlink on the previous install. On Herdr
