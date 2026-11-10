@@ -1620,9 +1620,13 @@ update moves the install to a new directory (the old one is removed — on herdr
 rather than downgrade the daemon). `hap
 update` repoints the link itself; after an update done by herdr
 (`herdr plugin update`) run `"$PLUGIN_ROOT/bin/hap" link`. It reuses an existing
-`hap` symlink wherever it is on `PATH`, else creates one in `/usr/local/bin`
-when writable, otherwise `~/.local/bin`. It never replaces a regular file or a
-symlink to a binary that is not one of hap's own installs.
+`hap` symlink wherever it is on `PATH`, else creates one in the first writable
+of `/usr/local/bin`, the directory `herdr` runs from (when on `PATH`), and
+`~/.local/bin`. It never replaces a regular file or a symlink to a binary that
+is not one of hap's own installs. A stale `hap` link in a directory it cannot
+write (a `/usr/local/bin/hap` made with `sudo`) is left alone: it creates a new
+link and prints the `sudo rm …` that stops the old one shadowing it — relay that
+command to the operator, never run `sudo` yourself.
 
 ## installing this skill for other agents
 

@@ -92,6 +92,7 @@ func TestConfigShortcutYesAndDefaultEnterExecute(t *testing.T) {
 }
 
 func TestShortcutLabelsMatchState(t *testing.T) {
+	t.Setenv("HOME", "/nonexistent-home") // paths below are shown unabbreviated
 	const path = "/home/op/.local/bin/hap"
 	tests := []struct {
 		state      shortcut.State
@@ -126,10 +127,66 @@ func TestShortcutLabelsMatchState(t *testing.T) {
 	}
 }
 
+// A stale link the operator cannot write is stepped over (internal/shortcut),
+// so the row acts somewhere else than they expect: the label says why before
+// they press, and the result leads with the one command that needs root —
+// both on a line the pane truncates.
+func TestShortcutRowExplainsABlockedLink(t *testing.T) {
+	t.Setenv("HOME", "/Users/op")
+	link := shortcut.Link{
+		Path: "/Users/op/.local/bin/hap", State: shortcut.Absent, OnPath: true,
+		Blocked: "/usr/local/bin/hap", Shadows: true,
+	}
+	label := shortcutLabel(link)
+	if !strings.HasPrefix(label, "Create ~/.local/bin/hap symlink") ||
+		!strings.Contains(label, "/usr/local/bin/hap is stale and needs sudo") {
+		t.Errorf("label = %q, want the new location and why the old link is not used", label)
+	}
+	result := shortcutResult(link)
+	if want := "created ~/.local/bin/hap symlink — run: sudo rm /usr/local/bin/hap"; !strings.HasPrefix(result, want) {
+		t.Errorf("result = %q, want it to start %q", result, want)
+	}
+
+	// A blocked link that does not win on PATH is litter: the label still
+	// explains the location, but the result sends nobody after it with sudo.
+	harmless := link
+	harmless.Shadows = false
+	if got := shortcutResult(harmless); got != "created ~/.local/bin/hap symlink" {
+		t.Errorf("result for a harmless blocked link = %q, want no follow-up", got)
+	}
+	if got := shortcutLabel(harmless); !strings.Contains(got, "/usr/local/bin/hap is stale and needs sudo") {
+		t.Errorf("label for a harmless blocked link = %q, want it to still say why", got)
+	}
+
+	// Both follow-ups at once: the root step first, it is the one that
+	// cannot be guessed.
+	link.OnPath = false
+	result = shortcutResult(link)
+	rm, path := strings.Index(result, "sudo rm"), strings.Index(result, "add ~/.local/bin to your PATH")
+	if rm < 0 || path < 0 || rm > path {
+		t.Errorf("result = %q, want the sudo step, then the PATH step", result)
+	}
+}
+
+func TestTildePath(t *testing.T) {
+	t.Setenv("HOME", "/Users/op")
+	for in, want := range map[string]string{
+		"/Users/op/.local/bin/hap": "~/.local/bin/hap",
+		"/Users/op":                "~",
+		"/Users/operator/bin/hap":  "/Users/operator/bin/hap", // a prefix, not the home
+		"/usr/local/bin/hap":       "/usr/local/bin/hap",
+	} {
+		if got := tildePath(in); got != want {
+			t.Errorf("tildePath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // A link created outside PATH succeeds and still leaves `hap` unfound; the
 // result has to say so, or the operator sees "created" and a shell that
 // disagrees.
 func TestShortcutResultWarnsWhenTheDirectoryIsNotOnPath(t *testing.T) {
+	t.Setenv("HOME", "/nonexistent-home")
 	link := shortcut.Link{Path: "/home/op/.local/bin/hap", State: shortcut.Absent}
 	if got := shortcutResult(link); !strings.Contains(got, "add /home/op/.local/bin to your PATH") {
 		t.Errorf("result for an off-PATH link = %q, want the PATH instruction", got)
