@@ -1,6 +1,7 @@
 package embedder
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -158,4 +159,62 @@ func mustStat(t *testing.T, p string) os.FileInfo {
 		t.Fatal(err)
 	}
 	return fi
+}
+
+// TestModelIDCacheForgetsModelsThatAreGone: the cache is keyed by the model's
+// path, and the bundled model sits inside the plugin install — a new directory
+// on every install and update under herdr ≥0.9.5, with the old one deleted
+// later. Without pruning, model-ids.json gains a dead entry per update forever.
+func TestModelIDCacheForgetsModelsThatAreGone(t *testing.T) {
+	state, installs := t.TempDir(), t.TempDir()
+	generation := func(name string) string {
+		model := filepath.Join(installs, name, "checkout", "models", "m.gguf")
+		if err := os.MkdirAll(filepath.Dir(model), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(model, []byte("model bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return model
+	}
+	entries := func() map[string]modelIDEntry {
+		t.Helper()
+		data, err := os.ReadFile(filepath.Join(state, modelIDFile))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var all map[string]modelIDEntry
+		if err := json.Unmarshal(data, &all); err != nil {
+			t.Fatal(err)
+		}
+		return all
+	}
+
+	old, kept := generation("84692-0"), generation("2305008-0")
+	freshProcess(t, state)
+	ModelIDFor(old)
+	ModelIDFor(kept)
+	if got := entries(); len(got) != 2 {
+		t.Fatalf("premise: both generations cached, got %d entries", len(got))
+	}
+
+	// herdr cleans the oldest generation up; the next update is hashed.
+	if err := os.RemoveAll(filepath.Join(installs, "84692-0")); err != nil {
+		t.Fatal(err)
+	}
+	current := generation("2217958-0")
+	freshProcess(t, state)
+	ModelIDFor(current)
+
+	got := entries()
+	if _, ok := got[old]; ok {
+		t.Errorf("the entry for a deleted install survived: %v", got)
+	}
+	// The control: a retained previous generation is still on disk (herdr
+	// keeps it until its server exits) and its entry must stay valid.
+	for _, path := range []string{kept, current} {
+		if _, ok := got[path]; !ok {
+			t.Errorf("the entry for %s, which still exists, was dropped", path)
+		}
+	}
 }

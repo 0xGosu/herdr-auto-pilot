@@ -103,6 +103,53 @@ func TestResolveFallsBackToNewestInstallDir(t *testing.T) {
 	}
 }
 
+// herdr 0.9.5 moved installs to <root>/github-installations/<id>-<hash>/
+// <generation>/checkout. The scan knew only the older two-level layout, so on
+// a current herdr it found nothing — unnoticed, because the registry lookup
+// ahead of it normally answers, and fatal exactly when herdr cannot be asked.
+func TestInstallDirScanFindsTheHerdr095Layout(t *testing.T) {
+	dir := isolate(t)
+	install := filepath.Join(dir, "config", "herdr", "plugins", "github-installations", "herd-auto-prompter-e001d0f4b256")
+	old := writeExe(t, filepath.Join(install, "84692-0", "checkout", "bin", "hap"))
+	recent := writeExe(t, filepath.Join(install, "2217958-0", "checkout", "bin", "hap"))
+	// Generations are not ordered by name ("84692-0" sorts after "2217958-0"),
+	// so the newest binary has to win by mtime here too.
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(old, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+
+	if got := fromInstallDirs(); got != recent {
+		t.Fatalf("fromInstallDirs = %q, want the newest generation %q", got, recent)
+	}
+	if got := Installed(); got != recent {
+		t.Fatalf("Installed = %q, want %q", got, recent)
+	}
+}
+
+// A machine upgraded across the layout change can hold both trees for a
+// while; the newest binary wins whichever layout it is in.
+func TestInstallDirScanPicksTheNewestAcrossLayouts(t *testing.T) {
+	dir := isolate(t)
+	plugins := filepath.Join(dir, "config", "herdr", "plugins")
+	legacy := writeExe(t, filepath.Join(plugins, "github", "herd-auto-prompter-0.9.70", "bin", "hap"))
+	current := writeExe(t, filepath.Join(plugins, "github-installations", "herd-auto-prompter-e001d0f4b256", "1-0", "checkout", "bin", "hap"))
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(legacy, past, past); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if got := fromInstallDirs(); got != current {
+		t.Fatalf("fromInstallDirs = %q, want %q", got, current)
+	}
+
+	if err := os.Chtimes(current, past.Add(-time.Hour), past.Add(-time.Hour)); err != nil {
+		t.Fatalf("chtimes: %v", err)
+	}
+	if got := fromInstallDirs(); got != legacy {
+		t.Fatalf("fromInstallDirs = %q, want %q once it is the newer one", got, legacy)
+	}
+}
+
 func TestResolveReplacementSkipsNonExecutableCandidate(t *testing.T) {
 	dir := isolate(t)
 	plugins := filepath.Join(dir, "config", "herdr", "plugins", "github")
@@ -249,4 +296,105 @@ func TestInstalledReportsNothingWhenUndiscoverable(t *testing.T) {
 	if got := Installed(); got != "" {
 		t.Errorf("Installed = %q, want empty when nothing is installed", got)
 	}
+}
+
+// fakeHerdr installs a herdr that answers `plugin list --json` the way herdr
+// 0.9.5 does (shape captured live), naming root as the plugin's install.
+func fakeHerdr(t *testing.T, dir, root string) {
+	t.Helper()
+	body := `{"id":"cli:plugin","result":{"plugins":[{"enabled":true,"plugin_id":"other-plugin","plugin_root":"/elsewhere"},` +
+		`{"enabled":true,"plugin_id":"herd-auto-prompter","plugin_root":"` + root + `",` +
+		`"source":{"kind":"github","managed_path":"` + root + `"},"version":"0.9.77"}],"type":"plugin_list"}}`
+	bin := filepath.Join(dir, "herdr")
+	// printf is a shell builtin: isolate() empties PATH, so no external tool
+	// (cat) can be relied on.
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\\n' '"+body+"'\n"), 0o755); err != nil {
+		t.Fatalf("write fake herdr: %v", err)
+	}
+	t.Setenv("HERDR_BIN_PATH", bin)
+}
+
+func install095(dir, generation string) string {
+	return filepath.Join(dir, "config", "herdr", "plugins", "github-installations",
+		"herd-auto-prompter-e001d0f4b256", generation, "checkout")
+}
+
+func TestManaged(t *testing.T) {
+	dir := isolate(t)
+	plugins := filepath.Join(dir, "config", "herdr", "plugins")
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{filepath.Join(install095(dir, "1-0"), "bin", "hap"), true},
+		{filepath.Join(plugins, "github", "herd-auto-prompter-0.9.70", "bin", "hap"), true},
+		// The install root itself is not an install.
+		{plugins, false},
+		// A linked working tree, and a look-alike path outside the root.
+		{filepath.Join(dir, "workspace", "herdr-auto-pilot", "bin", "hap"), false},
+		{filepath.Join(dir, "elsewhere", "herdr", "plugins", "github", "x", "bin", "hap"), false},
+		{plugins + "-backup/bin/hap", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		if got := Managed(tt.path); got != tt.want {
+			t.Errorf("Managed(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+// TestSupersededBy pins the herdr 0.9.5 question: a replaced installation
+// stays on disk, so "my binary exists" no longer means "I am the installed
+// build". Only herdr's registry can say, and only a managed install can lose.
+func TestSupersededBy(t *testing.T) {
+	t.Run("an older retained generation is superseded by the registered one", func(t *testing.T) {
+		dir := isolate(t)
+		old := writeExe(t, filepath.Join(install095(dir, "84692-0"), "bin", "hap"))
+		current := writeExe(t, filepath.Join(install095(dir, "2217958-0"), "bin", "hap"))
+		fakeHerdr(t, dir, install095(dir, "2217958-0"))
+
+		if got := SupersededBy(old); got != current {
+			t.Fatalf("SupersededBy(old) = %q, want %q", got, current)
+		}
+		if got := SupersededBy(current); got != "" {
+			t.Fatalf("SupersededBy(current) = %q, want none — it is the registered install", got)
+		}
+		if got := Registered(); got != current {
+			t.Fatalf("Registered = %q, want %q", got, current)
+		}
+	})
+
+	// The dev loop: a linked working tree taking the daemon over from a
+	// registered release is deliberate, never "superseded".
+	t.Run("a binary outside the install tree is never superseded", func(t *testing.T) {
+		dir := isolate(t)
+		dev := writeExe(t, filepath.Join(dir, "workspace", "herdr-auto-pilot", "bin", "hap"))
+		writeExe(t, filepath.Join(install095(dir, "1-0"), "bin", "hap"))
+		fakeHerdr(t, dir, install095(dir, "1-0"))
+
+		if got := SupersededBy(dev); got != "" {
+			t.Fatalf("SupersededBy(dev tree) = %q, want none", got)
+		}
+	})
+
+	// Unknown is not "superseded": with herdr unreachable, or naming an
+	// install whose binary is not there, the caller carries on as itself. The
+	// install-tree scan is deliberately NOT consulted — a sibling generation
+	// may be a build herdr aborted before registering.
+	t.Run("nothing is concluded when the registry cannot say", func(t *testing.T) {
+		dir := isolate(t) // HERDR_BIN_PATH names no herdr
+		old := writeExe(t, filepath.Join(install095(dir, "1-0"), "bin", "hap"))
+		writeExe(t, filepath.Join(install095(dir, "2-0"), "bin", "hap"))
+		if got := SupersededBy(old); got != "" {
+			t.Fatalf("herdr unreachable: SupersededBy = %q, want none", got)
+		}
+
+		fakeHerdr(t, dir, install095(dir, "3-0")) // registered, but no binary there
+		if got := SupersededBy(old); got != "" {
+			t.Fatalf("registered binary missing: SupersededBy = %q, want none", got)
+		}
+		if got := Registered(); got != "" {
+			t.Fatalf("Registered = %q, want none for a missing binary", got)
+		}
+	})
 }

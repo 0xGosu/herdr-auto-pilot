@@ -113,9 +113,9 @@ func buildCommands() {
 			Summary: "run the monitoring daemon (the process that watches agents and answers them)",
 			Usage:   []string{"hap daemon", "hap daemon --ensure", "hap daemon --ensure --replace-only", "hap daemon --restart", "hap daemon --reload"},
 			Flags: []FlagDoc{
-				{Name: "--ensure", Desc: "start a daemon only if none is running; replace one left by an older binary or a binary at a different path (this is what herdr's event hook runs, and how you pick up a rebuild)"},
+				{Name: "--ensure", Desc: "start a daemon only if none is running; replace one left by an older binary or a binary at a different path (this is what herdr's event hook runs, and how you pick up a rebuild). Run from a plugin install that herdr has since replaced, it hands over to the install herdr now runs instead of starting the old build"},
 				{Name: "--replace-only", Desc: "with --ensure: replace a running daemon, but never start one when none is running (used by the plugin install step, so installing hap does not bring a daemon up as a side effect)"},
-				{Name: "--restart", Desc: "stop the running daemon whatever binary it came from, and start a fresh one (starts one if none is running) — the only way to pick up a [database] or [logging] change, apart from database.sync_paused, which applies on a reload. It waits for the new daemon to report healthy, and says so plainly when it does not"},
+				{Name: "--restart", Desc: "stop the running daemon whatever binary it came from, and start a fresh one from the install herdr runs (starts one if none is running) — the only way to pick up a [database] or [logging] change, apart from database.sync_paused, which applies on a reload. It waits for the new daemon to report healthy, and says so plainly when it does not"},
 				{Name: "--reload", Desc: "ask the running daemon to re-read config.toml, without restarting it; fails when no daemon is running"},
 			},
 			Details: "Without a flag the daemon runs in the foreground and holds the state-dir lock.\n" +
@@ -154,8 +154,8 @@ func buildCommands() {
 			Usage:   []string{"hap tui"},
 			Details: "Tabs: Agents, Tasks, Escalations, Audit, Rules, Config, Pause/Kill.\n" +
 				"Nearly everything the TUI does is also a CLI verb, which is what scripts and AI\n" +
-				"agents should use. The exceptions are interactive-only conveniences: the Config\n" +
-				"tab's `/usr/local/bin/hap` symlink shortcut, and the daemon-stderr viewer (`!`).\n" +
+				"agents should use — the Config tab's `hap` symlink shortcut is `hap link`, and\n" +
+				"the daemon-stderr viewer (`!`) is `hap status --stderr`.\n" +
 				"Only ONE TUI stays open: each instance re-polls the whole state every 2s (30s\n" +
 				"once idle for 10 minutes), so\n" +
 				"starting one closes the older ones. Raise the cap with `hap config set\n" +
@@ -244,9 +244,12 @@ func buildCommands() {
 			Details: "Runs `herdr plugin install " + updatecheck.Repo + " --yes` — the same\n" +
 				"upgrade the TUI header points at when it flags a newer version. The running\n" +
 				"daemon keeps working on the old binary until it is handed over; `hap daemon\n" +
-				"--ensure` does that immediately. The printed follow-up names the NEWLY\n" +
-				"installed binary by absolute path whenever `hap` on your PATH still resolves\n" +
-				"to the previous build, so the hand-over cannot restart the old version.\n" +
+				"--ensure` does that immediately. herdr installs every update into a new\n" +
+				"directory, so a `hap` symlink on your PATH that pointed at the previous\n" +
+				"install is repointed at the new one (see `hap link`;\n" +
+				"a `hap` that is not one of hap's own installs is never touched). When that\n" +
+				"was not possible the printed follow-up names the NEWLY installed binary by\n" +
+				"absolute path, so the hand-over cannot restart the old version.\n" +
 				"The version check behind the header hint is the plugin's only outbound network\n" +
 				"call; turn it off with `hap config set tui.disable_check_for_update true`.\n" +
 				"That switch silences the TUI hint; `hap update` still asks GitHub which\n" +
@@ -257,6 +260,33 @@ func buildCommands() {
 			},
 			Examples: []string{"hap update"},
 			Handler:  update,
+		},
+		{
+			Name:    "link",
+			Group:   groupOperate,
+			Summary: "put `hap` on your PATH: symlink it to this binary",
+			Usage:   []string{"hap link"},
+			Details: "herdr runs the plugin as ./bin/hap inside its install directory and puts\n" +
+				"nothing on PATH, so `hap` in a shell works only through a symlink. This creates\n" +
+				"it, or repoints one stranded by a plugin update: herdr installs every update\n" +
+				"into a new directory, and from herdr 0.9.5 keeps the previous one until its\n" +
+				"server exits — so a stranded `hap` first keeps working as the OLD version, and\n" +
+				"only later reads \"command not found\". It is the same action as the TUI Config\n" +
+				"tab's Quick Shortcuts row.\n" +
+				"An existing `hap` symlink is found wherever it is on PATH and reused; a new one\n" +
+				"goes in /usr/local/bin when you can write there, otherwise ~/.local/bin (created\n" +
+				"if missing — the output says so when that directory is not on PATH). A regular\n" +
+				"file named hap, or a symlink to a binary that is not one of hap's own plugin\n" +
+				"installs, is never replaced: remove it yourself first.\n" +
+				"When `hap` is already \"command not found\", run the installed binary by path:\n" +
+				"`<plugin_root>/bin/hap link`, with plugin_root as `herdr plugin list --json`\n" +
+				"reports it for herd-auto-prompter.",
+			Examples: []string{"hap link"},
+			Next: []Hint{
+				{Cmd: "hap version", Why: "confirm `hap` on PATH is this build"},
+				{Cmd: "hap status", Why: "check the daemon it talks to"},
+			},
+			Handler: link,
 		},
 		{
 			Name:    "status",

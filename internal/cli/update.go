@@ -110,7 +110,12 @@ func update(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	} else {
 		fmt.Fprintln(out, "\ninstall finished")
 	}
-	printEnsureStep(out)
+	// Before the follow-up line, which reads PATH: once the link is repointed
+	// the short `hap daemon --ensure` is correct again.
+	// Asked once: each call is a `herdr plugin list` shell-out.
+	newBin := installedBinary()
+	repointShortcut(out, newBin)
+	printEnsureStep(out, newBin)
 	return nil
 }
 
@@ -162,10 +167,11 @@ func versionFromOutput(s string) string {
 // This process is the OLD build, and the operator's `hap` shortcut is a
 // symlink herdr does not repoint on install — so a bare `hap daemon --ensure`
 // can hand the daemon to the very binary the upgrade just replaced (or to one
-// that no longer exists). When the newly installed binary is discoverable and
-// is NOT what `hap` resolves to, the absolute path is printed instead.
-func printEnsureStep(out io.Writer) {
-	newBin := installedBinary()
+// that no longer exists). repointShortcut fixes the link when it is one of
+// ours; when it could not (a foreign `hap`, an unwritable directory, no link
+// at all) and the newly installed binary is discoverable and is NOT what
+// `hap` resolves to, the absolute path is printed instead.
+func printEnsureStep(out io.Writer, newBin string) {
 	if newBin == "" || sameAsPathHap(newBin) {
 		fmt.Fprintln(out, "run `hap daemon --ensure` to hand the running daemon over to the new build now")
 		return
