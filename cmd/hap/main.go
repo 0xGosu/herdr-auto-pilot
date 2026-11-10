@@ -841,6 +841,12 @@ var (
 // --ensure` taking over from a release — is untouched.
 func deferToRegisteredInstall(self string, args ...string) (bool, error) {
 	if os.Getenv(delegatedEnv) != "" {
+		// One hop only: the marker must not outlive this process. The daemon
+		// started below inherits our environment, and every `hap daemon
+		// --ensure` / `--restart` IT later spawns (the HandOff after its binary
+		// is removed, a wedged-sync RestartSelf) would otherwise carry the
+		// marker too and skip this check for the life of the lineage.
+		_ = os.Unsetenv(delegatedEnv)
 		return false, nil
 	}
 	registered := supersededBy(self)

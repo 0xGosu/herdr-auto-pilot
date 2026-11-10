@@ -107,6 +107,15 @@ func Install() (Link, error) {
 	if err != nil {
 		return Link{}, fmt.Errorf("locate the running hap binary: %w", err)
 	}
+	// herdr ≥0.9.5 keeps a replaced install runnable, so this process may be
+	// a SUPERSEDED build (a TUI left open across an update, a `hap link`
+	// typed through a stale path). To it, a link `hap update` already moved
+	// to the new install reads as Stale — "a previous version of ourselves" —
+	// and repointing would move the operator's `hap` BACK to the old build.
+	// Link the install herdr runs instead, as `daemon --ensure` does.
+	if registered := selfpath.SupersededBy(source); registered != "" {
+		source = registered
+	}
 	return install(source)
 }
 

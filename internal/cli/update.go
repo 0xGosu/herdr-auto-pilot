@@ -112,8 +112,10 @@ func update(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	}
 	// Before the follow-up line, which reads PATH: once the link is repointed
 	// the short `hap daemon --ensure` is correct again.
-	repointShortcut(out)
-	printEnsureStep(out)
+	// Asked once: each call is a `herdr plugin list` shell-out.
+	newBin := installedBinary()
+	repointShortcut(out, newBin)
+	printEnsureStep(out, newBin)
 	return nil
 }
 
@@ -169,8 +171,7 @@ func versionFromOutput(s string) string {
 // ours; when it could not (a foreign `hap`, an unwritable directory, no link
 // at all) and the newly installed binary is discoverable and is NOT what
 // `hap` resolves to, the absolute path is printed instead.
-func printEnsureStep(out io.Writer) {
-	newBin := installedBinary()
+func printEnsureStep(out io.Writer, newBin string) {
 	if newBin == "" || sameAsPathHap(newBin) {
 		fmt.Fprintln(out, "run `hap daemon --ensure` to hand the running daemon over to the new build now")
 		return

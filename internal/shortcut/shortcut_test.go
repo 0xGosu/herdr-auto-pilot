@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/0xGosu/herdr-auto-pilot/internal/selfpath"
 )
 
 // sandbox gives a test its own HOME, PATH, herdr config home and "system" bin
@@ -43,6 +45,9 @@ func newSandbox(t *testing.T) sandbox {
 	t.Setenv("HOME", filepath.Join(root, "home"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
 	t.Setenv("PATH", sb.pathDir)
+	// No test may ask the operator's real herdr which install is registered.
+	t.Setenv("HERDR_BIN_PATH", filepath.Join(root, "no-such-herdr"))
+	t.Setenv(selfpath.EnvOverride, "")
 	origSystem, origAllow := systemBinDir, allowUnderTest
 	systemBinDir, allowUnderTest = sb.systemDir, true
 	t.Cleanup(func() { systemBinDir, allowUnderTest = origSystem, origAllow })
@@ -290,6 +295,67 @@ func TestHeal(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// registerWithHerdr installs a fake herdr whose registry names root as the
+// plugin's install, and makes self the binary this process "is".
+func (sb sandbox) registerWithHerdr(t *testing.T, self, registered string) {
+	t.Helper()
+	root := filepath.Dir(filepath.Dir(registered))
+	// printf is a shell builtin; the sandbox PATH holds no external tools.
+	script := "#!/bin/sh\nprintf '%s\\n' '" +
+		`{"result":{"plugins":[{"plugin_id":"herd-auto-prompter","plugin_root":"` + root + `"}]}}` + "'\n"
+	herdr := filepath.Join(sb.root, "herdr")
+	if err := os.WriteFile(herdr, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HERDR_BIN_PATH", herdr)
+	t.Setenv(selfpath.EnvOverride, self)
+}
+
+// TestInstallFromASupersededBuildLinksTheRegisteredInstall: herdr ≥0.9.5 keeps
+// a replaced install runnable, so a TUI left open across `hap update` is the
+// OLD build. `hap update` has already moved the link to the new install — and
+// to the old build that link reads as Stale ("a previous version of
+// ourselves"). Acting on it must not move `hap` BACK to the superseded build.
+func TestInstallFromASupersededBuildLinksTheRegisteredInstall(t *testing.T) {
+	sb := newSandbox(t)
+	old := writeExe(t, sb.install095("1-0"))
+	current := writeExe(t, sb.install095("2-0"))
+	link := symlink(t, current, filepath.Join(sb.pathDir, "hap")) // already healed
+	sb.registerWithHerdr(t, old, current)
+
+	// The premise: seen from the old build, the healed link looks stale.
+	if got := Locate(); got.Path != link || got.State != Stale {
+		t.Fatalf("premise: Locate from the old build = %+v, want %s stale", got, link)
+	}
+
+	got, err := Install()
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	resolvesTo(t, link, current)
+	if got.Source != current || got.State != Current {
+		t.Errorf("Install reported %+v, want the registered install %s, already linked", got, current)
+	}
+}
+
+// The control: the build herdr runs links ITSELF, superseding the old link.
+func TestInstallFromTheRegisteredBuildLinksItself(t *testing.T) {
+	sb := newSandbox(t)
+	old := writeExe(t, sb.install095("1-0"))
+	current := writeExe(t, sb.install095("2-0"))
+	link := symlink(t, old, filepath.Join(sb.pathDir, "hap"))
+	sb.registerWithHerdr(t, current, current)
+
+	got, err := Install()
+	if err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	resolvesTo(t, link, current)
+	if got.State != Stale {
+		t.Errorf("Install reported state %v, want the link's pre-change state (stale)", got.State)
 	}
 }
 

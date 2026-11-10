@@ -54,8 +54,7 @@ func link(_ context.Context, _ *frontend.App, out io.Writer, args []string) erro
 // It is unattended, so it only ever repoints a link that was already hap's
 // (see shortcut.Heal) and never creates one. A failure is a note, not an
 // error: the install itself succeeded.
-func repointShortcut(out io.Writer) {
-	newBin := installedBinary()
+func repointShortcut(out io.Writer, newBin string) {
 	if newBin == "" {
 		return
 	}

@@ -559,3 +559,24 @@ func TestUpdateSaysNothingWithoutAShortcut(t *testing.T) {
 		}
 	}
 }
+
+// Each lookup of the installed binary is a `herdr plugin list` shell-out, and
+// the repoint and the follow-up line must agree on its answer: ask once.
+func TestUpdateAsksForTheInstalledBinaryOnce(t *testing.T) {
+	stampRelease(t, "v0.5.1")
+	stubRunner(t, nil)
+	stubBinaries(t, "", "")
+	stubHeal(t, "", false, nil)
+	asked := 0
+	installedBinary = func() string { // stubBinaries restores it
+		asked++
+		return "/plugins/new/bin/hap"
+	}
+
+	if err := update(context.Background(), updateTestApp(t, "v0.5.2"), &bytes.Buffer{}, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if asked != 1 {
+		t.Errorf("installed binary looked up %d times, want 1", asked)
+	}
+}

@@ -159,6 +159,13 @@ func TestDeferToRegisteredInstall(t *testing.T) {
 		if h.asked != 0 {
 			t.Errorf("asked the registry %d time(s) on a delegated run", h.asked)
 		}
+		// One hop only. The daemon this run starts inherits its environment,
+		// and every `hap daemon --ensure`/`--restart` THAT daemon later spawns
+		// (its hand-off, a wedged-sync restart) would carry the mark too —
+		// switching this guard off for the life of the lineage.
+		if got := os.Getenv(delegatedEnv); got != "" {
+			t.Errorf("%s=%q survived the delegated run; its daemon would inherit it", delegatedEnv, got)
+		}
 	})
 
 	// The hand-off IS this command's outcome: its failure must surface, and
