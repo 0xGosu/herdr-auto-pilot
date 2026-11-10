@@ -1,5 +1,0 @@
-- Fixed the `hap` symlink shortcut failing with "permission denied" on every attempt when an old `hap` link sits in a directory you cannot write — the usual case on macOS, where `/usr/local/bin` is root-owned: the old link is left alone and a working one is created beside `herdr`, or in `~/.local/bin`
-- Fixed `hap link` and the TUI sending you after a stale link with `sudo` when it does not matter: you are shown `sudo rm …` only when the old link still wins on `PATH` and so keeps running the old build
-- Fixed symlink errors in the TUI hiding their reason: the status line reads `repoint /usr/local/bin/hap: permission denied` instead of being cut off inside a long path
-- Changed where a new `hap` link goes when `/usr/local/bin` is not writable: the directory `herdr` runs from is tried before `~/.local/bin`, since macOS does not put `~/.local/bin` on `PATH`
-- Fixed `hap update` stopping at a `hap` link it cannot write instead of repointing a writable one further along `PATH`
