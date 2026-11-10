@@ -1,8 +1,0 @@
-- Fixed the `hap` symlink shortcut on herdr 0.9.5 and per-user installs: an existing `hap` link is now found wherever it is on `PATH` and repointed, instead of the TUI offering to create a second one at `/usr/local/bin/hap` and failing with "permission denied"
-- Fixed new `hap` links failing where `/usr/local/bin` is not writable: they go in `~/.local/bin` (created if missing), and you are told when that directory is not on `PATH`
-- Added `hap link`, the shell twin of the TUI's Quick Shortcuts row, so a `hap` stranded by a plugin update can be repaired by running the installed binary by path
-- Fixed `hap update` leaving `hap` on the previous install: it repoints a `hap` link that pointed there (never one that is not hap's own, and it never creates one)
-- Fixed an old `hap` downgrading the daemon on herdr 0.9.5, which keeps a replaced plugin install runnable until the herdr server exits: `hap daemon --ensure` and `--restart` from a superseded install now hand over to the install herdr runs, and say so
-- Fixed updates on herdr 0.9.5 re-downloading the 25 MB embedding model every time, and silently losing semantic matching when that download failed: the model is carried over from the previous install (checksum-verified)
-- Fixed hap failing to find its own replacement binary when herdr could not be asked, on herdr 0.9.5's new plugin install layout
-- Fixed `model-ids.json` gaining a dead entry for every plugin update
