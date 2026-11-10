@@ -20,8 +20,13 @@ import (
 //
 // exePath is this binary's path; a holder running from a DIFFERENT one is
 // stale even at the same version, because an upgrade that reuses the version
-// string still unlinks the old binary and strands every child the running
-// daemon spawns from it. Pass "" to compare on version alone.
+// string still ends with the old binary removed, stranding every child the
+// running daemon spawns from it. Pass "" to compare on version alone.
+//
+// "Different path" cuts both ways now that herdr ≥0.9.5 keeps a replaced
+// install on disk: to a SUPERSEDED binary the current daemon is the different
+// one. This function cannot tell which side is current — the caller asks
+// herdr's registry first (cmd/hap's deferToRegisteredInstall).
 func EnsureFresh(paths config.Paths, version, exePath string, waitTimeout time.Duration, stop func(pid int) error, start func() error) error {
 	_, err := replaceHolder(paths, version, exePath, waitTimeout, stop, start, false)
 	return err
@@ -84,6 +89,16 @@ func replaceHolder(paths config.Paths, version, exePath string, waitTimeout time
 			pid, VersionLabel(ver), waitTimeout)
 	}
 	return Outcome{Replaced: true, StoppedPID: pid, StoppedVersion: ver}, start()
+}
+
+// Current reports whether a daemon is running AND is already the binary an
+// --ensure from exePath would start — the case where --ensure does nothing.
+// It is the cheap pre-check for callers with something expensive to ask
+// before a start or a replacement (see cmd/hap's deferToRegisteredInstall):
+// herdr's event hooks run --ensure constantly and almost always land here.
+func Current(paths config.Paths, version, exePath string) bool {
+	running, _, ver, exe := info(paths)
+	return running && current(ver, exe, version, exePath)
 }
 
 // current reports whether the running holder is the binary we would start.

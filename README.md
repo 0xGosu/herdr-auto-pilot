@@ -173,18 +173,32 @@ hap update            # installs the newest release, then prints the command bel
 hap update --force    # required on a linked working tree, which an install would replace
 ```
 
-It prints a `daemon --ensure` follow-up to run next. **That command names the
-new binary by absolute path on purpose** — a plugin install does not repoint the
-`hap` on your `PATH`, so a bare `hap daemon --ensure` could restart the version
-you just replaced.
+Herdr installs every update into a new directory, so
+`hap update` also repoints the `hap` symlink on your `PATH` at the new install
+(see [Make the CLI available from any shell](#make-the-cli-available-from-any-shell)).
+It then prints a `daemon --ensure` follow-up to run next. When the symlink could
+not be repointed, **that command names the new binary by absolute path on
+purpose** — a bare `hap daemon --ensure` could restart the version you just
+replaced, or find nothing at all.
 
-The install hands a running daemon over to the new build itself, and a daemon
-that misses the handover notices its own binary is gone within ~10 seconds and
-starts the replacement. `hap status` reports one that could not hand over. This
-matters because a release installs into its own directory: the old binary is
-removed while the daemon still runs from it, so every child it spawns by path —
-the MCP server, the embedding worker — would break until it is replaced. Nothing
-on disk goes stale; the binary path is resolved at spawn time, never stored.
+The install hands a running daemon over to the new build itself; one that
+misses the handover is replaced by Herdr's next agent or workspace event, which
+runs `hap daemon --ensure` from the new install. `hap status` reports a daemon
+on an older build as STALE.
+
+A release installs into its own directory. Herdr 0.9.5 and later keep the
+previous one until the Herdr server exits, so an old daemon keeps working until
+it is replaced. Earlier Herdr versions removed it at once, and so does 0.9.5's
+later cleanup: a daemon whose own binary is gone notices within ~10 seconds and
+starts the replacement, because every child it spawns by path — the MCP server,
+the embedding worker — would otherwise break. Nothing on disk goes stale; the
+binary path is resolved at spawn time, never stored. The embedding model is
+carried over from the previous install rather than downloaded again.
+
+Because the previous install stays runnable, a `hap` that still points at it is
+a working *old* build. `hap daemon --ensure` and `--restart` from such a binary
+hand over to the install Herdr actually runs instead of starting the old
+version, and say so.
 
 For a clean reinstall, `herdr plugin uninstall herd-auto-prompter` first.
 
@@ -208,13 +222,28 @@ and `hap status` if you want the kill switch one chord away.
 
 ### Make the CLI available from any shell
 
-Open the pane, switch to the **Config** tab, and select **Create
-/usr/local/bin/hap symlink to this running binary** under **Quick Shortcuts**.
+Herdr runs the plugin from its own install directory and puts nothing on
+`PATH`. Open the pane, switch to the **Config** tab, and select **Create … hap
+symlink to this running binary** under **Quick Shortcuts** — or run `hap link`,
+which does the same thing from a shell.
 
-Each release installs into its own directory, so an upgrade leaves the symlink
-pointing at a version that no longer exists; the row then reads **Repoint
-/usr/local/bin/hap … (currently stale)**. A symlink pointing at anything that is
-not one of hap's own installs is never touched.
+The symlink goes in `/usr/local/bin` when you can write there, otherwise in
+`~/.local/bin` (created if missing; you are told when it is not on your `PATH`).
+An existing `hap` symlink is found wherever it is on `PATH` and reused instead.
+
+Each update installs into its own directory, so an update done outside hap
+(`herdr plugin update`) strands the symlink on the previous install. On Herdr
+0.9.5 and later that install is kept until the Herdr server exits — `hap` keeps
+working, as the **old version** — and is then removed, after which `hap` reads
+*command not found*. Either way the row reads **Repoint … (currently stale)**;
+from a shell, run the installed binary by path:
+
+```sh
+"$(herdr plugin list --json | python3 -c 'import sys,json; print(next(p["plugin_root"] for p in json.load(sys.stdin)["result"]["plugins"] if p["plugin_id"]=="herd-auto-prompter"))')/bin/hap" link
+```
+
+`hap update` repoints it for you. A regular file named `hap`, or a symlink to
+anything that is not one of hap's own installs, is never touched.
 
 Run from any shell, `hap` operates on the same instance the daemon uses: it
 honors the `HERDR_PLUGIN_CONFIG_DIR` / `HERDR_PLUGIN_STATE_DIR` vars Herdr
@@ -247,9 +276,9 @@ these affect the help pages.
 directories (agy's is `~/.gemini/antigravity-cli/skills`) — so a coding agent
 can drive hap without a repo checkout.
 
-Nearly everything the TUI does is also a CLI verb. The exceptions are two
-interactive-only conveniences: the `/usr/local/bin/hap` symlink shortcut and the
-daemon-stderr viewer (`!`, also available as `hap status --stderr`).
+Nearly everything the TUI does is also a CLI verb, including its two conveniences: the
+`hap` symlink shortcut is `hap link`, and the daemon-stderr viewer (`!`) is
+`hap status --stderr`.
 
 ## Architecture
 

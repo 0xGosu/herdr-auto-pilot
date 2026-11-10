@@ -102,9 +102,16 @@ func requireTools(t *testing.T) {
 // whose git history carries tags, and whose fake store publishes releases.
 func newInstallEnv(t *testing.T, manifestVersion string, tags []string, releases []release) *installEnv {
 	t.Helper()
+	return newInstallEnvAt(t, t.TempDir(), manifestVersion, tags, releases)
+}
+
+// newInstallEnvAt is newInstallEnv with the plugin root at a chosen path, for
+// the cases where WHERE herdr put the install is the thing under test.
+func newInstallEnvAt(t *testing.T, root, manifestVersion string, tags []string, releases []release) *installEnv {
+	t.Helper()
 	requireTools(t)
 
-	env := &installEnv{root: t.TempDir(), store: t.TempDir()}
+	env := &installEnv{root: root, store: t.TempDir()}
 
 	if err := os.MkdirAll(filepath.Join(env.root, "scripts"), 0o755); err != nil {
 		t.Fatalf("mkdir scripts: %v", err)
@@ -953,4 +960,117 @@ func TestInstallPostChecksumFailureIsFatalAndNeverFallsBack(t *testing.T) {
 	// The previous install is untouched: nothing live is touched until the
 	// whole payload has been assembled.
 	env.assertPriorInstallIntact(t, out)
+}
+
+// herdr095Root lays out herdr ≥0.9.5's install tree and returns the checkout
+// of a new generation plus the models dir of a previous one beside it.
+func herdr095Root(t *testing.T) (root, previousModels string) {
+	t.Helper()
+	install := filepath.Join(t.TempDir(), "github-installations", "herd-auto-prompter-e001d0f4b256")
+	root = filepath.Join(install, "2217958-0", "checkout")
+	previousModels = filepath.Join(install, "84692-0", "checkout", "models")
+	for _, dir := range []string{root, previousModels} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	return root, previousModels
+}
+
+// dropModelAsset makes the release's model undownloadable while SHA256SUMS
+// still lists it — a flaky or blocked download of the one OPTIONAL asset.
+func (e *installEnv) dropModelAsset(t *testing.T, version string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(e.store, "v"+version, modelFile)); err != nil {
+		t.Fatalf("drop model asset: %v", err)
+	}
+}
+
+// TestInstallReusesTheModelFromAPreviousHerdr095Install: herdr ≥0.9.5 builds
+// every update in a fresh clone beside the previous one, so models/ starts
+// empty and "already present" never fires. The model is optional, so an update
+// whose model download failed used to keep the working model (the reinstall
+// was in place) and under 0.9.5 silently lost semantic matching.
+func TestInstallReusesTheModelFromAPreviousHerdr095Install(t *testing.T) {
+	root, previous := herdr095Root(t)
+	env := newInstallEnvAt(t, root, "0.6.2", []string{"v0.6.2"}, []release{{version: "0.6.2"}})
+	writeFile(t, filepath.Join(previous, modelFile), []byte("fake embedding model\n"), 0o644)
+	env.dropModelAsset(t, "0.6.2")
+
+	code, out := env.run(t)
+	if code != 0 {
+		t.Fatalf("install failed (exit %d):\n%s", code, out)
+	}
+	got, err := os.ReadFile(filepath.Join(root, "models", modelFile))
+	if err != nil || string(got) != "fake embedding model\n" {
+		t.Fatalf("model not carried over (err=%v, content=%q):\n%s", err, got, out)
+	}
+	if !strings.Contains(out, "reused the embedding model from a previous install") {
+		t.Errorf("output does not say the model was reused:\n%s", out)
+	}
+	mustNotContain(t, out, "embedding model download failed")
+}
+
+// The control pair. A previous install's model is taken on the release's
+// checksum, never on its name: a different or truncated file is left alone —
+// and removed again, so a failed download cannot leave it behind as "the
+// model" for the daemon to load.
+func TestInstallNeverReusesAModelThatFailsTheChecksum(t *testing.T) {
+	root, previous := herdr095Root(t)
+	env := newInstallEnvAt(t, root, "0.6.2", []string{"v0.6.2"}, []release{{version: "0.6.2"}})
+	writeFile(t, filepath.Join(previous, modelFile), []byte("a different model\n"), 0o644)
+
+	t.Run("the release's own model is downloaded instead", func(t *testing.T) {
+		code, out := env.run(t)
+		if code != 0 {
+			t.Fatalf("install failed (exit %d):\n%s", code, out)
+		}
+		got, _ := os.ReadFile(filepath.Join(root, "models", modelFile))
+		if string(got) != "fake embedding model\n" {
+			t.Fatalf("installed model = %q, want the release's:\n%s", got, out)
+		}
+		mustNotContain(t, out, "reused the embedding model")
+	})
+
+	t.Run("and when that download fails, no model is left at all", func(t *testing.T) {
+		if err := os.Remove(filepath.Join(root, "models", modelFile)); err != nil {
+			t.Fatal(err)
+		}
+		env.dropModelAsset(t, "0.6.2")
+		code, out := env.run(t)
+		if code != 0 {
+			t.Fatalf("a missing optional model must not fail the install (exit %d):\n%s", code, out)
+		}
+		if env.exists(filepath.Join("models", modelFile)) {
+			t.Errorf("a model that failed the checksum was left in place:\n%s", out)
+		}
+		if !strings.Contains(out, "embedding model download failed") {
+			t.Errorf("output does not report the failed download:\n%s", out)
+		}
+	})
+}
+
+// Outside the 0.9.5 layout the two directories above the plugin root are not
+// herdr's, so they are never searched — even when a matching file sits exactly
+// where a sibling generation would.
+func TestInstallDoesNotSearchForAModelOutsideTheHerdr095Layout(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "plugin", "2-0", "working-tree") // not named "checkout"
+	lookalike := filepath.Join(base, "plugin", "1-0", "checkout", "models")
+	for _, dir := range []string{root, lookalike} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := newInstallEnvAt(t, root, "0.6.2", []string{"v0.6.2"}, []release{{version: "0.6.2"}})
+	writeFile(t, filepath.Join(lookalike, modelFile), []byte("fake embedding model\n"), 0o644)
+	env.dropModelAsset(t, "0.6.2")
+
+	code, out := env.run(t)
+	if code != 0 {
+		t.Fatalf("install failed (exit %d):\n%s", code, out)
+	}
+	if env.exists(filepath.Join("models", modelFile)) {
+		t.Errorf("a model was taken from outside herdr's install layout:\n%s", out)
+	}
 }

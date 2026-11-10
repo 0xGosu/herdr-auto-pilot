@@ -1497,9 +1497,14 @@ func (d *Daemon) upsertNode(startedAt time.Time) {
 	}
 }
 
-// checkOwnBinary detects that this daemon's own executable was replaced —
-// what a plugin upgrade does, since herdr installs each release into its own
-// directory and unlinks the previous one. The process survives that, but every
+// checkOwnBinary detects that this daemon's own executable was REMOVED —
+// what a plugin upgrade ends in, since herdr installs each release into its
+// own directory and removes the previous one: at once before herdr 0.9.5, and
+// only after the herdr server using it has exited from 0.9.5 on. So on a
+// current herdr this is the backstop, not the upgrade path — a superseded
+// daemon whose files are still there is replaced by install.sh's handover or
+// by the next event hook's `daemon --ensure`, and this fires when herdr's
+// cleanup finally deletes them. The process survives that, but every
 // child it spawns by path does not: the LLM CLI can no longer launch `hap mcp`
 // (so consults come back with no decision at all) and the embed worker fails
 // until the degrade latch trips. Nothing else notices — the version in the lock

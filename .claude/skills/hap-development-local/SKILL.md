@@ -28,8 +28,9 @@ three moving parts, keep them straight:
 - **the running daemon** — a long-lived process spawned from whatever binary
   last ran `hap daemon --ensure`. It does *not* pick up a new binary on its
   own; you must re-run `--ensure` to make it self-replace.
-- **`/usr/local/bin/hap` (PATH symlink)** — a convenience symlink for *your*
-  shell. **`herdr plugin link` does NOT repoint it** — see the gotcha below.
+- **the `hap` PATH symlink** (`/usr/local/bin/hap`, or `~/.local/bin/hap` when
+  that is not writable) — a convenience symlink for *your* shell. **`herdr
+  plugin link` does NOT repoint it** — see the gotcha below.
 
 a local build reports version **`dev`** (`internal/buildinfo.Version`, stamped
 only by release ldflags). that string is how you tell local-vs-release apart.
@@ -48,19 +49,21 @@ herdr plugin link /workspaces/herdr-auto-pilot
 
 ### GOTCHA: fix the PATH symlink once
 
-`herdr plugin link` leaves `/usr/local/bin/hap` pointing at the **old GitHub
-install copy** (`~/.config/herdr/plugins/github/herd-auto-prompter-*/bin/hap`,
-an *old* release version). So typing `hap …` in a shell still runs the stale
-binary even though herdr's own invocations use your local build. Repoint it once:
+`herdr plugin link` leaves the `hap` symlink pointing at the **old GitHub
+install copy** (herdr ≥0.9.5:
+`~/.config/herdr/plugins/github-installations/herd-auto-prompter-*/<generation>/checkout/bin/hap`;
+earlier: `~/.config/herdr/plugins/github/herd-auto-prompter-*/bin/hap`), an *old*
+release version. So typing `hap …` in a shell still runs the stale binary even
+though herdr's own invocations use your local build. Repoint it once:
 
 ```bash
-ln -sf /workspaces/herdr-auto-pilot/bin/hap /usr/local/bin/hap
-hap version   # → "hap (herd-auto-prompter) dev"  (confirms PATH = local build)
+./bin/hap link   # finds the existing `hap` symlink on PATH and repoints it at this build
+hap version      # → "hap (herd-auto-prompter) dev"  (confirms PATH = local build)
 ```
 
-(The TUI's **Quick Shortcuts** row also repoints it now — it reads *Repoint
-/usr/local/bin/hap … (currently stale)* whenever the link is dangling or points
-at another plugin install. `ln -sf` is still the quicker path from a shell.)
+(The TUI's **Quick Shortcuts** row is the same action — it reads *Repoint …
+(currently stale)* whenever the link is dangling or points at another plugin
+install.)
 
 Alternatively, skip the symlink entirely and always call `./bin/hap` from the
 repo root. But repointing it means `hap status` / `hap daemon --ensure` in any
@@ -82,7 +85,7 @@ Borrow the installed copy before the first swap, and add it to the shared exclud
 (the `models/` ignore rule does not match a symlink):
 
 ```bash
-ln -s ~/.config/herdr/plugins/github/herd-auto-prompter-*/models /workspaces/<tree>/models
+ln -s ~/.config/herdr/plugins/github-installations/herd-auto-prompter-*/*/checkout/models /workspaces/<tree>/models   # herdr <0.9.5: plugins/github/herd-auto-prompter-*/models
 echo /models >> "$(git rev-parse --git-common-dir)/info/exclude"
 hap status | grep -i degraded   # must print nothing once the daemon restarted
 ```
@@ -265,8 +268,8 @@ classification. cross-check the shape:
 | goal | command |
 |---|---|
 | link working tree | `herdr plugin link /workspaces/herdr-auto-pilot` |
-| fix PATH symlink (once) | `ln -sf /workspaces/herdr-auto-pilot/bin/hap /usr/local/bin/hap` |
-| give the tree its model (once) | `ln -s ~/.config/herdr/plugins/github/herd-auto-prompter-*/models <tree>/models` |
+| fix PATH symlink (once) | `./bin/hap link` |
+| give the tree its model (once) | `ln -s ~/.config/herdr/plugins/github-installations/herd-auto-prompter-*/*/checkout/models <tree>/models` |
 | rebuild | `go build -tags "vectors cpu" -o bin/hap ./cmd/hap` |
 | hot-swap daemon | `hap daemon --ensure` |
 | confirm swap | `hap status` → `running dev` |
@@ -275,7 +278,7 @@ classification. cross-check the shape:
 
 ## gotchas recap
 
-- **link does not repoint `/usr/local/bin/hap`** — fix it manually (`ln -sf`), via the
+- **link does not repoint the `hap` PATH symlink** — fix it with `./bin/hap link`, via the
   TUI Quick Shortcuts row, or use `./bin/hap`.
 - **link does not overwrite `bin/hap`** — the build/install step doesn't run on link.
 - **the daemon does not hot-reload** — always `hap daemon --ensure` after a rebuild.

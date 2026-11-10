@@ -213,7 +213,11 @@ func run(verb string, args []string) error {
 	// operator runs them to inspect (an unwritable parent dir, a corrupt DB:
 	// "paste your `hap paths`"). Resolve before the creating ResolvePaths below
 	// so none of that filesystem mutation happens on this path.
-	if verb == "state-dir" || verb == "paths" ||
+	//
+	// `link` rides along for the second half of that: it repairs the operator's
+	// `hap` command and needs neither the store nor the daemon, so a broken
+	// state dir must not be able to stop it.
+	if verb == "state-dir" || verb == "paths" || verb == "link" ||
 		(verb == "config" && len(args) > 0 && args[0] == "path") {
 		paths, err := config.ResolvePathsNoCreate()
 		if err != nil {
@@ -775,9 +779,81 @@ func ensureDaemon(paths config.Paths, replaceOnly bool) error {
 	if err != nil {
 		return fmt.Errorf("resolve the hap binary to run as the daemon: %w", err)
 	}
+	// Asked only when this run would START or REPLACE a daemon. The common
+	// case — herdr's hook finding the daemon already current — returns from
+	// EnsureFresh without ever paying for the registry lookup.
+	//
+	// Never under --replace-only: that is scripts/install.sh handing the herd
+	// to the binary it just fetched, from inside herdr's [[build]] step, when
+	// the registry still names the PREVIOUS install. Deferring to "the
+	// registered install" there would hand the daemon straight back to the
+	// build being replaced.
+	if ensureMayDefer(replaceOnly, func() bool { return daemonlock.Current(paths, buildinfo.Version, self) }) {
+		if deferred, err := deferToRegisteredInstall(self, "daemon", "--ensure"); deferred {
+			return err
+		}
+	}
 	return daemonlock.EnsureFresh(paths, buildinfo.Version, self, ensureWaitTimeout, daemonlock.Stop, func() error {
 		return spawnDaemon(paths, self, "daemon")
 	})
+}
+
+// ensureMayDefer reports whether an --ensure run should ask if this binary was
+// superseded: never for the installer's --replace-only, and never when the
+// daemon is already the one this binary would start (nothing would happen).
+func ensureMayDefer(replaceOnly bool, current func() bool) bool {
+	return !replaceOnly && !current()
+}
+
+// delegatedEnv marks a hap that a superseded install started in its own
+// place, so a registry that changes its answer mid-flight cannot bounce the
+// request between two installs forever.
+const delegatedEnv = "HAP_DAEMON_DELEGATED"
+
+// supersededBy and runRegistered are the two side effects of
+// deferToRegisteredInstall, vars so a test can describe an install layout and
+// observe the hand-off without a herdr or a second hap binary.
+var (
+	supersededBy  = selfpath.SupersededBy
+	runRegistered = func(bin string, env []string, args ...string) error {
+		cmd := exec.Command(bin, args...)
+		cmd.Env = env
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		return cmd.Run()
+	}
+)
+
+// deferToRegisteredInstall hands a daemon start to the install herdr actually
+// runs when THIS binary is a superseded one, and reports whether it did.
+//
+// herdr ≥0.9.5 keeps a replaced plugin installation on disk until the herdr
+// server exits (before, an upgrade unlinked it at once). So a `hap` reached
+// through a PATH symlink that was never repointed, or typed in a shell that
+// still has the old path, is a fully working OLD build — and to it the
+// current daemon is "a different binary": --ensure would stop it and start
+// the superseded version, and `hap status` from that same old build even
+// recommends doing so. herdr's next event hook would put the new one back,
+// and the two would trade the herd for as long as both are used.
+//
+// Running the registered binary's own `daemon …` instead makes the stale
+// command do what its operator meant. A linked working tree is never
+// "superseded" (selfpath.Managed), so the dev loop — `./bin/hap daemon
+// --ensure` taking over from a release — is untouched.
+func deferToRegisteredInstall(self string, args ...string) (bool, error) {
+	if os.Getenv(delegatedEnv) != "" {
+		return false, nil
+	}
+	registered := supersededBy(self)
+	if registered == "" {
+		return false, nil
+	}
+	fmt.Fprintf(os.Stderr, "note: this hap is a superseded install (%s); herdr now runs %s — handing over to it.\n"+
+		"      Repoint your `hap` command with: %s link\n", self, registered, registered)
+	env := append(os.Environ(), delegatedEnv+"=1")
+	if err := runRegistered(registered, env, args...); err != nil {
+		return true, fmt.Errorf("%s %s: %w", registered, strings.Join(args, " "), err)
+	}
+	return true, nil
 }
 
 // spawnBlocked asks the crash-loop breaker whether a daemon may be started,
@@ -818,6 +894,12 @@ func restartDaemon(paths config.Paths, out io.Writer) error {
 	self, err := selfpath.Resolve()
 	if err != nil {
 		return fmt.Errorf("resolve the hap binary to run as the daemon: %w", err)
+	}
+	// "Whatever binary it came from" is about the daemon being STOPPED. The
+	// one started must still be the install herdr runs, or a restart typed
+	// through a stale `hap` downgrades the herd (see deferToRegisteredInstall).
+	if deferred, err := deferToRegisteredInstall(self, "daemon", "--restart"); deferred {
+		return err
 	}
 	return restartWith(paths, out, daemonlock.Stop,
 		func() error { return spawnDaemon(paths, self, "daemon") },

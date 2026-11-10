@@ -232,8 +232,10 @@ Supporting packages not otherwise called out below: `internal/config` (TOML load
 cross-platform advisory file lock behind the *locked read-modify-write* FR-011
 promises for checklist edits + `[-]` reservation); `internal/selfpath` (resolves a
 live `hap` binary for `{self}`, the embed worker, and daemon re-exec across plugin
-upgrades — an upgrade unlinks the running binary, so `os.Executable()` alone names
-a dead path); `internal/buildinfo` (ldflags-stamped version); `internal/updatecheck`
+upgrades — an upgrade eventually removes the running binary, so `os.Executable()`
+alone names a dead path; herdr ≥0.9.5 first keeps it until the herdr server exits,
+so `SupersededBy` asks herdr's registry whether a still-runnable binary is the
+installed one, and `daemon --ensure`/`--restart` defer to that install); `internal/buildinfo` (ldflags-stamped version); `internal/updatecheck`
 (§13); and `internal/testutil`.
 
 ### Ports (adapter boundary — `internal/ports`)
@@ -400,8 +402,11 @@ and its history. Operator-owned mutations are written directly to the DB/TOML in
 a transaction, then the daemon is nudged to reload. Front-ends never write
 daemon-owned hot-path rows (with the two narrow exceptions listed in §11).
 
-Two conveniences are deliberately interactive-only and have no CLI twin: the
-Config tab's `/usr/local/bin/hap` symlink shortcut and the daemon-stderr viewer.
+The Config tab's two conveniences have CLI twins as well: the `hap` symlink
+shortcut is `hap link` (both go through `internal/shortcut`, which finds an
+existing link anywhere on `PATH` before proposing `/usr/local/bin` or
+`~/.local/bin`; `hap update` repoints a link the install left dangling), and
+the daemon-stderr viewer is `hap status --stderr`.
 
 **TUI instance limit** *(`internal/tuisession`)*. Each TUI re-reads the whole
 state on a 2s tick and shells out to herdr per agent, so instances left open in

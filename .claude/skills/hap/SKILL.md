@@ -24,6 +24,13 @@ PLUGIN_ROOT=$(herdr plugin list --json | python3 -c 'import sys,json; print(next
 HAP="$PLUGIN_ROOT/bin/hap"
 ```
 
+`"$HAP" link` puts it back on `PATH` (see "paths, version, upgrade"). A `hap`
+that used to work and now reads *command not found* is a symlink stranded by a
+plugin update — herdr installs every update into a new directory. On herdr
+≥0.9.5 the previous install is kept until the herdr server exits, so before it
+dangles a stranded `hap` runs the **old version**: if `hap version` disagrees
+with `"$HAP" version`, repoint it the same way.
+
 ## rules for an agent driving hap
 
 These are the ones whose absence causes damage. Everything else in this
@@ -42,6 +49,8 @@ document is convenience.
   agent — the decision is only recorded and learned. Be sure of what you send.
 - **`hap clear-data --yes` is irreversible** (all learned rules, decisions and
   audit rows). **`hap update` mutates the install** — never run it unprompted.
+  **`hap link` writes a symlink into a `PATH` directory** — run it when asked,
+  or when `hap` is not found.
 - **`@noop` means "no reply is needed"** and never sends anything to a pane.
 - **An orchestrating agent runs hap as `HAP_ACTOR=orchestrator`** (see "the
   orchestrator agent") so the operator can tell its decisions from their own.
@@ -1594,11 +1603,26 @@ hap update            # install the newest release; MUTATES the install
 hap update --force    # required on a `herdr plugin link` dev build
 ```
 
-`hap update` runs `herdr plugin install 0xGosu/herdr-auto-pilot --yes`, then
-prints the `daemon --ensure` follow-up that hands the running daemon over. **It
-names an absolute path on purpose** — a plugin install does not repoint `hap` on
-your `PATH`, so a bare `hap daemon --ensure` could restart the binary that was
-just replaced.
+`hap update` runs `herdr plugin install 0xGosu/herdr-auto-pilot --yes`,
+repoints the `hap` symlink on your `PATH` at the new install, then prints the
+`daemon --ensure` follow-up that hands the running daemon over. **When the
+symlink could not be repointed it names an absolute path on purpose** — a bare
+`hap daemon --ensure` could restart the binary that was just replaced.
+
+```bash
+hap link              # create or repoint the `hap` symlink on PATH -> this binary
+```
+
+herdr puts nothing on `PATH`; `hap` in a shell is a symlink, and every plugin
+update moves the install to a new directory (the old one is removed — on herdr
+≥0.9.5 only after its server exits, so until then the link runs the OLD build;
+`hap daemon --ensure`/`--restart` from it hand over to the current install
+rather than downgrade the daemon). `hap
+update` repoints the link itself; after an update done by herdr
+(`herdr plugin update`) run `"$PLUGIN_ROOT/bin/hap" link`. It reuses an existing
+`hap` symlink wherever it is on `PATH`, else creates one in `/usr/local/bin`
+when writable, otherwise `~/.local/bin`. It never replaces a regular file or a
+symlink to a binary that is not one of hap's own installs.
 
 ## installing this skill for other agents
 

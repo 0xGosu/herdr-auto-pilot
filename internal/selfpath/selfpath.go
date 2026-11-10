@@ -3,15 +3,24 @@
 // Every self-spawn in hap — the {self} placeholder handed to the operator's
 // LLM CLI so it can launch `hap mcp`, the embed-worker subprocess, the daemon
 // re-exec — needs to name this binary on disk. os.Executable() alone is not
-// enough: herdr installs each plugin release into its own directory
-// (~/.config/herdr/plugins/<source>/herd-auto-prompter-*/bin/hap) and an
-// upgrade unlinks the old one, so a long-lived process keeps reporting a path
+// enough: herdr installs each plugin release into its own directory (see
+// installGlobs for the layouts) and sooner or later removes the old one, so a
+// long-lived process keeps reporting a path
 // that no longer exists (Go strips the " (deleted)" suffix procfs appends).
 // Every child spawned from that path then fails with ENOENT, silently: the LLM
 // CLI cannot start the MCP server, the embedder latches degraded mode.
 //
 // Resolve therefore VALIDATES os.Executable's answer and, only when it has gone
 // away, looks for the binary that replaced it.
+//
+// WHEN the old directory goes is herdr's call, and it changed. Before herdr
+// 0.9.5 an upgrade unlinked it at once. From 0.9.5 (docs/plugins.mdx,
+// "Install and link") the previous installation is RETAINED so running
+// commands and panes keep their files, and is removed by a later install or
+// server startup once the servers using it have exited. So a superseded
+// binary can now stay runnable for days: "my executable still exists" no
+// longer means "I am the installed build". SupersededBy answers that question;
+// Resolve deliberately does not — it names a binary that can be spawned.
 package selfpath
 
 import (
@@ -23,6 +32,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -97,6 +107,74 @@ func Installed() string {
 		}
 	}
 	return ""
+}
+
+// Registered reports the hap binary herdr's registry names for the plugin —
+// what herdr itself runs for every hook, action and pane — or "" when herdr
+// cannot be asked or names nothing usable. Unlike Installed it never guesses
+// from the install tree: callers use it to decide that some OTHER binary is
+// obsolete, and a guess there would hand the herd to an unregistered build.
+func Registered() string {
+	if p := fromHerdrRegistry(); executable(p) {
+		return p
+	}
+	return ""
+}
+
+// Managed reports whether path lies inside herdr's plugin install tree, i.e.
+// is part of an install herdr created and will eventually clean up — as
+// opposed to a `herdr plugin link` working tree or a standalone binary, which
+// herdr never replaces. Layout-agnostic on purpose: it is anchored at the
+// install root, so a new directory scheme below it needs no change here.
+func Managed(path string) bool {
+	root := PluginInstallRoot()
+	if root == "" || path == "" {
+		return false
+	}
+	// A resolved path must be compared against the resolved root (a symlinked
+	// config home), a raw link target against the root as spelled; accept
+	// either so both kinds of caller match.
+	roots := []string{root}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != root {
+		roots = append(roots, resolved)
+	}
+	paths := []string{filepath.Clean(path)}
+	if resolved, err := canonical(path); err == nil && resolved != paths[0] {
+		paths = append(paths, resolved)
+	}
+	for _, r := range roots {
+		for _, p := range paths {
+			rel, err := filepath.Rel(r, p)
+			if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// SupersededBy returns the binary that replaced self as the plugin's
+// registered install, or "" when self is still the one herdr runs (or nothing
+// can be concluded).
+//
+// It exists because herdr ≥0.9.5 keeps a replaced installation on disk (see
+// the package comment). A `hap` reached through a stale PATH symlink, or an
+// old pane's process, is then a perfectly runnable OLD build — and
+// `hap daemon --ensure` from it would see the current daemon as "a different
+// binary", stop it, and start the superseded version in its place.
+//
+// Only a Managed self can be superseded: a linked working tree is the
+// developer's deliberate choice even while a GitHub install is registered.
+// It costs one `herdr plugin list`, so callers ask only when about to act.
+func SupersededBy(self string) string {
+	if !Managed(self) {
+		return ""
+	}
+	registered := Registered()
+	if registered == "" || Same(registered, self) {
+		return ""
+	}
+	return registered
 }
 
 // Missing reports whether path no longer names an executable file. The daemon
@@ -220,34 +298,57 @@ func fromHerdrRegistry() string {
 	return ""
 }
 
+// installGlobs lists where herdr puts this plugin's binary under root, one
+// pattern per install layout herdr has shipped:
+//
+//   - herdr ≥0.9.5: <root>/github-installations/<id>-<hash>/<generation>/checkout/bin/hap.
+//     Each install or update lands in a new <generation> directory; previous
+//     generations are retained until the herdr servers using them exit, so
+//     several coexist routinely (the newest binary is the current one, bar a
+//     build herdr aborted before registering it).
+//   - earlier:      <root>/github/<id>-<version>/bin/hap.
+//
+// Both stay: the scan is the fallback for when herdr cannot be asked, which is
+// exactly when its version is unknown. A layout this list does not know makes
+// fromInstallDirs find nothing — silently, since the registry lookup ahead of
+// it usually answers — so a new herdr layout is added HERE.
+func installGlobs(root string) []string {
+	return []string{
+		filepath.Join(root, "*", pluginID+"*", "*", "checkout", "bin", "hap"),
+		filepath.Join(root, "*", pluginID+"*", "bin", "hap"),
+	}
+}
+
 // fromInstallDirs scans herdr's plugin install tree directly, for when herdr
-// itself cannot be reached. Install dirs are version-stamped, so the newest
-// one wins.
+// itself cannot be reached. Every install gets its own directory, so the
+// newest binary wins.
 func fromInstallDirs() string {
 	root := PluginInstallRoot()
 	if root == "" {
 		return ""
 	}
-	matches, err := filepath.Glob(filepath.Join(root, "*", pluginID+"*", "bin", "hap"))
-	if err != nil {
-		return ""
-	}
 	var newest string
 	var newestMod time.Time
-	for _, m := range matches {
-		info, err := os.Stat(m)
-		if err != nil || !info.Mode().IsRegular() {
+	for _, pattern := range installGlobs(root) {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
 			continue
 		}
-		if newest == "" || info.ModTime().After(newestMod) {
-			newest, newestMod = m, info.ModTime()
+		for _, m := range matches {
+			info, err := os.Stat(m)
+			if err != nil || !info.Mode().IsRegular() {
+				continue
+			}
+			if newest == "" || info.ModTime().After(newestMod) {
+				newest, newestMod = m, info.ModTime()
+			}
 		}
 	}
 	return newest
 }
 
 // fromPATH is the last resort: the operator's own `hap` shortcut
-// (/usr/local/bin/hap), which is how a linked working tree or an install this
+// (internal/shortcut), which is how a linked working tree or an install this
 // package cannot otherwise discover is found.
 //
 // It is last for a reason. Whatever it returns gets EXECUTED, and PATH is

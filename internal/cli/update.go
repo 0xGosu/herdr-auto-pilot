@@ -110,6 +110,9 @@ func update(ctx context.Context, app *frontend.App, out io.Writer, args []string
 	} else {
 		fmt.Fprintln(out, "\ninstall finished")
 	}
+	// Before the follow-up line, which reads PATH: once the link is repointed
+	// the short `hap daemon --ensure` is correct again.
+	repointShortcut(out)
 	printEnsureStep(out)
 	return nil
 }
@@ -162,8 +165,10 @@ func versionFromOutput(s string) string {
 // This process is the OLD build, and the operator's `hap` shortcut is a
 // symlink herdr does not repoint on install — so a bare `hap daemon --ensure`
 // can hand the daemon to the very binary the upgrade just replaced (or to one
-// that no longer exists). When the newly installed binary is discoverable and
-// is NOT what `hap` resolves to, the absolute path is printed instead.
+// that no longer exists). repointShortcut fixes the link when it is one of
+// ours; when it could not (a foreign `hap`, an unwritable directory, no link
+// at all) and the newly installed binary is discoverable and is NOT what
+// `hap` resolves to, the absolute path is printed instead.
 func printEnsureStep(out io.Writer) {
 	newBin := installedBinary()
 	if newBin == "" || sameAsPathHap(newBin) {

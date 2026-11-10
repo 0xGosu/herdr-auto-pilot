@@ -474,3 +474,88 @@ func TestHerdrBinHonoursEnv(t *testing.T) {
 		t.Errorf("herdrBin() = %q, want the PATH fallback", got)
 	}
 }
+
+// stubHeal replaces the shortcut repoint with a canned outcome and records
+// which binary it was asked to point at.
+func stubHeal(t *testing.T, path string, repointed bool, err error) *string {
+	t.Helper()
+	orig := healShortcut
+	t.Cleanup(func() { healShortcut = orig })
+	var asked string
+	healShortcut = func(source string) (string, bool, error) {
+		asked = source
+		return path, repointed, err
+	}
+	return &asked
+}
+
+// TestUpdateRepointsTheShortcut: herdr installs the update into a new
+// directory and removes the old one, so the operator's `hap` link dangles the
+// moment the install finishes. `hap update` repoints it at what herdr
+// installed — not at this (old, possibly deleted) process's binary.
+func TestUpdateRepointsTheShortcut(t *testing.T) {
+	stampRelease(t, "v0.5.1")
+	stubRunner(t, nil)
+	newBin := "/plugins/github-installations/herd-auto-prompter-abc/2-0/checkout/bin/hap"
+	// PATH resolves to the new binary once the link is repointed.
+	stubBinaries(t, newBin, newBin)
+	asked := stubHeal(t, "/home/op/.local/bin/hap", true, nil)
+
+	var out bytes.Buffer
+	if err := update(context.Background(), updateTestApp(t, "v0.5.2"), &out, nil); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if *asked != newBin {
+		t.Errorf("shortcut repointed at %q, want the newly installed binary %q", *asked, newBin)
+	}
+	got := out.String()
+	if !strings.Contains(got, "repointed /home/op/.local/bin/hap") {
+		t.Errorf("output does not report the repoint:\n%s", got)
+	}
+	if !strings.Contains(got, "`hap daemon --ensure`") {
+		t.Errorf("with the link repointed the short follow-up is correct again:\n%s", got)
+	}
+}
+
+// A repoint that fails must not fail the update (the install succeeded), and
+// must leave the operator a command that works with `hap` off PATH.
+func TestUpdateReportsAFailedRepoint(t *testing.T) {
+	stampRelease(t, "v0.5.1")
+	stubRunner(t, nil)
+	newBin := "/plugins/new/bin/hap"
+	stubBinaries(t, newBin, "")
+	stubHeal(t, "/usr/local/bin/hap", false, errors.New("permission denied"))
+
+	var out bytes.Buffer
+	if err := update(context.Background(), updateTestApp(t, "v0.5.2"), &out, nil); err != nil {
+		t.Fatalf("a failed repoint must not fail the update: %v", err)
+	}
+	got := out.String()
+	for _, want := range []string{"could not repoint /usr/local/bin/hap", "permission denied", newBin + " link", newBin + " daemon --ensure"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output lacks %q:\n%s", want, got)
+		}
+	}
+}
+
+// The control: no link of hap's, nothing said — and nothing asked at all when
+// the new install cannot be discovered, since there is nothing to point at.
+func TestUpdateSaysNothingWithoutAShortcut(t *testing.T) {
+	for _, installed := range []string{"/plugins/new/bin/hap", ""} {
+		stampRelease(t, "v0.5.1")
+		stubRunner(t, nil)
+		stubBinaries(t, installed, "")
+		asked := stubHeal(t, "", false, nil)
+
+		var out bytes.Buffer
+		if err := update(context.Background(), updateTestApp(t, "v0.5.2"), &out, nil); err != nil {
+			t.Fatalf("update: %v", err)
+		}
+		if strings.Contains(out.String(), "repoint") {
+			t.Errorf("installed=%q: output mentions a repoint that did not happen:\n%s", installed, out.String())
+		}
+		if *asked != installed {
+			t.Errorf("installed=%q: heal asked about %q", installed, *asked)
+		}
+	}
+}

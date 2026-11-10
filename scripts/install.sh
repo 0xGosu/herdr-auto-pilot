@@ -339,6 +339,8 @@ install_model() {
   mkdir -p models
   if model_ok "$dir"; then
     echo "embedding model already present (checksum ok); skipping download"
+  elif seed_model "$dir"; then
+    echo "reused the embedding model from a previous install (checksum ok); skipping download"
   elif curl -fsSL --retry 3 --retry-delay 5 -o "${dir}/${MODEL_FILE}" "${base}/${MODEL_FILE}" &&
     verify "$dir" "${MODEL_FILE}"; then
     if install -m 644 "${dir}/${MODEL_FILE}" "models/${MODEL_FILE}"; then
@@ -350,6 +352,38 @@ install_model() {
     echo "warning: embedding model download failed; semantic matching will fall back to text search" >&2
     echo "         retry later with: bash scripts/install.sh" >&2
   fi
+}
+
+# seed_model <attempt-dir> — take the model from a PREVIOUS install instead of
+# downloading it again.
+#
+# herdr ≥0.9.5 builds every install and update in a fresh clone
+# (<install>/<generation>/checkout) and keeps the previous generations beside
+# it until the herdr server exits. So models/ is always empty here, and the
+# "already present" branch above — which is what made an update cheap when
+# herdr reinstalled in place — never fires. Worse than the 25MB: the model is
+# OPTIONAL, so an update whose model download failed used to keep the working
+# model and now silently drops semantic matching.
+#
+# Only the 0.9.5 layout is searched (a root named "checkout"); anywhere else
+# the two levels up are somebody else's directory. A candidate is used only if
+# it passes the release's checksum — the same proof a download needs — and a
+# failed or partial copy is removed so it can never be loaded as the model.
+seed_model() {
+  local dir="$1"
+  local dest="${ROOT}/models/${MODEL_FILE}"
+  local installs cand
+  [ "$(basename "$ROOT")" = "checkout" ] || return 1
+  installs="$(dirname "$(dirname "$ROOT")")"
+  for cand in "$installs"/*/checkout/models/"$MODEL_FILE"; do
+    [ -f "$cand" ] || continue
+    [ "$cand" = "$dest" ] && continue
+    if cp "$cand" "$dest" 2>/dev/null && model_ok "$dir"; then
+      return 0
+    fi
+    rm -f "$dest"
+  done
+  return 1
 }
 
 model_ok() {
@@ -482,19 +516,24 @@ else
 fi
 
 # Hand a RUNNING daemon over to the binary we just installed. An upgrade puts
-# the new release in a new directory and unlinks the old one, but the live
-# daemon keeps running from the removed path — and every child it spawns from
-# there (the MCP server the LLM CLI launches, the embed worker) then fails, so
-# consults silently come back empty. Without this the swap waited for herdr's
+# the new release in a new directory, but the live daemon keeps running the
+# old one. Before herdr 0.9.5 that directory was unlinked at once — every child
+# the daemon spawned from there (the MCP server the LLM CLI launches, the embed
+# worker) then failed, so consults silently came back empty, and the daemon
+# noticed its binary was gone and replaced itself. From 0.9.5 the old install
+# is RETAINED until the herdr server exits, so nothing breaks and nothing is
+# noticed: without this the herd simply stays on the old version until herdr's
 # next pane.agent_detected / workspace.created event, which may be hours away.
 #
 # --replace-only never STARTS a daemon: a fresh install (and any CI run of this
 # script) must not bring one up as a side effect of building the plugin.
 #
-# This runs inside herdr's [[build]] step, so herdr may not have registered the
-# new plugin directory yet — which is fine: the daemon we start is spawned from
+# This runs inside herdr's [[build]] step, so herdr has not registered the new
+# plugin directory yet — which is fine: the daemon we start is spawned from
 # THIS binary's own path (it exists, so hap's self-resolution never reaches the
-# registry lookup). Best-effort — a plugin install must not fail because the
+# registry lookup), and --replace-only is also what tells hap not to defer to
+# "the registered install", which right now is still the one being replaced.
+# Best-effort — a plugin install must not fail because the
 # handover did not take; `hap daemon --ensure` still fixes it.
 if "./${DEST}" daemon --ensure --replace-only; then
   echo "handed a running daemon over to the new binary (if one was running)"

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -135,6 +136,18 @@ func persistModelID(path string, facts modelIDEntry, id string) {
 	}
 	if all == nil {
 		all = map[string]modelIDEntry{}
+	}
+	// Drop entries whose model is gone. The key is the model's PATH, and the
+	// bundled model lives inside the plugin install — which herdr ≥0.9.5 puts
+	// in a new directory on every install and update, later deleting the old
+	// one. Without this the file gains a dead entry per update, forever, and
+	// every one-shot `hap` parses all of them to find its own. Only a path
+	// that positively no longer exists goes: a model that merely cannot be
+	// inspected right now (an unreadable directory) keeps its id.
+	for other := range all {
+		if _, err := os.Lstat(other); errors.Is(err, os.ErrNotExist) {
+			delete(all, other)
+		}
 	}
 	facts.ID = id
 	all[path] = facts

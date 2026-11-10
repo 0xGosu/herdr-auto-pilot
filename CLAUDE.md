@@ -329,5 +329,21 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
 - Agent names: `[a-z][a-z0-9_-]{0,31}`, unique. `agent prompt` right after `agent start` may land without
   submitting — don't remove the status-gated retry-Enter loop in `CLI.send`.
 - `HERDR_BIN_PATH` / `HERDR_SOCKET_PATH` override the binary and events socket.
+- Plugin installs (herdr 0.9.5): `<config>/herdr/plugins/github-installations/<id>-<hash>/<generation>/checkout`
+  (before: `plugins/github/<id>-<version>`); every install/update is a FRESH clone in a new `<generation>`.
+  The previous one is RETAINED until the herdr servers using it exit, then removed by a later install or
+  server startup (herdr docs, `plugins.mdx` "Install and link"; before 0.9.5 it was unlinked at once). So:
+  - "My binary exists" does not mean "I am the installed build": only the registry says
+    (`selfpath.SupersededBy`, never the install-tree scan — a sibling may be an aborted build). `daemon
+    --ensure`/`--restart` from a superseded managed install defer to the registered one
+    (`deferToRegisteredInstall`); never under `--replace-only`, which runs inside `[[build]]` while the
+    registry still names the install being replaced. `checkOwnBinary` only fires once the files are gone.
+  - Anything holding an install path goes stale, then dangles — the operator's `hap` PATH symlink included
+    (`internal/shortcut`: finds a link before proposing a location; `Heal` never creates).
+  - Nothing durable survives in the plugin root: `install.sh` `seed_model` carries the optional model over
+    (on the release's checksum), and path-keyed caches must prune (`persistModelID`).
+  - A new layout is added to `selfpath.installGlobs`. herdr's per-user install is `~/.local/bin`, where
+    `/usr/local/bin` is root's. **Test trap:** the shortcut's mutating entry points refuse inside a test
+    binary (`refuseUnderTest`) — that, not the sweep's exclusion list, keeps tests off the real PATH.
 
 Full architecture: `docs/architect/herd-auto-prompter-architecture.md` (FR-/NFR- ids used in comments).

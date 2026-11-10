@@ -35,6 +35,7 @@ import (
 	"github.com/0xGosu/herdr-auto-pilot/internal/frontend"
 	"github.com/0xGosu/herdr-auto-pilot/internal/logging"
 	"github.com/0xGosu/herdr-auto-pilot/internal/ports"
+	"github.com/0xGosu/herdr-auto-pilot/internal/shortcut"
 	"github.com/0xGosu/herdr-auto-pilot/internal/tasklocator"
 	"github.com/0xGosu/herdr-auto-pilot/internal/updatecheck"
 )
@@ -995,7 +996,7 @@ type Model struct {
 	height    int
 
 	// installShortcut is injectable so the key flow can be tested without
-	// writing /usr/local/bin. A nil value uses installHAPShortcut.
+	// writing a PATH directory. A nil value uses installHAPShortcut.
 	installShortcut func() error
 
 	// installSkill is injectable so the skill-install flow can be tested
@@ -2378,7 +2379,7 @@ func buildRuleItems(cfg config.Config) []ruleItem {
 	items = append(items, ruleItem{
 		kind:  "shortcut",
 		key:   "install-hap",
-		label: shortcutLabel(hapShortcutState()),
+		label: shortcutLabel(shortcut.Locate()),
 	})
 	items = append(items, ruleItem{
 		kind:  "shortcut",
@@ -6619,7 +6620,7 @@ func (m Model) activateSelectedConfig() (tea.Model, tea.Cmd) {
 		return m.editSelectedRule()
 	}
 	// The two shortcuts confirm differently on purpose: the symlink touches
-	// /usr/local/bin and keeps its Y/n modal; the skill install's multi-select
+	// a PATH directory and keeps its Y/n modal; the skill install's multi-select
 	// IS the confirmation (it only creates or refreshes hap's own file under
 	// the operator's home).
 	switch item.key {
@@ -6628,18 +6629,18 @@ func (m Model) activateSelectedConfig() (tea.Model, tea.Cmd) {
 		if install == nil {
 			install = installHAPShortcut
 		}
-		// Read the state once, here, so the prompt and the result message agree
+		// Locate the link once, here, so the prompt and the result message agree
 		// with each other and with the row the operator selected.
-		state := hapShortcutState()
+		link := shortcut.Locate()
 		m.message = ""
 		m.confirm = &confirmation{
-			label: shortcutConfirm(state),
+			label: shortcutConfirm(link),
 			onConfirm: func() tea.Cmd {
 				return func() tea.Msg {
 					if err := install(); err != nil {
 						return actionResultMsg{err: err}
 					}
-					return actionResultMsg{message: shortcutResult(state)}
+					return actionResultMsg{message: shortcutResult(link)}
 				}
 			},
 		}
