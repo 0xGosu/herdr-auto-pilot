@@ -216,7 +216,7 @@ func (d *Daemon) describeRules(ctx context.Context, cfg config.Config, cands []d
 	defer cancel()
 
 	sigs := make([]string, 0, len(cands))
-	floors := make(map[string]int64, len(cands))
+	states := make(map[string]domain.SignatureState, len(cands))
 	for i := range cands {
 		st, err := d.opt.Store.GetSignature(dctx, cands[i].Signature)
 		if err != nil || st == nil {
@@ -227,7 +227,7 @@ func (d *Daemon) describeRules(ctx context.Context, cfg config.Config, cands []d
 			continue
 		}
 		cands[i].Mode = st.Mode
-		floors[cands[i].Signature] = st.DecisionFloorID
+		states[cands[i].Signature] = *st
 		sigs = append(sigs, cands[i].Signature)
 	}
 	if len(sigs) == 0 {
@@ -236,12 +236,16 @@ func (d *Daemon) describeRules(ctx context.Context, cfg config.Config, cands []d
 
 	histories := d.rerankHistories(dctx, sigs)
 	weight := cfg.Learning.ConfirmationWeight
+	// Aged like every other reading of a rule's confidence, so the judge is
+	// shown the score the decision core will gate its pick on.
+	decay, now := confidenceDecay(cfg), d.opt.Clock.Now()
 	for i := range cands {
 		history, ok := histories[cands[i].Signature]
 		if !ok {
 			continue
 		}
-		conf := domain.LiveConfidence(history, floors[cands[i].Signature], weight)
+		st := states[cands[i].Signature]
+		conf := domain.LiveConfidence(history, st.DecisionFloorID, weight, st.Age(decay, now))
 		cands[i].TopAction = conf.TopAction
 		cands[i].Confidence = conf.Score
 		cands[i].Decisions = len(history)

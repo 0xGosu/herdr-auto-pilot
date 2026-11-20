@@ -648,6 +648,36 @@ operator reset**, which zeroes the count and stamps a `decision_floor_id`
 graduation, so the score reads a fresh 1.0) while still surfacing the learned
 answer as the suggestion — trust is re-earned by re-confirming.
 
+**Confidence ages.** The agreement ratio is timeless, so on its own a rule
+confirmed once a year ago would answer forever and a rule whose screen no longer
+occurs would stay in every candidate set. `domain.LiveConfidence` therefore
+subtracts a time-based penalty (`domain.ConfidenceDecay`): nothing for
+`learning.confidence_decay_grace_days` after the rule's **decay anchor**, then
+1/`learning.confidence_decay_days` per day, floored at 0. The anchor
+(`signatures.decay_anchor_at`) is the rule's creation or the last explicit
+operator act that vouched for it — a processed correction, a raise of the streak,
+a reset (`domain.RestartDecay`) — never an LLM answer, an auto-accept or the rule
+firing. The newest operator decision in the scored history floors it
+(`domain.EffectiveDecayAnchor`), so a confirmation recorded by a node on an
+older build still renews. Aging only lowers the score the confidence gate reads:
+it never changes a rule's mode and never feeds the variance guard, so an aged
+autonomous rule escalates `below_threshold` with its learned answer as the
+suggestion and one confirmation restores it. A rule under its threshold only
+because it aged goes to the operator even when an LLM is configured — the
+consult cannot renew it; a contested rule keeps the LLM fallback.
+
+The daemon's daily retention sweep does the bookkeeping a read cannot
+(`daemon.expireStaleRules`): it stamps unanchored rows (databases from before
+aging, older nodes) with the time it first sees them, records when it first
+**observed** a rule at zero (`signatures.zero_since_at`), and deletes a rule —
+with its decisions, embedding and snapshot — once that observation is older than
+`learning.stale_rule_removal_days`. The window is measured from the observation
+rather than computed from the anchor so that enabling aging, or shortening it,
+can never delete a rule that was not first shown at zero for the whole window;
+for the same reason the stamps are cleared whenever aging or removal is off.
+On a shared database a rule is removed only once every running node's settings
+agree it sits at zero.
+
 **Per-situation thresholds.** Each situation type (idle, approval, choice, error)
 has its own operator-configurable confidence threshold.
 
@@ -755,6 +785,8 @@ erDiagram
         text guard_state
         int decision_floor_id
         int updated_at
+        int decay_anchor_at
+        int zero_since_at
     }
     DECISIONS {
         int id PK
@@ -839,7 +871,7 @@ erDiagram
 
 | Table | Role |
 |---|---|
-| **signatures** | Per-signature learning state: mode, confirmations, cached confidence, guard state, `decision_floor_id` (operator reset) |
+| **signatures** | Per-signature learning state: mode, confirmations, cached confidence, guard state, `decision_floor_id` (operator reset), `decay_anchor_at` / `zero_since_at` (confidence aging) |
 | **decisions** | Every learned/observed decision (operator/rule/LLM), incl. corrections; feeds confidence and lineage |
 | **audit_log** | Append-only trail; records `match_method`/`match_score`/`embed_error` (resolution provenance), `llm_output`, and `corrects_audit_id` lineage |
 | **agent_rate** | Per-agent consecutive/windowed counters + pause flag for the runaway guard |

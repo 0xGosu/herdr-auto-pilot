@@ -96,7 +96,8 @@ type DecideInput struct {
 	State                *SignatureState  // nil when the signature is new
 	History              []DecisionRecord // newest first
 	ConfidenceThresholds ConfidenceThresholds
-	ConfirmationWeight   float64 // operator-confirmation boost for Confidence
+	ConfirmationWeight   float64         // operator-confirmation boost for Confidence
+	Decay                ConfidenceDecay // time-based aging of State's score, against State.DecayAnchor and Now; zero ages nothing
 	GraduationN          int
 	KillActive           bool
 	Rate                 AgentRate
@@ -146,12 +147,29 @@ func Decide(in DecideInput) Decision {
 	// the one gated on here. Computed before the safety vetoes below so an
 	// escalation forced by one of them still reports the rule's actual
 	// confidence instead of a bare 0.
+	//
+	// The score is also AGED here (ConfidenceDecay): a rule nobody has
+	// re-confirmed for long enough drifts under its threshold and reaches the
+	// confidence gate below like any other under-confident rule. Aging only
+	// ever lowers the score that gate reads. It deliberately does NOT feed the
+	// variance guard, which asks whether the operator's decisions CONTRADICT
+	// each other and reads `post` directly — an old rule is not a contradictory
+	// one, and reporting it as such would send the operator looking for a
+	// disagreement that never happened.
 	var floor int64
+	var age ConfidenceAge
 	if in.State != nil {
 		floor = in.State.DecisionFloorID
+		age = in.State.Age(in.Decay, in.Now)
 	}
 	post := DecisionsSince(in.History, floor)
-	conf := LiveConfidence(in.History, floor, in.ConfirmationWeight)
+	conf := LiveConfidence(in.History, floor, in.ConfirmationWeight, age)
+	// agedNote is empty unless aging is what lowered the score, so the two
+	// confidence-gate rationales below can name the calendar as the cause.
+	agedNote := conf.AgedNote(in.Now)
+	if agedNote != "" {
+		agedNote = "; " + agedNote
+	}
 
 	// Safety controls veto first (Constitution: safety over throughput).
 	// Rationales are tag-only where the reason token self-explains — the
@@ -359,12 +377,22 @@ func Decide(in DecideInput) Decision {
 
 	// Confidence gate (FR-008).
 	if conf.Score <= threshold {
-		if in.LLMConfigured {
+		// An under-confident rule normally goes to the LLM when one is
+		// configured. A rule that is under its threshold ONLY because it aged
+		// does not: it goes to the operator, with its learned answer as the
+		// suggestion. Aging exists to bring a rule back to a human, and an LLM
+		// answer never renews one (RestartDecay) — so consulting here would
+		// keep the rule draining behind the operator's back until the expiry
+		// sweep deleted it, decisions and all, while its screen still came up
+		// every day. A rule that is contested as well (raw score at or under
+		// the threshold) keeps the consult: there the LLM is the fallback it
+		// always was.
+		if in.LLMConfigured && !conf.AgedOutOf(threshold) {
 			return Decision{Action: ActionConsult, Confidence: conf.Score,
-				Rationale: fmt.Sprintf("confidence %.2f at/below threshold %.2f; consulting LLM", conf.Score, threshold)}
+				Rationale: fmt.Sprintf("confidence %.2f at/below threshold %.2f%s; consulting LLM", conf.Score, threshold, agedNote)}
 		}
 		return esc(ReasonBelowThreshold,
-			fmt.Sprintf("%.2f ≤ %.2f", conf.Score, threshold),
+			fmt.Sprintf("%.2f ≤ %.2f%s", conf.Score, threshold, agedNote),
 			conf.Score, suggestion)
 	}
 

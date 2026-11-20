@@ -1,0 +1,5 @@
+- Added time-based aging of learned rules: a rule's confidence now drains while no operator re-confirms it (full score for 14 days, then to 0 over 30), so an autonomous rule eventually escalates to the operator again (even with an LLM configured) with its learned answer as the suggestion, and one confirmation — or `hap signatures confirm <prefix>` / the Rules tab's `+` — restores it
+- Added automatic removal of rules that stay at 0 confidence for 14 days, with their decision history, keeping the rule set and the semantic index limited to rules still in use (`rule.deleted … reason=expired` on the stream)
+- Added `learning.confidence_decay_grace_days`, `learning.confidence_decay_days` (0 turns aging off) and `learning.stale_rule_removal_days` (0 keeps aged-out rules)
+- Added an `aging:` line to `hap signatures show` and the Rules detail saying where a rule stands and what happens to it next; a listed confidence of `0.00` now means "aged to zero", distinct from `-` (never scored)
+- Started a fresh aging clock for every existing rule the first time the upgraded daemon runs, so nothing is aged or removed against time that passed before the upgrade

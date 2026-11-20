@@ -154,16 +154,23 @@ func (a *App) nudge(ctx context.Context, kind control.Kind) (delivered bool) {
 	return true
 }
 
-// confirmationWeight resolves the operator-confirmation boost for display-side
-// Confidence calls so a listed/detailed signature scores the same way the
-// daemon does. Config is best-effort here (display only): a read error falls
-// back to the documented default rather than failing the listing.
-func (a *App) confirmationWeight() float64 {
+// learningPolicy resolves, in ONE config read, both inputs a display-side
+// LiveConfidence call needs beyond the rows: the operator-confirmation weight
+// and the rule-aging policy. One read because App.Config has no cache and
+// costs ~9ms (see Signatures); two helpers each loading it would double that on
+// the TUI's 2s refresh.
+//
+// Config is best-effort here (display only), so a listed rule scores the way
+// the daemon does when it can and a read error falls back to the documented
+// defaults rather than failing the listing. The fallback for aging
+// is the DEFAULT policy, not "no aging" — showing un-aged scores beside
+// escalations that cite aged ones is the drift LiveConfidence exists to prevent.
+func (a *App) learningPolicy() (float64, domain.ConfidenceDecay) {
 	cfg, err := a.Config()
 	if err != nil {
-		return domain.DefaultConfirmationWeight
+		return domain.DefaultConfirmationWeight, confidenceDecay(config.Default())
 	}
-	return cfg.Learning.ConfirmationWeight
+	return cfg.Learning.ConfirmationWeight, confidenceDecay(cfg)
 }
 
 // Status summarizes daemon-relevant state.
@@ -2635,6 +2642,9 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "confidence_thresholds.error", TUIEditable: true},
 	{Key: "learning.graduation_n", TUIEditable: true},
 	{Key: "learning.confirmation_weight", TUIEditable: true},
+	{Key: "learning.confidence_decay_grace_days", TUIEditable: true},
+	{Key: "learning.confidence_decay_days", TUIEditable: true},
+	{Key: "learning.stale_rule_removal_days", TUIEditable: true},
 	{Key: "limits.max_consecutive_auto_prompts", TUIEditable: true},
 	{Key: "limits.max_auto_prompts_per_minute", TUIEditable: true},
 	{Key: "limits.max_error_retries", TUIEditable: true},
@@ -2753,6 +2763,30 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.palette.running", TUIEditable: true, TUIHidden: true},
 	{Key: "tui.palette.warn", TUIEditable: true, TUIHidden: true},
 	{Key: "tui.palette.help", TUIEditable: true, TUIHidden: true},
+}
+
+// parseAgingDays validates one of the learning aging keys: a whole number of
+// days, with 0 as the key's own "off" (zeroMeans says which).
+func parseAgingDays(key, value, zeroMeans string) (int, error) {
+	v, err := strconv.Atoi(value)
+	if err != nil || v < 0 || v > config.MaxAgingDays {
+		return 0, fmt.Errorf("%s must be a whole number of days between 0 and %d (0 = %s), got %q",
+			key, config.MaxAgingDays, zeroMeans, value)
+	}
+	return v, nil
+}
+
+// agingDaysValue renders one of the learning aging keys, naming the default
+// when the key is absent and what 0 means when it is set to that.
+func agingDaysValue(v *int, def int, zeroMeans string) string {
+	switch {
+	case v == nil:
+		return fmt.Sprintf("%d (default)", def)
+	case *v <= 0:
+		return fmt.Sprintf("0 (%s)", zeroMeans)
+	default:
+		return strconv.Itoa(*v)
+	}
 }
 
 // ConfigFieldKeys lists every scalar config field editable via SetField, in
@@ -2882,6 +2916,15 @@ func FieldValue(cfg config.Config, key string) string {
 			return fmt.Sprintf("%g (default)", domain.DefaultConfirmationWeight)
 		}
 		return fmt.Sprintf("%g", cfg.Learning.ConfirmationWeight)
+	case "learning.confidence_decay_grace_days":
+		return agingDaysValue(cfg.Learning.ConfidenceDecayGraceDays,
+			config.DefaultConfidenceDecayGraceDays, "aging starts at once")
+	case "learning.confidence_decay_days":
+		return agingDaysValue(cfg.Learning.ConfidenceDecayDays,
+			config.DefaultConfidenceDecayDays, "aging off")
+	case "learning.stale_rule_removal_days":
+		return agingDaysValue(cfg.Learning.StaleRuleRemovalDays,
+			config.DefaultStaleRuleRemovalDays, "never remove")
 	case "embedding.min_salient_chars":
 		if cfg.Embedding.MinSalientChars <= 0 {
 			return fmt.Sprintf("%d (default)", domain.DefaultMinSalientChars)
@@ -3245,6 +3288,27 @@ func (a *App) SetField(ctx context.Context, key, value string) (reloaded bool, e
 				return fmt.Errorf("learning.confirmation_weight must be a number >= 1 (1 disables the boost), got %q", value)
 			}
 			cfg.Learning.ConfirmationWeight = v
+			return nil
+		case "learning.confidence_decay_grace_days":
+			v, err := parseAgingDays(key, value, "aging starts at once")
+			if err != nil {
+				return err
+			}
+			cfg.Learning.ConfidenceDecayGraceDays = &v
+			return nil
+		case "learning.confidence_decay_days":
+			v, err := parseAgingDays(key, value, "aging off")
+			if err != nil {
+				return err
+			}
+			cfg.Learning.ConfidenceDecayDays = &v
+			return nil
+		case "learning.stale_rule_removal_days":
+			v, err := parseAgingDays(key, value, "never remove")
+			if err != nil {
+				return err
+			}
+			cfg.Learning.StaleRuleRemovalDays = &v
 			return nil
 		case "embedding.min_salient_chars":
 			return setInt(&cfg.Embedding.MinSalientChars)
@@ -5521,7 +5585,17 @@ type SignatureRow struct {
 	// only refreshed on a confirm/correct and is stamped to a fake 1.0 by a
 	// reset, so it drifts from the score that actually drives decisions.
 	Confidence float64
-	TopAction  string
+	// RawConfidence is that score BEFORE time-based aging (domain
+	// .ConfidenceDecay) — what the decisions alone say. Equal to Confidence
+	// for a rule aging has not touched. It is what tells "aged to zero" from
+	// "never scored" (ConfidenceLabel).
+	RawConfidence float64
+	// Aging is a one-line account of where the rule stands on the decay
+	// clock (RuleAging), "" when aging is off. Rendered rather than left to
+	// each view to compute, so the CLI and the TUI cannot word it differently
+	// — or read the clock at different instants.
+	Aging     string
+	TopAction string
 	// Decisions counts only the decisions behind Confidence (post-floor), so it
 	// belongs beside a confidence figure. It is NOT how much history exists:
 	// use TotalDecisions for anything describing the stored rows themselves.
@@ -5557,11 +5631,67 @@ type SignatureRow struct {
 // measured", while reading as "measured, and found no confidence" — the
 // opposite. Every CONF an operator sees (escalations, audit, rules — TUI and
 // CLI) goes through here so the wording cannot drift.
+//
+// One real zero now exists: a rule whose score time-based aging drained
+// (domain.ConfidenceDecay). A bare score cannot tell that from "never scored",
+// so a RULE is rendered through SignatureRow.ConfidenceLabel, which can; this
+// function is for rows that carry only a number (escalations, audit), where an
+// aged-out rule's "-" is explained by the rationale beside it.
 func ConfidenceLabel(conf float64) string {
 	if conf == 0 {
 		return "-"
 	}
 	return fmt.Sprintf("%.2f", conf)
+}
+
+// ConfidenceLabel renders this rule's live score: "0.00" when aging drained a
+// score the decisions earned, otherwise exactly what the package-level
+// ConfidenceLabel says ("-" for a rule with nothing scored).
+func (r SignatureRow) ConfidenceLabel() string {
+	if r.Confidence == 0 && r.RawConfidence > 0 {
+		return "0.00"
+	}
+	return ConfidenceLabel(r.Confidence)
+}
+
+// RuleAging describes where a rule stands on the confidence-decay clock, for
+// `hap signatures show` and the Rules detail overlay. "" when aging is off.
+//
+// It always names the NEXT thing that will happen to the rule and when, because
+// that is the question the line exists to answer: a score quietly lower than
+// last week, or a rule that vanished, is otherwise indistinguishable from a bug.
+func RuleAging(st domain.SignatureState, conf domain.ConfidenceResult, decay domain.ConfidenceDecay, now time.Time) string {
+	if !decay.Enabled() {
+		return ""
+	}
+	// The EFFECTIVE anchor LiveConfidence aged the score from, not the stored
+	// column: a confirmation made on an older node moves the one and not the
+	// other (domain.EffectiveDecayAnchor), and the dates here have to describe
+	// the score printed beside them.
+	anchor := conf.AgedSince
+	if anchor.IsZero() {
+		return "not started — the daemon starts this rule's clock on its next daily sweep"
+	}
+	const day = "2006-01-02"
+	since := "unconfirmed " + domain.DaysLabel(now.Sub(anchor))
+	if conf.Score == 0 {
+		if at, ok := decay.RemovalAt(st.ZeroSince); ok {
+			return fmt.Sprintf("%s — at 0 since %s, removed on %s unless confirmed",
+				since, st.ZeroSince.Format(day), at.Format(day))
+		}
+		if decay.Removal > 0 {
+			return fmt.Sprintf("%s — at 0, removed after %s there unless confirmed",
+				since, domain.DaysLabel(decay.Removal))
+		}
+		return since + " — at 0"
+	}
+	zeroAt, _ := decay.ZeroAt(conf.RawScore, anchor)
+	if conf.Score < conf.RawScore {
+		return fmt.Sprintf("%s — aged from %.2f, reaches 0 on %s unless confirmed",
+			since, conf.RawScore, zeroAt.Format(day))
+	}
+	return fmt.Sprintf("%s — full score until %s, reaches 0 on %s unless confirmed",
+		since, anchor.Add(decay.Grace).Format(day), zeroAt.Format(day))
 }
 
 // AuditStatusWidth is the display width AuditStatusLabel's output fits in.
@@ -5621,7 +5751,7 @@ func AuditStatusLabel(r domain.AuditRecord) string {
 // wording so operators see the same rule either way).
 func RuleSummary(row SignatureRow, graduationN int) string {
 	s := fmt.Sprintf("%s — %d/%d confirmations, confidence %s",
-		row.Mode, row.ConsecutiveConfirmations, graduationN, ConfidenceLabel(row.Confidence))
+		row.Mode, row.ConsecutiveConfirmations, graduationN, row.ConfidenceLabel())
 	if row.TopAction != "" {
 		s += fmt.Sprintf(", top action %q over %d decision(s)", row.TopAction, row.Decisions)
 	}
@@ -5714,13 +5844,16 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 		return nil, auditsErr
 	}
 	var err error
-	// Resolved ONCE, outside the loop. confirmationWeight re-reads and re-parses
+	// Resolved ONCE, outside the loop. learningPolicy re-reads and re-parses
 	// config.toml on every call (App.Config has no cache), which costs ~9ms —
 	// three orders of magnitude more than the per-row queries beside it. Called
 	// per signature it made this listing O(signatures) file reads, and the TUI
 	// calls Signatures on its 2s refresh, so ~80 learned rules burned ~700ms of
 	// CPU every 2s for a value that cannot change mid-listing anyway.
-	weight := a.confirmationWeight()
+	// The aging policy and "now" are fixed here for the same reason, and for one
+	// more: every row of a listing must be aged against the same instant.
+	weight, decay := a.learningPolicy()
+	now := time.Now()
 	// Two queries for the whole listing when the store offers the bulk reads,
 	// instead of two PER RULE. Both maps stay nil when it does not, and the loop
 	// falls back to the per-signature calls — a fake store keeps working, just
@@ -5762,7 +5895,7 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 				return nil, err
 			}
 		}
-		conf := domain.LiveConfidence(history, st.DecisionFloorID, weight)
+		conf := domain.LiveConfidence(history, st.DecisionFloorID, weight, st.Age(decay, now))
 		// min-conf filters the LIVE score here, not cached_confidence in SQL:
 		// the store cannot do it correctly (see domain.SignatureFilter).
 		if f.MinConfidence > 0 && conf.Score < f.MinConfidence {
@@ -5777,7 +5910,8 @@ func (a *App) Signatures(ctx context.Context, f domain.SignatureFilter) ([]Signa
 			}
 		}
 		row := SignatureRow{
-			SignatureState: st, Confidence: conf.Score,
+			SignatureState: st, Confidence: conf.Score, RawConfidence: conf.RawScore,
+			Aging:     RuleAging(st, conf, decay, now),
 			TopAction: conf.TopAction, Decisions: conf.Decisions,
 			TotalDecisions: total,
 		}
@@ -5809,14 +5943,17 @@ func (a *App) SignatureDetail(ctx context.Context, prefix string) (SignatureRow,
 	if err != nil {
 		return row, nil, err
 	}
-	conf := domain.LiveConfidence(history, st.DecisionFloorID, a.confirmationWeight())
+	weight, decay := a.learningPolicy()
+	now := time.Now()
+	conf := domain.LiveConfidence(history, st.DecisionFloorID, weight, st.Age(decay, now))
 	// An exact count, not len(history): history is a capped window, and the
 	// delete prompts this feeds erase every row.
 	total, err := a.Store.CountDecisionsForSignature(ctx, sig)
 	if err != nil {
 		return row, nil, err
 	}
-	row = SignatureRow{SignatureState: *st, Confidence: conf.Score,
+	row = SignatureRow{SignatureState: *st, Confidence: conf.Score, RawConfidence: conf.RawScore,
+		Aging:     RuleAging(*st, conf, decay, now),
 		TopAction: conf.TopAction, Decisions: conf.Decisions,
 		TotalDecisions: total}
 	audit, err := a.Store.LatestAuditForSignature(ctx, sig)
@@ -5891,6 +6028,10 @@ func (a *App) ResetSignatureGraduation(ctx context.Context, prefix string) (stri
 		reset.DecisionFloorID = newest[0].ID
 	}
 	reset.UpdatedAt = time.Now()
+	// A reset is an operator act on the rule, so its decay clock restarts
+	// (domain.RestartDecay): the score is 0 either way, but the rule gets a
+	// full removal window to re-earn trust in, not the remainder of an old one.
+	reset = domain.RestartDecay(reset, reset.UpdatedAt)
 	if err := a.Store.UpsertSignature(ctx, reset); err != nil {
 		return "", err
 	}
@@ -5915,6 +6056,16 @@ type SignatureAdjustment struct {
 	// for this rule's situation type.
 	Confidence float64
 	Threshold  float64
+	// RawConfidence is Confidence before time-based aging. It differs only on a
+	// LOWER of an aged rule (a raise renews the rule first, so there the two
+	// are equal), and is what lets Summary tell a score aging drained from one
+	// that was never earned.
+	RawConfidence float64
+	// Renewed reports that this nudge gave back confidence aging had taken: a
+	// raise of a rule whose score had drained. False on a raise of a rule that
+	// was not aged yet — its clock restarts all the same, but there is nothing
+	// to tell the operator about.
+	Renewed bool
 }
 
 // Graduated reports that this adjustment promoted the rule.
@@ -5952,11 +6103,23 @@ func (a SignatureAdjustment) ConfidenceBlocked() bool {
 // operator would otherwise take for a dead key.
 func (a SignatureAdjustment) Summary() string {
 	streak := fmt.Sprintf("streak %d/%d", a.Confirmations, a.GraduationN)
+	// Said on every raise that renewed, whatever else happened: restoring an
+	// aged score is the reason an operator presses `+` on a rule that is
+	// already autonomous, and there the streak line alone reads as a no-op.
+	renewed := ""
+	if a.Renewed {
+		renewed = fmt.Sprintf("; confidence renewed to %.2f", a.Confidence)
+	}
 	switch {
 	case a.Graduated():
-		return streak + " — graduated to autonomous"
+		return streak + " — graduated to autonomous" + renewed
 	case a.Demoted():
 		return streak + " — demoted to shadow"
+	case a.ConfidenceBlocked() && a.Confidence == 0 && a.RawConfidence > 0:
+		// Aged to zero, not unscored: the decisions are there, the calendar
+		// took the score. Only reachable on a lower (a raise renews first).
+		return fmt.Sprintf("%s (%s; confidence aged from %.2f to 0, which blocks graduation — confirm it to renew)",
+			streak, a.Mode, a.RawConfidence)
 	case a.ConfidenceBlocked() && a.Confidence == 0:
 		// A zero score means NEVER SCORED, not a measured 0.00 — the same
 		// convention ConfidenceLabel renders as "-". Printing "0.00 ≤ 0.70"
@@ -5967,7 +6130,7 @@ func (a SignatureAdjustment) Summary() string {
 		return fmt.Sprintf("%s (%s; confidence %.2f ≤ %.2f blocks graduation)",
 			streak, a.Mode, a.Confidence, a.Threshold)
 	default:
-		return fmt.Sprintf("%s (%s)", streak, a.Mode)
+		return fmt.Sprintf("%s (%s)", streak, a.Mode) + renewed
 	}
 }
 
@@ -5994,7 +6157,7 @@ func (a *App) AdjustSignatureConfirmations(ctx context.Context, prefix string, d
 	if st == nil {
 		return out, fmt.Errorf("no learned signature %s", sig)
 	}
-	// Config is NOT best-effort here (unlike confirmationWeight, which only
+	// Config is NOT best-effort here (unlike learningPolicy, which only
 	// feeds a display): graduation_n and the threshold decide whether this
 	// write changes the rule's MODE, so a silent fallback to defaults could
 	// graduate a rule the operator's own config says is not ready.
@@ -6009,10 +6172,28 @@ func (a *App) AdjustSignatureConfirmations(ctx context.Context, prefix string, d
 	if err != nil {
 		return out, err
 	}
-	conf := domain.LiveConfidence(history, st.DecisionFloorID, cfg.Learning.ConfirmationWeight)
+	//
+	// A RAISE is the operator vouching for the rule, so it restarts the decay
+	// clock (domain.RestartDecay) BEFORE the score is read: the graduation gate
+	// below must see the confidence the rule will have once this write lands,
+	// or `+` on an aged rule would renew it and still refuse to graduate it on
+	// the stale, aged score. A LOWER never renews — it would raise a decayed
+	// score on the key that means "trust this less".
+	now := time.Now()
+	decay := confidenceDecay(cfg)
+	base := *st
+	if delta > 0 {
+		base = domain.RestartDecay(base, now)
+	}
+	conf := domain.LiveConfidence(history, st.DecisionFloorID, cfg.Learning.ConfirmationWeight,
+		base.Age(decay, now))
+	// What the rule scored a moment ago, on its old clock — only to report
+	// whether this nudge gave anything back (SignatureAdjustment.Renewed).
+	before := domain.LiveConfidence(history, st.DecisionFloorID, cfg.Learning.ConfirmationWeight,
+		st.Age(decay, now))
 	threshold := confidenceThresholds(cfg).ForType(st.SituationType)
 
-	adjusted := domain.AdjustConfirmations(*st, delta, conf.Score, threshold, cfg.Learning.GraduationN)
+	adjusted := domain.AdjustConfirmations(base, delta, conf.Score, threshold, cfg.Learning.GraduationN)
 	// UpdatedAt is deliberately NOT stamped. Store.ListSignatures orders by
 	// `updated_at DESC` and the TUI's cursor is a positional index into that
 	// listing with no selection-by-identity machinery, so stamping would float
@@ -6034,8 +6215,19 @@ func (a *App) AdjustSignatureConfirmations(ctx context.Context, prefix string, d
 		Signature: sig, Confirmations: adjusted.ConsecutiveConfirmations,
 		GraduationN: cfg.Learning.GraduationN,
 		Mode:        adjusted.Mode, PreviousMode: st.Mode,
-		Confidence: conf.Score, Threshold: threshold,
+		Confidence: conf.Score, RawConfidence: conf.RawScore, Threshold: threshold,
+		Renewed: before.Score < conf.Score,
 	}, nil
+}
+
+// confidenceDecay assembles the rule-aging policy from config. It MIRRORS the
+// daemon's helper of the same name: the two packages cannot share one (config
+// stays decoupled from domain, and neither imports the other), and a front end
+// that aged rules differently from the daemon would list scores the decision
+// core does not gate on.
+func confidenceDecay(cfg config.Config) domain.ConfidenceDecay {
+	grace, span, removal := cfg.Learning.ConfidenceDecay()
+	return domain.ConfidenceDecay{Grace: grace, Span: span, Removal: removal}
 }
 
 // confidenceThresholds maps the config section onto the domain type. Twin of

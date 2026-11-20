@@ -965,7 +965,7 @@ func buildCommands() {
 				{Name: "--limit", Arg: "N", Default: "20", Desc: "search --semantic/--screen: max matches to return"},
 				{Name: "--min-score", Arg: "S", Default: "0.3", Desc: "search --semantic: minimum cosine score in (0,1]; 0 uses the default"},
 				{Name: "--yes", Desc: "delete/reset: skip the interactive confirmation (required when stdin is not a terminal)"},
-				{Name: "--delta", Arg: "N", Default: "1", Desc: "confirm: signed change to the confirmation streak (e.g. -1 to walk it back)"},
+				{Name: "--delta", Arg: "N", Default: "1", Desc: "confirm: signed change to the confirmation streak (e.g. -1 to walk it back); a positive one also renews an aged rule's confidence"},
 				{Name: "--force", Desc: "reembed: re-run even when no model drift is detected"},
 			},
 			Details: "A signature is one learned situation. `list` shows: short signature, situation,\n" +
@@ -997,6 +997,15 @@ func buildCommands() {
 				"by --delta instead: reaching graduation N graduates the rule when its confidence\n" +
 				"also clears the threshold, and --delta -1 walks a graduated rule back one notch\n" +
 				"(demoting it below N) while KEEPING its history — the graded alternative to reset.\n" +
+				"\n" +
+				"Rules AGE: confidence drains while no operator re-confirms a rule (see `hap config`\n" +
+				"learning.confidence_decay_grace_days / confidence_decay_days), so an autonomous rule\n" +
+				"eventually escalates again with its learned answer as the suggestion. Confirming\n" +
+				"that escalation, or `confirm` here with a positive --delta, restores the score and\n" +
+				"restarts the clock; --delta -1 never does. A rule left at 0 for\n" +
+				"learning.stale_rule_removal_days is removed with its decisions. `show` prints an\n" +
+				"`aging:` line saying where the rule stands and what happens to it next; in `list`,\n" +
+				"conf=0.00 is a rule aged to zero and conf=- one that was never scored.\n" +
 				"`reembed` re-computes stored embeddings after an embedding model change (via\n" +
 				"the running daemon when there is one).",
 			Examples: []string{
@@ -1566,7 +1575,7 @@ var workflows = []struct {
 			"hap signatures list --mode autonomous # rules acting without asking",
 			"hap signatures show <prefix>          # the situation and its recent decisions",
 			"hap signatures reset <prefix> --yes   # back to shadow; must re-earn graduation",
-			"hap signatures confirm <prefix>       # +1 the streak (--delta -1 walks it back)",
+			"hap signatures confirm <prefix>       # +1 the streak and renew an aged rule (--delta -1 walks it back)",
 			"hap signatures delete <prefix> --yes  # erase the rule entirely",
 		},
 	},

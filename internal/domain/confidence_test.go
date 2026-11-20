@@ -126,7 +126,7 @@ func TestLiveConfidenceFloorFallbackCarriesProvenance(t *testing.T) {
 	for i := range recs {
 		recs[i].ID = int64(i + 1)
 	}
-	c := LiveConfidence(recs, 10, DefaultConfirmationWeight) // floor excludes all
+	c := LiveConfidence(recs, 10, DefaultConfirmationWeight, ConfidenceAge{}) // floor excludes all
 	if c.Score != 0 || c.Decisions != 0 {
 		t.Fatalf("floored history must score zero, got %+v", c)
 	}
@@ -234,18 +234,18 @@ func TestLiveConfidencePostFloorWithTopActionFallback(t *testing.T) {
 		{ID: 8, ChosenAction: "no"},
 	}
 	// No floor: identical to a plain Confidence over the whole history.
-	full := LiveConfidence(recs, 0, 1.0)
+	full := LiveConfidence(recs, 0, 1.0, ConfidenceAge{})
 	if want := Confidence(recs, 1.0); full != want {
 		t.Errorf("floor 0 must match Confidence: got %+v want %+v", full, want)
 	}
 	// A floor narrows the score to post-reset decisions only.
-	post := LiveConfidence(recs, 9, 1.0)
+	post := LiveConfidence(recs, 9, 1.0, ConfidenceAge{})
 	if post.Score != 1 || post.Decisions != 1 || post.TopAction != "yes" {
 		t.Errorf("floor 9 should score only id 10, got %+v", post)
 	}
 	// A floor above everything: no evidence, but the rule still names the
 	// action it learned so a reset rule keeps offering its answer.
-	reset := LiveConfidence(recs, 99, 1.0)
+	reset := LiveConfidence(recs, 99, 1.0, ConfidenceAge{})
 	if reset.Score != 0 || reset.Decisions != 0 {
 		t.Errorf("a fully-reset rule must carry no post-floor evidence, got %+v", reset)
 	}
@@ -253,7 +253,7 @@ func TestLiveConfidencePostFloorWithTopActionFallback(t *testing.T) {
 		t.Errorf("TopAction must fall back to full history, got %q", reset.TopAction)
 	}
 	// Empty history has nothing to fall back to.
-	if got := LiveConfidence(nil, 0, 1.0); got.TopAction != "" || got.Score != 0 {
+	if got := LiveConfidence(nil, 0, 1.0, ConfidenceAge{}); got.TopAction != "" || got.Score != 0 {
 		t.Errorf("empty history must stay zero, got %+v", got)
 	}
 }

@@ -412,6 +412,26 @@ A learned rule never acts on a situation before you have taught it.
    and demotes only once it falls below `graduation_n`, changing nothing else —
    `+`/`--delta 1` is the same nudge upward, and graduates the rule only if its
    confidence already clears the threshold.
+5. **Rules age.** A rule's confidence drains while nobody re-confirms it: it
+   keeps its full score for `learning.confidence_decay_grace_days` (14), then
+   loses 1/`learning.confidence_decay_days` (30) of confidence per day, down to
+   0. An autonomous rule that drifts under its threshold stops answering and
+   escalates to you with its learned answer as the suggestion — even with an
+   LLM configured, since an LLM answer cannot renew a rule. One confirmation (or
+   `hap signatures confirm <prefix>`, TUI *Rules* tab: `+`) restores the score
+   and restarts the clock. Only an operator act renews a rule (the orchestrator's
+   confirmations count, as they do toward graduation); the rule firing on its
+   own, an LLM answer or an auto-accept never does. A rule left at 0 for
+   `learning.stale_rule_removal_days` (14) is removed with its decision history
+   by the daemon's daily sweep, which keeps the rule set — and the semantic
+   index matched against it — limited to rules still in use. `hap signatures
+   show <prefix>` prints where a rule stands (`aging:`). Mode is never changed
+   by aging: a renewed rule is still autonomous. Set `confidence_decay_days = 0`
+   to turn aging off, or `stale_rule_removal_days = 0` to keep aged-out rules.
+   Rules are shared across the machines of a shared database while these
+   settings are per machine: there a rule is removed only once every running
+   machine's settings agree it has sat at 0, so a machine with longer settings,
+   or with aging or removal off, keeps it for all of them.
 
 When your first response creates a rule, earlier LLM-only guesses for that
 signature stay in history for audit but do not seed the new rule's confidence.
@@ -492,6 +512,9 @@ error = 0.75
 [learning]
 graduation_n = 1           # consecutive confirmations to graduate (1-10)
 confirmation_weight = 2.0  # confidence weight of an operator confirmation (>=1)
+confidence_decay_grace_days = 14  # days a rule keeps its full score after its last confirmation
+confidence_decay_days = 30        # days a 1.00 then takes to drain to 0 (0 = aging off)
+stale_rule_removal_days = 14      # days at 0 before a rule is removed (0 = never remove)
 
 [limits]
 max_consecutive_auto_prompts = 50  # per agent, without human interaction

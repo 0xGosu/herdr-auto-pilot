@@ -179,7 +179,7 @@ func (im *importer) copySteps() []copyStep {
 			r["id"], r["node_id"] = id, self
 		}},
 		{"signatures", `signature, situation_type, agent_type, mode, consecutive_confirmations,
-			cached_confidence, decision_floor_id, guard_state, updated_at`, "signature", nil, func(r row) {
+			cached_confidence, decision_floor_id, guard_state, updated_at, decay_anchor_at, zero_since_at`, "signature", nil, func(r row) {
 			r["decision_floor_id"] = remapFloor(im.decisions, r["decision_floor_id"].(int64))
 		}},
 		{"signature_embeddings", "signature, situation_type, agent_type, model, dims, vector, salient, created_at", "signature", nil, nil},

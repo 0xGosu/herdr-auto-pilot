@@ -108,6 +108,20 @@ rule. Nothing AUTOMATIC demotes; the two explicit operator acts that do are
 `hap signatures reset` (back to a fresh rule) and `hap signatures confirm
 --delta -1` (one notch down, demoting only below `graduation_n`).
 
+**aging** — a rule's confidence drains while no operator re-confirms it: full
+score for `learning.confidence_decay_grace_days`, then 1/`learning
+.confidence_decay_days` per day down to 0. An autonomous rule that drifts under
+its threshold escalates again with its learned answer as the suggestion
+(rationale `… aged from 0.95, unconfirmed 47d`) — to the operator even when an
+LLM is configured. Confirming it, or `hap signatures confirm <prefix>`, restores
+the score and restarts the clock (an orchestrator's confirmation counts, as it
+does toward graduation). The rule firing on its own, an LLM answer and an
+auto-accept never renew it. A rule
+left at 0 for `learning.stale_rule_removal_days` is removed with its decisions
+(stream event `rule.deleted … reason=expired`). `hap signatures show <prefix>`
+prints the `aging:` line; a listed `conf=0.00` is a rule aged to zero, `conf=-`
+one never scored. Aging never changes a rule's mode.
+
 **escalation** — hap is not confident enough (or a safety control refused), so
 the situation is queued for a human instead of answered.
 
@@ -612,6 +626,9 @@ tab-separated stdout is unaffected.
 | `confidence_thresholds.error` | 0.75 | …an error |
 | `learning.graduation_n` | 1 | consecutive confirmations to graduate (1-10) |
 | `learning.confirmation_weight` | 2.0 | vote weight of an operator confirmation (1 disables the boost) |
+| `learning.confidence_decay_grace_days` | 14 | days a rule keeps its full confidence after its last confirmation |
+| `learning.confidence_decay_days` | 30 | days a 1.00 then takes to drain to 0 (0 = aging off) |
+| `learning.stale_rule_removal_days` | 14 | days at 0 before a rule is removed (0 = never remove) |
 | `limits.max_consecutive_auto_prompts` | 30 | per agent, without human interaction |
 | `limits.max_auto_prompts_per_minute` | 5 | per agent, rolling 1-minute window |
 | `limits.max_error_retries` | 2 | per error signature |

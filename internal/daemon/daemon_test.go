@@ -701,6 +701,43 @@ func (s *failingStore) PruneAgedRows(ctx context.Context, now, cutoff time.Time)
 	return rp.PruneAgedRows(ctx, now, cutoff)
 }
 
+// StampDecayAnchors, ClearZeroSinceStamps, SetSignatureZeroSince and
+// DeleteStaleSignature forward the
+// OPTIONAL ports.RuleExpiryPort capability, for the reason PruneAgedRows above
+// is forwarded: without them the daemon's type assertion answers false and the
+// rule-expiry sweep is silently switched off for the whole suite.
+func (s *failingStore) StampDecayAnchors(ctx context.Context, now time.Time) (int64, error) {
+	rx, ok := s.StorePort.(ports.RuleExpiryPort)
+	if !ok {
+		return 0, errors.New("wrapped store cannot expire rules")
+	}
+	return rx.StampDecayAnchors(ctx, now)
+}
+
+func (s *failingStore) ClearZeroSinceStamps(ctx context.Context) (int64, error) {
+	rx, ok := s.StorePort.(ports.RuleExpiryPort)
+	if !ok {
+		return 0, errors.New("wrapped store cannot expire rules")
+	}
+	return rx.ClearZeroSinceStamps(ctx)
+}
+
+func (s *failingStore) SetSignatureZeroSince(ctx context.Context, signature string, was, at time.Time) (bool, error) {
+	rx, ok := s.StorePort.(ports.RuleExpiryPort)
+	if !ok {
+		return false, errors.New("wrapped store cannot expire rules")
+	}
+	return rx.SetSignatureZeroSince(ctx, signature, was, at)
+}
+
+func (s *failingStore) DeleteStaleSignature(ctx context.Context, state domain.SignatureState) (bool, int64, error) {
+	rx, ok := s.StorePort.(ports.RuleExpiryPort)
+	if !ok {
+		return false, 0, errors.New("wrapped store cannot expire rules")
+	}
+	return rx.DeleteStaleSignature(ctx, state)
+}
+
 // SignatureEmbeddingsFingerprint forwards the OPTIONAL
 // ports.KnowledgeFingerprinter capability for the same reason: without it every
 // knowledge refresh in the suite silently rebuilds the index.
@@ -1128,6 +1165,17 @@ func (h *harness) pushIn(agentID, workspaceID, status string) {
 // history, mirroring graduated shadow-mode learning.
 func (h *harness) seedAutonomous(pane string, situationType domain.SituationType, action string) string {
 	h.t.Helper()
+	return h.seedAutonomousAt(pane, situationType, action, time.Now())
+}
+
+// seedAutonomousAt is seedAutonomous with the operator's eight confirmations
+// ending at `last` instead of now. Rule aging reads those timestamps — the
+// newest operator decision floors the decay anchor
+// (domain.EffectiveDecayAnchor) — so a test of an AGED rule has to place them
+// in the past; back-dating the anchor alone leaves the rule looking freshly
+// confirmed.
+func (h *harness) seedAutonomousAt(pane string, situationType domain.SituationType, action string, last time.Time) string {
+	h.t.Helper()
 	ctx := context.Background()
 	// Classify exactly as the live pipeline will, so the seeded signature
 	// matches the runtime signature (option sets, permission verbs, and
@@ -1148,7 +1196,7 @@ func (h *harness) seedAutonomous(pane string, situationType domain.SituationType
 		if _, err := h.raw.RecordDecision(ctx, domain.DecisionRecord{
 			Signature: sig.Signature, SituationType: situationType, AgentType: "claude",
 			ChosenAction: action, Source: domain.SourceOperator,
-			CreatedAt: time.Now().Add(-time.Duration(8-i) * time.Minute),
+			CreatedAt: last.Add(-time.Duration(8-i) * time.Minute),
 		}); err != nil {
 			h.t.Fatal(err)
 		}

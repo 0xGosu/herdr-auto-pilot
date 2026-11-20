@@ -141,6 +141,33 @@ type RowRetentionPort interface {
 	PruneAgedRows(ctx context.Context, now, cutoff time.Time) (domain.PruneCounts, error)
 }
 
+// RuleExpiryPort is implemented by stores that can age learned rules out: start
+// the confidence-decay clock on rows that have none, record how long a rule has
+// sat at zero confidence, and delete one that has outlived the removal window
+// (domain.ConfidenceDecay). Optional and separate for the same reason as its
+// neighbours — the daemon type-asserts, and a store without it simply never
+// expires a rule.
+//
+// This is the one place learned rules and their decisions are deleted without
+// an operator typing the command, so each write is conditional on the state its
+// caller read: see the implementations for what each compare protects.
+type RuleExpiryPort interface {
+	// StampDecayAnchors starts the clock, at now, on every rule with no anchor
+	// and returns how many it stamped.
+	StampDecayAnchors(ctx context.Context, now time.Time) (int64, error)
+	// ClearZeroSinceStamps forgets every zero-since stamp and returns how many
+	// rules it cleared; called while no removal window is running.
+	ClearZeroSinceStamps(ctx context.Context) (int64, error)
+	// SetSignatureZeroSince moves a rule's zero-since stamp from was to at
+	// (the zero time clears it), only while the row still holds was.
+	SetSignatureZeroSince(ctx context.Context, signature string, was, at time.Time) (bool, error)
+	// DeleteStaleSignature removes the rule with its decision history,
+	// embedding and snapshot, only while its decay anchor and zero-since stamp
+	// are still the ones in state. Returns whether it was removed and the
+	// number of decision rows that went with it.
+	DeleteStaleSignature(ctx context.Context, state domain.SignatureState) (deleted bool, decisions int64, err error)
+}
+
 // NodePruner is implemented by stores that can retire ANOTHER, long-offline
 // node's agent rows (`hap nodes prune`). Optional for the same reason as
 // RowRetentionPort: the fakes that predate it need not grow it, and a front

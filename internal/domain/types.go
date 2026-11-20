@@ -385,6 +385,30 @@ type SignatureState struct {
 	DecisionFloorID int64
 	GuardState      string
 	UpdatedAt       time.Time
+	// DecayAnchor is when this rule's confidence-decay clock last (re)started:
+	// its creation, or the last explicit operator act that vouched for it
+	// (RestartDecay lists them). LiveConfidence ages the score by the time
+	// elapsed since (ConfidenceDecay).
+	//
+	// It is NOT UpdatedAt, and cannot be: a streak nudge deliberately leaves
+	// UpdatedAt alone (the Rules listing is ordered by it), yet a raise must
+	// renew the rule and a lower must not.
+	//
+	// Zero means UNKNOWN — a row written by a build from before aging existed,
+	// or by an older node sharing the database. Unknown ages nothing and
+	// expires nothing; the daemon's sweep stamps such rows with the time it
+	// first saw them (Store.StampDecayAnchors), so on the day a database is
+	// upgraded every existing rule starts a fresh clock instead of being
+	// scored — or deleted — against an age nobody recorded.
+	DecayAnchor time.Time
+	// ZeroSince is when the daemon's expiry sweep first SAW this rule's live
+	// confidence at exactly 0, with it having stayed there on every look since;
+	// zero when the rule is not at zero (or no sweep has looked yet). A rule
+	// whose ZeroSince is older than the removal window is deleted
+	// (ConfidenceDecay.RemovalDue). Observed rather than computed on purpose —
+	// see RemovalDue — and written only by that sweep and by RestartDecay,
+	// which clears it.
+	ZeroSince time.Time
 }
 
 // SignatureFilter narrows a learned-signature listing; zero-valued fields

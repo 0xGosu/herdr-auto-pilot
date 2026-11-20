@@ -30,7 +30,8 @@ const vacuumFreelistPages = 2048
 
 // maybeRunRetentionSweep runs the retention sweep at most once per
 // retentionInterval: aged pane excerpts blanked, finished bookkeeping rows
-// deleted, and the freed pages reclaimed once there are enough of them.
+// deleted, learned rules that aged out removed (expireStaleRules), and the
+// freed pages reclaimed once there are enough of them.
 //
 // It is called from the 1-minute sweep on the daemon's select loop but does all
 // its work on a background goroutine: the UPDATE touches every aged row and the
@@ -48,15 +49,21 @@ const vacuumFreelistPages = 2048
 func (d *Daemon) maybeRunRetentionSweep(now time.Time) {
 	excerptWindow, excerptOn := d.cfgLoggingRetention()
 	_, rowsOn := d.cfgRowRetention()
-	if !excerptOn && !rowsOn {
-		return
-	}
 	// Optional capability: a store that cannot prune simply never does, which
 	// is what keeps every existing fake usable without a retention stub.
 	rp, _ := d.opt.Store.(ports.RetentionPort)
 	_, canPruneRows := d.opt.Store.(ports.RowRetentionPort)
 	_, canDropLists := d.opt.Store.(ports.TaskListDeleter)
-	if rp == nil && !canPruneRows && !canDropLists {
+	_, canExpireRules := d.opt.Store.(ports.RuleExpiryPort)
+	// Rule aging is a third, independent half: it is configured under
+	// [learning], not [logging], so it runs with both retention windows
+	// switched off. It runs with aging switched off too — that pass is what
+	// clears the zero stamps an off period would otherwise leave to expire
+	// rules the moment aging came back (expireStaleRules).
+	if !excerptOn && !rowsOn && !canExpireRules {
+		return
+	}
+	if rp == nil && !canPruneRows && !canDropLists && !canExpireRules {
 		return
 	}
 	d.mu.Lock()
@@ -95,6 +102,13 @@ func (d *Daemon) maybeRunRetentionSweep(now time.Time) {
 			// delete, so its count has to feed the same "was anything freed"
 			// gate or the space is never returned.
 			if d.pruneOrphanTaskLists(ctx, now) {
+				freed = true
+			}
+			// Learned rules that have sat at zero confidence past the removal
+			// window. Governed by [learning], so it runs whatever the two
+			// [logging] windows say; a removed rule takes its decision history
+			// with it, which is what feeds the vacuum gate.
+			if d.expireStaleRules(ctx, now) {
 				freed = true
 			}
 			if !freed || rp == nil {
