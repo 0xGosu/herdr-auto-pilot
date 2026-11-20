@@ -37,6 +37,28 @@ func TestLearningConfidenceDecayDefaultsAndOverrides(t *testing.T) {
 	}
 }
 
+// A hand-edited day count past MaxAgingDays must be clamped, not converted:
+// 200000 days overflows time.Duration and wraps NEGATIVE, which would turn a
+// grace period written to mean "never age" into no grace at all.
+func TestAgingDaysAreClampedBeforeTheyCanOverflow(t *testing.T) {
+	const day = 24 * time.Hour
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("[learning]\nconfidence_decay_grace_days = 200000\n"+
+		"confidence_decay_days = 9000000\nstale_rule_removal_days = 2147483647\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	grace, span, removal := cfg.Learning.ConfidenceDecay()
+	for name, got := range map[string]time.Duration{"grace": grace, "span": span, "removal": removal} {
+		if got != MaxAgingDays*day {
+			t.Errorf("%s = %v, want it clamped to %d days", name, got, MaxAgingDays)
+		}
+	}
+}
+
 // An explicit 0 must survive Load (fillZeroes) and a Save round trip. A plain
 // int would be read as "unset" and silently switch aging back ON for an
 // operator who turned it off.

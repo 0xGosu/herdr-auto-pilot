@@ -657,10 +657,14 @@ subtracts a time-based penalty (`domain.ConfidenceDecay`): nothing for
 (`signatures.decay_anchor_at`) is the rule's creation or the last explicit
 operator act that vouched for it — a processed correction, a raise of the streak,
 a reset (`domain.RestartDecay`) — never an LLM answer, an auto-accept or the rule
-firing. Aging only lowers the score the confidence gate reads: it never changes a
-rule's mode and never feeds the variance guard, so an aged autonomous rule
-escalates `below_threshold` with its learned answer as the suggestion and one
-confirmation restores it.
+firing. The newest operator decision in the scored history floors it
+(`domain.EffectiveDecayAnchor`), so a confirmation recorded by a node on an
+older build still renews. Aging only lowers the score the confidence gate reads:
+it never changes a rule's mode and never feeds the variance guard, so an aged
+autonomous rule escalates `below_threshold` with its learned answer as the
+suggestion and one confirmation restores it. A rule under its threshold only
+because it aged goes to the operator even when an LLM is configured — the
+consult cannot renew it; a contested rule keeps the LLM fallback.
 
 The daemon's daily retention sweep does the bookkeeping a read cannot
 (`daemon.expireStaleRules`): it stamps unanchored rows (databases from before
@@ -669,7 +673,10 @@ aging, older nodes) with the time it first sees them, records when it first
 with its decisions, embedding and snapshot — once that observation is older than
 `learning.stale_rule_removal_days`. The window is measured from the observation
 rather than computed from the anchor so that enabling aging, or shortening it,
-can never delete a rule that was not first shown at zero for the whole window.
+can never delete a rule that was not first shown at zero for the whole window;
+for the same reason the stamps are cleared whenever aging or removal is off.
+On a shared database a rule is removed only once every running node's settings
+agree it sits at zero.
 
 **Per-situation thresholds.** Each situation type (idle, approval, choice, error)
 has its own operator-configurable confidence threshold.

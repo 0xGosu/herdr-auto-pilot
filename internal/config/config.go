@@ -76,6 +76,15 @@ const (
 	DefaultStaleRuleRemovalDays     = 14
 )
 
+// MaxAgingDays bounds the three aging keys, wherever the value came from. Ten
+// years is far past any useful setting; the bound exists because the policy is
+// computed in time.Duration, which wraps NEGATIVE a little past 106,000 days —
+// so a hand-written `confidence_decay_grace_days = 200000`, meaning "never
+// age", would read as no grace at all and start draining every rule at once.
+// `hap config set` refuses values above it; a config.toml edit is clamped to
+// it by ConfidenceDecay.
+const MaxAgingDays = 3650
+
 // ConfidenceDecay returns the aging policy as durations: the grace period, the
 // time a full score takes to drain (0 = aging off) and how long a rule may sit
 // at zero before removal (0 = never). Durations rather than a domain type so
@@ -87,9 +96,9 @@ func (l Learning) ConfidenceDecay() (grace, span, removal time.Duration) {
 		if v != nil {
 			d = *v
 		}
-		if d < 0 {
-			d = 0
-		}
+		// Clamped at BOTH ends: a negative reads as 0, and a value past
+		// MaxAgingDays must not be allowed to overflow the duration.
+		d = min(max(d, 0), MaxAgingDays)
 		return time.Duration(d) * 24 * time.Hour
 	}
 	return days(l.ConfidenceDecayGraceDays, DefaultConfidenceDecayGraceDays),

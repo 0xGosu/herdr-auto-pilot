@@ -49,19 +49,20 @@ const vacuumFreelistPages = 2048
 func (d *Daemon) maybeRunRetentionSweep(now time.Time) {
 	excerptWindow, excerptOn := d.cfgLoggingRetention()
 	_, rowsOn := d.cfgRowRetention()
-	// Rule aging is a third, independent half: it is configured under
-	// [learning], not [logging], and must keep running with both retention
-	// windows switched off.
-	agingOn := d.cfgConfidenceDecay().Enabled()
-	if !excerptOn && !rowsOn && !agingOn {
-		return
-	}
 	// Optional capability: a store that cannot prune simply never does, which
 	// is what keeps every existing fake usable without a retention stub.
 	rp, _ := d.opt.Store.(ports.RetentionPort)
 	_, canPruneRows := d.opt.Store.(ports.RowRetentionPort)
 	_, canDropLists := d.opt.Store.(ports.TaskListDeleter)
 	_, canExpireRules := d.opt.Store.(ports.RuleExpiryPort)
+	// Rule aging is a third, independent half: it is configured under
+	// [learning], not [logging], so it runs with both retention windows
+	// switched off. It runs with aging switched off too — that pass is what
+	// clears the zero stamps an off period would otherwise leave to expire
+	// rules the moment aging came back (expireStaleRules).
+	if !excerptOn && !rowsOn && !canExpireRules {
+		return
+	}
 	if rp == nil && !canPruneRows && !canDropLists && !canExpireRules {
 		return
 	}

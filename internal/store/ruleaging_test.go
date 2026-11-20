@@ -196,6 +196,36 @@ func TestSetSignatureZeroSinceWritesOnlyOverTheValueItRead(t *testing.T) {
 	}
 }
 
+func TestClearZeroSinceStampsForgetsEveryStayAtZero(t *testing.T) {
+	s, _ := openTestStore(t)
+	ctx := context.Background()
+	anchor := time.Now().Add(-200 * 24 * time.Hour).Truncate(time.Millisecond)
+	agingRule(t, s, "approval:a", anchor, anchor.Add(time.Hour))
+	agingRule(t, s, "approval:b", anchor, anchor.Add(2*time.Hour))
+	agingRule(t, s, "approval:c", anchor, time.Time{})
+
+	if n, err := s.ClearZeroSinceStamps(ctx); err != nil || n != 2 {
+		t.Fatalf("ClearZeroSinceStamps = %d, %v; want 2", n, err)
+	}
+	for _, sig := range []string{"approval:a", "approval:b", "approval:c"} {
+		got, _ := s.GetSignature(ctx, sig)
+		if !got.ZeroSince.IsZero() {
+			t.Errorf("%s: stamp survived: %v", sig, got.ZeroSince)
+		}
+		// Only the stamp goes: the decay clock itself is not this call's to move.
+		if !got.DecayAnchor.Equal(anchor) {
+			t.Errorf("%s: the decay anchor moved to %v", sig, got.DecayAnchor)
+		}
+	}
+	// Silent when there is nothing to forget: it runs on every sweep while
+	// the feature is off, and each reported write arms a sync push.
+	var writes int
+	s.onWrite = func() { writes++ }
+	if n, err := s.ClearZeroSinceStamps(ctx); err != nil || n != 0 || writes != 0 {
+		t.Errorf("second call = %d, %v with %d write(s); want a silent no-op", n, err, writes)
+	}
+}
+
 // seedExpirable stores a rule at zero since zeroSince with everything
 // DeleteSignature's cascade is meant to take: decisions, an error-retry row,
 // an embedding and a snapshot — plus an audit row, which must be KEPT.

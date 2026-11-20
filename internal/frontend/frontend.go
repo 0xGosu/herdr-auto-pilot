@@ -2765,19 +2765,13 @@ var ConfigFields = []ConfigFieldDef{
 	{Key: "tui.palette.help", TUIEditable: true, TUIHidden: true},
 }
 
-// maxAgingDays bounds the three learning aging keys. Ten years is far past any
-// useful setting; the bound exists so a mistyped value cannot overflow the
-// time.Duration the policy is computed in (which wraps negative near 292 years
-// and would turn "very slow" into "already expired").
-const maxAgingDays = 3650
-
 // parseAgingDays validates one of the learning aging keys: a whole number of
 // days, with 0 as the key's own "off" (zeroMeans says which).
 func parseAgingDays(key, value, zeroMeans string) (int, error) {
 	v, err := strconv.Atoi(value)
-	if err != nil || v < 0 || v > maxAgingDays {
+	if err != nil || v < 0 || v > config.MaxAgingDays {
 		return 0, fmt.Errorf("%s must be a whole number of days between 0 and %d (0 = %s), got %q",
-			key, maxAgingDays, zeroMeans, value)
+			key, config.MaxAgingDays, zeroMeans, value)
 	}
 	return v, nil
 }
@@ -5670,11 +5664,16 @@ func RuleAging(st domain.SignatureState, conf domain.ConfidenceResult, decay dom
 	if !decay.Enabled() {
 		return ""
 	}
-	if st.DecayAnchor.IsZero() {
+	// The EFFECTIVE anchor LiveConfidence aged the score from, not the stored
+	// column: a confirmation made on an older node moves the one and not the
+	// other (domain.EffectiveDecayAnchor), and the dates here have to describe
+	// the score printed beside them.
+	anchor := conf.AgedSince
+	if anchor.IsZero() {
 		return "not started — the daemon starts this rule's clock on its next daily sweep"
 	}
 	const day = "2006-01-02"
-	since := "unconfirmed " + domain.DaysLabel(now.Sub(st.DecayAnchor))
+	since := "unconfirmed " + domain.DaysLabel(now.Sub(anchor))
 	if conf.Score == 0 {
 		if at, ok := decay.RemovalAt(st.ZeroSince); ok {
 			return fmt.Sprintf("%s — at 0 since %s, removed on %s unless confirmed",
@@ -5686,13 +5685,13 @@ func RuleAging(st domain.SignatureState, conf domain.ConfidenceResult, decay dom
 		}
 		return since + " — at 0"
 	}
-	zeroAt, _ := decay.ZeroAt(conf.RawScore, st.DecayAnchor)
+	zeroAt, _ := decay.ZeroAt(conf.RawScore, anchor)
 	if conf.Score < conf.RawScore {
 		return fmt.Sprintf("%s — aged from %.2f, reaches 0 on %s unless confirmed",
 			since, conf.RawScore, zeroAt.Format(day))
 	}
 	return fmt.Sprintf("%s — full score until %s, reaches 0 on %s unless confirmed",
-		since, st.DecayAnchor.Add(decay.Grace).Format(day), zeroAt.Format(day))
+		since, anchor.Add(decay.Grace).Format(day), zeroAt.Format(day))
 }
 
 // AuditStatusWidth is the display width AuditStatusLabel's output fits in.
@@ -6221,10 +6220,6 @@ func (a *App) AdjustSignatureConfirmations(ctx context.Context, prefix string, d
 	}, nil
 }
 
-// confidenceThresholds maps the config section onto the domain type. Twin of
-// daemon.confidenceThresholds: internal/config does not import internal/domain
-// (so this cannot be a method on the config type) and internal/daemon must not
-// import internal/frontend, so the two front ends each carry the copy.
 // confidenceDecay assembles the rule-aging policy from config. It MIRRORS the
 // daemon's helper of the same name: the two packages cannot share one (config
 // stays decoupled from domain, and neither imports the other), and a front end
@@ -6235,6 +6230,10 @@ func confidenceDecay(cfg config.Config) domain.ConfidenceDecay {
 	return domain.ConfidenceDecay{Grace: grace, Span: span, Removal: removal}
 }
 
+// confidenceThresholds maps the config section onto the domain type. Twin of
+// daemon.confidenceThresholds: internal/config does not import internal/domain
+// (so this cannot be a method on the config type) and internal/daemon must not
+// import internal/frontend, so the two front ends each carry the copy.
 func confidenceThresholds(cfg config.Config) domain.ConfidenceThresholds {
 	return domain.ConfidenceThresholds{
 		Minimum:  cfg.ConfidenceThresholds.Minimum,

@@ -275,16 +275,25 @@ points. **Test traps:** push cases must satisfy `parkedAndSettled` (pin the list
 - `DecayAnchor` moves only through `domain.RestartDecay` — a processed correction, a streak RAISE, a reset.
   Never a lower, an LLM answer, an auto-accept or the rule firing. Zero is UNKNOWN (ages and expires
   nothing): `UpsertSignature` never blanks a known anchor, and only `StampDecayAnchors` starts such a
-  clock, at "now" — back-dating it would age out a whole rule set on upgrade day.
+  clock, at "now" — back-dating it would age out a whole rule set on upgrade day. The newest operator
+  DECISION floors it (`domain.EffectiveDecayAnchor`): an older-build node records a confirmation but
+  never writes the column. **Test trap:** to age a rule, back-date its operator decisions too
+  (`seedAutonomousAt`), not just the anchor.
+- A rule under its threshold ONLY because it aged (`ConfidenceResult.AgedOutOf`) escalates to the
+  operator even with an LLM configured — a consult cannot renew it, and it would drain to deletion
+  unseen. A contested rule keeps the consult.
 - Removal waits on the OBSERVED `ZeroSince`, never a computed instant (`ConfidenceDecay.RemovalDue`), so
-  never on the sweep that first sees a rule at zero. `expireStaleRules` must tell an unreadable history
+  never on the sweep that first sees a rule at zero. Stamps exist only while aging AND removal are on;
+  otherwise the sweep clears them (`ClearZeroSinceStamps`) — which is why it runs with aging off. `expireStaleRules` must tell an unreadable history
   from an empty one (`expiryHistories`: empty scores 0, and 0 is what it deletes on).
   `DeleteStaleSignature` re-checks anchor and stamp inside its transaction.
-- `signatures` is fleet-wide and config is per node: on a shared database a node's sweep expires rules
-  for the fleet under ITS `[learning]` settings.
+- `signatures` is fleet-wide and config is per node: on a shared database a rule is removed only once
+  every running node's `[learning]` settings agree it sits at zero (a longer-policy node clears the
+  stamp a shorter one wrote).
 - A rule's `0.00` (aged out) against `-` (never scored) is `SignatureRow.ConfidenceLabel`.
   `confidenceDecay(cfg)` is duplicated in daemon and frontend, like `confidenceThresholds`. The three
-  `[learning]` aging keys are pointers (0 = off, absent = default).
+  `[learning]` aging keys are pointers (0 = off, absent = default), clamped to `config.MaxAgingDays`
+  where the duration is computed — a config.toml edit bypasses `hap config set`.
 - **Test trap:** `seedAutonomous` and most fixtures leave `DecayAnchor` zero, so they never age — set it
   to test aging.
 

@@ -14,9 +14,26 @@ import (
 // reads 0.00 rather than "-", and `signatures confirm` gives the score back.
 func TestSignaturesReportAgingAndConfirmRenews(t *testing.T) {
 	app, st := testApp(t)
-	seedSignatures(t, st) // approval:aaaa… — two operator confirmations, raw 1.00
 	ctx := context.Background()
 	const day = 24 * time.Hour
+	// Two operator confirmations, raw 1.00, made a year ago. They have to be
+	// OLD: the newest operator decision floors the decay anchor
+	// (domain.EffectiveDecayAnchor), so a rule confirmed today cannot be aged
+	// by back-dating its anchor alone.
+	longAgo := time.Now().Add(-365 * day)
+	if err := st.UpsertSignature(ctx, domain.SignatureState{
+		Signature: "approval:aaaa1111bbbb2222", SituationType: domain.SituationApproval,
+		AgentType: "claude", Mode: domain.ModeShadow, UpdatedAt: longAgo, DecayAnchor: longAgo,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:aaaa1111bbbb2222",
+			SituationType: domain.SituationApproval, AgentType: "claude",
+			ChosenAction: "1", Source: domain.SourceOperator, CreatedAt: longAgo}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	setAnchor := func(unconfirmed time.Duration) {
 		t.Helper()
 		rule, err := st.GetSignature(ctx, "approval:aaaa1111bbbb2222")

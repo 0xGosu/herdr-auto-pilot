@@ -139,11 +139,47 @@ func (s SignatureState) Age(decay ConfidenceDecay, now time.Time) ConfidenceAge 
 	return ConfidenceAge{Decay: decay, Anchor: s.DecayAnchor, Now: now}
 }
 
+// EffectiveDecayAnchor is the instant a rule is actually aged from: its stored
+// anchor, or the newest operator decision in its scored history when that is
+// later.
+//
+// The stored anchor alone is not enough on a shared database. A node still on
+// a build from before aging records an operator's confirmation as a decision
+// row but never writes decay_anchor_at, so by the column alone a rule the
+// operator confirms every week on that machine would drain to zero and be
+// deleted, with those confirmations, by an upgraded node. The decision row is
+// the one piece of evidence every build writes, so it floors the anchor. It
+// also covers the crash window between applyCorrection's decision write and
+// its state write.
+//
+// It can only move the anchor LATER, and only on an operator-sourced decision
+// — the same act RestartDecay is called for — so it never renews a rule on an
+// LLM answer or the rule firing. An UNSTAMPED rule stays unstamped: deriving an
+// anchor from its old decisions is exactly the back-dating StampDecayAnchors
+// exists to avoid.
+//
+// post is the scored (post-floor) history, as LiveConfidence holds it.
+func EffectiveDecayAnchor(anchor time.Time, post []DecisionRecord) time.Time {
+	if anchor.IsZero() {
+		return anchor
+	}
+	for _, d := range post {
+		if d.Source == SourceOperator && d.CreatedAt.After(anchor) {
+			anchor = d.CreatedAt
+		}
+	}
+	return anchor
+}
+
 // RestartDecay restarts a rule's decay clock at now. It is the ONE writer of
 // DecayAnchor after creation, and only an explicit operator act may call it:
 //
 //   - a processed correction — the operator confirmed or corrected the rule's
-//     answer on a live escalation (daemon.applyCorrection);
+//     answer on a live escalation (daemon.applyCorrection). "Operator" here
+//     is whoever a correction may be authored by, the orchestrator included:
+//     its confirmations already count toward graduation as operator decisions
+//     (SourceOperator carries no author), so a rule it may graduate it may
+//     also renew, and EffectiveDecayAnchor could not tell the two apart;
 //   - a RAISE of the streak (`hap signatures confirm`, the Rules tab's `+`),
 //     the operator vouching for the rule without waiting for its screen;
 //   - a reset, so a rule sent back to re-earn trust gets a full removal window
@@ -170,11 +206,20 @@ func RestartDecay(state SignatureState, now time.Time) SignatureState {
 // AgedNote explains a score that aging lowered, for an escalation rationale or
 // a rule line: "aged from 0.95, unconfirmed 47d". Empty when aging took
 // nothing off, so callers can append it unconditionally.
-func (c ConfidenceResult) AgedNote(age ConfidenceAge) string {
-	if c.RawScore <= c.Score || age.Anchor.IsZero() || age.Now.IsZero() {
+func (c ConfidenceResult) AgedNote(now time.Time) string {
+	if c.RawScore <= c.Score || c.AgedSince.IsZero() || now.IsZero() {
 		return ""
 	}
-	return fmt.Sprintf("aged from %.2f, unconfirmed %s", c.RawScore, DaysLabel(age.Now.Sub(age.Anchor)))
+	return fmt.Sprintf("aged from %.2f, unconfirmed %s", c.RawScore, DaysLabel(now.Sub(c.AgedSince)))
+}
+
+// AgedOutOf reports that aging ALONE is why this score does not clear
+// threshold: the operator's decisions still agree strongly enough to pass, and
+// only the calendar took the rule under. It is what separates "this rule needs
+// a human to vouch for it again" from "this rule is contested", which the
+// confidence gate answers differently (see Decide).
+func (c ConfidenceResult) AgedOutOf(threshold float64) bool {
+	return c.Score <= threshold && c.RawScore > threshold
 }
 
 // DaysLabel renders a duration in whole days ("47d"), the only resolution the

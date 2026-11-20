@@ -112,9 +112,11 @@ rule. Nothing AUTOMATIC demotes; the two explicit operator acts that do are
 score for `learning.confidence_decay_grace_days`, then 1/`learning
 .confidence_decay_days` per day down to 0. An autonomous rule that drifts under
 its threshold escalates again with its learned answer as the suggestion
-(rationale `… aged from 0.95, unconfirmed 47d`); confirming it, or `hap
-signatures confirm <prefix>`, restores the score and restarts the clock. The
-rule firing on its own, an LLM answer and an auto-accept never renew it. A rule
+(rationale `… aged from 0.95, unconfirmed 47d`) — to the operator even when an
+LLM is configured. Confirming it, or `hap signatures confirm <prefix>`, restores
+the score and restarts the clock (an orchestrator's confirmation counts, as it
+does toward graduation). The rule firing on its own, an LLM answer and an
+auto-accept never renew it. A rule
 left at 0 for `learning.stale_rule_removal_days` is removed with its decisions
 (stream event `rule.deleted … reason=expired`). `hap signatures show <prefix>`
 prints the `aging:` line; a listed `conf=0.00` is a rule aged to zero, `conf=-`

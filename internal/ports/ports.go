@@ -155,6 +155,9 @@ type RuleExpiryPort interface {
 	// StampDecayAnchors starts the clock, at now, on every rule with no anchor
 	// and returns how many it stamped.
 	StampDecayAnchors(ctx context.Context, now time.Time) (int64, error)
+	// ClearZeroSinceStamps forgets every zero-since stamp and returns how many
+	// rules it cleared; called while no removal window is running.
+	ClearZeroSinceStamps(ctx context.Context) (int64, error)
 	// SetSignatureZeroSince moves a rule's zero-since stamp from was to at
 	// (the zero time clears it), only while the row still holds was.
 	SetSignatureZeroSince(ctx context.Context, signature string, was, at time.Time) (bool, error)

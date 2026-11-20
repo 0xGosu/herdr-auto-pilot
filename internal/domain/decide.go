@@ -166,7 +166,7 @@ func Decide(in DecideInput) Decision {
 	conf := LiveConfidence(in.History, floor, in.ConfirmationWeight, age)
 	// agedNote is empty unless aging is what lowered the score, so the two
 	// confidence-gate rationales below can name the calendar as the cause.
-	agedNote := conf.AgedNote(age)
+	agedNote := conf.AgedNote(in.Now)
 	if agedNote != "" {
 		agedNote = "; " + agedNote
 	}
@@ -377,7 +377,17 @@ func Decide(in DecideInput) Decision {
 
 	// Confidence gate (FR-008).
 	if conf.Score <= threshold {
-		if in.LLMConfigured {
+		// An under-confident rule normally goes to the LLM when one is
+		// configured. A rule that is under its threshold ONLY because it aged
+		// does not: it goes to the operator, with its learned answer as the
+		// suggestion. Aging exists to bring a rule back to a human, and an LLM
+		// answer never renews one (RestartDecay) — so consulting here would
+		// keep the rule draining behind the operator's back until the expiry
+		// sweep deleted it, decisions and all, while its screen still came up
+		// every day. A rule that is contested as well (raw score at or under
+		// the threshold) keeps the consult: there the LLM is the fallback it
+		// always was.
+		if in.LLMConfigured && !conf.AgedOutOf(threshold) {
 			return Decision{Action: ActionConsult, Confidence: conf.Score,
 				Rationale: fmt.Sprintf("confidence %.2f at/below threshold %.2f%s; consulting LLM", conf.Score, threshold, agedNote)}
 		}

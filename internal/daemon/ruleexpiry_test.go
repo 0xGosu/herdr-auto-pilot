@@ -279,9 +279,10 @@ func TestExpirySweepLeavesRulesItCannotScore(t *testing.T) {
 	}
 }
 
-// learning.confidence_decay_days = 0 is the feature's off switch: nothing is
-// stamped, observed or removed — not even a rule already past its window.
-func TestExpirySweepDoesNothingWithAgingOff(t *testing.T) {
+// learning.confidence_decay_days = 0 is the feature's off switch: no clock is
+// started and nothing is removed — not even a rule already past its window.
+// What it DOES do is forget every recorded stay at zero.
+func TestExpirySweepWithAgingOffRemovesNothingAndForgetsStamps(t *testing.T) {
 	d, st := expiryDaemon(t, 10, 0, 30)
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Millisecond)
@@ -299,27 +300,134 @@ func TestExpirySweepDoesNothingWithAgingOff(t *testing.T) {
 	if got := ruleState(t, st, "approval:legacy"); got == nil || !got.DecayAnchor.IsZero() {
 		t.Errorf("with aging off no clock is started, got %+v", got)
 	}
-	if ruleState(t, st, "approval:stamped") == nil {
-		t.Error("a leftover zero stamp deleted a rule with aging off")
+	got := ruleState(t, st, "approval:stamped")
+	if got == nil {
+		t.Fatal("a leftover zero stamp deleted a rule with aging off")
+	}
+	if !got.ZeroSince.IsZero() {
+		t.Errorf("with aging off the rule is not at zero, so its stamp must go: %v", got.ZeroSince)
+	}
+}
+
+// Aging switched off and back on must not delete on the first sweep. While it
+// was off the rule scored its raw agreement and fired again — it was NOT at
+// zero — so the stamp from before must not have kept ageing behind its back.
+func TestExpirySweepTurningAgingBackOnOpensAFreshWindow(t *testing.T) {
+	on, st := expiryDaemon(t, 10, 100, 30)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	seedExpiryRule(t, st, "approval:working", now.Add(-400*expiryDay))
+
+	on.expireStaleRules(ctx, now) // day 0: seen at zero
+	if got := ruleState(t, st, "approval:working"); got == nil || got.ZeroSince.IsZero() {
+		t.Fatalf("precondition: want the rule stamped at zero, got %+v", got)
+	}
+
+	// Day 5: the operator switches aging off. The rule works again.
+	off := expiryDaemonOver(t, st, 10, 0, 30)
+	off.expireStaleRules(ctx, now.Add(5*expiryDay))
+
+	// Day 35: aging back on. The old stamp would be 35 days old — past the
+	// 30-day window — and the rule would be deleted here with no warning.
+	if on.expireStaleRules(ctx, now.Add(35*expiryDay)) {
+		t.Fatal("re-enabling aging deleted a rule on the first sweep")
+	}
+	got := ruleState(t, st, "approval:working")
+	if got == nil || !got.ZeroSince.Equal(now.Add(35*expiryDay)) {
+		t.Fatalf("got %+v, want the rule kept with a window opened on day 35", got)
+	}
+	// And it gets that window in full.
+	if on.expireStaleRules(ctx, now.Add(64*expiryDay)) || ruleState(t, st, "approval:working") == nil {
+		t.Fatal("removed before the fresh window closed")
+	}
+	if !on.expireStaleRules(ctx, now.Add(65*expiryDay)) {
+		t.Fatal("not removed once the fresh window had passed")
 	}
 }
 
 // learning.stale_rule_removal_days = 0 keeps aging and drops removal: rules
-// drain to zero and stay.
+// drain to zero and stay, and no stay at zero is recorded — so enabling
+// removal later, on a herd that has been aging for months, gives every rule
+// its window from that day rather than deleting on the first sweep.
 func TestExpirySweepKeepsZeroRulesWithRemovalOff(t *testing.T) {
 	d, st := expiryDaemon(t, 10, 100, 0)
 	ctx := context.Background()
 	now := time.Now().Truncate(time.Millisecond)
+	// One rule from before aging existed: its clock must still be started,
+	// since aging itself is on.
+	seedExpiryRule(t, st, "approval:legacy", time.Time{})
 	seedExpiryRule(t, st, "approval:kept", now.Add(-400*expiryDay))
+
 	d.expireStaleRules(ctx, now)
-	if d.expireStaleRules(ctx, now.Add(5000*expiryDay)) || ruleState(t, st, "approval:kept") == nil {
+	if got := ruleState(t, st, "approval:legacy"); got == nil || !got.DecayAnchor.Equal(now) {
+		t.Errorf("aging is on, so an unstamped rule's clock must start: %+v", got)
+	}
+	if d.expireStaleRules(ctx, now.Add(200*expiryDay)) || ruleState(t, st, "approval:kept") == nil {
 		t.Fatal("removed a rule with removal off")
+	}
+	if got := ruleState(t, st, "approval:kept"); !got.ZeroSince.IsZero() {
+		t.Fatalf("with removal off no stay at zero may be recorded, got %v", got.ZeroSince)
+	}
+
+	// Removal switched on at day 200: first sighting, not a deletion.
+	withRemoval := expiryDaemonOver(t, st, 10, 100, 30)
+	if withRemoval.expireStaleRules(ctx, now.Add(200*expiryDay)) {
+		t.Fatal("enabling removal deleted a rule on the first sweep")
+	}
+	if got := ruleState(t, st, "approval:kept"); got == nil || !got.ZeroSince.Equal(now.Add(200*expiryDay)) {
+		t.Fatalf("got %+v, want the window opened when removal was enabled", got)
+	}
+}
+
+// A node on a build from before aging records an operator's confirmation as a
+// decision but never moves the anchor. The upgraded node's sweep must read
+// that decision as the renewal it is, and leave the rule alone.
+func TestExpirySweepKeepsARuleConfirmedOnAnOlderNode(t *testing.T) {
+	d, st := expiryDaemon(t, 10, 100, 30)
+	ctx := context.Background()
+	now := time.Now().Truncate(time.Millisecond)
+	seedExpiryRule(t, st, "approval:elsewhere", now.Add(-400*expiryDay))
+	stamped := ruleState(t, st, "approval:elsewhere")
+	stamped.ZeroSince = now.Add(-60 * expiryDay) // long past its window
+	if err := st.UpsertSignature(ctx, *stamped); err != nil {
+		t.Fatal(err)
+	}
+	// The old node's write: a decision row, and nothing else.
+	if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:elsewhere",
+		SituationType: domain.SituationApproval, AgentType: "claude", ChosenAction: "1",
+		Source: domain.SourceOperator, CreatedAt: now.Add(-2 * expiryDay)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if d.expireStaleRules(ctx, now) {
+		t.Fatal("deleted a rule the operator confirmed two days ago on another node")
+	}
+	got := ruleState(t, st, "approval:elsewhere")
+	if got == nil || !got.ZeroSince.IsZero() {
+		t.Fatalf("got %+v, want the rule kept and its stale zero stamp cleared", got)
+	}
+
+	// Control: an LLM answer in the same place renews nothing.
+	seedExpiryRule(t, st, "approval:machine", now.Add(-400*expiryDay))
+	machine := ruleState(t, st, "approval:machine")
+	machine.ZeroSince = now.Add(-60 * expiryDay)
+	if err := st.UpsertSignature(ctx, *machine); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.RecordDecision(ctx, domain.DecisionRecord{Signature: "approval:machine",
+		SituationType: domain.SituationApproval, AgentType: "claude", ChosenAction: "1",
+		Source: domain.SourceLLM, CreatedAt: now.Add(-2 * expiryDay)}); err != nil {
+		t.Fatal(err)
+	}
+	if !d.expireStaleRules(ctx, now) || ruleState(t, st, "approval:machine") != nil {
+		t.Fatal("control: an LLM answer must not save a rule from removal")
 	}
 }
 
 // The sweep is reached through the daily retention pass, and rule aging is
 // configured under [learning] — so it must still run with BOTH [logging]
-// retention windows switched off.
+// retention windows switched off. That holds with aging off as well: that pass
+// is the one that forgets stale zero stamps.
 func TestRetentionSweepExpiresRulesWithBothRetentionWindowsOff(t *testing.T) {
 	d, st := expiryDaemon(t, 10, 100, 30)
 	off := -1
@@ -332,6 +440,22 @@ func TestRetentionSweepExpiresRulesWithBothRetentionWindowsOff(t *testing.T) {
 	d.bg.Wait()
 	if got := ruleState(t, st, "approval:legacy"); got == nil || !got.DecayAnchor.Equal(now) {
 		t.Fatalf("the retention pass did not run the rule sweep: %+v", got)
+	}
+
+	// Aging off too: the pass still runs, and clears a leftover stamp.
+	idle, st2 := expiryDaemon(t, 10, 0, 30)
+	idle.cfg.Logging.AuditExcerptRetentionDays = &off
+	idle.cfg.Logging.RowRetentionDays = &off
+	seedExpiryRule(t, st2, "approval:stamped", now.Add(-900*expiryDay))
+	stamped := ruleState(t, st2, "approval:stamped")
+	stamped.ZeroSince = now.Add(-500 * expiryDay)
+	if err := st2.UpsertSignature(context.Background(), *stamped); err != nil {
+		t.Fatal(err)
+	}
+	idle.maybeRunRetentionSweep(now)
+	idle.bg.Wait()
+	if got := ruleState(t, st2, "approval:stamped"); got == nil || !got.ZeroSince.IsZero() {
+		t.Fatalf("with everything off the pass must still forget zero stamps: %+v", got)
 	}
 }
 
@@ -363,13 +487,14 @@ func TestExpirySweepForgetsTheRemovedRule(t *testing.T) {
 func TestPipelineAgedRuleAsksAgainAndAConfirmationRenewsIt(t *testing.T) {
 	h := newHarness(t, "")
 	h.herdr.setPane(approvalPane)
-	sigKey := h.seedAutonomous(approvalPane, domain.SituationApproval, "1")
+	// Last vouched for 400 days ago — the confirmations AND the anchor: under
+	// the default policy that is a 1.00 drained to 0.
+	stale := time.Now().Add(-400 * expiryDay)
+	sigKey := h.seedAutonomousAt(approvalPane, domain.SituationApproval, "1", stale)
 	ctx := context.Background()
 
-	// Last vouched for 400 days ago: under the default policy that is a 1.00
-	// drained to 0.
 	st, _ := h.raw.GetSignature(ctx, sigKey)
-	st.DecayAnchor = time.Now().Add(-400 * expiryDay)
+	st.DecayAnchor = stale
 	if err := h.raw.UpsertSignature(ctx, *st); err != nil {
 		t.Fatal(err)
 	}

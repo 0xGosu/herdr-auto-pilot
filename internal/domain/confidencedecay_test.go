@@ -240,15 +240,82 @@ func TestRestartDecayMovesTheAnchorAndEndsTheStayAtZero(t *testing.T) {
 
 func TestAgedNoteOnlyWhenAgingLoweredTheScore(t *testing.T) {
 	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	age := ConfidenceAge{Decay: testDecay, Anchor: anchor, Now: anchor.Add(47 * testDay)}
-	if got := (ConfidenceResult{Score: 0.58, RawScore: 0.95}).AgedNote(age); got != "aged from 0.95, unconfirmed 47d" {
+	now := anchor.Add(47 * testDay)
+	if got := (ConfidenceResult{Score: 0.58, RawScore: 0.95, AgedSince: anchor}).AgedNote(now); got != "aged from 0.95, unconfirmed 47d" {
 		t.Errorf("AgedNote = %q", got)
 	}
-	if got := (ConfidenceResult{Score: 0.95, RawScore: 0.95}).AgedNote(age); got != "" {
+	if got := (ConfidenceResult{Score: 0.95, RawScore: 0.95, AgedSince: anchor}).AgedNote(now); got != "" {
 		t.Errorf("an un-aged score must carry no note, got %q", got)
 	}
-	if got := (ConfidenceResult{Score: 0.58, RawScore: 0.95}).AgedNote(ConfidenceAge{}); got != "" {
+	if got := (ConfidenceResult{Score: 0.58, RawScore: 0.95}).AgedNote(now); got != "" {
 		t.Errorf("no clock, no note; got %q", got)
+	}
+}
+
+func TestAgedOutOfSeparatesTheCalendarFromDisagreement(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		score, raw float64
+		want       bool
+	}{
+		{"clears the threshold", 0.9, 0.9, false},
+		{"aged under it", 0.6, 0.9, true},
+		{"aged to exactly it", 0.7, 0.9, true},
+		{"contested, never cleared it", 0.6, 0.6, false},
+		{"contested AND aged", 0.3, 0.65, false},
+		{"raw exactly at it", 0.5, 0.7, false},
+	} {
+		if got := (ConfidenceResult{Score: tc.score, RawScore: tc.raw}).AgedOutOf(0.7); got != tc.want {
+			t.Errorf("%s: AgedOutOf(0.7) = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A node on a build from before aging records an operator's confirmation as a
+// decision row but never moves decay_anchor_at. The decision is the evidence
+// every build writes, so it floors the anchor — otherwise an upgraded node
+// would age out and delete a rule the operator confirms weekly elsewhere.
+func TestEffectiveDecayAnchorIsFlooredByTheNewestOperatorDecision(t *testing.T) {
+	anchor := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(days int) time.Time { return anchor.Add(time.Duration(days) * testDay) }
+
+	post := []DecisionRecord{
+		{ID: 4, ChosenAction: "y", Source: SourceRule, CreatedAt: at(90)},
+		{ID: 3, ChosenAction: "y", Source: SourceOperator, CreatedAt: at(60)},
+		{ID: 2, ChosenAction: "y", Source: SourceLLM, CreatedAt: at(80)},
+		{ID: 1, ChosenAction: "y", Source: SourceOperator, CreatedAt: at(-5)},
+	}
+	if got := EffectiveDecayAnchor(anchor, post); !got.Equal(at(60)) {
+		t.Errorf("EffectiveDecayAnchor = %v, want the operator decision at day 60", got)
+	}
+	// Only an operator decision renews: the rule firing (day 90) and an LLM
+	// answer (day 80) are newer and must not move the clock.
+	machine := []DecisionRecord{post[0], post[2], post[3]}
+	if got := EffectiveDecayAnchor(anchor, machine); !got.Equal(anchor) {
+		t.Errorf("a rule/LLM decision moved the anchor to %v", got)
+	}
+	// It only ever moves the anchor LATER.
+	if got := EffectiveDecayAnchor(at(200), post); !got.Equal(at(200)) {
+		t.Errorf("an older decision pulled the anchor back to %v", got)
+	}
+	// An unstamped rule stays unstamped: deriving an anchor from its old
+	// decisions would back-date it on upgrade day.
+	if got := EffectiveDecayAnchor(time.Time{}, post); !got.IsZero() {
+		t.Errorf("an unstamped rule was given an anchor from its history: %v", got)
+	}
+
+	// And LiveConfidence ages from it: 100 days after a stale anchor this rule
+	// would be at 0.10, but the operator confirmed it 40 days ago (30 past
+	// grace), so it reads 0.70.
+	st := SignatureState{DecayAnchor: anchor}
+	got := LiveConfidence(post, 0, 1.0, st.Age(testDecay, at(100)))
+	if !approx(got.Score, 0.7) || !got.AgedSince.Equal(at(60)) {
+		t.Errorf("Score %.3f AgedSince %v; want 0.70 aged from day 60", got.Score, got.AgedSince)
+	}
+	// A floor hides pre-reset operator decisions from the clock too.
+	reset := LiveConfidence(post, 3, 1.0, st.Age(testDecay, at(100)))
+	if !reset.AgedSince.Equal(anchor) {
+		t.Errorf("a floored-out operator decision still renewed the rule: AgedSince %v", reset.AgedSince)
 	}
 }
 
@@ -329,17 +396,50 @@ func TestDecideAgingNeverTripsTheVarianceGuard(t *testing.T) {
 	}
 }
 
-// Aging is a confidence-gate input like any other: with an LLM configured an
-// aged rule is consulted on, as an under-confident rule always was.
-func TestDecideAgedRuleConsultsLLMWhenConfigured(t *testing.T) {
+// A rule that is under its threshold ONLY because it aged goes to the OPERATOR
+// even with an LLM configured. An LLM answer never renews a rule, so a consult
+// here would keep it draining behind the operator's back until the sweep
+// deleted it — while its screen still came up every day.
+func TestDecideAgedOutRuleAsksTheOperatorNotTheLLM(t *testing.T) {
 	in := agedRule(60 * testDay)
 	in.LLMConfigured = true
 	d := Decide(in)
-	if d.Action != ActionConsult {
-		t.Fatalf("got %+v, want a consult", d)
+	if d.Action != ActionEscalate || d.Reason != ReasonBelowThreshold {
+		t.Fatalf("got %+v, want a below_threshold escalation to the operator", d)
+	}
+	if d.Suggestion != "respond: y" {
+		t.Errorf("the escalation must offer the learned answer to confirm, got %q", d.Suggestion)
 	}
 	if !strings.Contains(d.Rationale, "aged from 1.00") {
-		t.Errorf("the consult rationale must say the score was aged, got %q", d.Rationale)
+		t.Errorf("the rationale must say the score was aged, got %q", d.Rationale)
+	}
+
+	// Control 1: the same rule, fresh, still acts — the LLM flag changes nothing.
+	fresh := agedRule(5 * testDay)
+	fresh.LLMConfigured = true
+	if d := Decide(fresh); d.Action != ActionSend {
+		t.Errorf("a fresh rule must act, got %+v", d)
+	}
+}
+
+// Control 2: a CONTESTED rule keeps the LLM fallback, aged or not. Its raw
+// agreement never cleared the threshold, so the calendar is not why it is
+// under it and there is nothing for the operator to simply re-confirm.
+func TestDecideContestedRuleStillConsultsLLMWhenAged(t *testing.T) {
+	for _, since := range []time.Duration{0, 20 * testDay} {
+		// Newest first; raw agreement ≈ 0.61: above the 0.50 variance-guard
+		// minimum, at/under the 0.70 approval threshold.
+		in := autonomous(baseInput(SituationApproval), "y", "n", "y", "n", "y")
+		in.Decay = testDecay
+		in.State.DecayAnchor = in.Now.Add(-since)
+		in.LLMConfigured = true
+		d := Decide(in)
+		if d.Action != ActionConsult {
+			t.Fatalf("unconfirmed %v: got %+v, want a consult", since, d)
+		}
+		if aged := strings.Contains(d.Rationale, "aged from"); aged != (since > testDecay.Grace) {
+			t.Errorf("unconfirmed %v: rationale %q", since, d.Rationale)
+		}
 	}
 }
 

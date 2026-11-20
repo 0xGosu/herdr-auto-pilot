@@ -1,6 +1,9 @@
 package domain
 
-import "math"
+import (
+	"math"
+	"time"
+)
 
 // recencyDecay is the per-step decay applied to older decisions when
 // computing the recency-weighted agreement ratio (FR-005). The newest
@@ -32,6 +35,11 @@ type ConfidenceResult struct {
 	// than by disagreement, and so the expiry sweep can tell when a rule
 	// reached zero.
 	RawScore float64
+	// AgedSince is the instant LiveConfidence aged Score from: the rule's
+	// effective decay anchor (EffectiveDecayAnchor). Zero when no clock applies
+	// — plain Confidence, aging off, or an unstamped rule. Carried so a view
+	// says "unconfirmed 47d" about the same instant the score was aged from.
+	AgedSince time.Time
 	// TopAction is the dominant historical action ("" with empty history).
 	TopAction string
 	// Decisions is the number of history records considered.
@@ -101,7 +109,10 @@ func HasOperatorEvidence(history []DecisionRecord) bool {
 func LiveConfidence(history []DecisionRecord, floorID int64, confirmWeight float64, age ConfidenceAge) ConfidenceResult {
 	post := DecisionsSince(history, floorID)
 	conf := Confidence(post, confirmWeight)
-	conf.Score = age.Decay.Apply(conf.RawScore, age.Anchor, age.Now)
+	if age.Decay.Enabled() {
+		conf.AgedSince = EffectiveDecayAnchor(age.Anchor, post)
+	}
+	conf.Score = age.Decay.Apply(conf.RawScore, conf.AgedSince, age.Now)
 	if len(post) == 0 {
 		// Only TopAction (and its provenance) falls back; Score and Decisions
 		// stay zero so a reset rule reads as "no post-reset evidence yet",

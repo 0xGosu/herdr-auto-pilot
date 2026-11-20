@@ -19,12 +19,6 @@ func confidenceDecay(cfg config.Config) domain.ConfidenceDecay {
 	return domain.ConfidenceDecay{Grace: grace, Span: span, Removal: removal}
 }
 
-// cfgConfidenceDecay reads the configured rule-aging policy under the config lock.
-func (d *Daemon) cfgConfidenceDecay() domain.ConfidenceDecay {
-	cfg, _, _ := d.snapshot()
-	return confidenceDecay(cfg)
-}
-
 // expiryHistoryLimit is the decision window the sweep scores a rule over. It
 // must equal the window every other confidence read uses (50): the sweep
 // deletes on "this rule's live confidence is 0", and a different window would
@@ -54,10 +48,22 @@ const expiryHistoryLimit = 50
 // written a moment ago), and the store re-checks, inside the deleting
 // transaction, that no operator has vouched for the rule since it was read.
 //
-// Runs with aging on only. With learning.confidence_decay_days = 0 nothing is
-// stamped, observed or removed, and existing stamps are left where they are —
-// harmless, because nothing reads them while aging is off, and RestartDecay
-// clears them on the next operator act either way.
+// A zero stamp exists only while a removal window is actually running — aging
+// on AND removal on. Whenever either is off the sweep CLEARS every stamp
+// instead (ClearZeroSinceStamps) and observes nothing, so that switching the
+// feature back on, or enabling removal on a herd that has been aging for
+// months, opens a fresh window for every rule. Leaving stamps in place across
+// an off period is how a working rule would be deleted on the first sweep
+// after it: with aging off the rule fires again and is not at zero, yet its
+// stamp goes on getting older.
+//
+// On a shared database rules are fleet-wide and this policy is per node, so
+// the nodes' sweeps answer for each other: a node whose settings still score a
+// rule above zero clears the stamp a shorter-policy node wrote (the "recovered"
+// branch below), and a node with aging or removal off clears them all. A rule
+// is therefore removed only once EVERY running node's settings agree it has
+// sat at zero — the conservative reading of a disagreement, since the delete
+// cannot be undone. The cost is a write per disputed rule per node per day.
 //
 // Not gated on the kill switch, a pause or per-agent disable: those stop hap
 // ACTING on panes, and this touches no pane. It is retention, and retention
@@ -65,23 +71,33 @@ const expiryHistoryLimit = 50
 func (d *Daemon) expireStaleRules(ctx context.Context, now time.Time) bool {
 	cfg, _, _ := d.snapshot()
 	decay := confidenceDecay(cfg)
-	if !decay.Enabled() {
-		return false
-	}
 	// Optional capability, exactly like RowRetentionPort: a store that cannot
 	// expire rules simply never does, so no fake has to grow a stub.
 	rx, ok := d.opt.Store.(ports.RuleExpiryPort)
 	if !ok {
 		return false
 	}
+	windowRunning := decay.Enabled() && decay.Removal > 0
+	if !windowRunning {
+		if n, err := rx.ClearZeroSinceStamps(ctx); err != nil {
+			slog.Warn("rule aging: clearing zero stamps while removal is off failed", "error", err)
+		} else if n > 0 {
+			slog.Info("rule aging: removal is off, so recorded stays at zero were forgotten", "rules", n)
+		}
+	}
+	if !decay.Enabled() {
+		return false
+	}
 
-	// Step 1 runs before the listing so the rows it stamps are read back WITH
-	// their anchor — though it would be equally safe after: an unstamped rule
-	// ages nothing and so can only be "at zero" by having no score at all.
+	// Step 1 needs aging only, not removal: an unstamped rule is never aged,
+	// so the clock has to start even when nothing will ever be removed.
 	if n, err := rx.StampDecayAnchors(ctx, now); err != nil {
 		slog.Warn("rule aging: starting the decay clock on unstamped rules failed", "error", err)
 	} else if n > 0 {
 		slog.Info("rule aging: started the decay clock on rules that had none", "rules", n)
+	}
+	if !windowRunning {
+		return false
 	}
 
 	states, err := d.opt.Store.ListSignatures(ctx, domain.SignatureFilter{})
@@ -109,9 +125,12 @@ func (d *Daemon) expireStaleRules(ctx context.Context, now time.Time) bool {
 		atZero := conf.Score == 0
 		switch {
 		case !atZero && !st.ZeroSince.IsZero():
-			// Recovered without an operator renewing it (which would have
-			// cleared the stamp itself): the policy got longer, or a decision
-			// arrived on a rule that had none. Its stay at zero is over.
+			// Recovered without RestartDecay clearing the stamp itself: the
+			// policy got longer, a decision arrived on a rule that had none,
+			// or an operator confirmed it on a node whose build writes the
+			// decision but not the anchor (domain.EffectiveDecayAnchor). On a
+			// shared database this is also a longer-policy node answering a
+			// shorter one's stamp. Either way its stay at zero is over.
 			if _, err := rx.SetSignatureZeroSince(ctx, st.Signature, st.ZeroSince, time.Time{}); err != nil {
 				slog.Warn("rule aging: clearing a recovered rule's zero stamp failed",
 					"signature", shortSignature(st.Signature), "error", err)

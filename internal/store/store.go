@@ -1586,6 +1586,34 @@ func (s *Store) SetSignatureZeroSince(ctx context.Context, signature string, was
 	return n > 0, nil
 }
 
+// ClearZeroSinceStamps forgets every recorded stay at zero and returns how many
+// rules it cleared. The expiry sweep calls it whenever no removal window is
+// running (aging off, or removal off).
+//
+// A stamp left in place across such a period would lie when the window came
+// back: with aging off a rule scores its raw agreement and fires again, so it
+// is NOT at zero, yet its stamp keeps getting older — and the first sweep after
+// aging was switched back on would find a stamp past the window and delete a
+// working rule that was never shown at zero under the policy now in force.
+//
+// Conditional, and silent when nothing changed, like StampDecayAnchors: it runs
+// on every sweep while the feature is off.
+func (s *Store) ClearZeroSinceStamps(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE signatures SET zero_since_at = 0 WHERE zero_since_at != 0`)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		s.noteWrite()
+	}
+	return n, nil
+}
+
 // StampDecayAnchors starts the decay clock, at now, for every rule that has
 // none, and returns how many it stamped.
 //
