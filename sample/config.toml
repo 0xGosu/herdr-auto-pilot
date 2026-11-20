@@ -22,6 +22,14 @@ error = 0.75
 graduation_n = 1           # consecutive consistent confirmations to graduate a rule (1-10)
 confirmation_weight = 2.0  # how much more an operator confirm/send counts toward
                            # confidence than a passive observation
+# Rule aging: confidence drains while nobody re-confirms a rule, so an old rule
+# comes back to you instead of answering forever, and an unused one is removed.
+# Only an operator act renews a rule (confirming its escalation, or
+# `hap signatures confirm <prefix>`); the rule firing on its own never does.
+confidence_decay_grace_days = 14  # days a rule keeps its full score after its last confirmation
+confidence_decay_days = 30        # days a 1.00 then takes to drain to 0 (0 = aging off)
+stale_rule_removal_days = 14      # days a rule stays at 0 before the daily sweep removes
+                                  # it with its decision history (0 = never remove)
 
 # ── Safety (never-auto) ─────────────────────────────────────────────
 [safety]

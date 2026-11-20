@@ -2981,6 +2981,7 @@ func (d *Daemon) decideAndActResolved(ctx context.Context, situation domain.Situ
 		History:              history,
 		ConfidenceThresholds: confidenceThresholds(cfg),
 		ConfirmationWeight:   cfg.Learning.ConfirmationWeight,
+		Decay:                confidenceDecay(cfg),
 		GraduationN:          cfg.Learning.GraduationN,
 		KillActive:           killActive,
 		Rate:                 rate,
@@ -6354,9 +6355,13 @@ func (d *Daemon) handleLLMOutcome(ctx context.Context, res llmOutcome) {
 // not reject an accepted LLM decision (fail-safe daemon path).
 func (d *Daemon) ensureSignatureRow(ctx context.Context, signature string,
 	situationType domain.SituationType, agentType string, now time.Time) {
+	// DecayAnchor rides along for stores that take the whole state; the SQL
+	// store starts a new row's decay clock at UpdatedAt itself, and leaves an
+	// existing row's alone — an LLM answer never renews a rule
+	// (domain.RestartDecay).
 	if err := d.opt.Store.EnsureSignature(ctx, domain.SignatureState{
 		Signature: signature, SituationType: situationType,
-		AgentType: agentType, Mode: domain.ModeShadow, UpdatedAt: now,
+		AgentType: agentType, Mode: domain.ModeShadow, UpdatedAt: now, DecayAnchor: now,
 	}); err != nil {
 		slog.Error("signature row write failed", "signature", signature, "error", err)
 	}
@@ -6683,6 +6688,12 @@ func (d *Daemon) applyCorrection(ctx context.Context, cfg config.Config, c domai
 	conf := domain.Confidence(domain.DecisionsSince(refreshed, newState.DecisionFloorID), cfg.Learning.ConfirmationWeight)
 	newState.CachedConfidence = conf.Score
 	newState.UpdatedAt = now
+	// The operator has just spoken about this rule — confirmed its answer or
+	// corrected it — so its decay clock restarts. This is the renewal aging
+	// exists to ask for, and it is why the graduation gate below reads the RAW
+	// agreement (domain.Confidence) rather than an aged LiveConfidence: as of
+	// this write the rule has no age to take anything off.
+	newState = domain.RestartDecay(newState, now)
 	newState = domain.MaybeGraduate(newState, conf.Score,
 		confidenceThresholds(cfg).ForType(audit.SituationType), cfg.Learning.GraduationN)
 

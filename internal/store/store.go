@@ -412,12 +412,28 @@ func fromUnix(ms int64) time.Time {
 // --- Daemon-exclusive writes ---
 
 // UpsertSignature stores per-signature learning state (daemon-owned).
+//
+// decay_anchor_at is the one column an update may DECLINE to write: a zero
+// DecayAnchor is "unknown" (domain.SignatureState), never an instruction to
+// forget the anchor the row already has. Without the CASE, any caller that
+// built its state from scratch rather than from GetSignature would blank the
+// column, and the daemon's next sweep would then stamp it with the current time
+// (StampDecayAnchors) — renewing the rule's confidence with no operator having
+// vouched for it. The only way to move an anchor is to pass a real one, which
+// is domain.RestartDecay's job.
+//
+// zero_since_at has no such guard, because there zero is a real value ("not at
+// zero") that RestartDecay must be able to write. Every caller upserts a state
+// it read with GetSignature, so the column round-trips; a caller racing the
+// sweep can at worst clear a stamp the sweep puts back on its next pass, which
+// only ever DELAYS a removal.
 func (s *Store) UpsertSignature(ctx context.Context, sig domain.SignatureState) error {
 	return s.tx(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO signatures (signature, situation_type, agent_type, mode,
-				consecutive_confirmations, cached_confidence, decision_floor_id, guard_state, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				consecutive_confirmations, cached_confidence, decision_floor_id, guard_state, updated_at,
+				decay_anchor_at, zero_since_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(signature) DO UPDATE SET
 				agent_type=excluded.agent_type,
 				mode=excluded.mode,
@@ -425,9 +441,13 @@ func (s *Store) UpsertSignature(ctx context.Context, sig domain.SignatureState) 
 				cached_confidence=excluded.cached_confidence,
 				decision_floor_id=excluded.decision_floor_id,
 				guard_state=excluded.guard_state,
-				updated_at=excluded.updated_at`,
+				updated_at=excluded.updated_at,
+				decay_anchor_at=CASE WHEN excluded.decay_anchor_at != 0
+					THEN excluded.decay_anchor_at ELSE signatures.decay_anchor_at END,
+				zero_since_at=excluded.zero_since_at`,
 			sig.Signature, string(sig.SituationType), sig.AgentType, string(sig.Mode),
-			sig.ConsecutiveConfirmations, sig.CachedConfidence, sig.DecisionFloorID, sig.GuardState, unix(sig.UpdatedAt))
+			sig.ConsecutiveConfirmations, sig.CachedConfidence, sig.DecisionFloorID, sig.GuardState, unix(sig.UpdatedAt),
+			unix(sig.DecayAnchor), unix(sig.ZeroSince))
 		return err
 	})
 }
@@ -440,13 +460,17 @@ func (s *Store) UpsertSignature(ctx context.Context, sig domain.SignatureState) 
 // with a fresh shadow row. Learning-state fields are forced to their fresh
 // zero values: only identity fields (signature, types, mode, timestamp) come
 // from the caller.
+//
+// The row's decay clock starts at its creation (decay_anchor_at = updated_at):
+// a rule nobody has vouched for yet ages from the moment it was learned.
 func (s *Store) EnsureSignature(ctx context.Context, sig domain.SignatureState) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO signatures (signature, situation_type, agent_type,
 			mode, consecutive_confirmations, cached_confidence, decision_floor_id,
-			guard_state, updated_at)
-		VALUES (?, ?, ?, ?, 0, 0, 0, '', ?)`,
-		sig.Signature, string(sig.SituationType), sig.AgentType, string(sig.Mode), unix(sig.UpdatedAt))
+			guard_state, updated_at, decay_anchor_at)
+		VALUES (?, ?, ?, ?, 0, 0, 0, '', ?, ?)`,
+		sig.Signature, string(sig.SituationType), sig.AgentType, string(sig.Mode), unix(sig.UpdatedAt),
+		unix(sig.UpdatedAt))
 	if err == nil {
 		s.noteWrite()
 	}
@@ -928,8 +952,10 @@ func (s *Store) SignatureEmbeddingsFingerprint(ctx context.Context) (string, err
 }
 
 // RuleStateFingerprint digests the learned STATE the re-rank judge is shown
-// about each rule: its mode and decision floor (signatures) and the decision
-// history its listed confidence is computed from. With
+// about each rule: its mode, decision floor and decay anchor (signatures) and
+// the decision history its listed confidence is computed from. The anchor is
+// in because a renewal (`hap signatures confirm`) restores an aged score
+// without writing a decision row, so nothing else here would see it. With
 // SignatureEmbeddingsFingerprint it covers everything the rendered candidate
 // listing reads, so the daemon can keep in-flight verdicts across a fleet pull
 // that moved none of it (see ports.RuleStateFingerprinter).
@@ -942,7 +968,7 @@ func (s *Store) SignatureEmbeddingsFingerprint(ctx context.Context) (string, err
 // same pull would otherwise cancel out.
 func (s *Store) RuleStateFingerprint(ctx context.Context) (string, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT signature, mode, decision_floor_id FROM signatures ORDER BY signature`)
+		`SELECT signature, mode, decision_floor_id, decay_anchor_at FROM signatures ORDER BY signature`)
 	if err != nil {
 		return "", err
 	}
@@ -950,13 +976,14 @@ func (s *Store) RuleStateFingerprint(ctx context.Context) (string, error) {
 	d := newFieldDigest()
 	for rows.Next() {
 		var sig, mode string
-		var floor int64
-		if err := rows.Scan(&sig, &mode, &floor); err != nil {
+		var floor, anchor int64
+		if err := rows.Scan(&sig, &mode, &floor, &anchor); err != nil {
 			return "", err
 		}
 		d.str(sig)
 		d.str(mode)
 		d.int(floor)
+		d.int(anchor)
 	}
 	if err := rows.Err(); err != nil {
 		return "", err
@@ -1116,13 +1143,14 @@ func (s *Store) InsertLLMDecision(ctx context.Context, d domain.LLMDecision) (in
 func (s *Store) GetSignature(ctx context.Context, signature string) (*domain.SignatureState, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT signature, situation_type, agent_type, mode, consecutive_confirmations,
-			cached_confidence, decision_floor_id, guard_state, updated_at
+			cached_confidence, decision_floor_id, guard_state, updated_at, decay_anchor_at, zero_since_at
 		FROM signatures WHERE signature = ?`, signature)
 	var st domain.SignatureState
 	var situationType, mode string
-	var updated int64
+	var updated, anchor, zeroSince int64
 	err := row.Scan(&st.Signature, &situationType, &st.AgentType, &mode,
-		&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.DecisionFloorID, &st.GuardState, &updated)
+		&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.DecisionFloorID, &st.GuardState, &updated,
+		&anchor, &zeroSince)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1132,6 +1160,8 @@ func (s *Store) GetSignature(ctx context.Context, signature string) (*domain.Sig
 	st.SituationType = domain.SituationType(situationType)
 	st.Mode = domain.Mode(mode)
 	st.UpdatedAt = fromUnix(updated)
+	st.DecayAnchor = fromUnix(anchor)
+	st.ZeroSince = fromUnix(zeroSince)
 	return &st, nil
 }
 
@@ -1331,7 +1361,7 @@ func collectCounts(rows *sql.Rows, out map[string]int) error {
 func (s *Store) ListSignatures(ctx context.Context, f domain.SignatureFilter) ([]domain.SignatureState, error) {
 	query := `
 		SELECT signature, situation_type, agent_type, mode, consecutive_confirmations,
-			cached_confidence, decision_floor_id, guard_state, updated_at
+			cached_confidence, decision_floor_id, guard_state, updated_at, decay_anchor_at, zero_since_at
 		FROM signatures WHERE 1=1`
 	var args []any
 	if f.SituationType != "" {
@@ -1359,14 +1389,17 @@ func (s *Store) ListSignatures(ctx context.Context, f domain.SignatureFilter) ([
 	for rows.Next() {
 		var st domain.SignatureState
 		var situationType, mode string
-		var updated int64
+		var updated, anchor, zeroSince int64
 		if err := rows.Scan(&st.Signature, &situationType, &st.AgentType, &mode,
-			&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.DecisionFloorID, &st.GuardState, &updated); err != nil {
+			&st.ConsecutiveConfirmations, &st.CachedConfidence, &st.DecisionFloorID, &st.GuardState, &updated,
+			&anchor, &zeroSince); err != nil {
 			return nil, err
 		}
 		st.SituationType = domain.SituationType(situationType)
 		st.Mode = domain.Mode(mode)
 		st.UpdatedAt = fromUnix(updated)
+		st.DecayAnchor = fromUnix(anchor)
+		st.ZeroSince = fromUnix(zeroSince)
 		out = append(out, st)
 	}
 	return out, rows.Err()
@@ -1442,27 +1475,147 @@ func (s *Store) DeleteSignature(ctx context.Context, signature string) (int64, e
 		if n == 0 {
 			return fmt.Errorf("no signature %q", signature)
 		}
-		res, err = tx.ExecContext(ctx, `DELETE FROM decisions WHERE signature = ?`, signature)
-		if err != nil {
-			return err
-		}
-		if decisions, err = res.RowsAffected(); err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM error_retries WHERE error_signature = ?`, signature); err != nil {
-			return err
-		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM signature_embeddings WHERE signature = ?`, signature); err != nil {
-			return err
-		}
-		// Snapshot goes too: a re-learned rule re-captures its situation.
-		_, err = tx.ExecContext(ctx, `DELETE FROM signature_snapshots WHERE signature = ?`, signature)
+		decisions, err = deleteSignatureCascade(ctx, tx, signature)
 		return err
 	})
 	if err != nil {
 		return 0, err
 	}
 	return decisions, nil
+}
+
+// deleteSignatureCascade removes everything keyed on a signature whose state
+// row the caller has just deleted in tx — its decision history, every node's
+// error-retry row, its embedding and its snapshot — and returns the number of
+// decision rows removed. Shared by the operator's delete and the expiry sweep
+// so the two can never disagree about what "the rule is gone" leaves behind:
+// a stray decision row is not just litter, the #175 backfill in migrate
+// re-creates a signatures row from it on the next open.
+func deleteSignatureCascade(ctx context.Context, tx *sql.Tx, signature string) (int64, error) {
+	res, err := tx.ExecContext(ctx, `DELETE FROM decisions WHERE signature = ?`, signature)
+	if err != nil {
+		return 0, err
+	}
+	decisions, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM error_retries WHERE error_signature = ?`, signature); err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM signature_embeddings WHERE signature = ?`, signature); err != nil {
+		return 0, err
+	}
+	// Snapshot goes too: a re-learned rule re-captures its situation.
+	if _, err = tx.ExecContext(ctx, `DELETE FROM signature_snapshots WHERE signature = ?`, signature); err != nil {
+		return 0, err
+	}
+	return decisions, nil
+}
+
+// DeleteStaleSignature is the expiry sweep's delete: DeleteSignature's cascade,
+// but only if the rule is STILL in the state the sweep judged it by — the same
+// decay anchor and the same unbroken stay at zero. It reports whether the rule
+// was removed and how many decision rows went with it; a rule that is gone
+// already, or that moved, is (false, 0, nil).
+//
+// The compare is the freshness re-check, made inside the deleting transaction
+// because the sweep's verdict is a history read old by the time it gets here
+// and, on a shared database, another machine's operator may have confirmed the
+// rule in between. Every operator act that vouches for a rule moves the anchor
+// and clears the stamp (domain.RestartDecay), so "both unchanged" is exactly
+// "nobody has vouched for this rule since I read it" — the one fact that would
+// make deleting it wrong. A decision recorded in that window by anything else
+// (an LLM answer) does not renew a rule and is deleted with it, the same
+// accepted race DeleteSignature documents.
+//
+// A zero zeroSince never matches anything: a rule not seen at zero has no
+// removal window to have outlived (domain.ConfidenceDecay.RemovalDue).
+func (s *Store) DeleteStaleSignature(ctx context.Context, state domain.SignatureState) (bool, int64, error) {
+	if state.ZeroSince.IsZero() {
+		return false, 0, nil
+	}
+	var (
+		deleted   bool
+		decisions int64
+	)
+	err := s.tx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM signatures WHERE signature = ? AND decay_anchor_at = ? AND zero_since_at = ?`,
+			state.Signature, unix(state.DecayAnchor), unix(state.ZeroSince))
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil || n == 0 {
+			return err
+		}
+		deleted = true
+		decisions, err = deleteSignatureCascade(ctx, tx, state.Signature)
+		return err
+	})
+	if err != nil {
+		return false, 0, err
+	}
+	return deleted, decisions, nil
+}
+
+// SetSignatureZeroSince records the expiry sweep's observation of one rule:
+// at, the moment it was first seen at zero confidence, or the zero time to say
+// it is no longer there. It reports whether the row changed.
+//
+// was is the value the sweep read, and the write happens only while the row
+// still holds it. That makes the stamp first-writer-wins across the daemons of
+// a shared database (each would otherwise push the start of the window forward
+// to its own clock), and keeps a sweep that read the row before an operator
+// renewed the rule from re-stamping it afterwards on stale evidence.
+func (s *Store) SetSignatureZeroSince(ctx context.Context, signature string, was, at time.Time) (bool, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE signatures SET zero_since_at = ? WHERE signature = ? AND zero_since_at = ?`,
+		unix(at), signature, unix(was))
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n > 0 {
+		s.noteWrite()
+	}
+	return n > 0, nil
+}
+
+// StampDecayAnchors starts the decay clock, at now, for every rule that has
+// none, and returns how many it stamped.
+//
+// Such rows come from a build that predates confidence aging (the column is
+// added with DEFAULT 0) or from an older node writing to a shared database.
+// Stamping them with the time they were first SEEN rather than back-dating
+// them from updated_at is the point: on upgrade day a year-old rule would
+// otherwise be scored — and, past the removal window, deleted — against an age
+// nobody was tracking, wiping out a working rule set in the first sweep.
+//
+// Conditional by construction (WHERE decay_anchor_at = 0), and it only reports
+// a write when a row actually changed: this runs on every retention sweep, and
+// an unconditional write would arm a sync push each time for nothing.
+func (s *Store) StampDecayAnchors(ctx context.Context, now time.Time) (int64, error) {
+	if now.IsZero() {
+		return 0, nil
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE signatures SET decay_anchor_at = ? WHERE decay_anchor_at = 0`, unix(now))
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		s.noteWrite()
+	}
+	return n, nil
 }
 
 // DismissEscalation flips one pending escalation to "dismissed" (front-end

@@ -701,6 +701,34 @@ func (s *failingStore) PruneAgedRows(ctx context.Context, now, cutoff time.Time)
 	return rp.PruneAgedRows(ctx, now, cutoff)
 }
 
+// StampDecayAnchors, SetSignatureZeroSince and DeleteStaleSignature forward the
+// OPTIONAL ports.RuleExpiryPort capability, for the reason PruneAgedRows above
+// is forwarded: without them the daemon's type assertion answers false and the
+// rule-expiry sweep is silently switched off for the whole suite.
+func (s *failingStore) StampDecayAnchors(ctx context.Context, now time.Time) (int64, error) {
+	rx, ok := s.StorePort.(ports.RuleExpiryPort)
+	if !ok {
+		return 0, errors.New("wrapped store cannot expire rules")
+	}
+	return rx.StampDecayAnchors(ctx, now)
+}
+
+func (s *failingStore) SetSignatureZeroSince(ctx context.Context, signature string, was, at time.Time) (bool, error) {
+	rx, ok := s.StorePort.(ports.RuleExpiryPort)
+	if !ok {
+		return false, errors.New("wrapped store cannot expire rules")
+	}
+	return rx.SetSignatureZeroSince(ctx, signature, was, at)
+}
+
+func (s *failingStore) DeleteStaleSignature(ctx context.Context, state domain.SignatureState) (bool, int64, error) {
+	rx, ok := s.StorePort.(ports.RuleExpiryPort)
+	if !ok {
+		return false, 0, errors.New("wrapped store cannot expire rules")
+	}
+	return rx.DeleteStaleSignature(ctx, state)
+}
+
 // SignatureEmbeddingsFingerprint forwards the OPTIONAL
 // ports.KnowledgeFingerprinter capability for the same reason: without it every
 // knowledge refresh in the suite silently rebuilds the index.

@@ -6518,7 +6518,10 @@ func (m Model) signatureDetailLines(row frontend.SignatureRow, history []domain.
 	lines = m.detailField(lines, w, "Agent type", orDash(row.AgentType))
 	lines = m.detailField(lines, w, "Mode", string(row.Mode))
 	lines = m.detailField(lines, w, "Streak", fmt.Sprintf("%d/%d confirmations toward graduation", row.ConsecutiveConfirmations, graduationN))
-	lines = m.detailField(lines, w, "Confidence", frontend.ConfidenceLabel(row.Confidence))
+	lines = m.detailField(lines, w, "Confidence", row.ConfidenceLabel())
+	if row.Aging != "" {
+		lines = m.detailField(lines, w, "Aging", row.Aging)
+	}
 	if row.TopAction != "" {
 		lines = m.detailField(lines, w, "Top action", fmt.Sprintf("%q over %d decision(s)", row.TopAction, row.Decisions))
 	}
@@ -8172,7 +8175,7 @@ func (m Model) renderSignatures(b *strings.Builder) {
 		}
 		line := semCol + fmt.Sprintf(rulesRowFmt,
 			sigW, r.Signature, humanizeWhen(lastUsed, m.renderNow()), orDash(r.AgentType),
-			frontend.ConfidenceLabel(r.Confidence), r.Mode,
+			r.ConfidenceLabel(), r.Mode,
 			fmt.Sprintf("%d/%d", r.ConsecutiveConfirmations, gradN),
 			oneLine(r.TopAction, actWidth))
 		switch {

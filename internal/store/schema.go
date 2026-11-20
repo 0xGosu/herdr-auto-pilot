@@ -239,7 +239,9 @@ CREATE TABLE IF NOT EXISTS signatures (
 	cached_confidence REAL NOT NULL DEFAULT 0,
 	decision_floor_id INTEGER NOT NULL DEFAULT 0,
 	guard_state TEXT NOT NULL DEFAULT '',
-	updated_at INTEGER NOT NULL
+	updated_at INTEGER NOT NULL,
+	decay_anchor_at INTEGER NOT NULL DEFAULT 0,
+	zero_since_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS decisions (
 	id INTEGER PRIMARY KEY` + autoincPlaceholder + `,
@@ -534,6 +536,18 @@ var columnAdds = []columnAdd{
 	// Per-signature decision-id floor: decisions with id <= this are kept
 	// but excluded from confidence/graduation (stamped by an operator reset).
 	{"signatures", "decision_floor_id", `ALTER TABLE signatures ADD COLUMN decision_floor_id INTEGER NOT NULL DEFAULT 0`},
+	// When the rule's confidence-decay clock last (re)started: its creation,
+	// or the last operator act that vouched for it. NOT backfilled here, on
+	// purpose: 0 means "unknown", which ages and expires nothing, and the
+	// daemon's sweep stamps such rows with the time it first sees them
+	// (StampDecayAnchors) — so an upgraded database starts every existing
+	// rule on a fresh clock instead of judging it by an age nobody recorded.
+	// Fleet-wide like the rest of the row: no node_id.
+	{"signatures", "decay_anchor_at", `ALTER TABLE signatures ADD COLUMN decay_anchor_at INTEGER NOT NULL DEFAULT 0`},
+	// When the expiry sweep first saw the rule's aged confidence at zero; 0 =
+	// not at zero. A rule is removed only after this has stood for the whole
+	// removal window, so the default is also the safe one.
+	{"signatures", "zero_since_at", `ALTER TABLE signatures ADD COLUMN zero_since_at INTEGER NOT NULL DEFAULT 0`},
 	// Operator-owned per-agent automation switch. Kept on agent_names so
 	// renames preserve it and disabled agents remain visible by name.
 	{"agent_names", "disabled", `ALTER TABLE agent_names ADD COLUMN disabled INTEGER NOT NULL DEFAULT 0`},

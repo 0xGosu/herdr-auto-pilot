@@ -2043,8 +2043,22 @@ func TestSampleConfigParsesWithDocumentedDefaults(t *testing.T) {
 		t.Errorf("sample confidence_thresholds = %+v, defaults are %+v",
 			cfg.ConfidenceThresholds, def.ConfidenceThresholds)
 	}
-	if cfg.Learning != def.Learning {
+	// Compared by VALUE, not with a struct `!=`: the three aging keys are
+	// pointers (absent and 0 differ), the sample states them outright and
+	// Default leaves them nil, so a struct compare would test addresses. The
+	// effective policy is what has to match the defaults the sample documents.
+	if cfg.Learning.GraduationN != def.Learning.GraduationN ||
+		cfg.Learning.ConfirmationWeight != def.Learning.ConfirmationWeight {
 		t.Errorf("sample learning = %+v, defaults are %+v", cfg.Learning, def.Learning)
+	}
+	for _, key := range []string{"confidence_decay_grace_days", "confidence_decay_days", "stale_rule_removal_days"} {
+		if !strings.Contains(string(raw), "\n"+key+" = ") {
+			t.Errorf("sample config does not state [learning].%s", key)
+		}
+	}
+	sg, ss, sr := cfg.Learning.ConfidenceDecay()
+	if dg, ds, dr := def.Learning.ConfidenceDecay(); sg != dg || ss != ds || sr != dr {
+		t.Errorf("sample rule aging = %v/%v/%v, defaults are %v/%v/%v", sg, ss, sr, dg, ds, dr)
 	}
 	if cfg.Limits != def.Limits {
 		t.Errorf("sample limits = %+v, defaults are %+v", cfg.Limits, def.Limits)

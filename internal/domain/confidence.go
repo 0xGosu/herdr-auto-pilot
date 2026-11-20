@@ -21,8 +21,17 @@ const DefaultConfirmationWeight = 2.0
 // ConfidenceResult carries the recency-weighted agreement ratio and the
 // action it agrees on.
 type ConfidenceResult struct {
-	// Score is the recency-weighted share of the dominant action in [0,1].
+	// Score is the confidence everything gates on and every view shows, in
+	// [0,1]: the recency-weighted share of the dominant action, less whatever
+	// time-based aging has taken off it (ConfidenceDecay). Confidence itself
+	// never ages — only LiveConfidence does — so there Score == RawScore.
 	Score float64
+	// RawScore is that share BEFORE aging. It is what the operator's own
+	// decisions say, and Score can only ever be at or below it. Kept beside
+	// Score so an escalation can say a rule was demoted by the calendar rather
+	// than by disagreement, and so the expiry sweep can tell when a rule
+	// reached zero.
+	RawScore float64
 	// TopAction is the dominant historical action ("" with empty history).
 	TopAction string
 	// Decisions is the number of history records considered.
@@ -72,7 +81,13 @@ func HasOperatorEvidence(history []DecisionRecord) bool {
 }
 
 // LiveConfidence is the confidence the decision core gates on RIGHT NOW for a
-// signature: the recency-weighted agreement over post-floor decisions only.
+// signature: the recency-weighted agreement over post-floor decisions only,
+// aged by how long the rule has gone without an operator re-confirming it
+// (age; see ConfidenceDecay). Aging lives HERE rather than in a caller so the
+// gate and every view age a rule identically — a Rules tab showing 0.95 beside
+// an escalation that says the rule decayed to 0.40 is the same drift this
+// function was introduced to end. Pass ConfidenceAge{} for a signature with no
+// state row.
 // The TopAction, however, still comes from the FULL learned history when the
 // floor excludes everything — a reset rule keeps naming its learned answer
 // while its score starts fresh, so re-earning trust is just re-confirming it.
@@ -83,9 +98,10 @@ func HasOperatorEvidence(history []DecisionRecord) bool {
 // snapshot — refreshed only on a confirm/correct, and stamped to a fake 1.0 by
 // ResetGraduation — so a rule the core scored 0.45 displayed as 1.00 next to
 // its own "contradictory history" escalation.
-func LiveConfidence(history []DecisionRecord, floorID int64, confirmWeight float64) ConfidenceResult {
+func LiveConfidence(history []DecisionRecord, floorID int64, confirmWeight float64, age ConfidenceAge) ConfidenceResult {
 	post := DecisionsSince(history, floorID)
 	conf := Confidence(post, confirmWeight)
+	conf.Score = age.Decay.Apply(conf.RawScore, age.Anchor, age.Now)
 	if len(post) == 0 {
 		// Only TopAction (and its provenance) falls back; Score and Decisions
 		// stay zero so a reset rule reads as "no post-reset evidence yet",
@@ -136,6 +152,7 @@ func Confidence(history []DecisionRecord, confirmWeight float64) ConfidenceResul
 			top, topW = action, aw
 		}
 	}
-	return ConfidenceResult{Score: topW / total, TopAction: top, Decisions: len(history),
+	score := topW / total
+	return ConfidenceResult{Score: score, RawScore: score, TopAction: top, Decisions: len(history),
 		TopActionOperatorBacked: operatorBacked[top]}
 }

@@ -2377,13 +2377,19 @@ func TestConfigFieldRegistryParity(t *testing.T) {
 	// One valid sample value per registry key. When you add a field to
 	// frontend.ConfigFields, add a sample here or this test fails loudly.
 	samples := map[string]string{
-		"confidence_thresholds.minimum":          "0.55",
-		"confidence_thresholds.idle":             "0.70",
-		"confidence_thresholds.approval":         "0.85",
-		"confidence_thresholds.choice":           "0.85",
-		"confidence_thresholds.error":            "0.90",
-		"learning.graduation_n":                  "5",
-		"learning.confirmation_weight":           "2.5",
+		"confidence_thresholds.minimum":  "0.55",
+		"confidence_thresholds.idle":     "0.70",
+		"confidence_thresholds.approval": "0.85",
+		"confidence_thresholds.choice":   "0.85",
+		"confidence_thresholds.error":    "0.90",
+		"learning.graduation_n":          "5",
+		"learning.confirmation_weight":   "2.5",
+		// Non-zero like the retention samples below: 0 is each key's "off",
+		// and a real day count is the round trip worth exercising here. The
+		// explicit-0 path is TestAgingConfigKeysRoundTripTheirOffValue.
+		"learning.confidence_decay_grace_days":   "7",
+		"learning.confidence_decay_days":         "120",
+		"learning.stale_rule_removal_days":       "45",
 		"embedding.pane_salient_chars":           "800",
 		"limits.max_consecutive_auto_prompts":    "5",
 		"limits.max_auto_prompts_per_minute":     "10",

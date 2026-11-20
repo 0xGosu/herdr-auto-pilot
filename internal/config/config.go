@@ -38,6 +38,63 @@ type Learning struct {
 	// when computing a signature's confidence (FR-005). >1 grades confirmed
 	// rules higher; 1 disables the boost. Values <1 fall back to the default.
 	ConfirmationWeight float64 `toml:"confirmation_weight"`
+	// ConfidenceDecayGraceDays, ConfidenceDecayDays and StaleRuleRemovalDays
+	// are the time-based aging of learned rules (domain.ConfidenceDecay): a
+	// rule's confidence drains while no operator re-confirms it, and a rule
+	// that has then sat at zero long enough is removed.
+	//
+	//   - confidence_decay_grace_days: days a rule keeps its full score after
+	//     it was learned or last confirmed. 0 = aging starts at once.
+	//   - confidence_decay_days: days a score of 1.00 then takes to reach 0
+	//     (so the rate is 1/N per day, and a lower score gets there sooner).
+	//     0 = aging off: scores never drain and nothing is ever removed.
+	//   - stale_rule_removal_days: days a rule must stay at 0 before the daily
+	//     sweep deletes it with its decision history. 0 = never remove.
+	//
+	// Turning aging off does not pause the clock: a rule's anchor is still
+	// written on every confirmation, so turning it back on applies each rule's
+	// real age at once. Removal still waits the full window from the first
+	// daily sweep that sees a rule at 0, so nothing is deleted by surprise.
+	//
+	// POINTERS for the reason Logging's retention keys are: absent and 0 mean
+	// different things here ("use the default" against "off"), and a plain int
+	// would let fillZeroes read an operator's explicit 0 as unset and switch
+	// the feature back ON. Negative values are not a third meaning — they read
+	// as 0, the conservative end of each key.
+	ConfidenceDecayGraceDays *int `toml:"confidence_decay_grace_days,omitempty"`
+	ConfidenceDecayDays      *int `toml:"confidence_decay_days,omitempty"`
+	StaleRuleRemovalDays     *int `toml:"stale_rule_removal_days,omitempty"`
+}
+
+// Defaults for the aging keys above. Together: a rule nobody re-confirms keeps
+// its score for two weeks, drifts under a typical 0.70 threshold about three
+// weeks after its last confirmation, reaches 0 after about six weeks, and is
+// removed two weeks after that.
+const (
+	DefaultConfidenceDecayGraceDays = 14
+	DefaultConfidenceDecayDays      = 30
+	DefaultStaleRuleRemovalDays     = 14
+)
+
+// ConfidenceDecay returns the aging policy as durations: the grace period, the
+// time a full score takes to drain (0 = aging off) and how long a rule may sit
+// at zero before removal (0 = never). Durations rather than a domain type so
+// this package stays decoupled from domain, as ConfidenceThresholds is; the
+// daemon and the front ends each assemble domain.ConfidenceDecay from it.
+func (l Learning) ConfidenceDecay() (grace, span, removal time.Duration) {
+	days := func(v *int, def int) time.Duration {
+		d := def
+		if v != nil {
+			d = *v
+		}
+		if d < 0 {
+			d = 0
+		}
+		return time.Duration(d) * 24 * time.Hour
+	}
+	return days(l.ConfidenceDecayGraceDays, DefaultConfidenceDecayGraceDays),
+		days(l.ConfidenceDecayDays, DefaultConfidenceDecayDays),
+		days(l.StaleRuleRemovalDays, DefaultStaleRuleRemovalDays)
 }
 
 // Safety holds the never-auto patterns and heuristic configuration (FR-015/016).
@@ -2474,6 +2531,9 @@ func (c *Config) fillZeroes() {
 	if w := c.Learning.ConfirmationWeight; w < 1 || math.IsNaN(w) || math.IsInf(w, 0) {
 		c.Learning.ConfirmationWeight = d.Learning.ConfirmationWeight
 	}
+	// The three Learning aging keys (confidence_decay_*, stale_rule_removal_days)
+	// are deliberately absent here: they are pointers precisely so an explicit
+	// 0 ("off") survives this pass. Learning.ConfidenceDecay applies defaults.
 	// An unknown level falls back rather than silencing the log: SlogLevel
 	// already defaults unknown values to Info, so normalize the stored string
 	// too and the operator sees what is actually in effect.

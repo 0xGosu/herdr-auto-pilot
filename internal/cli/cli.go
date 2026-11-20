@@ -560,7 +560,7 @@ func signaturesSearch(ctx context.Context, app *frontend.App, out io.Writer, arg
 		}
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%s\ttop=%q\t%s",
 			shortSignature(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
-			r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence),
+			r.ConsecutiveConfirmations, graduationN, r.ConfidenceLabel(),
 			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
 		// A screen match names a signature and nothing an operator recognizes,
 		// so it carries the hit itself. Appended as a trailing field, never
@@ -633,7 +633,7 @@ func signaturesList(ctx context.Context, app *frontend.App, out io.Writer, args 
 	for _, r := range rows {
 		fmt.Fprintf(out, "%s\t%s\t%s\t%s\t%d/%d\tconf=%s\ttop=%q\t%s\n",
 			shortSignature(r.Signature), r.SituationType, orDash(r.AgentType), r.Mode,
-			r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence),
+			r.ConsecutiveConfirmations, graduationN, r.ConfidenceLabel(),
 			r.TopAction, r.UpdatedAt.Format("01-02 15:04:05"))
 	}
 	fmt.Fprintf(out, "\n%d signature(s)\n", len(rows))
@@ -846,9 +846,15 @@ func printSignatureRow(out io.Writer, r frontend.SignatureRow, graduationN int) 
 	fmt.Fprintf(out, "signature:   %s\n", r.Signature)
 	fmt.Fprintf(out, "situation:   %s\tagent type: %s\n", r.SituationType, orDash(r.AgentType))
 	fmt.Fprintf(out, "mode:        %s\tstreak: %d/%d\tconfidence: %s\n",
-		r.Mode, r.ConsecutiveConfirmations, graduationN, frontend.ConfidenceLabel(r.Confidence))
+		r.Mode, r.ConsecutiveConfirmations, graduationN, r.ConfidenceLabel())
 	fmt.Fprintf(out, "top action:  %q over %d decision(s)\n", r.TopAction, r.Decisions)
 	fmt.Fprintf(out, "updated:     %s\n", r.UpdatedAt.Format(time.RFC3339))
+	// Only with aging on (frontend.RuleAging): where the rule stands on the
+	// decay clock and what happens to it next, which is otherwise the one
+	// thing about a score that the decisions listed below cannot explain.
+	if r.Aging != "" {
+		fmt.Fprintf(out, "aging:       %s\n", r.Aging)
+	}
 }
 
 // graduationN reads the live graduation threshold for streak display.
@@ -1921,6 +1927,12 @@ func printConfig(out io.Writer, cfg config.Config) {
 		cfg.ConfidenceThresholds.Minimum, cfg.ConfidenceThresholds.Idle, cfg.ConfidenceThresholds.Approval,
 		cfg.ConfidenceThresholds.Choice, cfg.ConfidenceThresholds.Error)
 	fmt.Fprintf(out, "learning:   graduation_n=%d confirmation_weight=%g\n", cfg.Learning.GraduationN, cfg.Learning.ConfirmationWeight)
+	// The EFFECTIVE aging policy, defaults applied, in days — the three keys
+	// are optional and an operator reading this wants what is in force.
+	grace, span, removal := cfg.Learning.ConfidenceDecay()
+	const day = 24 * time.Hour
+	fmt.Fprintf(out, "            confidence_decay_grace_days=%d confidence_decay_days=%d stale_rule_removal_days=%d\n",
+		int(grace/day), int(span/day), int(removal/day))
 	limitsNote := ""
 	if cfg.FullSelfPrompting.Enabled && !cfg.FullSelfPrompting.HonourLimits {
 		// Printing three ceilings that nothing enforces reads as a broken

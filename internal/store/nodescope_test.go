@@ -72,7 +72,7 @@ var nodeScopeExemptions = map[string]string{
 	"RetireEscalationForRetry#1":     "by id",
 	"GetLLMRequest#1":                "by request_id",
 	"LLMDecisionByRequest#1":         "by request_id",
-	"DeleteSignature#3":              "forgetting a shared rule clears EVERY node's retry counter for it",
+	"deleteSignatureCascade#2":       "forgetting a shared rule clears EVERY node's retry counter for it",
 	"AgentActionByID#1":              "by id: the surface that queued an action on any node polls it",
 	"FinishAgentAction#1":            "by id, guarded on the daemon's own running claim",
 	"ReleaseAgentAction#1":           "by id, guarded on the daemon's own running claim",
