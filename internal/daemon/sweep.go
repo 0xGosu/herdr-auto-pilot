@@ -399,7 +399,7 @@ func (d *Daemon) handleSweepOutcome(ctx context.Context, res sweepOutcome) {
 		cfg, _, _ := d.snapshot()
 		sig := domain.ComputeSignatureN(res.situation, cfg.Embedding.PaneSalientChars)
 		d.escalate(ctx, res.situation, sig, domain.Decision{
-			Action: domain.ActionEscalate, Reason: domain.ReasonHerdrUnreachable,
+			Action: domain.ActionEscalate, Reason: domain.ReasonSweepDegraded,
 			Rationale: "sweep failed: " + res.reason + "; partial capture, answer in pane",
 		}, res.tr, now)
 		return

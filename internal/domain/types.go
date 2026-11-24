@@ -211,8 +211,16 @@ const (
 	// confidence was below the operator's auto_act_confidence_threshold (or
 	// it reported no score), so the suggestion is surfaced for confirmation
 	// instead of being auto-acted.
-	ReasonLLMLowConfidence  EscalateReason = "llm_low_confidence"
-	ReasonHerdrUnreachable  EscalateReason = "herdr_unreachable"
+	ReasonLLMLowConfidence EscalateReason = "llm_low_confidence"
+	ReasonHerdrUnreachable EscalateReason = "herdr_unreachable"
+	// ReasonSweepDegraded: the multi-tab form sweep (daemon.sweepFrames) could
+	// not capture every tab, so only the first frame is known and the form is
+	// left for the operator to answer in the pane. The rationale names the
+	// cause — a failed herdr read or keystroke, or a tab that no longer parses
+	// as the same form. The latter is the common one and is no herdr fault:
+	// every multi-question Claude form read as herdr_unreachable when Claude
+	// Code v2.1.330 reworded its Submit tab (#605).
+	ReasonSweepDegraded     EscalateReason = "sweep_degraded"
 	ReasonPersistenceFailed EscalateReason = "persistence_failed"
 	ReasonShadowMode        EscalateReason = "shadow_mode"
 	ReasonNoTaskSource      EscalateReason = "no_task_source"
