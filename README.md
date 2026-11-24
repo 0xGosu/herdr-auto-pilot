@@ -428,6 +428,8 @@ A learned rule never acts on a situation before you have taught it.
    show <prefix>` prints where a rule stands (`aging:`). Mode is never changed
    by aging: a renewed rule is still autonomous. Set `confidence_decay_days = 0`
    to turn aging off, or `stale_rule_removal_days = 0` to keep aged-out rules.
+   With the defaults, a rule nobody confirms reaches 0 after 44 days (14 + 30)
+   and is removed 14 days later, 58 days after its last confirmation.
    Rules are shared across the machines of a shared database while these
    settings are per machine: there a rule is removed only once every running
    machine's settings agree it has sat at 0, so a machine with longer settings,
