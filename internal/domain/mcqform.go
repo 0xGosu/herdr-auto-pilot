@@ -42,11 +42,19 @@ var (
 // mcqSubmitScreenRE matches the final Submit tab's confirmation body. That
 // tab keeps the `←…✔ Submit…→` header but DROPS the tab-navigation footer
 // (issue #95), so the footer alone can not stand for "this is still the live
-// multi-tab form". The "Ready to submit your answers?" prompt is present
-// whether or not every question is answered (the "⚠ You have not answered all
-// questions" warning is conditional), and it is line-anchored so narration
-// can not trip it.
-var mcqSubmitScreenRE = regexp.MustCompile(`(?im)^\s*ready to submit your answers\?\s*$`)
+// multi-tab form". Either of two line-anchored body lines stands for it, so
+// narration can not trip it:
+//
+//   - "Ready to submit your answers?" — the prompt up to Claude Code v2.1.329,
+//     shown under a "Review your answers" heading.
+//   - "Review your answers" — since v2.1.330 that heading is the only body
+//     line left (verified live on v2.1.331, issue #605): the prompt is gone,
+//     the conditional warning reads "⚠ Some questions are unanswered" and an
+//     answered form lists "● <question>" / "→ <answer>" pairs instead.
+//
+// Both are present whether or not every question is answered. Matching only
+// the old prompt aborted every multi-question sweep on its last tab.
+var mcqSubmitScreenRE = regexp.MustCompile(`(?im)^\s*(?:ready to submit your answers\?|review your answers)\s*$`)
 
 // mcqSingleFooterRE matches Claude's single-question selection footer — the
 // "Enter to select" line plus its navigation tail (a "·" separator or the

@@ -250,6 +250,42 @@ func TestMultiTabSweepAndSeriesDelivery(t *testing.T) {
 	}
 }
 
+// mcqFramesV2330 is mcqFrames with the Submit tab as Claude Code renders it
+// since v2.1.330 (live capture on v2.1.331, issue #605): the "Ready to submit
+// your answers?" prompt is gone and "Review your answers" is the only body line.
+var mcqFramesV2330 = []string{
+	mcqFrames[0],
+	mcqFrames[1],
+	"scrollback narration up here\n──────\n" + mcqHeader + "\n\nReview your answers\n\n" +
+		"⚠ Some questions are unanswered\n\n❯ 1. Submit answers\n  2. Cancel\n",
+}
+
+// Regression for #605: the sweep must read the v2.1.330 Submit tab as the same
+// form and deliver the learned series, not degrade at "answer 3/3 no longer
+// shows the same 3-answer form" and escalate.
+func TestMultiTabSweepAcceptsV2330SubmitTab(t *testing.T) {
+	h := newHarness(t, "")
+	h.herdr.setFrames(mcqFramesV2330)
+	sig := h.seedSeriesRuleFrom(t, mcqFramesV2330, "1 2 1")
+
+	h.push("agent-mcq", "blocked")
+
+	ctx := context.Background()
+	waitFor(t, 10*time.Second, func() bool {
+		decs, _ := h.raw.DecisionsForSignature(ctx, sig, 10)
+		return len(decs) == 9
+	})
+	audits, _ := h.raw.AuditLog(ctx, 10)
+	if audits[0].Status != "auto" || audits[0].Signature != sig {
+		t.Errorf("series audit mismatch (sweep degraded?): %+v", audits[0])
+	}
+	reset := strings.TrimSpace(strings.Repeat("left ", 10))
+	want := "right right " + reset + " " + reset + " 1 2 1"
+	if joined := strings.Join(h.herdr.keysSent(), " "); joined != want {
+		t.Errorf("keystroke protocol mismatch:\n got %s\nwant %s", joined, want)
+	}
+}
+
 // A form with a MULTI-SELECT tab (tab 2) delivers the toggle digits for that
 // tab followed by an explicit advance keystroke — a multi-select tab does not
 // auto-advance — while the single-select tabs still advance on their one digit.
@@ -560,6 +596,11 @@ func TestSweepFailureDegradesToSingleFrame(t *testing.T) {
 	}
 	if !strings.Contains(esc[0].Rationale, "sweep failed") {
 		t.Errorf("escalation must name the sweep failure: %+v", esc[0])
+	}
+	// #605: a degraded sweep carries its own reason, not herdr_unreachable —
+	// most degrade because a tab stopped parsing, which is no herdr fault.
+	if reason, _ := domain.EscalationReason(esc[0].Rationale); reason != domain.ReasonSweepDegraded {
+		t.Errorf("degraded sweep reason = %q, want %q (rationale %q)", reason, domain.ReasonSweepDegraded, esc[0].Rationale)
 	}
 	if len(h.herdr.sentInputs()) != 0 {
 		t.Errorf("nothing may be sent on a failed sweep, sent %v", h.herdr.sentInputs())

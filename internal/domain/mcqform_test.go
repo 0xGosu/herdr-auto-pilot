@@ -106,6 +106,57 @@ func TestMultiTabFormDetectsFooterlessSubmitTab(t *testing.T) {
 	}
 }
 
+// mcqSubmitFrameV2330 and mcqSubmitFrameV2330Answered are LIVE captures
+// (2026-11-24, Claude Code v2.1.331) of the Submit tab as rendered since
+// v2.1.330: "Ready to submit your answers?" is gone, leaving the "Review your
+// answers" heading as the only confirmation-body line (issue #605).
+const mcqSubmitFrameV2330 = `⏺ Pick a color?
+
+────────────────────────────────────────────────────────────────────────────────
+←  ☐ Color  ☐ Size  ✔ Submit  →
+
+Review your answers
+
+⚠ Some questions are unanswered
+
+❯ 1. Submit answers
+  2. Cancel
+`
+
+const mcqSubmitFrameV2330Answered = `  Pick a color?
+
+────────────────────────────────────────────────────────────────────────────────
+←  ☒ Color  ☒ Size  ✔ Submit  →
+
+Review your answers
+
+ ● Pick a color?
+   → Red
+ ● Pick a size?
+   → Large
+
+❯ 1. Submit answers
+  2. Cancel
+`
+
+func TestMultiTabFormDetectsV2330SubmitTab(t *testing.T) {
+	for name, pane := range map[string]string{
+		"unanswered": mcqSubmitFrameV2330,
+		"answered":   mcqSubmitFrameV2330Answered,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tabs, ok := MultiTabForm(pane)
+			if !ok || tabs != 3 {
+				t.Fatalf("MultiTabForm(v2.1.330 submit tab) = (%d,%v), want (3,true)", tabs, ok)
+			}
+			state, ok := ParseMCQForm("claude", pane)
+			if !ok || state.Kind != MCQClaudeTabs || state.AnswerCount != 3 {
+				t.Fatalf("ParseMCQForm = (%+v,%v), want a 3-answer %q form", state, ok, MCQClaudeTabs)
+			}
+		})
+	}
+}
+
 func TestMultiTabFormRejectsNarratedCheckboxes(t *testing.T) {
 	// A narrated checkbox list without the navigation footer must not
 	// trigger the sweep protocol.
@@ -327,6 +378,9 @@ func TestClaudeMCQForm(t *testing.T) {
 		{"narrated checkbox no footer", "Plan status:\n←  ☐ step one  ✔ done  →\nall good\n", false},
 		{"submit prompt without tab header", "All done.\nReady to submit your answers?\nyes I think so\n", false},
 		{"submit narration mid-line with header", "←  ☐ a  ☐ b  ✔ Submit  →\nSo, are you ready to submit your answers? Not yet.\n", false},
+		{"multi-tab submit tab v2.1.330", mcqSubmitFrameV2330, true},
+		{"review heading without tab header", "All done.\nReview your answers\nlooks fine\n", false},
+		{"review narration mid-line with header", "←  ☐ a  ☐ b  ✔ Submit  →\nPlease review your answers before merging.\n", false},
 		{"plain numbered list", "Summary:\n1. Refactored the consumer\n2. Updated the spec\n", false},
 		{"narrated enter to select without nav tail", "run help: press Enter to select an entry\n", false},
 	}
@@ -543,6 +597,11 @@ func TestClaudeTabForm(t *testing.T) {
 		{
 			name: "submit tab: all answered, footer-less confirmation body",
 			pane: claudeSubmitFrame, wantOK: true,
+			wantCount: 3, wantUnanswered: 0, wantCaret: "1",
+		},
+		{
+			name: "submit tab v2.1.330: all answered, review heading only",
+			pane: mcqSubmitFrameV2330Answered, wantOK: true,
 			wantCount: 3, wantUnanswered: 0, wantCaret: "1",
 		},
 		{

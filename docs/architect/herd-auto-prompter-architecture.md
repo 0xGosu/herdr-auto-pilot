@@ -1014,7 +1014,7 @@ Exactly two tools:
 `unclassifiable`, `below_threshold`, `variance_guard`, `over_masked`,
 `never_auto_match`, `suspected_irreversible`, `rate_limited`, `retry_exhausted`,
 `daemon_paused`, `llm_timeout`, `llm_no_submit`, `llm_low_confidence`,
-`herdr_unreachable`, `persistence_failed`, `shadow_mode`, `no_task_source`,
+`herdr_unreachable`, `sweep_degraded`, `persistence_failed`, `shadow_mode`, `no_task_source`,
 `task_source_exhausted`, `task_source_unusable`, `noop_vs_pending_tasks`, `unfamiliar_options`,
 `no_history`, `graduation_pending`, `task_gen_failed`, `llm_retry`.
 
