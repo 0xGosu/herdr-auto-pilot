@@ -8,6 +8,11 @@ section in `CLAUDE.md`.
 automation folds those into a new section here under the version it actually
 assigns. Do not add a heading or an entry by hand.
 
+## 0.9.81
+
+- Fixed Claude Code 2.1.330+ multi-question forms escalating as `[herdr_unreachable] sweep failed` on their Submit tab instead of being answered (#605)
+- Changed a multi-question form that could not be fully read to escalate as `[sweep_degraded]` instead of `[herdr_unreachable]`, so a form hap could not parse no longer reads as a herdr outage
+
 ## 0.9.80
 
 - Added time-based aging of learned rules: a rule's confidence now drains while no operator re-confirms it (full score for 14 days, then to 0 over 30), so an autonomous rule eventually escalates to the operator again (even with an LLM configured) with its learned answer as the suggestion, and one confirmation — or `hap signatures confirm <prefix>` / the Rules tab's `+` — restores it

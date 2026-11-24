@@ -1,2 +1,0 @@
-- Fixed Claude Code 2.1.330+ multi-question forms escalating as `[herdr_unreachable] sweep failed` on their Submit tab instead of being answered (#605)
-- Changed a multi-question form that could not be fully read to escalate as `[sweep_degraded]` instead of `[herdr_unreachable]`, so a form hap could not parse no longer reads as a herdr outage
